@@ -181,13 +181,18 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
 
 #if defined(AK_OS_MACOS)
     if (!mach_server_name.is_empty()) {
-        [[maybe_unused]] auto server_port = Core::Platform::register_with_mach_server(mach_server_name);
-
-        // FIXME: For some reason, our implementation of IOSurface does not work on Intel macOS. Remove this conditional
-        //        compilation when that is resolved.
+        auto server_port = Core::Platform::register_with_mach_server(mach_server_name);
+        
+        // Only proceed with IOSurface setup if we successfully registered with the server
+        if (server_port.port() != MACH_PORT_NULL) {
+            // FIXME: For some reason, our implementation of IOSurface does not work on Intel macOS. Remove this conditional
+            //        compilation when that is resolved.
 #    if ARCH(AARCH64)
-        WebContent::BackingStoreManager::set_browser_mach_port(move(server_port));
+            WebContent::BackingStoreManager::set_browser_mach_port(move(server_port));
 #    endif
+        } else {
+            dbgln("Note: Could not register with mach server '{}', continuing without IOSurface support", mach_server_name);
+        }
     }
 #endif
 
@@ -215,6 +220,18 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     auto maybe_content_filter_error = load_content_filters(config_path);
     if (maybe_content_filter_error.is_error())
         dbgln("Failed to load content filters: {}", maybe_content_filter_error.error());
+    
+    // Load default ad blocking filters only if content filter file doesn't exist
+    // This prevents double-filtering which can cause site breakage
+    if (maybe_content_filter_error.is_error()) {
+        auto maybe_adblock_error = Web::ContentFilter::the().load_default_adblock_filters();
+        if (maybe_adblock_error.is_error())
+            dbgln("Failed to load default ad blocking filters: {}", maybe_adblock_error.error());
+        else
+            dbgln("Ad blocking filters loaded successfully");
+    } else {
+        dbgln("Using content filters from file instead of defaults");
+    }
 
     // TODO: Mach IPC
 

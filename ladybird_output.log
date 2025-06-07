@@ -1,0 +1,11 @@
+Ladybird PID file '/Users/wisp/Library/Application Support/Ladybird.pid' exists with PID 5506, but process cannot be found
+343488.355 [33;1mWebContent(6070)[0m: Unable to look up service org.ladybird.Ladybird.helper.6052 in bootstrap
+343488.355 [33;1mWebContent(6070)[0m: Failed to lookup server port: Unknown service name
+VERIFICATION FAILED: false at /Volumes/Bon/GitHub/ladybird/Libraries/LibCore/Platform/ProcessStatisticsMach.cpp:84
+0   liblagom-ak.0.0.0.dylib             0x0000000102c7d650 dump_backtrace + 72
+1   liblagom-ak.0.0.0.dylib             0x0000000102c7d908 ak_trap + 12
+2   liblagom-ak.0.0.0.dylib             0x0000000102c7d9b4 ak_assertion_failed + 0
+3   liblagom-core.0.0.0.dylib           0x0000000102a7a884 Core::Platform::register_with_mach_server(AK::ByteString const&) + 104
+4   WebContent                          0x00000001020a3bec serenity_main(Main::Arguments) + 1668
+5   WebContent                          0x00000001021439c0 main + 196
+6   dyld                                0x00000001880beb98 start + 6076

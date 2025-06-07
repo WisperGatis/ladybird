@@ -85,10 +85,8 @@ void DisplayListPlayerSkia::draw_glyph_run(DrawGlyphRun const& command)
     glyphs.ensure_capacity(glyph_count);
     Vector<SkPoint> positions;
     positions.ensure_capacity(glyph_count);
-    auto font_ascent = gfx_font.pixel_metrics().ascent;
     for (auto const& glyph : command.glyph_run->glyphs()) {
         auto transformed_glyph = glyph;
-        transformed_glyph.position.set_y(glyph.position.y() + font_ascent);
         transformed_glyph.position = transformed_glyph.position.scaled(command.scale);
         auto const& point = transformed_glyph.position;
         glyphs.append(transformed_glyph.glyph_id);
@@ -281,8 +279,8 @@ static ColorStopList expand_repeat_length(ColorStopList const& color_stop_list, 
 {
     // https://drafts.csswg.org/css-images/#repeating-gradients
     // When rendered, however, the color-stops are repeated infinitely in both directions, with their
-    // positions shifted by multiples of the difference between the last specified color-stop’s position
-    // and the first specified color-stop’s position. For example, repeating-linear-gradient(red 10px, blue 50px)
+    // positions shifted by multiples of the difference between the last specified color-stop's position
+    // and the first specified color-stop's position. For example, repeating-linear-gradient(red 10px, blue 50px)
     // is equivalent to linear-gradient(..., red -30px, blue 10px, red 10px, blue 50px, red 50px, blue 90px, ...).
 
     auto first_stop_position = color_stop_list.first().position;
@@ -434,7 +432,7 @@ static void add_spread_distance_to_border_radius(int& border_radius, int spread_
         return;
 
     // https://drafts.csswg.org/css-backgrounds/#shadow-shape
-    // To preserve the box’s shape when spread is applied, the corner radii of the shadow are also increased (decreased,
+    // To preserve the box's shape when spread is applied, the corner radii of the shadow are also increased (decreased,
     // for inner shadows) from the border-box (padding-box) radii by adding (subtracting) the spread distance (and flooring
     // at zero). However, in order to create a sharper corner when the border radius is small (and thus ensure continuity
     // between round and sharp corners), when the border radius is less than the spread distance (or in the case of an inner

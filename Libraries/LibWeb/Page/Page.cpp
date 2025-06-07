@@ -26,6 +26,7 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/Extensions/ExtensionManager.h>
 
 namespace Web {
 
@@ -39,6 +40,12 @@ GC::Ref<Page> Page::create(JS::VM& vm, GC::Ref<PageClient> page_client)
 Page::Page(GC::Ref<PageClient> client)
     : m_client(client)
 {
+    // Initialize extension support with development mode enabled for testing
+    if (m_extensions_enabled) {
+        auto& ext_manager = extension_manager();
+        ext_manager.set_development_mode(true);
+        (void)ext_manager.scan_for_development_extensions();
+    }
 }
 
 Page::~Page() = default;
@@ -51,6 +58,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_window_rect_observer);
     visitor.visit(m_on_pending_dialog_closed);
     visitor.visit(m_pending_clipboard_requests);
+    visitor.visit(m_extension_manager);
 }
 
 HTML::Navigable& Page::focused_navigable()
@@ -750,6 +758,20 @@ void Page::update_find_in_page_selection(Vector<GC::Root<DOM::Range>> matches)
         scroll_options.behavior = Bindings::ScrollBehavior::Instant;
         (void)element->scroll_into_view(scroll_options);
     }
+}
+
+Extensions::ExtensionManager& Page::extension_manager()
+{
+    if (!m_extension_manager) {
+        m_extension_manager = Extensions::ExtensionManager::create(*this);
+    }
+    return *m_extension_manager;
+}
+
+Extensions::ExtensionManager const& Page::extension_manager() const
+{
+    VERIFY(m_extension_manager);
+    return *m_extension_manager;
 }
 
 }

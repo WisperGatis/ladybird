@@ -8,15 +8,20 @@
 #include "Editor.h"
 #include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
+#include <AK/Format.h>
 #include <AK/GenericLexer.h>
 #include <AK/JsonObject.h>
 #include <AK/MemoryStream.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/RedBlackTree.h>
 #include <AK/ScopeGuard.h>
 #include <AK/ScopedValueRollback.h>
+#include <AK/StdLibExtras.h>
 #include <AK/StringBuilder.h>
+#include <AK/Time.h>
 #include <AK/Utf32View.h>
 #include <AK/Utf8View.h>
+#include <AK/Vector.h>
 #include <LibCore/ConfigFile.h>
 #include <LibCore/Event.h>
 #include <LibCore/EventLoop.h>
@@ -158,7 +163,7 @@ void Editor::set_default_keybinds()
     register_key_input_callback('\n', EDITOR_INTERNAL_FUNCTION(finish));
 
     // ^X^E: Edit in external editor
-    register_key_input_callback(Vector<Key> { ctrl('X'), ctrl('E') }, EDITOR_INTERNAL_FUNCTION(edit_in_external_editor));
+    register_key_input_callback(Vector<Key> { Key { ctrl('X') }, Key { ctrl('E') } }, EDITOR_INTERNAL_FUNCTION(edit_in_external_editor));
 
     // ^[.: alt-.: insert last arg of previous command (similar to `!$`)
     register_key_input_callback(Key { '.', Key::Alt }, EDITOR_INTERNAL_FUNCTION(insert_last_words));
@@ -223,7 +228,8 @@ void Editor::get_terminal_size()
     if (ws.ws_col == 0 || ws.ws_row == 0) {
         // LLDB uses ttys which "work" and then gives us a zero sized
         // terminal which is far from useful
-        if (int fd = open("/dev/tty", O_RDONLY); fd != -1) {
+        int fd = open("/dev/tty", O_RDONLY);
+        if (fd != -1) {
             ioctl(fd, TIOCGWINSZ, &ws);
             close(fd);
         }
@@ -423,7 +429,7 @@ void Editor::register_key_input_callback(KeyBinding const& binding)
             dbgln("LibLine: Unknown internal function '{}'", binding.binding);
             return;
         }
-        return register_key_input_callback(binding.keys, move(internal_function));
+        return register_key_input_callback(binding.keys, AK::move(internal_function));
     }
 
     return register_key_input_callback(binding.keys, [binding = ByteString(binding.binding)](auto& editor) {
@@ -514,10 +520,10 @@ void Editor::stylize(Span const& span, Style const& style)
                 m_current_masks.remove(next_it.key());
             }
         }
-        m_current_masks.insert(span.beginning(), move(maybe_mask));
+        m_current_masks.insert(span.beginning(), AK::move(maybe_mask));
         m_current_masks.insert(span.end(), {});
         if (last_encountered_entry.has_value())
-            m_current_masks.insert(span.end() + 1, move(last_encountered_entry));
+            m_current_masks.insert(span.end() + 1, AK::move(last_encountered_entry));
         style.unset_mask();
     }
 
@@ -1955,7 +1961,7 @@ StringMetrics Editor::actual_rendered_string_metrics(Utf32View const& view, RedB
     for (auto& line : metrics.line_metrics)
         metrics.max_line_length = max(line.total_length(), metrics.max_line_length);
 
-    metrics.grapheme_breaks = move(grapheme_breaks);
+    metrics.grapheme_breaks = AK::move(grapheme_breaks);
 
     return metrics;
 }

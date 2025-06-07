@@ -132,6 +132,7 @@ public slots:
     void show_find_in_page();
     void paste();
     void copy_selected_text();
+    void show_extension_manager();
 
 protected:
     bool eventFilter(QObject* obj, QEvent* event) override;

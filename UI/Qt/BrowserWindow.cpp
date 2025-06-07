@@ -177,6 +177,11 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
 
     edit_menu->addSeparator();
 
+    auto* extensions_action = new QAction("&Extensions", this);
+    extensions_action->setIcon(load_icon_from_uri("resource://icons/16x16/app-plus.png"sv));
+    edit_menu->addAction(extensions_action);
+    QObject::connect(extensions_action, &QAction::triggered, this, &BrowserWindow::show_extension_manager);
+
     auto* settings_action = new QAction("&Settings", this);
     settings_action->setIcon(load_icon_from_uri("resource://icons/16x16/settings.png"sv));
     settings_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Preferences));
@@ -1156,6 +1161,11 @@ void BrowserWindow::copy_selected_text()
 
     auto* clipboard = QGuiApplication::clipboard();
     clipboard->setText(qstring_from_ak_string(text));
+}
+
+void BrowserWindow::show_extension_manager()
+{
+    new_tab_from_url(URL::URL("about:extensions"_string), Web::HTML::ActivateTab::Yes);
 }
 
 bool BrowserWindow::event(QEvent* event)

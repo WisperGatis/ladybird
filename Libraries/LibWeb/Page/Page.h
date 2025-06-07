@@ -43,6 +43,10 @@ namespace Web {
 
 class PageClient;
 
+namespace Extensions {
+class ExtensionManager;
+}
+
 class Page final : public JS::Cell {
     GC_CELL(Page, JS::Cell);
     GC_DECLARE_ALLOCATOR(Page);
@@ -223,6 +227,12 @@ public:
     bool listen_for_dom_mutations() const { return m_listen_for_dom_mutations; }
     void set_listen_for_dom_mutations(bool listen_for_dom_mutations) { m_listen_for_dom_mutations = listen_for_dom_mutations; }
 
+    // Extension support
+    Extensions::ExtensionManager& extension_manager();
+    Extensions::ExtensionManager const& extension_manager() const;
+    bool extensions_enabled() const { return m_extensions_enabled; }
+    void set_extensions_enabled(bool enabled) { m_extensions_enabled = enabled; }
+
 private:
     explicit Page(GC::Ref<PageClient>);
     virtual void visit_edges(Visitor&) override;
@@ -297,6 +307,10 @@ private:
     URL::URL m_last_find_in_page_url;
 
     bool m_listen_for_dom_mutations { false };
+
+    // Extension support
+    bool m_extensions_enabled { true };  // Enable extensions by default for testing
+    GC::Ptr<Extensions::ExtensionManager> m_extension_manager;
 };
 
 struct PaintOptions {

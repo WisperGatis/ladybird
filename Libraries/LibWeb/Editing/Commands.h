@@ -6,6 +6,13 @@
 
 #pragma once
 
+#include <AK/FlyString.h>
+#include <AK/Function.h>
+#include <AK/Optional.h>
+#include <AK/String.h>
+#include <AK/StringView.h>
+#include <AK/Vector.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::Editing {

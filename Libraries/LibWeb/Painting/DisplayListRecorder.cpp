@@ -247,7 +247,7 @@ void DisplayListRecorder::draw_text(Gfx::IntRect const& rect, String raw_text, G
         TODO();
     }
     auto metrics = font.pixel_metrics();
-    float baseline_y = static_cast<float>(rect.y()) + metrics.ascent + (static_cast<float>(rect.height()) - (metrics.ascent + metrics.descent)) / 2.0f;
+    float baseline_y = static_cast<float>(rect.y()) + (static_cast<float>(rect.height()) + metrics.ascent - metrics.descent) / 2.0f;
     draw_text_run({ baseline_x, baseline_y }, *glyph_run, color, rect, 1.0, Orientation::Horizontal);
 }
 

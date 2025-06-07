@@ -54,13 +54,24 @@ Vector<NonnullRefPtr<GlyphRun>> shape_text(FloatPoint baseline_start, Utf8View s
 
 RefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf8View string, Gfx::Font const& font, GlyphRun::TextType text_type, ShapeFeatures const& features)
 {
-    static hb_buffer_t* buffer = hb_buffer_create();
+    // Use thread-local buffer to avoid static contention and improve performance
+    thread_local hb_buffer_t* buffer = nullptr;
+    if (!buffer) {
+        buffer = hb_buffer_create();
+    }
+    
+    hb_buffer_clear_contents(buffer);
     hb_buffer_add_utf8(buffer, reinterpret_cast<char const*>(string.bytes()), string.byte_length(), 0, -1);
     hb_buffer_guess_segment_properties(buffer);
 
     u32 glyph_count;
     auto* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
     Vector<hb_glyph_info_t> const input_glyph_info({ glyph_info, glyph_count });
+
+    if (input_glyph_info.size() == 0) {
+        hb_buffer_clear_contents(buffer);
+        return nullptr;
+    }
 
     auto* hb_font = font.harfbuzz_font();
     hb_feature_t const* hb_features_data = nullptr;
@@ -85,13 +96,21 @@ RefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf
 
     Vector<Gfx::DrawGlyph> glyph_run;
     FloatPoint point = baseline_start;
+    
     for (size_t i = 0; i < glyph_count; ++i) {
-
+        // Handle coordinate system conversion properly
+        // HarfBuzz positions are relative to the baseline and need proper adjustment
         auto position = point
-            - FloatPoint { 0, font.pixel_metrics().ascent }
-            + FloatPoint { positions[i].x_offset, positions[i].y_offset } / text_shaping_resolution;
+            + FloatPoint {
+                positions[i].x_offset / text_shaping_resolution, 
+                -positions[i].y_offset / text_shaping_resolution 
+            };
+
         glyph_run.append({ position, glyph_info[i].codepoint });
-        point += FloatPoint { positions[i].x_advance, positions[i].y_advance } / text_shaping_resolution;
+        point += FloatPoint {
+            positions[i].x_advance / text_shaping_resolution, 
+            positions[i].y_advance / text_shaping_resolution 
+        };
 
         // don't apply spacing to last glyph
         // https://drafts.csswg.org/css-text/#example-7880704e
@@ -100,7 +119,9 @@ RefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf
     }
 
     auto run = adopt_ref(*new Gfx::GlyphRun(move(glyph_run), font, text_type, point.x() - baseline_start.x()));
-    hb_buffer_reset(buffer);
+    
+    // Clear buffer contents for next use - more efficient than reset
+    hb_buffer_clear_contents(buffer);
     return run;
 }
 

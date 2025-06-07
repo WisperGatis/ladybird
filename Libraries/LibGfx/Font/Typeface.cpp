@@ -53,11 +53,12 @@ NonnullRefPtr<Font> Typeface::font(float point_size) const
     if (it != m_fonts.end())
         return *it->value;
 
-    // FIXME: It might be nice to have a global cap on the number of fonts we cache
-    //        instead of doing it at the per-Typeface level like this.
-    constexpr size_t max_cached_font_size_count = 128;
-    if (m_fonts.size() > max_cached_font_size_count)
+    // Increase cache size for better performance and use LRU eviction
+    constexpr size_t max_cached_font_size_count = 512;
+    if (m_fonts.size() >= max_cached_font_size_count) {
+        // Simple LRU: remove oldest (first) entry
         m_fonts.remove(m_fonts.begin());
+    }
 
     auto font = adopt_ref(*new Font(*this, point_size, point_size));
     m_fonts.set(point_size, font);

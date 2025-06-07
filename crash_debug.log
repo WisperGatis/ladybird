@@ -1,0 +1,3 @@
+Ladybird PID file '/Users/wisp/Library/Application Support/Ladybird.pid' exists with PID 51450, but process cannot be found
+393972.718 [33;1mWebContent(52343)[0m: Unable to look up service org.ladybird.Ladybird.helper.52320 in bootstrap
+393972.718 [33;1mWebContent(52343)[0m: Failed to lookup server port: Unknown service name

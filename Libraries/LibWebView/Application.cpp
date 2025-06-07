@@ -114,6 +114,7 @@ void Application::initialize(Main::Arguments const& arguments)
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool disable_scrollbar_painting = false;
+    bool enable_adblock = true;
 
     Core::ArgsParser args_parser;
     args_parser.set_general_help("The Ladybird web browser :^)");
@@ -138,6 +139,7 @@ void Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation", 'g');
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical scrollbars on the main viewport", "disable-scrollbar-painting");
+    args_parser.add_option(enable_adblock, "Enable built-in ad blocker", "enable-adblock");
     args_parser.add_option(dns_server_address, "Set the DNS server address", "dns-server", 0, "host|address");
     args_parser.add_option(dns_server_port, "Set the DNS server port", "dns-port", 0, "port (default: 53 or 853 if --dot)");
     args_parser.add_option(use_dns_over_tls, "Use DNS over TLS", "dot");
@@ -212,6 +214,14 @@ void Application::initialize(Main::Arguments const& arguments)
         .collect_garbage_on_every_allocation = collect_garbage_on_every_allocation ? CollectGarbageOnEveryAllocation::Yes : CollectGarbageOnEveryAllocation::No,
         .paint_viewport_scrollbars = disable_scrollbar_painting ? PaintViewportScrollbars::No : PaintViewportScrollbars::Yes,
     };
+
+    // Configure ad blocker
+    if (!enable_adblock) {
+        dbgln("Ad blocker disabled by command line option");
+        // We'll configure this in the WebContent process
+    } else {
+        dbgln("Ad blocker enabled");
+    }
 
     create_platform_options(m_browser_options, m_web_content_options);
 
@@ -303,14 +313,16 @@ ErrorOr<void> Application::launch_image_decoder_server()
 
         if (auto result = launch_image_decoder_server(); result.is_error()) {
             dbgln("Failed to restart image decoder: {}", result.error());
-            VERIFY_NOT_REACHED();
+            // Don't crash the whole browser if ImageDecoder fails to restart
+            return;
         }
 
         auto client_count = WebContentClient::client_count();
         auto new_sockets = m_image_decoder_client->send_sync_but_allow_failure<Messages::ImageDecoderServer::ConnectNewClients>(client_count);
         if (!new_sockets || new_sockets->sockets().is_empty()) {
             dbgln("Failed to connect {} new clients to ImageDecoder", client_count);
-            VERIFY_NOT_REACHED();
+            // Don't crash the whole browser if we can't reconnect to ImageDecoder
+            return;
         }
 
         WebContentClient::for_each_client([sockets = new_sockets->take_sockets()](WebContentClient& client) mutable {

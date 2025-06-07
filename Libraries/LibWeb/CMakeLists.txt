@@ -938,6 +938,21 @@ set(SOURCES
     XHR/XMLHttpRequestUpload.cpp
     XLink/AttributeNames.cpp
     XML/XMLDocumentBuilder.cpp
+    Editing/Editor.cpp
+    EncryptedMediaExtensions/MediaKeyMessageEvent.cpp
+    EncryptedMediaExtensions/MediaKeySession.cpp
+    EncryptedMediaExtensions/MediaKeys.cpp
+    EncryptedMediaExtensions/MediaKeyStatusMap.cpp
+    EncryptedMediaExtensions/MediaKeySystemAccess.cpp
+    EntriesAPI/FileSystemDirectoryEntry.cpp
+    EntriesAPI/FileSystemEntry.cpp
+    EntriesAPI/FileSystemFileEntry.cpp
+    EventTiming/PerformanceEventTiming.cpp
+    Extensions/Extension.cpp
+    Extensions/ExtensionManifest.cpp
+    Extensions/ExtensionManager.cpp
+    Extensions/API/ExtensionRuntime.cpp
+    Extensions/API/MozillaExtensionRuntime.cpp
 )
 
 compile_ipc(Worker/WebWorkerClient.ipc Worker/WebWorkerClientEndpoint.h)
@@ -1006,7 +1021,7 @@ set(GENERATED_SOURCES
 
 serenity_lib(LibWeb web)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibIDL LibURL LibTLS LibRequests LibGC LibThreading skia)
+target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibFileSystem LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibIDL LibURL LibTLS LibRequests LibGC LibThreading skia)
 
 if (APPLE)
     target_link_libraries(LibWeb PRIVATE unofficial::angle::libEGL unofficial::angle::libGLESv2)

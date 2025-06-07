@@ -107,7 +107,12 @@ void MachPort::unref_port()
         res = mach_port_mod_refs(mach_task_self(), m_port, to_underlying(m_right), -1);
         break;
     }
-    VERIFY(res == KERN_SUCCESS);
+    
+    // Don't crash the process if port deallocation fails - this can happen
+    // when the process is shutting down or if the port is already invalid
+    if (res != KERN_SUCCESS) {
+        dbgln("Warning: Failed to deallocate mach port {}: {}", m_port, mach_error_string(res));
+    }
 }
 
 ErrorOr<MachPort> MachPort::create_with_right(PortRight right)

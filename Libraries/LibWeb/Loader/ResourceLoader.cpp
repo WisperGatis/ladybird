@@ -183,6 +183,15 @@ static void log_filtered_request(LoadRequest const& request)
     dbgln("ResourceLoader: Filtered request to: \"{}\"", url_for_logging);
 }
 
+static RequestType request_type_from_load_request(LoadRequest const& request)
+{
+    // Since LoadRequest doesn't have resource_type() method and Resource only has Generic type,
+    // we'll need to infer the type from the URL or other context
+    // For now, return Other as a safe default
+    (void)request; // Suppress unused parameter warning
+    return RequestType::Other;
+}
+
 static bool should_block_request(LoadRequest const& request)
 {
     auto const& url = request.url().value();
@@ -201,10 +210,26 @@ static bool should_block_request(LoadRequest const& request)
         return true;
     }
 
-    if (ContentFilter::the().is_filtered(url)) {
+    // Get origin domain from the request page if available
+    StringView origin_domain;
+    // TODO: Extract origin domain from page context when BrowsingContext API is available
+    // For now, we'll use empty origin domain which disables third-party detection
+    (void)request; // Suppress unused parameter warning for now
+
+    // Fast path: skip filtering if disabled
+    if (!ContentFilter::the().filtering_enabled()) {
+        return false;
+    }
+
+    // Use the enhanced ad blocking functionality
+    auto request_type = request_type_from_load_request(request);
+    if (ContentFilter::the().should_block_request(url, request_type, origin_domain)) {
+        ContentFilter::the().increment_blocked_request_count();
         log_filtered_request(request);
         return true;
     }
+
+    // Note: Removed duplicate check to avoid double filtering
 
     return false;
 }

@@ -5,6 +5,8 @@
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
+from __future__ import annotations
+
 import argparse
 import os
 import platform
@@ -13,7 +15,7 @@ import shutil
 import sys
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -299,7 +301,7 @@ def ensure_ladybird_source_dir() -> Path:
     return ladybird_source_dir
 
 
-def build_main(build_dir: Path, jobs: str | None, target: Optional[str] = None, args: list[str] = []):
+def build_main(build_dir: Path, jobs: Union[str, None], target: Optional[str] = None, args: list[str] = []):
     build_args = ["ninja", "-C", str(build_dir)]
 
     if not jobs:

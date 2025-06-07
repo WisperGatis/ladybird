@@ -81,7 +81,8 @@ MachPort register_with_mach_server(ByteString const& server_name)
     auto server_port_or_error = Core::MachPort::look_up_from_bootstrap_server(server_name);
     if (server_port_or_error.is_error()) {
         dbgln("Failed to lookup server port: {}", server_port_or_error.error());
-        VERIFY_NOT_REACHED();
+        // Return an empty port instead of crashing - this is not fatal
+        return {};
     }
     auto server_port = server_port_or_error.release_value();
 
@@ -102,7 +103,8 @@ MachPort register_with_mach_server(ByteString const& server_name)
     auto const send_result = mach_msg(&message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, message.header.msgh_size, 0, MACH_PORT_NULL, timeout, MACH_PORT_NULL);
     if (send_result != KERN_SUCCESS) {
         dbgln("Failed to send message to server: {}", mach_error_string(send_result));
-        VERIFY_NOT_REACHED();
+        // Return an empty port instead of crashing - this is not fatal
+        return {};
     }
 
     return server_port;

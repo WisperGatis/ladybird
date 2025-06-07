@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Ladybird Extensions</title>
+    <link href="settings/settings.css" rel="stylesheet" />
+    <style>
+        .extension-item {
+            background: var(--color-grey-100);
+            border: 1px solid var(--color-grey-200);
+            border-radius: var(--border-radius);
+            padding: 1rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .extension-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: var(--border-radius);
+            background: var(--color-grey-300);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            color: var(--color-grey-600);
+        }
+
+        .extension-info {
+            flex: 1;
+        }
+
+        .extension-name {
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+
+        .extension-description {
+            color: var(--color-grey-700);
+            font-size: 0.9rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .extension-version {
+            color: var(--color-grey-600);
+            font-size: 0.8rem;
+        }
+
+        .extension-actions {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .toggle-switch {
+            position: relative;
+            width: 44px;
+            height: 24px;
+            background: var(--color-grey-300);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .toggle-switch.enabled {
+            background: var(--color-primary);
+        }
+
+        .toggle-switch::before {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 20px;
+            height: 20px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.2s;
+        }
+
+        .toggle-switch.enabled::before {
+            transform: translateX(20px);
+        }
+
+        .no-extensions {
+            text-align: center;
+            padding: 3rem;
+            color: var(--color-grey-600);
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <picture>
+            <source
+                srcset="resource://icons/128x128/app-plus.png"
+                media="(prefers-color-scheme: dark)"
+            />
+            <img src="resource://icons/128x128/app-plus-dark.png" />
+        </picture>
+        <h1>Browser Extensions</h1>
+    </header>
+
+    <div class="card">
+        <div class="card-header">Extension Management</div>
+        <div class="card-body">
+            <div class="card-group inline-container">
+                <span>Development Mode</span>
+                <label class="toggle-switch" id="development-mode-toggle">
+                    <input type="checkbox" id="development-mode-checkbox" style="display: none;">
+                </label>
+            </div>
+
+            <div class="card-group inline-container">
+                <span>Load Extension</span>
+                <button id="load-extension-button" class="secondary-button">Load Unpacked...</button>
+                <button id="install-crx-button" class="secondary-button">Install CRX...</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            Installed Extensions 
+            <span id="extension-count" class="extension-version">(0)</span>
+        </div>
+        <div class="card-body">
+            <div id="extensions-list">
+                <div class="no-extensions">
+                    <h3>No extensions installed</h3>
+                    <p>Install extensions to enhance your browsing experience.</p>
+                    <p><strong>Note:</strong> Extension backend integration is in development.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const developmentModeToggle = document.getElementById('development-mode-toggle');
+        const developmentModeCheckbox = document.getElementById('development-mode-checkbox');
+        const extensionsList = document.getElementById('extensions-list');
+        const extensionCount = document.getElementById('extension-count');
+        const loadExtensionButton = document.getElementById('load-extension-button');
+        const installCrxButton = document.getElementById('install-crx-button');
+
+        let extensions = [];
+
+        function updateDevelopmentMode() {
+            if (developmentModeCheckbox.checked) {
+                developmentModeToggle.classList.add('enabled');
+            } else {
+                developmentModeToggle.classList.remove('enabled');
+            }
+        }
+
+        function loadExtensions(extensionData) {
+            extensions = extensionData || [];
+            extensionCount.textContent = `(${extensions.length})`;
+            
+            if (extensions.length === 0) {
+                extensionsList.innerHTML = `
+                    <div class="no-extensions">
+                        <h3>No extensions installed</h3>
+                        <p>Install extensions to enhance your browsing experience.</p>
+                        <p><strong>Note:</strong> Extension backend integration is in development.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            extensionsList.innerHTML = extensions.map(ext => `
+                <div class="extension-item">
+                    <div class="extension-icon">🧩</div>
+                    <div class="extension-info">
+                        <div class="extension-name">${ext.name || 'Unknown Extension'}</div>
+                        <div class="extension-description">${ext.description || 'No description available'}</div>
+                        <div class="extension-version">Version ${ext.version || '1.0'}</div>
+                    </div>
+                    <div class="extension-actions">
+                        <label class="toggle-switch ${ext.enabled ? 'enabled' : ''}">
+                            <input type="checkbox" ${ext.enabled ? 'checked' : ''} style="display: none;">
+                        </label>
+                        <button class="secondary-button">Remove</button>
+                        <button class="secondary-button">Reload</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Event listeners
+        developmentModeCheckbox.addEventListener('change', updateDevelopmentMode);
+
+        loadExtensionButton.addEventListener('click', () => {
+            alert('Load Extension functionality will be available when the backend is integrated.');
+        });
+
+        installCrxButton.addEventListener('click', () => {
+            alert('Install CRX functionality will be available when the backend is integrated.');
+        });
+
+        // Load initial data
+        document.addEventListener('WebUILoaded', () => {
+            // For now, show empty extensions list
+            loadExtensions([]);
+        });
+    </script>
+</body>
+</html>

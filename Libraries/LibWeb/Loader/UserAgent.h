@@ -67,7 +67,21 @@ enum class NavigatorCompatibilityMode {
 #define BROWSER_NAME "Ladybird"
 #define BROWSER_VERSION "1.0"
 
-constexpr auto default_user_agent = "Mozilla/5.0 (" OS_STRING "; " CPU_STRING ") " BROWSER_NAME "/" BROWSER_VERSION ""sv;
+// Chrome-compatible user agent for Web Store compatibility
+#if defined(AK_OS_MACOS)
+constexpr auto chrome_compatible_user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"sv;
+#elif defined(AK_OS_LINUX)
+constexpr auto chrome_compatible_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"sv;
+#elif defined(AK_OS_WINDOWS)
+constexpr auto chrome_compatible_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"sv;
+#else
+constexpr auto chrome_compatible_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"sv;
+#endif
+
+constexpr auto ladybird_user_agent = "Mozilla/5.0 (" OS_STRING "; " CPU_STRING ") " BROWSER_NAME "/" BROWSER_VERSION ""sv;
+
+// Use Chrome-compatible user agent by default for better web compatibility
+constexpr auto default_user_agent = chrome_compatible_user_agent;
 constexpr auto default_platform = OS_STRING " " CPU_STRING ""sv;
 constexpr auto default_navigator_compatibility_mode = NavigatorCompatibilityMode::Chrome;
 

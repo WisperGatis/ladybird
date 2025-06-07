@@ -145,12 +145,11 @@ void PathImplSkia::glyph_run(GlyphRun const& glyph_run)
 {
     auto sk_font = glyph_run.font().skia_font(1);
     m_path->setFillType(SkPathFillType::kWinding);
-    auto font_ascent = glyph_run.font().pixel_metrics().ascent;
     for (auto const& glyph : glyph_run.glyphs()) {
         SkPath glyph_path;
         if (!sk_font.getPath(static_cast<SkGlyphID>(glyph.glyph_id), &glyph_path))
             continue;
-        glyph_path.offset(glyph.position.x(), glyph.position.y() + font_ascent);
+        glyph_path.offset(glyph.position.x(), glyph.position.y());
         m_path->addPath(glyph_path);
     }
 }
