@@ -25,10 +25,11 @@ Loader::Loader(NonnullOwnPtr<LoaderPlugin> plugin)
 struct LoaderPluginInitializer {
     bool (*sniff)(SeekableStream&);
     ErrorOr<NonnullOwnPtr<LoaderPlugin>> (*create)(NonnullOwnPtr<SeekableStream>);
+    ErrorOr<NonnullOwnPtr<LoaderPlugin>> (*create_from_url)(StringView);
 };
 
 static constexpr LoaderPluginInitializer s_initializers[] = {
-    { FFmpegLoaderPlugin::sniff, FFmpegLoaderPlugin::create },
+    { FFmpegLoaderPlugin::sniff, FFmpegLoaderPlugin::create, FFmpegLoaderPlugin::create_from_url },
 };
 
 ErrorOr<NonnullRefPtr<Loader>> Loader::create(StringView path)
@@ -42,6 +43,13 @@ ErrorOr<NonnullRefPtr<Loader>> Loader::create(ReadonlyBytes buffer)
 {
     auto stream = TRY(try_make<FixedMemoryStream>(buffer));
     auto plugin = TRY(Loader::create_plugin(move(stream)));
+    return adopt_ref(*new (nothrow) Loader(move(plugin)));
+}
+
+ErrorOr<NonnullRefPtr<Loader>> Loader::create_from_url(StringView url)
+{
+    // For URL-based loading, we use FFmpeg directly since it's the only plugin that supports URLs
+    auto plugin = TRY(FFmpegLoaderPlugin::create_from_url(url));
     return adopt_ref(*new (nothrow) Loader(move(plugin)));
 }
 

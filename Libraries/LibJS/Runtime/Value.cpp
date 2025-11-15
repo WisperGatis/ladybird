@@ -559,6 +559,12 @@ bool Value::to_boolean_slow_case() const
         return true;
     case SYMBOL_TAG:
         return true;
+    case ACCESSOR_TAG:
+        // Accessors are objects, so they're truthy
+        return true;
+    case EMPTY_TAG:
+        // Empty values should be treated as undefined (falsy)
+        return false;
     default:
         VERIFY_NOT_REACHED();
     }

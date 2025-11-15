@@ -1,0 +1,149 @@
+---
+alwaysApply: true
+---
+# Ladybird Contribution Guidelines
+
+## Code Quality Standards
+
+### Language and Style
+- Write in **idiomatic C++23** using AK containers throughout
+- Follow [CodingStyle.md](mdc:Documentation/CodingStyle.md) precisely
+- Use `clang-format` for automatic formatting (correct version per `Meta/lint-clang-format.py`)
+- Write in **American English** with ISO 8601 dates and metric units
+- Use proper spelling, grammar, and punctuation
+- Use authoritative and technical tone
+- Avoid contractions, slang, idioms, humor, and sarcasm
+- Use gender-neutral pronouns
+
+### Code Clarity
+- Choose expressive variable, function, and class names
+- Make code intent as obvious as possible
+- Check spelling in code, comments, and commit messages
+- Don't include commented-out code
+
+### What Not to Do
+- Don't submit changes incompatible with 2-clause BSD license
+- Don't touch anything outside PR scope
+- Don't iterate excessively on design across multiple commits
+- Don't use weasel-words like "refactor" or "fix" without explanation
+- Don't write in C style - use C++ amenities
+- Don't attempt large architectural changes until familiar with system
+- Don't engage in "feng shui programming" (moving code without benefit)
+- Don't add jokes to user-facing parts
+
+## Commit Message Format
+
+### Subject Line (First Line)
+**Format:** `Category: Brief description of what's being changed`
+
+**Rules:**
+- Must be imperative mood: "Change the way X works" (not "Changed")
+- Wrap at 72 characters
+- No period at end
+- Write in proper English with care and punctuation
+
+**Category Guidelines:**
+- Use library/application/service/utility name: `LibMedia`, `WebContent`, `CI`, `AK`, `js`
+- Don't use generic categories like "Libraries" or "Utilities" (except for broad changes)
+- Don't use specific component names (e.g., class names) - mention in summary instead
+  - ✅ `LibGUI: Brief description of FooWidget changes`
+  - ❌ `FooWidget: Brief description`
+- Combine multiple categories with `+`: `LibJS+LibWeb+Browser: ...`
+
+### Examples
+
+```
+LibWeb: Implement CSS grid layout algorithm
+
+LibJS+LibWeb: Add support for async generators
+
+RequestServer: Fix memory leak in HTTP connection pool
+
+CI: Update GitHub Actions to latest versions
+```
+
+## Git Workflow
+
+### Commit Structure
+- Split changes into **atomic commits** (one feature/fix per commit)
+- Each commit should leave build, tests, and system functioning
+- Rebase commits on master branch
+- Amend existing commits when adding changes after review
+
+### Personal Contributions
+- Add your copyright line to files when making substantive changes (optional but encouraged)
+
+### Review Process
+- Mark each review comment as "resolved" after pushing fix
+- Engage with community on Discord for better review turnaround
+- Advertise PRs in `#code-review` Discord channel
+
+## Testing
+
+- Include tests when fixing bugs or adding features when possible
+- Import relevant [Web Platform Tests (WPT)](https://wpt.fyi/) if applicable
+- Commit imported tests along with code changes
+
+## Starting Out
+
+### First Contributions
+- **Start small** to get familiar with project and processes
+- **Don't start with large components**
+- Read all [Ladybird documentation](mdc:Documentation/README.md)
+- Join [Discord server](https://discord.gg/nvfjVJ4Svh) for development discussion
+
+### Getting Help
+- Build problems: ask in `#build-problems` on Discord (not GitHub issues)
+- Review requests: ping maintainers on Discord, not GitHub
+- Development questions: ask in development channels on Discord
+
+## Issue Policy
+
+### When Filing Issues
+- One issue per bug (don't combine multiple issues)
+- Follow [detailed issue-reporting guidelines](mdc:ISSUES.md)
+- No build issues or support requests in GitHub issues
+- Keep comments relevant (no jokes or irrelevant commentary)
+
+## Optimization and Media
+
+### Images
+- Run `optipng -strip all` on images to optimize and strip metadata
+- Can reduce file size from KB to hundreds of bytes
+
+## AI and LLM Usage
+
+- AI assistance is acceptable BUT you're responsible for output quality
+- AI-generated content must meet project standards
+- Current AI output often too verbose and lower quality than human contributions
+- Don't use AI to generate changes, respond to issues, or interact with PRs without meeting human-written content standards
+
+## Project Values
+
+### Neutrality
+- Goal: build browser for everyone, regardless of opinions/worldviews
+- Focus on shared goal of building the browser
+- Welcome contributions from anyone committed to goals
+- Keep discussions strictly related to browser development and web standards
+- No platform for causes unrelated to browser development/web standards
+- Discourage discussions on societal politics and divisive topics in project spaces
+
+### Bad Faith
+- Project reserves right to reject bad-faith issues and PRs
+- Participating in social media brigading results in permanent ban
+
+## Maintainers
+
+Pull requests approved and merged by maintainers (alphabetical):
+- Ali Mohammad Pur (@alimpfard)
+- Aliaksandr Kalenik (@kalenikaliaksandr)
+- Andreas Kling (@awesomekling)
+- Andrew Kaster (@ADKaster)
+- Dániel Bertalan (@BertalanD)
+- Gregory Bertilson (@Zaggy1024)
+- Jelle Raaijmakers (@GMTA)
+- Luke Wilde (@Lubrsi)
+- Sam Atkins (@AtkinsSJ)
+- Shannon Booth (@shannonbooth)
+- Tim Flynn (@trflynn89)
+- Tim Ledbetter (@tcl3)

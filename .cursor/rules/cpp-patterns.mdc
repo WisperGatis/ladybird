@@ -1,0 +1,236 @@
+---
+globs: *.cpp,*.h,*.mm
+---
+# Ladybird C++ Patterns
+
+## Main Entry Point Pattern
+
+Use `ladybird_main()` instead of standard C `main()`:
+
+```cpp
+#include <LibMain/Main.h>
+
+ErrorOr<int> ladybird_main(Main::Arguments arguments)
+{
+    // Main logic with TRY(...) support
+    TRY(initialize_system());
+    return 0;
+}
+```
+
+**Benefits:**
+- Idiomatic argument handling via `Main::Arguments`
+- Seamless error propagation with `TRY(...)`
+- Avoids C-style error handling
+- Link with LibMain to get actual `main()` function
+
+## Collections: Array vs Vector vs FixedArray
+
+### When to Use Each
+
+1. **C-style arrays `type[]`**: Generally discouraged
+   - Only for implementing other collections or specific circumstances
+
+2. **Array<type, SIZE>**: Compile-time fixed size
+   - Thin wrapper around C arrays (like `std::array`)
+   - Allocates inline (no dynamic allocation)
+   - Size must be known at compile time
+
+3. **Vector<type>**: Dynamic resizable array
+   - Like `std::vector`, go-to collection for most use cases
+   - Optional inline capacity (2nd template parameter)
+   - Automatically switches to heap when exceeding inline capacity
+
+4. **FixedArray<type>**: Runtime-sized, non-resizable
+   - Size known at runtime but doesn't change after construction
+   - Allocates/deallocates only in constructor/destructor
+   - Ideal when size is determined at runtime but remains constant
+
+### Examples
+
+```cpp
+// Array - compile-time size
+Array<int, 5> fixed = { 1, 2, 3, 4, 5 };
+
+// Vector - dynamic, most common
+Vector<String> names;
+TRY(names.try_append("Alice"));
+TRY(names.try_resize(100));
+
+// Vector with inline capacity
+Vector<int, 16> small_ints;  // First 16 elements stored inline
+
+// FixedArray - runtime size, no resizing
+ErrorOr<FixedArray<u8>> create_buffer(size_t size)
+{
+    return TRY(FixedArray<u8>::create(size));
+}
+```
+
+## Span<type> for Views
+
+Use `Span` for APIs that view data owned by others:
+- Doesn't own data
+- Provides view on all or part of other collections
+- Good for APIs not specific to collection type
+
+```cpp
+void process_bytes(ReadonlyBytes data)
+{
+    // Works with any contiguous collection
+}
+
+Vector<u8> vec = { 1, 2, 3 };
+process_bytes(vec.span());
+```
+
+## String View Literals
+
+Use `operator""sv` for zero-cost StringView literals:
+
+```cpp
+#include <AK/StringView.h>
+
+StringView literal_view = "foo"sv;  // No runtime cost, data in binary's data section
+
+// Use in comparisons
+if (name == "admin"sv) {
+    // ...
+}
+```
+
+## Source Location for Debugging
+
+Use `AK::SourceLocation` to capture caller information without macros:
+
+```cpp
+#include <AK/SourceLocation.h>
+
+void log_error(StringView message, SourceLocation const& loc = SourceLocation::current())
+{
+    dbgln("Error at {}:{}: {}", loc.filename(), loc.line_number(), message);
+}
+
+// Automatically captures call site
+log_error("Something went wrong");
+```
+
+### Conditional SourceLocation
+
+For debug-only capture, avoid `#ifdef` everywhere:
+
+```cpp
+#if LOCK_DEBUG
+#    include <AK/SourceLocation.h>
+using LockLocation = SourceLocation;
+#else
+struct LockLocation {
+    static constexpr LockLocation current() { return {}; }
+private:
+    constexpr LockLocation() = default;
+};
+#endif
+
+void acquire_lock(LockLocation const& loc = LockLocation::current())
+{
+    // Only captures location when LOCK_DEBUG is enabled
+}
+```
+
+## Static Assertions with Debug Info
+
+Use `AK::AssertSize` instead of `static_assert` for size checks - provides actual values in compiler errors:
+
+```cpp
+#include <AK/StdLibExtras.h>
+
+struct MyStruct {
+    u32 field1;
+    u64 field2;
+};
+
+// Compiler error shows actual size if wrong
+static_assert(AssertSize<MyStruct, 16>());
+```
+
+## Intrusive Lists
+
+Use when you need OOM-durability (no allocation on insertion):
+
+```cpp
+class MyNode {
+public:
+    using List = IntrusiveList<&MyNode::m_list_node>;
+    
+private:
+    IntrusiveListNode<MyNode> m_list_node;
+};
+
+// No allocations, OOM-safe
+MyNode::List my_list;
+my_list.append(*node);  // Cannot fail
+```
+
+## Comments
+
+### FIXME and TODO
+- Use `FIXME:` (without attribution) for items needing future work
+- `TODO:` also permitted
+- No personal attributions
+
+```cpp
+// FIXME: Add support for JPEG decoding
+draw_jpg();
+
+// TODO: Implement caching
+fetch_data();
+```
+
+### Explain Why, Not What
+
+```cpp
+// RIGHT - explains why
+i++; // Go to the next page
+
+// WRONG - states the obvious
+i++; // Increment i
+```
+
+### Wrap Long Comments
+Aim for ~120 character width for readability.
+
+## Type Safety
+
+### Prefer Const Over #define
+
+```cpp
+// RIGHT
+static constexpr u32 MAX_SIZE = 1024;
+
+// WRONG
+#define MAX_SIZE 1024
+```
+
+### Prefer Inline Functions Over Macros
+
+```cpp
+// RIGHT
+inline constexpr bool is_power_of_two(u32 x) {
+    return x && !(x & (x - 1));
+}
+
+// WRONG
+#define IS_POWER_OF_TWO(x) ((x) && !((x) & ((x) - 1)))
+```
+
+## Initialization
+
+Prefer initialization at definition:
+
+```cpp
+class Widget {
+    int m_width { 100 };
+    int m_height { 100 };
+    bool m_visible { true };
+};
+```

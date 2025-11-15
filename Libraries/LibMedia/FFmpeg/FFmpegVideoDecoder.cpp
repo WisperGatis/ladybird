@@ -6,6 +6,7 @@
 
 #include <LibCore/System.h>
 #include <LibMedia/VideoFrame.h>
+#include <cstring>
 
 #include "FFmpegHelpers.h"
 #include "FFmpegVideoDecoder.h"
@@ -72,6 +73,8 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> FFmpegVideoDecoder::try_create
             return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate codec initialization data buffer for FFmpeg codec"sv);
 
         memcpy(codec_context->extradata, codec_initialization_data.data(), codec_initialization_data.size());
+        // Zero out the padding bytes as required by FFmpeg
+        memset(codec_context->extradata + codec_initialization_data.size(), 0, AV_INPUT_BUFFER_PADDING_SIZE);
         codec_context->extradata_size = static_cast<int>(codec_initialization_data.size());
     }
 
@@ -125,8 +128,13 @@ DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(AK::Duration timesta
         return DecoderError::with_description(DecoderErrorCategory::Invalid, "FFmpeg codec has not been opened"sv);
     case AVERROR(ENOMEM):
         return DecoderError::with_description(DecoderErrorCategory::Memory, "FFmpeg codec ran out of internal memory"sv);
-    default:
-        return DecoderError::with_description(DecoderErrorCategory::Corrupted, "FFmpeg codec reports that the data is corrupted"sv);
+    default: {
+        // FFmpeg may return various error codes. Try to provide more specific error information.
+        // Some errors might be recoverable or indicate format issues rather than corruption.
+        char error_buffer[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(result, error_buffer, AV_ERROR_MAX_STRING_SIZE);
+        return DecoderError::format(DecoderErrorCategory::Corrupted, "FFmpeg codec error (code {}): {}", result, StringView(error_buffer, strlen(error_buffer)));
+    }
     }
 }
 

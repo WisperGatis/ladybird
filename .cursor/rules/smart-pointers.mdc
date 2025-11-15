@@ -1,0 +1,189 @@
+---
+alwaysApply: true
+---
+# Ladybird Smart Pointers
+
+Smart pointers make ownership explicit and prevent memory leaks and use-after-free bugs.
+
+## OwnPtr<T> and NonnullOwnPtr<T>
+
+### Overview
+- Used for **single-owner** objects
+- OwnPtr owns and is responsible for deleting the pointee
+- Cannot be copied; transfer ownership by moving
+- `NonnullOwnPtr` cannot be null (similar to `&` vs `*`)
+- Can assign `NonnullOwnPtr` to `OwnPtr` but not vice versa
+
+### Construction with Helpers (Preferred)
+
+```cpp
+// make<T>() - terminates on allocation failure
+NonnullOwnPtr<Foo> my_object = make<Foo>();
+my_object->do_stuff();
+
+// try_make<T>() - returns ErrorOr, allows handling allocation failure
+auto my_object_or_error = try_make<Foo>();
+if (my_object_or_error.is_error()) {
+    // handle allocation failure
+}
+auto my_object = my_object_or_error.release_value();
+```
+
+### Manual Construction (When Necessary)
+
+Only when helpers cannot access private constructors:
+
+```cpp
+// Known non-null pointer
+NonnullOwnPtr<Foo> my_object = adopt_own(*new Foo);
+
+// Possibly null pointer (use nothrow new)
+OwnPtr<Foo> my_object = adopt_own_if_nonnull(new (nothrow) Foo);
+```
+
+**Note:** Always prefer helper functions to manual construction.
+
+### Converting OwnPtr to NonnullOwnPtr
+
+```cpp
+OwnPtr<Foo> maybe_foo = get_foo();
+if (maybe_foo) {
+    NonnullOwnPtr<Foo> definitely_foo = maybe_foo.release_nonnull();
+}
+```
+
+## RefPtr<T> and NonnullRefPtr<T>
+
+### Overview
+- Used for **multiple-owner** objects
+- Shared ownership via reference counting
+- `NonnullRefPtr` cannot be null (similar to `&` vs `*`)
+- Can assign `NonnullRefPtr` to `RefPtr` but not vice versa
+- Objects must implement `ref()` and `unref()` (inherit from `RefCounted<T>`)
+
+### Making Classes Reference-Counted
+
+```cpp
+class Bar : public RefCounted<Bar> {
+    // Class implementation
+};
+```
+
+### Construction with Helpers (Preferred)
+
+```cpp
+// make_ref_counted<T>() - terminates on allocation failure
+NonnullRefPtr<Bar> our_object = make_ref_counted<Bar>();
+NonnullRefPtr<Bar> another_owner = our_object;
+// Bar deleted only when both owners are gone
+
+// try_make_ref_counted<T>() - returns ErrorOr
+auto our_object_or_error = try_make_ref_counted<Bar>();
+if (our_object_or_error.is_error()) {
+    // handle allocation failure
+}
+NonnullRefPtr<Bar> our_object = our_object_or_error.release_value();
+```
+
+### Manual Construction (When Necessary)
+
+Only when helpers cannot access private constructors:
+
+```cpp
+// Known non-null pointer
+NonnullRefPtr<Bar> our_object = adopt_ref(*new Bar);
+
+// Possibly null pointer (use nothrow new)
+RefPtr<Bar> our_object = adopt_ref_if_nonnull(new (nothrow) Bar);
+```
+
+**Note:** Always prefer helper functions to manual construction.
+
+### Converting RefPtr to NonnullRefPtr
+
+```cpp
+RefPtr<Bar> maybe_bar = get_bar();
+if (maybe_bar) {
+    // Option 1: release_nonnull()
+    NonnullRefPtr<Bar> definitely_bar = maybe_bar.release_nonnull();
+    
+    // Option 2: dereference
+    NonnullRefPtr<Bar> also_bar = *maybe_bar;
+}
+```
+
+## WeakPtr<T>
+
+### Overview
+- Used for objects owned by somebody else
+- Automatically becomes null when pointee is deleted
+- Requires class to inherit from `Weakable<T>`
+
+### Usage
+
+```cpp
+class Baz : public Weakable<Baz> {
+    // Class implementation
+};
+
+WeakPtr<Baz> a_baz;
+{
+    NonnullOwnPtr<Baz> my_baz = make<Baz>();
+    a_baz = my_baz->make_weak_ptr();
+    // a_baz now points to my_baz
+}
+// a_baz is now null, since my_baz went out of scope
+```
+
+## Smart Pointer Usage Guidelines
+
+### When to Use Each Type
+
+1. **OwnPtr/NonnullOwnPtr**: Single owner, clear ownership transfer
+   - Local variables owning heap objects
+   - Class members that exclusively own a resource
+   - Function returns transferring ownership
+
+2. **RefPtr/NonnullRefPtr**: Shared ownership, object needs multiple owners
+   - Objects shared across multiple components
+   - Circular references are impossible (prevents leaks)
+   - Objects with complex lifetime management
+
+3. **WeakPtr**: Observer pattern, avoid circular references
+   - Back-pointers in parent-child relationships
+   - Caching without ownership
+   - Breaking reference cycles
+
+### Common Patterns
+
+```cpp
+// Factory function returning owned object
+static ErrorOr<NonnullOwnPtr<Parser>> create()
+{
+    auto parser = TRY(try_make<Parser>());
+    TRY(parser->initialize());
+    return parser;
+}
+
+// Shared object with multiple owners
+ErrorOr<void> setup_document()
+{
+    auto document = TRY(try_make_ref_counted<Document>());
+    m_current_document = document;
+    return add_to_cache(document);
+}
+
+// Weak pointer for observation
+class Node : public RefCounted<Node> {
+    WeakPtr<Node> m_parent;  // Doesn't own parent
+    Vector<NonnullRefPtr<Node>> m_children;  // Owns children
+};
+```
+
+## Key Principles
+
+- **Always prefer helper functions** (`make`, `try_make`, `make_ref_counted`, `try_make_ref_counted`)
+- **Use Nonnull variants** when null is impossible (documents intent, prevents null checks)
+- **Use fallible constructors** pattern for classes requiring allocation during construction
+- **Never manually delete** objects held by smart pointers
+- **Move semantics** for transferring OwnPtr ownership

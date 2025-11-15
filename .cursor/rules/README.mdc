@@ -1,0 +1,101 @@
+---
+alwaysApply: false
+description: Overview of Cursor Rules for Ladybird development
+---
+# Cursor Rules for Ladybird
+
+This directory contains Cursor Rules to help with Ladybird browser development.
+
+## Rule Files
+
+### Always Applied (Core Standards)
+These rules are automatically applied to every request:
+
+1. **[coding-style.mdc](mdc:.cursor/rules/coding-style.mdc)** - C++ coding style conventions
+   - Naming conventions (snake_case, CamelCase, SCREAMING_CASE)
+   - Member prefixes (m_, s_, g_)
+   - Type conventions and casts
+   - Comments and documentation
+
+2. **[error-handling.mdc](mdc:.cursor/rules/error-handling.mdc)** - Error handling patterns
+   - TRY(...) macro usage
+   - MUST(...) macro usage  
+   - Fallible constructors pattern
+   - LibWeb error types (ErrorOr, ExceptionOr, SimpleException, DOMException)
+
+3. **[smart-pointers.mdc](mdc:.cursor/rules/smart-pointers.mdc)** - Smart pointer patterns
+   - OwnPtr/NonnullOwnPtr for single ownership
+   - RefPtr/NonnullRefPtr for shared ownership
+   - WeakPtr for observation
+   - Construction helpers and manual adoption
+
+4. **[contribution-guidelines.mdc](mdc:.cursor/rules/contribution-guidelines.mdc)** - Contribution standards
+   - Commit message format (Category: Description)
+   - Git workflow and review process
+   - Code quality standards
+   - Community guidelines
+
+5. **[project-overview.mdc](mdc:.cursor/rules/project-overview.mdc)** - Project structure
+   - Architecture overview
+   - Core libraries and their purposes
+   - Directory structure
+   - Documentation index
+
+### File-Type Specific (Applied by Pattern)
+
+6. **[cpp-patterns.mdc](mdc:.cursor/rules/cpp-patterns.mdc)** - C++ patterns (`*.cpp`, `*.h`, `*.mm`)
+   - ladybird_main() entry point
+   - Collections (Array, Vector, FixedArray, Span)
+   - String view literals
+   - Source location debugging
+   - Static assertions
+
+7. **[libweb-patterns.mdc](mdc:.cursor/rules/libweb-patterns.mdc)** - LibWeb patterns (`Libraries/LibWeb/**/*`)
+   - Spec implementation comments
+   - IDL file conventions
+   - Directory structure per spec
+   - LibWeb-specific error handling
+
+## Quick Reference
+
+### Naming
+```cpp
+class MyClass;              // CamelCase for types
+void my_function();         // snake_case for functions
+int m_member_variable;      // m_ prefix for members
+static int s_static_var;    // s_ prefix for statics
+constexpr int MAX_SIZE = 10; // SCREAMING_CASE for constants
+```
+
+### Error Handling
+```cpp
+ErrorOr<T> function() {
+    auto result = TRY(fallible_operation());
+    MUST(cannot_fail_operation());
+    return result;
+}
+```
+
+### Smart Pointers
+```cpp
+auto owned = make<MyClass>();              // OwnPtr
+auto shared = make_ref_counted<MyClass>(); // RefPtr
+auto weak = shared->make_weak_ptr();       // WeakPtr
+```
+
+### Commit Messages
+```
+LibWeb: Add CSS grid layout support
+
+LibJS+LibWeb: Implement async iterators
+
+RequestServer: Fix connection pooling issue
+```
+
+## Using These Rules
+
+- **Always Applied**: Core style, error handling, smart pointers, contribution guidelines, and project overview
+- **Pattern-Based**: C++ patterns for `.cpp/.h/.mm` files, LibWeb patterns for `Libraries/LibWeb/` files
+- **Manual**: This README can be manually invoked when you need an overview
+
+For detailed information, refer to the full documentation in [Documentation/](mdc:Documentation/).

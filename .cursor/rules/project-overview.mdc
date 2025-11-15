@@ -1,0 +1,126 @@
+---
+alwaysApply: true
+---
+# Ladybird Project Overview
+
+## About Ladybird
+
+[Ladybird](https://ladybird.org) is a truly independent web browser using a novel engine based on web standards.
+
+**Status:** Pre-alpha (suitable for developers only)
+
+**Goal:** Build a complete, usable browser for the modern web
+
+## Architecture
+
+### Multi-Process Architecture
+- **Main UI Process**: User interface
+- **WebContent Processes**: Renderer per tab (sandboxed)
+- **ImageDecoder Process**: Image decoding (isolated for security)
+- **RequestServer Process**: Network connections (isolated for robustness)
+
+Each tab has its own renderer process, sandboxed from the system for security against malicious content.
+
+## Core Libraries (Inherited from SerenityOS)
+
+### Web Technologies
+- **LibWeb**: Web rendering engine
+- **LibJS**: JavaScript engine
+- **LibWasm**: WebAssembly implementation
+- **LibIDL**: IDL parser and bindings generator
+
+### Networking & Security
+- **LibCrypto/LibTLS**: Cryptography primitives and TLS
+- **LibHTTP**: HTTP/1.1 client
+- **LibDNS**: DNS resolution
+- **LibWebSocket**: WebSocket implementation
+
+### Media & Graphics
+- **LibGfx**: 2D graphics, image decoding and rendering
+- **LibMedia**: Audio and video playback
+
+### System & Utilities
+- **LibCore**: Event loop and OS abstraction layer
+- **LibIPC**: Inter-process communication
+- **LibFileSystem**: File system utilities
+- **LibThreading**: Threading utilities
+- **LibMain**: Main entry point abstraction
+
+### Data & Utilities
+- **AK**: Application Kit - fundamental data structures and utilities
+- **LibCompress**: Compression (Deflate, Gzip, Zlib)
+- **LibUnicode**: Unicode and locale support
+- **LibTextCodec**: Text encoding/decoding
+- **LibURL**: URL parsing and manipulation
+- **LibRegex**: Regular expressions
+- **LibXML**: XML parsing
+- **LibDiff**: Diff algorithm
+
+### Development
+- **LibTest**: Testing framework
+- **LibDevTools**: Browser DevTools implementation
+- **LibSyntax**: Syntax highlighting
+
+## Key Directories
+
+### Source Code
+- **[AK/](mdc:AK)**: Application Kit - fundamental types and utilities
+- **[Libraries/](mdc:Libraries)**: All library implementations
+- **[Services/](mdc:Services)**: Multi-process services (ImageDecoder, RequestServer, WebContent, WebDriver, WebWorker)
+- **[UI/](mdc:UI)**: Platform-specific UI implementations (AppKit, Qt, Android)
+- **[Utilities/](mdc:Utilities)**: Command-line utilities (js, wasm, image, dns, etc.)
+
+### Build & Infrastructure
+- **[Build/](mdc:Build)**: Build output directory
+- **[Meta/](mdc:Meta)**: Build scripts, linters, code generators, CI configuration
+- **[Toolchain/](mdc:Toolchain)**: Toolchain build scripts
+
+### Resources & Testing
+- **[Base/](mdc:Base)**: Base resources (fonts, icons, themes)
+- **[Tests/](mdc:Tests)**: Test suites for all libraries
+- **[Documentation/](mdc:Documentation)**: Comprehensive project documentation
+
+## Build System
+
+- **CMake-based** with presets in [CMakePresets.json](mdc:CMakePresets.json)
+- **vcpkg** for dependency management
+- Supports: Linux, macOS, Windows (WSL2), and other *Nixes
+
+## Documentation
+
+All documentation in [Documentation/](mdc:Documentation):
+
+### Getting Started
+- [BuildInstructionsLadybird.md](mdc:Documentation/BuildInstructionsLadybird.md) - Build instructions
+- [GettingStartedContributing.md](mdc:Documentation/GettingStartedContributing.md) - Contribution guide
+- [FAQ.md](mdc:Documentation/FAQ.md) - Frequently asked questions
+
+### Development
+- [CodingStyle.md](mdc:Documentation/CodingStyle.md) - C++ coding style
+- [Patterns.md](mdc:Documentation/Patterns.md) - Common coding patterns
+- [LibWebPatterns.md](mdc:Documentation/LibWebPatterns.md) - LibWeb-specific patterns
+- [SmartPointers.md](mdc:Documentation/SmartPointers.md) - Smart pointer usage
+- [Testing.md](mdc:Documentation/Testing.md) - Testing guidelines
+
+### Architecture
+- [ProcessArchitecture.md](mdc:Documentation/ProcessArchitecture.md) - Multi-process architecture
+- [EventLoop.md](mdc:Documentation/EventLoop.md) - Event loop implementation
+- [BrowsingContextsAndNavigables.md](mdc:Documentation/BrowsingContextsAndNavigables.md) - Browser contexts
+- [LibWebFromLoadingToPainting.md](mdc:Documentation/LibWebFromLoadingToPainting.md) - Rendering pipeline
+
+### Specialized Topics
+- [AddNewIDLFile.md](mdc:Documentation/AddNewIDLFile.md) - Adding new IDL files
+- [CSSGeneratedFiles.md](mdc:Documentation/CSSGeneratedFiles.md) - CSS code generation
+- [CSSProperties.md](mdc:Documentation/CSSProperties.md) - CSS properties
+- [DevTools.md](mdc:Documentation/DevTools.md) - Developer tools
+- [Troubleshooting.md](mdc:Documentation/Troubleshooting.md) - Common issues
+
+## License
+
+Ladybird is licensed under **2-clause BSD license**. See [LICENSE](mdc:LICENSE) for details.
+
+## Community
+
+- **Discord**: https://discord.gg/nvfjVJ4Svh
+- **Governed by**: Ladybird Browser Initiative (501(c)(3) non-profit)
+- **Contributing**: See [CONTRIBUTING.md](mdc:CONTRIBUTING.md) and [ISSUES.md](mdc:ISSUES.md)

@@ -6,7 +6,9 @@
 
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/SourceBufferListPrototype.h>
+#include <LibWeb/DOM/Event.h>
 #include <LibWeb/MediaSourceExtensions/EventNames.h>
+#include <LibWeb/MediaSourceExtensions/SourceBuffer.h>
 #include <LibWeb/MediaSourceExtensions/SourceBufferList.h>
 
 namespace Web::MediaSourceExtensions {
@@ -24,6 +26,21 @@ void SourceBufferList::initialize(JS::Realm& realm)
 {
     WEB_SET_PROTOTYPE_FOR_INTERFACE(SourceBufferList);
     Base::initialize(realm);
+}
+
+void SourceBufferList::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    for (auto& buffer : m_buffers)
+        visitor.visit(buffer);
+}
+
+// https://w3c.github.io/media-source/#dom-sourcebufferlist-item
+GC::Ptr<SourceBuffer> SourceBufferList::item(size_t index) const
+{
+    if (index >= m_buffers.size())
+        return nullptr;
+    return m_buffers[index];
 }
 
 // https://w3c.github.io/media-source/#dom-sourcebufferlist-onaddsourcebuffer
@@ -48,6 +65,32 @@ void SourceBufferList::set_onremovesourcebuffer(GC::Ptr<WebIDL::CallbackType> ev
 GC::Ptr<WebIDL::CallbackType> SourceBufferList::onremovesourcebuffer()
 {
     return event_handler_attribute(EventNames::removesourcebuffer);
+}
+
+// Internal: Add a SourceBuffer
+void SourceBufferList::add(GC::Ref<SourceBuffer> buffer)
+{
+    m_buffers.append(buffer);
+    dispatch_event(DOM::Event::create(realm(), EventNames::addsourcebuffer));
+}
+
+// Internal: Remove a SourceBuffer
+void SourceBufferList::remove(GC::Ref<SourceBuffer> buffer)
+{
+    m_buffers.remove_first_matching([&](auto& item) {
+        return item == buffer;
+    });
+    dispatch_event(DOM::Event::create(realm(), EventNames::removesourcebuffer));
+}
+
+// Internal: Check if contains a SourceBuffer
+bool SourceBufferList::contains(GC::Ref<SourceBuffer> buffer) const
+{
+    for (auto& item : m_buffers) {
+        if (item == buffer)
+            return true;
+    }
+    return false;
 }
 
 }

@@ -1,0 +1,208 @@
+---
+alwaysApply: true
+---
+# Ladybird C++ Coding Style
+
+## Naming Conventions
+
+### Variable and Function Names
+- Use **snake_case** for variable and function names
+- Use **CamelCase** for class, struct, and namespace names (capitalize first letter, including all letters in acronyms)
+- Use **SCREAMING_CASE** for constants (both global and static member variables)
+
+Examples:
+```cpp
+struct Entry;
+size_t buffer_size;
+class FileDescriptor;
+String absolute_path();
+```
+
+### Data Members
+- Data members in classes must be **private**
+- Static data members: prefix with `s_`
+- Non-static data members: prefix with `m_`
+- Global variables: prefix with `g_`
+
+Example:
+```cpp
+class MyClass {
+private:
+    int m_length { 0 };
+    static int s_instance_count;
+};
+```
+
+### Getters and Setters
+- Setters: prefix with `set_`
+- Getters: use bare words (no `get_` prefix)
+- Getter/setter names should match member variable names (without prefix)
+- Getters with out arguments: prefix with `get_`
+- Getters that ensure object creation: prefix with `ensure_` and return reference (not pointer)
+
+Examples:
+```cpp
+void set_count(int);  // Sets m_count
+int count() const;    // Returns m_count
+void get_filename_and_inode_id(String&, InodeIdentifier&) const;
+Inode& ensure_inode();  // Ensures inode exists and returns reference
+```
+
+### Function Names
+- Use descriptive verbs in function names
+- Singleton accessor: use static method named `the()`
+
+Examples:
+```cpp
+bool convert_to_ascii(short*, size_t);
+class UniqueObject {
+public:
+    static UniqueObject& the();
+};
+```
+
+### Spec Algorithm Names
+When implementing spec algorithms, prefer closely matching the spec's exact naming:
+```cpp
+// RIGHT: matches spec exactly
+bool HTMLInputElement::suffering_from_being_missing();
+
+// WRONG: differs from spec
+bool HTMLInputElement::has_missing_constraint();
+```
+
+## Type Conventions
+
+### Integers
+- Omit "int" when using "unsigned" modifier
+- Do not use "signed" modifier; use "int" instead
+
+```cpp
+// RIGHT
+unsigned a;
+int b;
+
+// WRONG
+unsigned int a;
+signed b;
+```
+
+### Pointers and References
+- Write pointer/reference types with no space between type and `*` or `&`
+- Use "east const" style: `const` on the right side of the type
+
+```cpp
+// RIGHT
+Salt const& m_salt;
+String* ptr;
+
+// WRONG
+const Salt& m_salt;
+String * ptr;
+```
+
+### Casts
+- **Never use C-style casts** (except for `(void)parameter;` to mark as used)
+- Use appropriate C++ casts: `static_cast`, `reinterpret_cast`, `bit_cast`, `dynamic_cast`
+
+### Classes vs Structs
+- For types with methods, prefer `class` over `struct`
+- Classes: make members private with `m_` prefix, provide getters/setters
+- Structs: make everything public, skip `m_` prefix
+
+## Header Guards
+Use `#pragma once` instead of `#define` guards:
+```cpp
+// RIGHT
+#pragma once
+
+// WRONG
+#ifndef MyClass_h
+#define MyClass_h
+```
+
+## Constructors
+- Use C++ initializer syntax
+- Each member on separate line with colon/comma preceding it
+- Prefer initialization at member definition when possible
+
+```cpp
+class MyClass {
+    Document* m_document { nullptr };
+    int m_my_member { 0 };
+};
+
+MyClass::MyClass(Document* document)
+    : MySuperClass()
+    , m_document(document)
+{
+}
+```
+
+## Control Structures
+- Omit curly braces only if body is a single line
+- If any connected if/else requires braces, all must have braces
+
+```cpp
+// RIGHT
+if (condition)
+    foo();
+
+if (condition) {
+    foo();
+} else {
+    bar();
+    baz();
+}
+
+// WRONG
+if (condition)
+    foo();
+else {
+    bar();
+    baz();
+}
+```
+
+## Loops
+Prefer range-for over iterators:
+```cpp
+// RIGHT
+for (auto& child : children)
+    child->do_child_thing();
+
+// WRONG
+for (auto it = children.begin(); it != children.end(); ++it)
+    (*it)->do_child_thing();
+```
+
+## Virtual Methods
+- Base class: use `virtual` keyword
+- Derived classes: use `virtual` with `override` or `virtual` with `final`
+
+```cpp
+class Person {
+public:
+    virtual String description() { ... };
+}
+
+class Student : public Person {
+public:
+    virtual String description() override { ... };
+};
+```
+
+## Using Statements
+- In AK headers: use `using AK::ClassName;` at end to import to global scope
+- In .cpp files: **never** use `using` for std namespace; fully qualify: `std::swap()`
+
+## Enums
+- Enum members use InterCaps with initial capital letter
+- Prefer enums to bools in function parameters when passing constants
+
+```cpp
+do_something(something, AllowFooBar::Yes);
+```
+
+## Format Enforcement
+All code must follow the format in `.clang-format`. Use the correct clang-format version specified in `Meta/lint-clang-format.py`.

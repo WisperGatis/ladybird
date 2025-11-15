@@ -590,7 +590,8 @@ void CookieJar::TransientStorage::set_cookies(Cookies cookies)
 static void notify_cookies_changed(Vector<Web::Cookie::Cookie> cookies)
 {
     WebContentClient::for_each_client([&](WebContentClient& client) {
-        client.async_cookies_changed(move(cookies));
+        if (client.is_open())
+            client.async_cookies_changed(move(cookies));
         return IterationDecision::Continue;
     });
 }

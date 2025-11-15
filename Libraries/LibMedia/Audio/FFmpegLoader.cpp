@@ -5,6 +5,7 @@
  */
 
 #include "FFmpegLoader.h"
+#include <AK/MemoryStream.h>
 #include <AK/NumericLimits.h>
 #include <LibCore/System.h>
 
@@ -19,9 +20,10 @@ namespace Audio {
 
 static constexpr int BUFFER_MAX_PROBE_SIZE = 64 * KiB;
 
-FFmpegLoaderPlugin::FFmpegLoaderPlugin(NonnullOwnPtr<SeekableStream> stream, NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext> io_context)
+FFmpegLoaderPlugin::FFmpegLoaderPlugin(NonnullOwnPtr<SeekableStream> stream, Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>> io_context)
     : LoaderPlugin(move(stream))
     , m_io_context(move(io_context))
+    , m_is_url_based(!io_context.has_value())
 {
 }
 
@@ -35,6 +37,7 @@ FFmpegLoaderPlugin::~FFmpegLoaderPlugin()
         avcodec_free_context(&m_codec_context);
     if (m_format_context != nullptr)
         avformat_close_input(&m_format_context);
+    // Note: m_io_context is now OwnPtr and will be automatically cleaned up
 }
 
 ErrorOr<NonnullOwnPtr<LoaderPlugin>> FFmpegLoaderPlugin::create(NonnullOwnPtr<SeekableStream> stream)
@@ -45,15 +48,104 @@ ErrorOr<NonnullOwnPtr<LoaderPlugin>> FFmpegLoaderPlugin::create(NonnullOwnPtr<Se
     return loader;
 }
 
+ErrorOr<NonnullOwnPtr<LoaderPlugin>> FFmpegLoaderPlugin::create_from_url(StringView url)
+{
+    // Create a dummy stream for the interface - it won't be used for URL-based loading
+    auto dummy_stream = TRY(try_make<FixedMemoryStream>(ReadonlyBytes {}));
+    auto loader = TRY(adopt_nonnull_own_or_enomem(new (nothrow) FFmpegLoaderPlugin(move(dummy_stream), OptionalNone())));
+
+    // Initialize with URL instead of IO context
+    TRY(loader->initialize_with_url(url));
+    return loader;
+}
+
 ErrorOr<void> FFmpegLoaderPlugin::initialize()
 {
     // Open the container
     m_format_context = avformat_alloc_context();
     if (m_format_context == nullptr)
         return Error::from_string_literal("Failed to allocate format context");
-    m_format_context->pb = m_io_context->avio_context();
+
+    // For stream-based loading, set up the custom IO context
+    if (m_io_context.has_value())
+        m_format_context->pb = m_io_context.value()->avio_context();
+
     if (avformat_open_input(&m_format_context, nullptr, nullptr, nullptr) < 0)
         return Error::from_string_literal("Failed to open input for format parsing");
+
+    // Read stream info; doing this is required for headerless formats like MPEG
+    if (avformat_find_stream_info(m_format_context, nullptr) < 0)
+        return Error::from_string_literal("Failed to find stream info");
+
+#ifdef USE_CONSTIFIED_POINTERS
+    AVCodec const* codec {};
+#else
+    AVCodec* codec {};
+#endif
+    // Find the best stream to play within the container
+    int best_stream_index = av_find_best_stream(m_format_context, AVMediaType::AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+    if (best_stream_index == AVERROR_STREAM_NOT_FOUND)
+        return Error::from_string_literal("No audio stream found in container");
+    if (best_stream_index == AVERROR_DECODER_NOT_FOUND)
+        return Error::from_string_literal("No suitable decoder found for stream");
+    if (best_stream_index < 0)
+        return Error::from_string_literal("Failed to find an audio stream");
+    m_audio_stream = m_format_context->streams[best_stream_index];
+
+    // Set up the context to decode the audio stream
+    m_codec_context = avcodec_alloc_context3(codec);
+    if (m_codec_context == nullptr)
+        return Error::from_string_literal("Failed to allocate the codec context");
+
+    if (avcodec_parameters_to_context(m_codec_context, m_audio_stream->codecpar) < 0)
+        return Error::from_string_literal("Failed to copy codec parameters");
+
+    m_codec_context->pkt_timebase = m_audio_stream->time_base;
+    m_codec_context->thread_count = AK::min(static_cast<int>(Core::System::hardware_concurrency()), 4);
+
+    if (avcodec_open2(m_codec_context, codec, nullptr) < 0)
+        return Error::from_string_literal("Failed to open input for decoding");
+
+    // This is an initial estimate of the total number of samples in the stream.
+    // During decoding, we might need to increase the number as more frames come in.
+    auto duration_in_seconds = TRY([this] -> ErrorOr<double> {
+        if (m_audio_stream->duration >= 0) {
+            auto time_base = av_q2d(m_audio_stream->time_base);
+            return static_cast<double>(m_audio_stream->duration) * time_base;
+        }
+
+        // If the stream doesn't specify the duration, fallback to what the container says the duration is.
+        // If the container doesn't know the duration, then we're out of luck. Return an error.
+        if (m_format_context->duration < 0)
+            return Error::from_string_literal("Negative stream duration");
+
+        return static_cast<double>(m_format_context->duration) / AV_TIME_BASE;
+    }());
+
+    m_total_samples = AK::round_to<decltype(m_total_samples)>(sample_rate() * duration_in_seconds);
+
+    // Allocate packet (logical chunk of data) and frame (video / audio frame) buffers
+    m_packet = av_packet_alloc();
+    if (m_packet == nullptr)
+        return Error::from_string_literal("Failed to allocate packet");
+
+    m_frame = av_frame_alloc();
+    if (m_frame == nullptr)
+        return Error::from_string_literal("Failed to allocate frame");
+
+    return {};
+}
+
+ErrorOr<void> FFmpegLoaderPlugin::initialize_with_url(StringView url)
+{
+    // Open the container directly from URL
+    m_format_context = avformat_alloc_context();
+    if (m_format_context == nullptr)
+        return Error::from_string_literal("Failed to allocate format context");
+
+    // Use FFmpeg's built-in URL handling instead of custom IO context
+    if (avformat_open_input(&m_format_context, url.to_byte_string().characters(), nullptr, nullptr) < 0)
+        return Error::from_string_literal("Failed to open input from URL");
 
     // Read stream info; doing this is required for headerless formats like MPEG
     if (avformat_find_stream_info(m_format_context, nullptr) < 0)

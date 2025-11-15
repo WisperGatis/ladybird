@@ -45,6 +45,9 @@ public:
     GC::Ptr<MediaError> error() const { return m_error; }
     void set_decoder_error(String error_message);
 
+    GC::Ptr<MediaSourceExtensions::MediaSource> src_object() const { return m_src_object; }
+    void set_src_object(GC::Ptr<MediaSourceExtensions::MediaSource>);
+
     String const& current_src() const { return m_current_src; }
     WebIDL::ExceptionOr<void> select_resource();
 
@@ -199,6 +202,7 @@ private:
     WebIDL::ExceptionOr<void> fetch_resource(URL::URL const&, ESCAPING Function<void(String)> failure_callback);
     static bool verify_response(GC::Ref<Fetch::Infrastructure::Response>, ByteRange const&);
     WebIDL::ExceptionOr<void> process_media_data(Function<void(String)> failure_callback);
+    WebIDL::ExceptionOr<void> process_hls_stream(String url, Function<void(String)> failure_callback);
     WebIDL::ExceptionOr<void> handle_media_source_failure(Span<GC::Ref<WebIDL::Promise>> promises, String error_message);
     void forget_media_resource_specific_tracks();
     void set_ready_state(ReadyState);
@@ -250,6 +254,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-currentsrc
     String m_current_src;
+
+    // https://html.spec.whatwg.org/multipage/media.html#dom-media-srcobject
+    GC::Ptr<MediaSourceExtensions::MediaSource> m_src_object;
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-networkstate
     NetworkState m_network_state { NetworkState::Empty };

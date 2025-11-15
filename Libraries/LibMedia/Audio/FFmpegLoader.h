@@ -9,6 +9,7 @@
 #include "Loader.h"
 #include <AK/Error.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
 #include <LibMedia/FFmpeg/FFmpegIOContext.h>
 
 extern "C" {
@@ -20,11 +21,12 @@ namespace Audio {
 
 class FFmpegLoaderPlugin : public LoaderPlugin {
 public:
-    explicit FFmpegLoaderPlugin(NonnullOwnPtr<SeekableStream>, NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>);
+    explicit FFmpegLoaderPlugin(NonnullOwnPtr<SeekableStream>, Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>>);
     virtual ~FFmpegLoaderPlugin();
 
     static bool sniff(SeekableStream& stream);
     static ErrorOr<NonnullOwnPtr<LoaderPlugin>> create(NonnullOwnPtr<SeekableStream>);
+    static ErrorOr<NonnullOwnPtr<LoaderPlugin>> create_from_url(StringView url);
 
     virtual ErrorOr<Vector<FixedArray<Sample>>> load_chunks(size_t samples_to_read_from_input) override;
 
@@ -40,13 +42,15 @@ public:
 
 private:
     ErrorOr<void> initialize();
+    ErrorOr<void> initialize_with_url(StringView url);
     double time_base() const;
 
     AVStream* m_audio_stream;
     AVCodecContext* m_codec_context { nullptr };
     AVFormatContext* m_format_context { nullptr };
     AVFrame* m_frame { nullptr };
-    NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext> m_io_context;
+    Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>> m_io_context;
+    bool m_is_url_based { false };
     int m_loaded_samples { 0 };
     AVPacket* m_packet { nullptr };
     int m_total_samples { 0 };

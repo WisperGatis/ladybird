@@ -1,0 +1,143 @@
+---
+alwaysApply: true
+---
+# Ladybird Error Handling Patterns
+
+## TRY(...) Macro
+
+The `TRY(...)` macro is the primary error propagation mechanism in Ladybird.
+
+### Usage
+- Executes code and immediately returns any error from the function
+- If no error occurs, evaluates to the result
+- Similar to Rust's `?` operator
+- Used with `ErrorOr<T>` return types
+
+```cpp
+#include <AK/Try.h>
+
+ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::create_shareable(BitmapFormat format, IntSize size)
+{
+    if (size_would_overflow(format, size))
+        return Error::from_string_literal("Size overflow");
+    
+    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(size));
+    auto bitmap = TRY(Bitmap::create_with_anonymous_buffer(format, buffer, size));
+    return bitmap;
+}
+```
+
+## MUST(...) Macro
+
+The `MUST(...)` macro enforces that code must succeed or the program asserts.
+
+### When to Use
+- When you've determined through other circumstances that failure is impossible
+- When failure is serious enough that the program needs to crash
+- **NOT** as a replacement for `TRY(...)` when error propagation is not currently possible
+
+### When NOT to Use
+If error propagation is not currently possible, use `release_value_but_fixme_should_propagate_errors()` instead to mark for future improvement.
+
+```cpp
+ErrorOr<void> insert_one_to_onehundred(Vector<int>& vector)
+{
+    TRY(vector.try_ensure_capacity(vector.size() + 100));
+    
+    for (int i = 1; i <= 100; i++) {
+        // Space already allocated, append cannot fail
+        MUST(vector.try_append(i));
+    }
+    
+    return {};
+}
+```
+
+## Fallible Constructors
+
+C++ constructors are incompatible with ErrorOr returns. Use static factory functions instead.
+
+### Pattern
+- Create static `create()` function that returns `ErrorOr<T>` or `ErrorOr<NonnullOwnPtr<T>>`
+- Keep constructor private
+- Handle all fallible operations in `create()` before and after construction
+
+```cpp
+class Decompressor {
+public:
+    static ErrorOr<NonnullOwnPtr<Decompressor>> create(NonnullOwnPtr<Stream> stream)
+    {
+        auto buffer = TRY(CircularBuffer::create_empty(32 * KiB));
+        auto decompressor = TRY(adopt_nonnull_own_or_enomem(
+            new (nothrow) Decompressor(move(stream), move(buffer))));
+        TRY(decompressor->initialize_settings_from_header());
+        return decompressor;
+    }
+
+private:
+    Decompressor(NonnullOwnPtr<Stream> stream, CircularBuffer buffer)
+        : m_stream(move(stream))
+        , m_buffer(move(buffer))
+    {
+    }
+    
+    CircularBuffer m_buffer;
+    NonnullOwnPtr<Stream> m_stream;
+};
+```
+
+## LibWeb Error Types
+
+### ErrorOr<T>
+- Only for propagating OOM errors from AK and general libraries
+- Should NOT be used for other error types in LibWeb
+- Propagate as far as possible before converting to JS error via `TRY_OR_THROW_OOM`
+
+### WebIDL::ExceptionOr<T>
+- Most common error type in LibWeb
+- Used for JS bindings interactions
+- Internally stores variant of: `SimpleException`, `GC::Ref<DOMException>`, `JS::Completion`
+
+### WebIDL::SimpleException
+- Thin wrapper around ECMAScript built-in errors:
+  - EvalError, RangeError, ReferenceError, TypeError, URIError
+- Use when required by web spec
+- Converted to JS objects in bindings layer
+
+### WebIDL::DOMException
+- Web-specific error type from WebIDL spec
+- Use when JS built-in errors are insufficient
+- Use when indicated by web spec
+
+### JS::ThrowCompletionOr<T>
+- LibJS completion type
+- **Avoid in LibWeb** unless absolutely necessary (e.g., overriding JS::Object virtual methods)
+- Wrap in ExceptionOr<T> as soon as possible
+
+## Error Handling Examples
+
+```cpp
+// AK ErrorOr for OOM
+ErrorOr<void> allocate_buffer()
+{
+    auto buffer = TRY(ByteBuffer::create_uninitialized(size));
+    return {};
+}
+
+// WebIDL ExceptionOr for web APIs
+WebIDL::ExceptionOr<String> process_data(JS::Realm& realm)
+{
+    if (!is_valid())
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid data"sv };
+    
+    auto result = TRY(perform_operation());
+    return result;
+}
+
+// Converting ErrorOr to JS exception at boundary
+WebIDL::ExceptionOr<void> web_api_function(JS::Realm& realm)
+{
+    auto data = TRY_OR_THROW_OOM(realm.vm(), allocate_buffer());
+    return {};
+}
+```

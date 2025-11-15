@@ -63,6 +63,10 @@ ViewImplementation::ViewImplementation()
     on_request_file = [this](auto const& path, auto request_id) {
         auto file = Core::File::open(path, Core::File::OpenMode::Read);
 
+        // Don't try to send messages if the connection is shutting down
+        if (!client().is_open())
+            return;
+
         if (file.is_error())
             client().async_handle_file_return(page_id(), file.error().code(), {}, request_id);
         else
@@ -202,6 +206,10 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
     // prevented the default event behavior, at which point we either discard or handle that event, and then try to
     // process the next one.
     m_pending_input_events.enqueue(move(event));
+
+    // Don't try to send events if the connection is shutting down
+    if (!client().is_open())
+        return;
 
     m_pending_input_events.tail().visit(
         [this](Web::KeyEvent const& event) {

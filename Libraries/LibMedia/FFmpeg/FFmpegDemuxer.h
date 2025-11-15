@@ -8,6 +8,7 @@
 
 #include <AK/Error.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/FFmpeg/FFmpegIOContext.h>
 
@@ -21,8 +22,10 @@ namespace Media::FFmpeg {
 class FFmpegDemuxer : public Demuxer {
 public:
     static ErrorOr<NonnullOwnPtr<FFmpegDemuxer>> create(NonnullOwnPtr<SeekableStream> stream);
+    static ErrorOr<NonnullOwnPtr<FFmpegDemuxer>> create_from_url(StringView url);
 
-    FFmpegDemuxer(NonnullOwnPtr<SeekableStream> stream, NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>);
+    FFmpegDemuxer(NonnullOwnPtr<SeekableStream> stream, Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>> io_context);
+    FFmpegDemuxer(NonnullOwnPtr<SeekableStream> stream); // URL-based constructor
     virtual ~FFmpegDemuxer() override;
 
     virtual DecoderErrorOr<Vector<Track>> get_tracks_for_type(TrackType type) override;
@@ -45,8 +48,13 @@ private:
     NonnullOwnPtr<SeekableStream> m_stream;
     AVCodecContext* m_codec_context { nullptr };
     AVFormatContext* m_format_context { nullptr };
-    NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext> m_io_context;
+    Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>> m_io_context;
+    bool m_is_url_based { false };
     AVPacket* m_packet { nullptr };
+
+public:
+    bool is_hls_stream() const;
+    bool is_seekable() const;
 };
 
 }

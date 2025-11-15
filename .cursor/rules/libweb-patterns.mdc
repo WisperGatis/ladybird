@@ -1,0 +1,193 @@
+---
+globs: Libraries/LibWeb/**/*
+---
+# LibWeb-Specific Patterns
+
+## Directory Structure
+
+- Each spec gets its own subdirectory and C++ namespace
+  - Example: XHR spec → `LibWeb/XHR/` directory, `Web::XHR` namespace
+- Subdirectories allowed for grouping (e.g., `HTML/Scripting/`)
+- When spec affects multiple areas, use best judgement
+
+## Comments for Spec Implementations
+
+**ALL** functions representing spec operations or JS functions must have:
+
+### 1. Spec Link Above Function
+
+```cpp
+// https://fetch.spec.whatwg.org/#concept-fetch
+WebIDL::ExceptionOr<GC::Ref<Infrastructure::FetchController>> fetch(
+    JS::Realm& realm,
+    Infrastructure::Request& request)
+{
+    // Implementation
+}
+```
+
+### 2. Comments for Each Spec Step
+
+```cpp
+// 1. Assert: request's mode is "navigate" or processEarlyHintsResponse is null.
+VERIFY(request.mode() == Infrastructure::Request::Mode::Navigate);
+
+// 2. Let taskDestination be null.
+GC::Ptr<JS::Object> task_destination;
+
+// 3. If useParallelQueue is true, then set taskDestination to the result of
+//    starting a new parallel queue.
+if (use_parallel_queue == UseParallelQueue::Yes) {
+    task_destination = start_new_parallel_queue();
+}
+```
+
+**Rules:**
+- Copy spec step numbers exactly
+- If step cannot be implemented: prepend with `FIXME:`
+- Add blank line between code and next comment
+- Spec prose before/after algorithm doesn't need copying
+- Mark optimizations with `// OPTIMIZATION:` explaining reasoning
+- Mark non-standard additions (except in broadly-spec'd areas like layout/painting)
+
+## IDL Files
+
+### Copy IDL Verbatim
+
+- Minimal changes (only for parser limitations or non-standard attributes)
+- Don't reorder functions or change parameter names
+- Use 4 spaces for indentation (not 2 like specs)
+
+### File Placement
+
+- `.cpp`, `.h`, and `.idl` files in same directory
+- Exception: hand-written implementations go in `Bindings/` (no IDL file)
+
+## C++ Naming for Web Interfaces
+
+- Use exact interface name (no `Object` suffixes)
+- Handle name clashes with nested namespaces
+  - Example: `Fetch::Request` vs `Fetch::Infrastructure::Request`
+
+## Error Handling in LibWeb
+
+### Error Type Hierarchy
+
+1. **AK::ErrorOr<T>**
+   - Only for OOM errors from AK and general libraries
+   - NOT for other errors in LibWeb
+   - Convert to JS error at boundaries via `TRY_OR_THROW_OOM`
+
+2. **WebIDL::ExceptionOr<T>**
+   - Most common in LibWeb
+   - For JS bindings interactions
+   - Contains: `SimpleException`, `GC::Ref<DOMException>`, or `JS::Completion`
+
+3. **WebIDL::SimpleException**
+   - Wraps ECMAScript errors: EvalError, RangeError, ReferenceError, TypeError, URIError
+   - Use when required by spec
+   - Converted to JS objects in bindings
+
+4. **WebIDL::DOMException**
+   - Web-specific errors from WebIDL spec
+   - Use when JS built-ins insufficient
+   - Use when indicated by spec
+
+5. **JS::ThrowCompletionOr<T>**
+   - LibJS completion type
+   - Avoid in LibWeb unless required (e.g., overriding JS::Object virtuals)
+   - Wrap in ExceptionOr<T> ASAP
+
+### Error Handling Examples
+
+```cpp
+// OOM propagation in low-level code
+ErrorOr<void> allocate_resources()
+{
+    m_buffer = TRY(ByteBuffer::create_uninitialized(size));
+    return {};
+}
+
+// Web API with WebIDL exceptions
+WebIDL::ExceptionOr<String> get_attribute(JS::Realm& realm)
+{
+    if (!m_element)
+        return WebIDL::SimpleException {
+            WebIDL::SimpleExceptionType::TypeError,
+            "Element is null"sv
+        };
+    
+    auto value = TRY_OR_THROW_OOM(realm.vm(), compute_value());
+    return value;
+}
+
+// DOMException for web-specific errors
+WebIDL::ExceptionOr<void> insert_node(Node& node)
+{
+    if (is_ancestor_of(node)) {
+        return WebIDL::DOMException::create(
+            realm(),
+            WebIDL::DOMException::Type::HierarchyRequestError,
+            "Cannot insert ancestor"sv
+        );
+    }
+    return {};
+}
+```
+
+## Common Patterns
+
+### Spec Algorithm Template
+
+```cpp
+// https://spec.whatwg.org/#algorithm-name
+WebIDL::ExceptionOr<ReturnType> algorithm_name(Arguments args)
+{
+    // 1. Let variable be value.
+    Type variable = value;
+    
+    // 2. If condition is true, then:
+    if (condition) {
+        // 2.1. Do something.
+        do_something();
+        
+        // 2.2. Return result.
+        return result;
+    }
+    
+    // 3. Otherwise, do something else.
+    do_something_else();
+    
+    // 4. Return default value.
+    return default_value;
+}
+```
+
+### Fast Path Optimization
+
+```cpp
+// OPTIMIZATION: If the element has no children, we can skip traversal entirely
+if (!has_children())
+    return;
+
+// Standard spec algorithm follows
+for_each_child([&](Node& child) {
+    // ...
+});
+```
+
+### Non-Standard Code Marking
+
+```cpp
+// NON-STANDARD: Chrome and Firefox also do this for compatibility
+if (quirks_mode_enabled) {
+    apply_quirks_behavior();
+}
+```
+
+## LibWeb-Specific Types
+
+Use LibWeb types consistently:
+- `GC::Ref<T>` and `GC::Ptr<T>` for garbage-collected objects
+- `WebIDL::ExceptionOr<T>` for fallible operations
+- Spec-defined types from corresponding directories

@@ -41,6 +41,14 @@ DecoderErrorOr<NonnullOwnPtr<PlaybackManager>> PlaybackManager::from_stream(Nonn
     return create(demuxer_or_error.release_value());
 }
 
+DecoderErrorOr<NonnullOwnPtr<PlaybackManager>> PlaybackManager::from_url(StringView url)
+{
+    auto demuxer_or_error = FFmpeg::FFmpegDemuxer::create_from_url(url);
+    if (demuxer_or_error.is_error())
+        return DecoderError::format(DecoderErrorCategory::Unknown, "{}", demuxer_or_error.error());
+    return create(demuxer_or_error.release_value());
+}
+
 PlaybackManager::PlaybackManager(NonnullOwnPtr<Demuxer>& demuxer, Track video_track, NonnullOwnPtr<VideoDecoder>&& decoder, VideoFrameQueue&& frame_queue)
     : m_demuxer(move(demuxer))
     , m_selected_video_track(video_track)

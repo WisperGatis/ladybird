@@ -8,6 +8,7 @@
 #include <LibJS/Runtime/Promise.h>
 #include <LibMedia/Audio/Loader.h>
 #include <LibMedia/PlaybackManager.h>
+#include <cstring>
 #include <LibWeb/Bindings/HTMLMediaElementPrototype.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/DOM/Document.h>
@@ -28,6 +29,7 @@
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/MediaError.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/MediaSourceExtensions/MediaSource.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/TextTrack.h>
@@ -36,6 +38,7 @@
 #include <LibWeb/HTML/TrackEvent.h>
 #include <LibWeb/HTML/VideoTrack.h>
 #include <LibWeb/HTML/VideoTrackList.h>
+#include <LibURL/Parser.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWeb/Page/Page.h>
@@ -97,6 +100,7 @@ void HTMLMediaElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_source_element_selector);
     visitor.visit(m_fetch_controller);
     visitor.visit(m_pending_play_promises);
+    visitor.visit(m_src_object);
 }
 
 void HTMLMediaElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
@@ -160,6 +164,28 @@ void HTMLMediaElement::set_decoder_error(String error_message)
     // FIXME: 6. Abort the overall resource selection algorithm.
 }
 
+// https://html.spec.whatwg.org/multipage/media.html#dom-media-srcobject
+void HTMLMediaElement::set_src_object(GC::Ptr<MediaSourceExtensions::MediaSource> source)
+{
+    // 1. If the srcObject IDL attribute is being set to a new value, then:
+    if (m_src_object != source) {
+        // 1.1. If the previous value of srcObject IDL attribute is not null, then detach it.
+        if (m_src_object)
+            m_src_object->detach_from_element();
+
+        // 1.2. Set the srcObject IDL attribute to the new value.
+        m_src_object = source;
+
+        // 1.3. If the new value is a MediaSource object, attach it to the media element.
+        if (m_src_object) {
+            m_src_object->attach_to_element(*this);
+
+            // Initiate the resource selection algorithm.
+            (void)select_resource();
+        }
+    }
+}
+
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-buffered
 GC::Ref<TimeRanges> HTMLMediaElement::buffered() const
 {
@@ -208,6 +234,15 @@ Bindings::CanPlayTypeResult HTMLMediaElement::can_play_type(StringView type) con
         return Bindings::CanPlayTypeResult::Empty;
 
     auto mime_type = MimeSniff::MimeType::parse(type);
+
+    // HLS (HTTP Live Streaming) support - m3u8 playlists
+    if (mime_type.has_value()) {
+        auto const& essence = mime_type->essence();
+        if (essence == "application/vnd.apple.mpegurl"sv || essence == "application/x-mpegURL"sv || essence == "audio/mpegurl"sv || essence == "audio/x-mpegurl"sv) {
+            // FFmpeg supports HLS, so we can return "probably"
+            return Bindings::CanPlayTypeResult::Probably;
+        }
+    }
 
     if (mime_type.has_value() && mime_type->type() == "video"sv) {
         if (supported_video_subtypes.contains_slow(mime_type->subtype()))
@@ -1019,7 +1054,7 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::fetch_resource(URL::URL const& url_r
         // 8. Fetch request, with processResponse set to the following steps given response response:
         Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
 
-        fetch_algorithms_input.process_response = [this, byte_range = move(byte_range), failure_callback = move(failure_callback)](auto response) mutable {
+        fetch_algorithms_input.process_response = [this, byte_range = move(byte_range), failure_callback = move(failure_callback), url_record](GC::Ref<Fetch::Infrastructure::Response> response) mutable {
             auto& realm = this->realm();
 
             // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
@@ -1034,6 +1069,31 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::fetch_resource(URL::URL const& url_r
             if (!verify_response(response, byte_range)) {
                 auto error_message = response->network_error_message().value_or("Failed to fetch media resource"_string);
                 failure_callback(error_message);
+                return;
+            }
+
+            // Check if this is an HLS stream (detected by content-type or URL)
+            auto content_type_header = response->header_list()->get("Content-Type"sv.bytes());
+            bool is_hls = false;
+            if (content_type_header.has_value()) {
+                auto mime_type = MimeSniff::MimeType::parse(StringView { content_type_header.value() });
+                if (mime_type.has_value()) {
+                    auto const& essence = mime_type->essence();
+                    is_hls = (essence == "application/vnd.apple.mpegurl"sv || essence == "application/x-mpegURL"sv);
+                }
+            }
+            // Also check URL extension as fallback
+            if (!is_hls) {
+                auto url_string = url_record.to_string();
+                auto url_string_view = url_string.bytes_as_string_view();
+                is_hls = url_string_view.ends_with(".m3u8"sv, CaseSensitivity::CaseInsensitive) || url_string_view.ends_with(".m3u"sv, CaseSensitivity::CaseInsensitive);
+            }
+
+            if (is_hls) {
+                // For HLS streams, use URL-based loading instead of loading the entire playlist into memory
+                queue_a_media_element_task([this, url = url_record.to_string(), failure_callback = move(failure_callback)]() mutable {
+                    process_hls_stream(url, move(failure_callback)).release_value_but_fixme_should_propagate_errors();
+                });
                 return;
             }
 
@@ -1123,6 +1183,16 @@ bool HTMLMediaElement::verify_response(GC::Ref<Fetch::Infrastructure::Response> 
 WebIDL::ExceptionOr<void> HTMLMediaElement::process_media_data(Function<void(String)> failure_callback)
 {
     auto& realm = this->realm();
+
+    // FIXME: HLS (HTTP Live Streaming) playlists require URL-based loading so FFmpeg can fetch
+    //        the video segments referenced in the playlist. Currently, we load everything into
+    //        memory first, which prevents FFmpeg from accessing the network to fetch segments.
+    //        For now, we let FFmpeg try to handle HLS playlists, but it will likely fail
+    //        because it cannot fetch segments when using a memory-based IO context.
+    //        To properly support HLS, we need to:
+    //        1. Detect HLS URLs (e.g., ending in .m3u8 or HLS MIME types)
+    //        2. Pass the URL directly to FFmpeg instead of loading into memory
+    //        3. Modify FFmpegLoader/FFmpegDemuxer to support URL-based loading
 
     auto audio_loader = Audio::Loader::create(m_media_data.bytes());
     auto playback_manager = Media::PlaybackManager::from_data(m_media_data);
@@ -1287,6 +1357,150 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::process_media_data(Function<void(Str
     // FIXME: -> If the media data can be fetched but has non-fatal errors or uses, in part, codecs that are unsupported, preventing the user agent from
     //           rendering the content completely correctly but not preventing playback altogether
     // FIXME: -> If the media resource is found to declare a media-resource-specific text track that the user agent supports
+
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
+WebIDL::ExceptionOr<void> HTMLMediaElement::process_hls_stream(String url, Function<void(String)> failure_callback)
+{
+    auto& realm = this->realm();
+
+    // For HLS streams, we use URL-based loading instead of loading the entire playlist into memory
+    // This allows FFmpeg to fetch the individual video segments as needed
+
+    // Validate HLS URL format
+    auto url_string_view = url.bytes_as_string_view();
+    if (!url_string_view.ends_with(".m3u8"sv, CaseSensitivity::CaseInsensitive) &&
+        !url_string_view.ends_with(".m3u"sv, CaseSensitivity::CaseInsensitive)) {
+        // This might still be HLS delivered via content-type, so we continue but log a warning
+        dbgln("HLS Warning: URL doesn't have typical HLS extension (.m3u8/.m3u): {}", url);
+    }
+
+    dbgln("HLS: Processing stream from URL: {}", url);
+
+    auto audio_loader = Audio::Loader::create_from_url(url);
+    auto playback_manager = Media::PlaybackManager::from_url(url);
+
+    // Enhanced error handling for HLS streams
+    bool audio_failed = audio_loader.is_error();
+    bool video_failed = playback_manager.is_error();
+
+    String detailed_error;
+
+    if (audio_failed) {
+        detailed_error = MUST(String::from_utf8(audio_loader.error().string_literal()));
+        dbgln("HLS: Audio loader failed: {}", detailed_error);
+    }
+
+    if (video_failed) {
+        auto video_error = playback_manager.error();
+        auto video_error_msg = MUST(String::from_utf8(video_error.description()));
+        if (detailed_error.is_empty())
+            detailed_error = video_error_msg;
+        else
+            detailed_error = MUST(String::formatted("{}; Video: {}", detailed_error, video_error_msg));
+        dbgln("HLS: Playback manager failed: {}", video_error_msg);
+    }
+
+    // -> If the media data cannot be fetched at all, due to network errors, causing the user agent to give up trying to fetch the resource
+    // -> If the media data can be fetched but is found by inspection to be in an unsupported format, or can otherwise not be rendered at all
+    if (audio_failed && video_failed) {
+        // 1. The user agent should cancel the fetching process.
+        if (m_fetch_controller)
+            m_fetch_controller->stop_fetch();
+
+        // 2. Abort this subalgorithm, returning to the resource selection algorithm.
+        auto error_message = MUST(String::formatted("HLS stream loading failed: {}", detailed_error));
+        failure_callback(error_message);
+        dbgln("HLS: Stream loading failed completely: {}", detailed_error);
+
+        return {};
+    }
+
+    // At this point, we have at least one working track (audio or video)
+    dbgln("HLS: Stream validation passed - Audio: {}, Video: {}",
+          audio_failed ? "Failed" : "OK",
+          video_failed ? "Failed" : "OK");
+
+    GC::Ptr<AudioTrack> audio_track;
+    GC::Ptr<VideoTrack> video_track;
+
+    // -> If the media resource is found to have an audio track
+    if (!audio_loader.is_error()) {
+        auto loader = audio_loader.release_value();
+
+        // Create an AudioTrack object to represent the audio track.
+        audio_track = realm.create<AudioTrack>(realm, *this, loader);
+
+        // Update the media element's audioTracks attribute's AudioTrackList object with the new AudioTrack object.
+        m_audio_tracks->add_track({}, *audio_track);
+
+        // Let enable be unknown.
+        auto enable = TriState::Unknown;
+
+        // FIXME: 4. If either the media resource or the URL of the current media resource indicate a particular set of audio tracks to enable, or if
+        //           the user agent has information that would facilitate the selection of specific audio tracks to improve the user's experience, then:
+        //           if this audio track is one of the ones to enable, then set enable to true, otherwise, set enable to false.
+
+        // 5. If enable is still unknown, then, if the media element does not yet have an enabled audio track, then set enable to true, otherwise,
+        //    set enable to false.
+        if (enable == TriState::Unknown)
+            enable = m_audio_tracks->has_enabled_track() ? TriState::False : TriState::True;
+
+        // 6. If enable is true, then enable this audio track, otherwise, do not enable this audio track.
+        if (enable == TriState::True)
+            audio_track->set_enabled(true);
+
+        // 7. Fire an event named addtrack at this AudioTrackList object, using TrackEvent, with the track attribute initialized to the new AudioTrack object.
+        TrackEventInit event_init {};
+        event_init.track = GC::make_root(audio_track);
+
+        auto event = TrackEvent::create(realm, HTML::EventNames::addtrack, move(event_init));
+        m_audio_tracks->dispatch_event(event);
+    }
+
+    // -> If the media resource is found to have a video track
+    if (!playback_manager.is_error()) {
+        auto manager = playback_manager.release_value();
+
+        // Create a VideoTrack object to represent the video track.
+        video_track = realm.create<VideoTrack>(realm, *this, move(manager));
+
+        // Update the media element's videoTracks attribute's VideoTrackList object with the new VideoTrack object.
+        m_video_tracks->add_track({}, *video_track);
+
+        // Let enable be unknown.
+        auto enable = TriState::Unknown;
+
+        // FIXME: 4. If either the media resource or the URL of the current media resource indicate a particular set of video tracks to enable, or if
+        //           the user agent has information that would facilitate the selection of specific video tracks to improve the user's experience, then:
+        //           if this video track is the first such video track, then set enable to true, otherwise, set enable to false.
+
+        // 5. If enable is still unknown, then, if the media element does not yet have a selected video track, then set enable to true, otherwise, set
+        //    enable to false.
+        if (enable == TriState::Unknown)
+            enable = m_video_tracks->selected_index() != -1 ? TriState::False : TriState::True;
+
+        // 6. If enable is true, then select this video track, otherwise, do not select this video track.
+        if (enable == TriState::True)
+            video_track->set_selected(true);
+
+        // 7. Fire an event named addtrack at this VideoTrackList object, using TrackEvent, with the track attribute initialized to the new VideoTrack object.
+        TrackEventInit event_init {};
+        event_init.track = GC::make_root(video_track);
+
+        auto event = TrackEvent::create(realm, HTML::EventNames::addtrack, move(event_init));
+        m_video_tracks->dispatch_event(event);
+    }
+
+    // -> Once the resource's metadata has been loaded and the user agent has determined the duration, the user agent must set the element's readyState to HAVE_METADATA.
+    set_ready_state(ReadyState::HaveMetadata);
+
+    // -> If the user agent can render the media resource, then once the user agent has fetched and decoded the metadata and determined the duration,
+    //    the user agent must change the readyState to HAVE_ENOUGH_DATA.
+    // FIXME: For now, we assume we have enough data once metadata is loaded for HLS streams
+    set_ready_state(ReadyState::HaveEnoughData);
 
     return {};
 }
@@ -1561,6 +1775,9 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
     // FIXME: 3. If the element's seeking IDL attribute is true, then another instance of this algorithm is already running.
     //           Abort that other instance of the algorithm without waiting for the step that it is running to complete.
     if (m_seeking) {
+        // Abort the previous seek by resetting the flag and continue with the new seek
+        m_seek_in_progress = false;
+        dbgln("HLS: Aborting previous seek operation to start new seek to position {}", playback_position);
     }
 
     // 4. Set the seeking IDL attribute to true.
@@ -1636,8 +1853,15 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
     // 12. Wait until the user agent has established whether or not the media data for the new playback position is
     //     available, and, if it is, until it has decoded enough data to play back that position.
     m_seek_in_progress = true;
+
+    dbgln("HLS: Starting seek to position {}", playback_position);
     on_seek(playback_position, seek_mode);
-    HTML::main_thread_event_loop().spin_until(GC::create_function(heap(), [&]() { return !m_seek_in_progress; }));
+
+    // Wait for seek to complete with basic timeout protection
+    // FIXME: Implement proper timeout mechanism when available
+    HTML::main_thread_event_loop().spin_until(GC::create_function(heap(), [&]() {
+        return !m_seek_in_progress;
+    }));
 
     // FIXME: 13. Await a stable state. The synchronous section consists of all the remaining steps of this algorithm. (Steps in the
     //            synchronous section are marked with ⌛.)

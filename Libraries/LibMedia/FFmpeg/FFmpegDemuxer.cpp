@@ -5,6 +5,7 @@
  */
 
 #include <AK/Math.h>
+#include <AK/MemoryStream.h>
 #include <AK/Stream.h>
 #include <AK/Time.h>
 #include <LibMedia/FFmpeg/FFmpegDemuxer.h>
@@ -12,9 +13,16 @@
 
 namespace Media::FFmpeg {
 
-FFmpegDemuxer::FFmpegDemuxer(NonnullOwnPtr<SeekableStream> stream, NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext> io_context)
+FFmpegDemuxer::FFmpegDemuxer(NonnullOwnPtr<SeekableStream> stream, Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>> io_context)
     : m_stream(move(stream))
     , m_io_context(move(io_context))
+    , m_is_url_based(!io_context.has_value())
+{
+}
+
+FFmpegDemuxer::FFmpegDemuxer(NonnullOwnPtr<SeekableStream> stream)
+    : m_stream(move(stream))
+    , m_is_url_based(true)
 {
 }
 
@@ -31,15 +39,45 @@ FFmpegDemuxer::~FFmpegDemuxer()
 ErrorOr<NonnullOwnPtr<FFmpegDemuxer>> FFmpegDemuxer::create(NonnullOwnPtr<SeekableStream> stream)
 {
     auto io_context = TRY(Media::FFmpeg::FFmpegIOContext::create(*stream));
-    auto demuxer = make<FFmpegDemuxer>(move(stream), move(io_context));
+    auto demuxer = TRY(adopt_nonnull_own_or_enomem(new (nothrow) FFmpegDemuxer(move(stream), move(io_context))));
 
     // Open the container
     demuxer->m_format_context = avformat_alloc_context();
     if (demuxer->m_format_context == nullptr)
         return Error::from_string_literal("Failed to allocate format context");
-    demuxer->m_format_context->pb = demuxer->m_io_context->avio_context();
+
+    // For stream-based loading, set up the custom IO context
+    if (demuxer->m_io_context.has_value())
+        demuxer->m_format_context->pb = demuxer->m_io_context.value()->avio_context();
+
     if (avformat_open_input(&demuxer->m_format_context, nullptr, nullptr, nullptr) < 0)
         return Error::from_string_literal("Failed to open input for format parsing");
+
+    // Read stream info; doing this is required for headerless formats like MPEG
+    if (avformat_find_stream_info(demuxer->m_format_context, nullptr) < 0)
+        return Error::from_string_literal("Failed to find stream info");
+
+    demuxer->m_packet = av_packet_alloc();
+    if (demuxer->m_packet == nullptr)
+        return Error::from_string_literal("Failed to allocate packet");
+
+    return demuxer;
+}
+
+ErrorOr<NonnullOwnPtr<FFmpegDemuxer>> FFmpegDemuxer::create_from_url(StringView url)
+{
+    // Create a dummy stream for the interface - it won't be used for URL-based loading
+    auto dummy_stream = TRY(try_make<FixedMemoryStream>(ReadonlyBytes {}));
+    auto demuxer = TRY(adopt_nonnull_own_or_enomem(new (nothrow) FFmpegDemuxer(move(dummy_stream), OptionalNone())));
+
+    // Open the container directly from URL
+    demuxer->m_format_context = avformat_alloc_context();
+    if (demuxer->m_format_context == nullptr)
+        return Error::from_string_literal("Failed to allocate format context");
+
+    // Use FFmpeg's built-in URL handling instead of custom IO context
+    if (avformat_open_input(&demuxer->m_format_context, url.to_byte_string().characters(), nullptr, nullptr) < 0)
+        return Error::from_string_literal("Failed to open input from URL");
 
     // Read stream info; doing this is required for headerless formats like MPEG
     if (avformat_find_stream_info(demuxer->m_format_context, nullptr) < 0)
@@ -81,6 +119,12 @@ DecoderErrorOr<AK::Duration> FFmpegDemuxer::duration_of_track(Track const& track
 {
     VERIFY(track.identifier() < m_format_context->nb_streams);
     auto* stream = m_format_context->streams[track.identifier()];
+
+    // For HLS streams, the duration is stored in the format context, not the stream.
+    if (is_hls_stream()) {
+        if (m_format_context->duration != AV_NOPTS_VALUE)
+            return time_units_to_duration(m_format_context->duration, { 1, AV_TIME_BASE });
+    }
 
     if (stream->duration >= 0) {
         return time_units_to_duration(stream->duration, stream->time_base);
@@ -139,12 +183,41 @@ DecoderErrorOr<Optional<AK::Duration>> FFmpegDemuxer::seek_to_most_recent_keyfra
 
     VERIFY(track.identifier() < m_format_context->nb_streams);
     auto* stream = m_format_context->streams[track.identifier()];
-    auto time_base = av_q2d(stream->time_base);
-    auto time_in_seconds = static_cast<double>(timestamp.to_milliseconds()) / 1000.0 / time_base;
-    auto sample_timestamp = AK::round_to<int64_t>(time_in_seconds);
 
-    if (av_seek_frame(m_format_context, stream->index, sample_timestamp, AVSEEK_FLAG_BACKWARD) < 0)
-        return DecoderError::format(DecoderErrorCategory::Unknown, "Failed to seek");
+    // For HLS streams, seeking is handled by FFmpeg's internal HLS demuxer when we call av_read_frame.
+    // We can just flush the context and FFmpeg will do the right thing.
+    if (is_hls_stream()) {
+        avformat_flush(m_format_context);
+        return timestamp;
+    }
+
+    // Check if the stream is seekable
+    if (!is_seekable()) {
+        return DecoderError::format(DecoderErrorCategory::Unknown, "Stream is not seekable");
+    }
+
+    // Convert timestamp to stream time base using FFmpeg's av_rescale_q
+    // First convert from milliseconds to AV_TIME_BASE units, then to stream time_base
+    auto timestamp_in_av_time_base = static_cast<int64_t>((timestamp.to_milliseconds() * AV_TIME_BASE) / 1000);
+    auto time_base_d = stream->time_base;
+    if (time_base_d.num == 0 || time_base_d.den == 0) {
+        return DecoderError::format(DecoderErrorCategory::Unknown, "Invalid time base for stream (num: {}, den: {})", time_base_d.num, time_base_d.den);
+    }
+    auto sample_timestamp = av_rescale_q(timestamp_in_av_time_base, AVRational { 1, AV_TIME_BASE }, time_base_d);
+
+    // Try seeking with different strategies
+    int seek_result = av_seek_frame(m_format_context, stream->index, sample_timestamp, AVSEEK_FLAG_BACKWARD);
+    if (seek_result < 0) {
+        // Fallback: try without flags
+        seek_result = av_seek_frame(m_format_context, stream->index, sample_timestamp, 0);
+        if (seek_result < 0) {
+            // Final fallback: try nearest keyframe
+            seek_result = av_seek_frame(m_format_context, stream->index, sample_timestamp, AVSEEK_FLAG_FRAME);
+            if (seek_result < 0) {
+                return DecoderError::format(DecoderErrorCategory::Unknown, "Failed to seek to timestamp {}ms (stream index: {}, sample timestamp: {})", timestamp.to_milliseconds(), stream->index, sample_timestamp);
+            }
+        }
+    }
 
     return timestamp;
 }
@@ -161,6 +234,32 @@ DecoderErrorOr<ReadonlyBytes> FFmpegDemuxer::get_codec_initialization_data_for_t
     VERIFY(track.identifier() < m_format_context->nb_streams);
     auto* stream = m_format_context->streams[track.identifier()];
     return ReadonlyBytes { stream->codecpar->extradata, static_cast<size_t>(stream->codecpar->extradata_size) };
+}
+
+bool FFmpegDemuxer::is_hls_stream() const
+{
+    if (!m_format_context || !m_format_context->iformat)
+        return false;
+
+    // Check if the input format is HLS
+    return strcmp(m_format_context->iformat->name, "hls") == 0 ||
+           strcmp(m_format_context->iformat->name, "hls,applehttp") == 0;
+}
+
+bool FFmpegDemuxer::is_seekable() const
+{
+    if (!m_format_context)
+        return false;
+
+    // Check if the format context is marked as unseekable
+    if (m_format_context->ctx_flags & AVFMTCTX_UNSEEKABLE)
+        return false;
+
+    // For HLS streams, seeking might be limited but possible
+    if (is_hls_stream())
+        return true; // HLS streams can seek within buffered segments
+
+    return true; // Most formats are seekable
 }
 
 DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track track)
