@@ -1,0 +1,65 @@
+$a0b8e192 super-computed-eval-order.js:1:1
+  Registers: 8
+  Blocks:    1
+  Constants:
+    [0] = String("test")
+    [1] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] GetLexicalEnvironment dst:reg4
+  [  10] CreateLexicalEnvironment dst:reg5, parent:reg4, capacity:1, is_catch_environment:false
+  [  28] CreateVariable `Base`, is_immutable:true, is_global:false, is_strict:true
+  [  38] SetLexicalEnvironment environment:reg4
+  [  40] NewClass dst:reg6, class_environment:reg5, class_blueprint_index:0
+  [  60] DynamicInitializeLexicalBinding `Base`, src:reg6
+  [  70] CreateLexicalEnvironment dst:reg6, parent:reg4, capacity:1, is_catch_environment:false
+  [  88] CreateVariable `Derived`, is_immutable:true, is_global:false, is_strict:true
+  [  98] GetGlobal value_feedback:0, dst:reg5, `Base`
+  [  a8] SetLexicalEnvironment environment:reg4
+  [  b0] NewClass dst:reg7, super_class:reg5, class_environment:reg6, class_blueprint_index:1, element_keys:[element_keys:String("test")]
+  [  d8] DynamicInitializeLexicalBinding `Derived`, src:reg7
+  [  e8] GetGlobal value_feedback:1, dst:reg5, `Derived`
+  [  f8] CallConstruct value_feedback:2, call_feedback:0, dst:reg6, callee:reg5, Derived
+  [ 118] GetById value_feedback:3, dst:reg5, base:reg6, `test`
+  [ 130] Call value_feedback:4, call_feedback:1, dst:reg7, callee:reg5, this_value:reg6, <object>.test
+  [ 150] End value:reg7
+
+
+Derived$eee8d5da super-computed-eval-order.js:4:14
+  Registers: 8
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] GetSuperConstructor dst:reg5
+  [  10] NewArray dst:reg6
+  [  20] SuperCallWithArgumentArray value_feedback:0, call_feedback:0, dst:reg7, super_constructor:reg5, arguments:reg6, is_synthetic:false
+  [  38] End value:Undefined
+
+
+Base$25c3a990
+  Registers: 5
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] End value:Undefined
+
+
+test$b92c699d super-computed-eval-order.js:7:9
+  Registers: 7
+  Blocks:    1
+  Constants:
+    [0] = Int32(0)
+
+block0:
+  [   0] Enter
+  [   8] ResolveThisBinding
+  [  10] ResolveSuperBase dst:reg5
+  [  18] GetByValueWithThis value_feedback:0, dst:reg6, base:reg5, property:Int32(0), this_value:this
+  [  30] Return value:reg6

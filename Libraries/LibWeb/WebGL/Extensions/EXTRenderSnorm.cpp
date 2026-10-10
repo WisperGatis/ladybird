@@ -5,32 +5,25 @@
  */
 
 #include <LibJS/Runtime/Realm.h>
-#include <LibWeb/Bindings/EXTRenderSnormPrototype.h>
+#include <LibWeb/Bindings/EXTRenderSnorm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/WebGL/Extensions/EXTRenderSnorm.h>
-#include <LibWeb/WebGL/OpenGLContext.h>
-#include <LibWeb/WebGL/WebGL2RenderingContext.h>
+#include <LibWeb/WebGL/WebGLContextProxy.h>
+#include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(EXTRenderSnorm);
 
-JS::ThrowCompletionOr<GC::Ptr<EXTRenderSnorm>> EXTRenderSnorm::create(JS::Realm& realm, GC::Ref<WebGL2RenderingContext> context)
+GC::Ref<Bindings::Wrappable> EXTRenderSnorm::create(GC::Ref<WebGLRenderingContextBase> context)
 {
+    auto& realm = context->realm();
     return realm.create<EXTRenderSnorm>(realm, context);
 }
 
-EXTRenderSnorm::EXTRenderSnorm(JS::Realm& realm, GC::Ref<WebGL2RenderingContext> context)
-    : PlatformObject(realm)
-    , m_context(context)
+EXTRenderSnorm::EXTRenderSnorm(JS::Realm&, GC::Ref<WebGLRenderingContextBase> context)
+    : m_context(context)
 {
-    m_context->context().request_extension("GL_EXT_render_snorm");
-}
-
-void EXTRenderSnorm::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(EXTRenderSnorm);
-    Base::initialize(realm);
 }
 
 void EXTRenderSnorm::visit_edges(Visitor& visitor)

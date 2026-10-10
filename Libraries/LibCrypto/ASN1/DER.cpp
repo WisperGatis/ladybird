@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/BitmapView.h>
 #include <AK/IntegralMath.h>
 #include <AK/Math.h>
 #include <AK/Stream.h>
@@ -38,7 +39,7 @@ ErrorOr<size_t> Decoder::read_length()
 
     if (byte & 0x80) {
         auto count = byte & 0x7f;
-        if (count == 0x7f)
+        if (count == 0 || count == 0x7f)
             return Error::from_string_literal("ASN1::Decoder: Length has an invalid count value");
 
         auto data = TRY(read_bytes(count));
@@ -133,24 +134,38 @@ ErrorOr<nullptr_t> Decoder::decode_null(ReadonlyBytes data)
     return nullptr;
 }
 
-ErrorOr<Vector<int>> Decoder::decode_object_identifier(ReadonlyBytes data)
+ErrorOr<ObjectIdentifier> Decoder::decode_object_identifier(ReadonlyBytes data)
 {
-    Vector<int> result;
+    if (data.is_empty())
+        return Error::from_string_literal("ASN1::Decoder: Decoding object identifier from an empty span");
+
+    ObjectIdentifier result;
     result.append(0); // Reserved space.
 
-    u32 value = 0;
-    for (auto&& byte : data) {
+    // Subidentifiers must be encoded minimally, i.e. without leading zero digits, and we refuse any that is wider than
+    // the 28 bits our encoder is able to write back out. Neither a leading zero digit nor an overflow is therefore
+    // possible, which means a zero accumulator marks the start of a subidentifier.
+    static constexpr u64 max_subidentifier = 0x0fffffff;
+
+    u64 value = 0;
+    for (auto byte : data) {
         if (value == 0 && byte == 0x80)
-            return Error::from_string_literal("ASN1::Decoder: Invalid first byte in object identifier");
+            return Error::from_string_literal("ASN1::Decoder: Object identifier has a non-minimally encoded subidentifier");
 
         value = (value << 7) | (byte & 0x7f);
+        if (value > max_subidentifier)
+            return Error::from_string_literal("ASN1::Decoder: Object identifier has an excessively large subidentifier");
+
         if (!(byte & 0x80)) {
             result.append(value);
             value = 0;
         }
     }
 
-    if (result.size() == 1 || result[1] >= 1600)
+    if (value != 0)
+        return Error::from_string_literal("ASN1::Decoder: Object identifier ends with an unterminated subidentifier");
+
+    if (result[1] >= 1600)
         return Error::from_string_literal("ASN1::Decoder: Invalid encoding in object identifier");
 
     result[0] = result[1] / 40;
@@ -359,7 +374,7 @@ ErrorOr<void> Encoder::write_null(Optional<Class> class_override, Optional<Kind>
     return {};
 }
 
-ErrorOr<void> Encoder::write_object_identifier(Span<int const> segments, Optional<Class> class_override, Optional<Kind> kind_override)
+ErrorOr<void> Encoder::write_object_identifier(Span<u32 const> segments, Optional<Class> class_override, Optional<Kind> kind_override)
 {
     auto class_ = class_override.value_or(Class::Universal);
     auto type = Type::Primitive;
@@ -372,9 +387,6 @@ ErrorOr<void> Encoder::write_object_identifier(Span<int const> segments, Optiona
     size_t length = 1;
     for (size_t i = 2; i < segments.size(); i++) {
         auto segment = segments[i];
-        if (segment < 0)
-            return Error::from_string_literal("ASN1::Encoder: Object identifier segments must be non-negative");
-
         if (segment < 0x80)
             length += 1;
         else if (segment < 0x4000)
@@ -489,7 +501,7 @@ ErrorOr<void> pretty_print(Decoder& decoder, Stream& stream, int indent)
                 break;
             }
             case Kind::ObjectIdentifier: {
-                auto value = TRY(decoder.read<Vector<int>>());
+                auto value = TRY(decoder.read<ObjectIdentifier>());
                 for (auto& id : value)
                     builder.appendff(" {}", id);
                 break;

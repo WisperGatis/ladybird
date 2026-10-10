@@ -8,16 +8,19 @@
 #pragma once
 
 #include <AK/Badge.h>
+#include <AK/Concepts.h>
+#include <AK/Function.h>
 #include <AK/StringView.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/RootVector.h>
+#include <LibJS/Embedding/Layout.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/IndexedProperties.h>
 #include <LibJS/Runtime/PrimitiveString.h>
-#include <LibJS/Runtime/PrivateEnvironment.h>
 #include <LibJS/Runtime/PropertyDescriptor.h>
 #include <LibJS/Runtime/PropertyKey.h>
 #include <LibJS/Runtime/Shape.h>
@@ -25,56 +28,21 @@
 
 namespace JS {
 
-#define JS_OBJECT(class_, base_class) GC_CELL(class_, base_class)
+// The runtime's inline cache metadata, which a [[Get]] or [[Set]] hook only passes on to the internal method it defers
+// to. The runtime fills it in, so C++ never creates or reads one.
+struct CacheableGetPropertyMetadata;
+struct CacheableSetPropertyMetadata;
 
-struct PrivateElement {
-    enum class Kind {
-        Field,
-        Method,
-        Accessor
-    };
-
-    PrivateName key;
-    Kind kind { Kind::Field };
-    Value value;
-};
-
-// Non-standard: This is information optionally returned by object property access functions.
-//               It can be used to implement inline caches for property lookup.
-struct CacheableGetPropertyMetadata {
-    enum class Type {
-        NotCacheable,
-        GetOwnProperty,
-        GetPropertyInPrototypeChain,
-    };
-    Type type { Type::NotCacheable };
-    Optional<u32> property_offset;
-    GC::Ptr<Object const> prototype;
-};
-
-struct CacheableSetPropertyMetadata {
-    enum class Type {
-        NotCacheable,
-        AddOwnProperty,
-        ChangeOwnProperty,
-        ChangePropertyInPrototypeChain,
-    };
-    Type type { Type::NotCacheable };
-    Optional<u32> property_offset;
-    GC::Ptr<Object const> prototype;
-};
-
-class JS_API Object : public Cell {
-    GC_CELL(Object, Cell);
-    GC_DECLARE_ALLOCATOR(Object);
-
+// An object of the Rust runtime. Its internal methods are those of its class, so the internal_*() functions dispatch
+// on the class the way virtual functions would, and the ordinary_*() functions never dispatch.
+//
+// The facade type of a class of objects derives from Object and recognizes the objects of its class with
+// `static bool is_engine_class_of(Object const&)`, which is<T>(), as<T>() and as_if<T>() go through: an object flag
+// where the runtime keeps one, the class id for a class that no other class extends, and otherwise whether the object's
+// class is that class or extends it.
+class JS_API Object : public EngineCell {
 public:
-    static GC::Ref<Object> create_prototype(Realm&, Object* prototype);
-    static GC::Ref<Object> create(Realm&, Object* prototype);
-    static GC::Ref<Object> create_with_premade_shape(Shape&);
-
-    virtual void initialize(Realm&) override;
-    virtual ~Object();
+    static GC::Ref<Object> create(Realm&, GC::Ptr<Object> prototype);
 
     enum class PropertyKind {
         Key,
@@ -92,81 +60,57 @@ public:
         Yes,
     };
 
-    enum class MayInterfereWithIndexedPropertyAccess {
-        No,
-        Yes,
-    };
-
-    // Please DO NOT make up your own non-standard methods unless you
-    // have a very good reason to do so. If any object abstract
-    // operation from the spec is missing, add it instead.
-    // Functionality for implementation details like shapes and
-    // property storage are obviously exempt from this rule :^)
-    //
-    // Methods named [[Foo]]() in the spec are named internal_foo()
-    // here, as they are "The [[Foo]] internal method of a ... object".
-    // They must be virtual and may be overridden. All other methods
-    // follow the regular PascalCase name converted to camel_case
-    // naming convention and must not be virtual.
-
-    // 7.1 Type Conversion, https://tc39.es/ecma262/#sec-type-conversion
-
-    ThrowCompletionOr<Value> ordinary_to_primitive(Value::PreferredType preferred_type) const;
-
-    // 7.2 Testing and Comparison Operations, https://tc39.es/ecma262/#sec-testing-and-comparison-operations
-
-    ThrowCompletionOr<bool> is_extensible() const;
-
-    // 7.3 Operations on Objects, https://tc39.es/ecma262/#sec-operations-on-objects
-
-    ThrowCompletionOr<Value> get(PropertyKey const&) const;
-    ThrowCompletionOr<Value> get(PropertyKey const&, Bytecode::PropertyLookupCache&) const;
-    ThrowCompletionOr<void> set(PropertyKey const&, Value, ShouldThrowExceptions);
-    ThrowCompletionOr<bool> create_data_property(PropertyKey const&, Value, Optional<u32>* new_property_offset = nullptr);
-    void create_method_property(PropertyKey const&, Value);
-    ThrowCompletionOr<bool> create_data_property_or_throw(PropertyKey const&, Value);
-    void create_non_enumerable_data_property_or_throw(PropertyKey const&, Value);
-    ThrowCompletionOr<void> define_property_or_throw(PropertyKey const&, PropertyDescriptor&);
-    ThrowCompletionOr<void> delete_property_or_throw(PropertyKey const&);
-    ThrowCompletionOr<bool> has_property(PropertyKey const&) const;
-    ThrowCompletionOr<bool> has_own_property(PropertyKey const&) const;
-    ThrowCompletionOr<bool> set_integrity_level(IntegrityLevel);
-    ThrowCompletionOr<bool> test_integrity_level(IntegrityLevel) const;
-    ThrowCompletionOr<GC::RootVector<Value>> enumerable_own_property_names(PropertyKind kind) const;
-    ThrowCompletionOr<void> copy_data_properties(VM&, Value source, HashTable<PropertyKey> const& excluded_keys, HashTable<JS::Value> const& excluded_values = {});
-    ThrowCompletionOr<GC::Ref<Object>> snapshot_own_properties(VM&, GC::Ptr<Object> prototype, HashTable<PropertyKey> const& excluded_keys = {}, HashTable<Value> const& excluded_values = {});
-
-    PrivateElement* private_element_find(PrivateName const& name);
-    ThrowCompletionOr<void> private_field_add(PrivateName const& name, Value value);
-    ThrowCompletionOr<void> private_method_or_accessor_add(PrivateElement element);
-    ThrowCompletionOr<Value> private_get(PrivateName const& name);
-    ThrowCompletionOr<void> private_set(PrivateName const& name, Value value);
-    ThrowCompletionOr<void> define_field(ClassFieldDefinition const&);
-    ThrowCompletionOr<void> initialize_instance_elements(ECMAScriptFunctionObject& constructor);
-
-    // 10.1 Ordinary Object Internal Methods and Internal Slots, https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots
-
-    virtual ThrowCompletionOr<Object*> internal_get_prototype_of() const;
-    virtual ThrowCompletionOr<bool> internal_set_prototype_of(Object* prototype);
-    virtual ThrowCompletionOr<bool> internal_is_extensible() const;
-    virtual ThrowCompletionOr<bool> internal_prevent_extensions();
-    virtual ThrowCompletionOr<Optional<PropertyDescriptor>> internal_get_own_property(PropertyKey const&) const;
-    virtual ThrowCompletionOr<bool> internal_define_own_property(PropertyKey const&, PropertyDescriptor&, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr);
-    virtual ThrowCompletionOr<bool> internal_has_property(PropertyKey const&) const;
     enum class PropertyLookupPhase {
         OwnProperty,
         PrototypeChain,
     };
-    virtual ThrowCompletionOr<Value> internal_get(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) const;
-    virtual ThrowCompletionOr<bool> internal_set(PropertyKey const&, Value value, Value receiver, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
-    virtual ThrowCompletionOr<bool> internal_delete(PropertyKey const&);
-    virtual ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const;
 
-    // NOTE: Any subclass of Object that overrides property access slots ([[Get]], [[Set]] etc)
-    //       to customize access to indexed properties (properties where the name is a positive integer)
-    //       must return true for this, to opt out of optimizations that rely on assumptions that
-    //       might not hold when property access behaves differently.
-    bool may_interfere_with_indexed_property_access() const { return m_may_interfere_with_indexed_property_access; }
+    // 7.3 Operations on Objects, https://tc39.es/ecma262/#sec-operations-on-objects
+
+    ThrowCompletionOr<Value> get(PropertyKey const&) const;
+    ThrowCompletionOr<void> set(PropertyKey const&, Value, ShouldThrowExceptions);
+    ThrowCompletionOr<bool> create_data_property(PropertyKey const&, Value, Optional<u32>* new_property_offset = nullptr, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr);
+    ThrowCompletionOr<bool> create_data_property_or_throw(PropertyKey const&, Value);
+    void create_non_enumerable_data_property_or_throw(PropertyKey const&, Value);
+    ThrowCompletionOr<void> define_property_or_throw(PropertyKey const&, PropertyDescriptor&);
+    ThrowCompletionOr<bool> has_property(PropertyKey const&) const;
+    ThrowCompletionOr<bool> has_own_property(PropertyKey const&) const;
+    ThrowCompletionOr<bool> set_integrity_level(IntegrityLevel);
+    ThrowCompletionOr<GC::RootVector<Value>> enumerable_own_property_names(PropertyKind kind) const;
+
+    // 10.1 Ordinary Object Internal Methods and Internal Slots, https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots
+
+    ThrowCompletionOr<Object*> internal_get_prototype_of() const;
+    ThrowCompletionOr<bool> internal_set_prototype_of(Object* prototype);
+    ThrowCompletionOr<Optional<PropertyDescriptor>> internal_get_own_property(PropertyKey const&) const;
+    ThrowCompletionOr<bool> internal_define_own_property(PropertyKey const&, PropertyDescriptor&, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr);
+    ThrowCompletionOr<Value> internal_get(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) const;
+    ThrowCompletionOr<bool> internal_set(PropertyKey const&, Value value, Value receiver, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
+    ThrowCompletionOr<bool> internal_delete(PropertyKey const&);
+    ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const;
+
+    // Runs [[Get]] on this object as one found in the prototype chain of the lookup that metadata_for_caller belongs to,
+    // and fills that metadata only for a hit that an inline cache can keep. An object that forwards its lookups to
+    // another one can then cache them without reading the metadata itself.
+    ThrowCompletionOr<Value> internal_get_as_prototype_of(PropertyKey const&, Value receiver, CacheableGetPropertyMetadata* metadata_for_caller) const;
+
+    // OrdinaryGetPrototypeOf ( O ) through OrdinaryOwnPropertyKeys ( O ), for exotic objects whose internal methods
+    // defer to the ordinary ones. These never dispatch to the object's class.
+    ThrowCompletionOr<Object*> ordinary_get_prototype_of() const;
+    ThrowCompletionOr<bool> ordinary_set_prototype_of(Object* prototype);
+    ThrowCompletionOr<bool> ordinary_prevent_extensions();
+    ThrowCompletionOr<Optional<PropertyDescriptor>> ordinary_get_own_property(PropertyKey const& property_key) const;
+    ThrowCompletionOr<bool> ordinary_define_own_property(PropertyKey const& property_key, PropertyDescriptor& property_descriptor, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr);
+    ThrowCompletionOr<Value> ordinary_get(PropertyKey const& property_key, Value receiver, CacheableGetPropertyMetadata* cacheable_metadata = nullptr, PropertyLookupPhase phase = PropertyLookupPhase::OwnProperty) const;
+    ThrowCompletionOr<bool> ordinary_set(PropertyKey const& property_key, Value value, Value receiver, CacheableSetPropertyMetadata* cacheable_metadata = nullptr, PropertyLookupPhase phase = PropertyLookupPhase::OwnProperty);
+    ThrowCompletionOr<bool> ordinary_delete(PropertyKey const& property_key);
+    ThrowCompletionOr<GC::RootVector<Value>> ordinary_own_property_keys() const;
+
+    [[nodiscard]] bool extensible() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_EXTENSIBLE); }
+    [[nodiscard]] bool may_interfere_with_indexed_property_access() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS); }
+    [[nodiscard]] bool requires_slow_add_own_property() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_REQUIRES_SLOW_ADD_OWN_PROPERTY); }
+    void clear_requires_slow_add_own_property();
+    [[nodiscard]] bool is_platform_object() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_PLATFORM_OBJECT); }
 
     ThrowCompletionOr<bool> ordinary_set_with_own_descriptor(PropertyKey const&, Value, Value, Optional<PropertyDescriptor>, CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty);
 
@@ -174,140 +118,141 @@ public:
 
     ThrowCompletionOr<bool> set_immutable_prototype(Object* prototype);
 
-    // 20.1 Object Objects, https://tc39.es/ecma262/#sec-object-objects
-
-    ThrowCompletionOr<Object*> define_properties(Value properties);
-
     // 14.7.5 The for-in, for-of, and for-await-of Statements
 
     Optional<Completion> enumerate_object_properties(Function<Optional<Completion>(Value)>) const;
 
     // Implementation-specific storage abstractions
 
-    Optional<ValueAndAttributes> storage_get(PropertyKey const&) const;
     bool storage_has(PropertyKey const&) const;
-    Optional<u32> storage_set(PropertyKey const&, ValueAndAttributes const&);
     void storage_delete(PropertyKey const&);
 
     // Non-standard methods
 
-    ThrowCompletionOr<void> for_each_own_property_with_enumerability(Function<ThrowCompletionOr<void>(PropertyKey const&, bool)>&&) const;
-    size_t own_properties_count() const;
-
+    // The value of the property in the storage of the object or of its prototype chain, without running any internal
+    // method or getter: undefined if there is none, and the accessor itself for an accessor property.
     Value get_without_side_effects(PropertyKey const&) const;
 
-    void define_direct_property(PropertyKey const& property_key, Value value, PropertyAttributes attributes) { (void)storage_set(property_key, { value, attributes }); }
-    void define_direct_accessor(PropertyKey const&, FunctionObject* getter, FunctionObject* setter, PropertyAttributes attributes);
+    void define_direct_property(PropertyKey const& property_key, Value value, PropertyAttributes attributes);
+    void define_unimplemented_property(Utf16FlyString const& property_name);
+    void define_direct_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
+    // Cache the getter's result in an engine-private property on this object.
+    void define_direct_cached_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
+    void clear_cached_accessor_value(PropertyKey const&);
 
     using IntrinsicAccessor = Value (*)(Realm&);
     void define_intrinsic_accessor(PropertyKey const&, PropertyAttributes attributes, IntrinsicAccessor accessor);
 
-    void define_native_function(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)>, i32 length, PropertyAttributes attributes, Optional<Bytecode::Builtin> builtin = {});
+    void define_native_function(Realm&, PropertyKey const&, NativeFunctionPointer, i32 length, PropertyAttributes attributes);
+    void define_native_function(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)>, i32 length, PropertyAttributes attributes);
+    void define_native_accessor(Realm&, PropertyKey const&, NativeFunctionPointer getter, NativeFunctionPointer setter, PropertyAttributes attributes);
     void define_native_accessor(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> getter, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> setter, PropertyAttributes attributes);
 
-    virtual bool is_dom_node() const { return false; }
-    virtual bool is_dom_element() const { return false; }
-    virtual bool is_dom_event() const { return false; }
-    virtual bool is_html_window() const { return false; }
-    virtual bool is_html_window_proxy() const { return false; }
-    virtual bool is_html_location() const { return false; }
+    [[nodiscard]] bool is_function() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_FUNCTION); }
+    bool is_date() const;
+    [[nodiscard]] bool is_raw_native_function() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION); }
+    [[nodiscard]] bool is_direct_getter_function() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION); }
+    [[nodiscard]] bool has_global_object_flag() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_GLOBAL_OBJECT); }
+    [[nodiscard]] bool is_ecmascript_function_object() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT); }
 
-    virtual bool is_function() const { return false; }
-    virtual bool is_promise() const { return false; }
-    virtual bool is_error_object() const { return false; }
-    virtual bool is_date() const { return false; }
-    virtual bool is_number_object() const { return false; }
-    virtual bool is_boolean_object() const { return false; }
-    virtual bool is_regexp_object() const { return false; }
-    virtual bool is_bigint_object() const { return false; }
-    virtual bool is_string_object() const { return false; }
-    virtual bool is_array_exotic_object() const { return false; }
-    virtual bool is_global_object() const { return false; }
-    virtual bool is_proxy_object() const { return false; }
-    virtual bool is_native_function() const { return false; }
-    virtual bool is_ecmascript_function_object() const { return false; }
-    virtual bool is_array_iterator() const { return false; }
-    virtual bool is_raw_json_object() const { return false; }
-    virtual bool is_set_object() const { return false; }
-    virtual bool is_map_object() const { return false; }
+    // The [[ErrorData]] of an Error object, or of a host object whose class exposes some.
+    ErrorData* error_data();
+    ErrorData const* error_data() const;
+    bool has_error_data() const { return error_data(); }
 
-    virtual bool eligible_for_own_property_enumeration_fast_path() const { return true; }
-
-    virtual BuiltinIterator* as_builtin_iterator_if_next_is_not_redefined(IteratorRecord const&) { return nullptr; }
-
-    virtual bool is_array_iterator_prototype() const { return false; }
-    virtual bool is_map_iterator_prototype() const { return false; }
-    virtual bool is_set_iterator_prototype() const { return false; }
-    virtual bool is_string_iterator_prototype() const { return false; }
+    bool eligible_for_own_property_enumeration_fast_path() const;
 
     // B.3.7 The [[IsHTMLDDA]] Internal Slot, https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot
-    virtual bool is_htmldda() const { return false; }
+    [[nodiscard]] bool is_htmldda() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_HTMLDDA); }
 
-    bool has_parameter_map() const { return m_has_parameter_map; }
-    void set_has_parameter_map() { m_has_parameter_map = true; }
+    bool has_parameter_map() const;
 
-    virtual void visit_edges(Cell::Visitor&) override;
+    // Indexed property storage
+    u32 indexed_array_like_size() const;
+    // The runtime appends elements with the default attributes, the only ones LibJS's users append with.
+    void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
+    // The element taken has the default attributes, whatever the ones it was stored with.
+    ValueAndAttributes indexed_take_first();
 
-    Value get_direct(size_t index) const { return m_storage[index]; }
-    void put_direct(size_t index, Value value) { m_storage[index] = value; }
-
-    IndexedProperties const& indexed_properties() const { return m_indexed_properties; }
-    IndexedProperties& indexed_properties() { return m_indexed_properties; }
-    void set_indexed_property_elements(Vector<Value>&& values) { m_indexed_properties = IndexedProperties(move(values)); }
-
-    Shape& shape() { return *m_shape; }
-    Shape const& shape() const { return *m_shape; }
-    void unsafe_set_shape(Shape&);
+    Shape& shape() { return *engine_field<Shape*>(JS_LAYOUT_OBJECT_SHAPE_OFFSET); }
+    Shape const& shape() const { return *engine_field<Shape*>(JS_LAYOUT_OBJECT_SHAPE_OFFSET); }
 
     void convert_to_prototype_if_needed();
+    void invalidate_property_lookup_caches();
 
-    template<typename T>
-    bool fast_is() const = delete;
+    void set_prototype(GC::Ptr<Object>);
 
-    void set_prototype(Object*);
-
-    [[nodiscard]] bool has_magical_length_property() const { return m_has_magical_length_property; }
-
-    [[nodiscard]] bool is_typed_array() const { return m_is_typed_array; }
-    void set_is_typed_array() { m_is_typed_array = true; }
+    [[nodiscard]] bool has_magical_length_property() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_HAS_MAGICAL_LENGTH_PROPERTY); }
+    [[nodiscard]] bool is_typed_array() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_IS_TYPED_ARRAY); }
+    [[nodiscard]] bool has_intrinsic_accessors() const { return has_engine_object_flag(JS_LAYOUT_OBJECT_FLAG_HAS_INTRINSIC_ACCESSORS); }
 
     Object const* prototype() const { return shape().prototype(); }
 
+    // The name of the object's class, which for an object of a host class is the name in its JSHostClass.
+    StringView class_name() const;
+
+    template<typename T>
+    requires(IsBaseOf<Object, T> && requires(Object const& object) { { T::is_engine_class_of(object) } -> SameAs<bool>; })
+    bool fast_is() const
+    {
+        return T::is_engine_class_of(*this);
+    }
+
+    bool has_engine_object_flag(u16 layout_object_flag) const
+    {
+        static_assert(JS_LAYOUT_OBJECT_FLAGS_SIZE == sizeof(u16));
+        return (engine_field<u16>(JS_LAYOUT_OBJECT_FLAGS_OFFSET) & layout_object_flag) != 0;
+    }
+
+    // A JS_LAYOUT_CLASS_ID_* value. A class that the runtime derives at run time, as it does for each host class, has
+    // the id of the class it extends.
+    u16 engine_class_id() const { return engine_class_id_of(engine_class()); }
+
+    bool is_of_engine_class_or_subclass(u16 layout_class_id) const
+    {
+        for (auto const* engine_class = this->engine_class(); engine_class; engine_class = engine_parent_class_of(engine_class)) {
+            if (engine_class_id_of(engine_class) == layout_class_id)
+                return true;
+        }
+        return false;
+    }
+
 protected:
-    enum class GlobalObjectTag { Tag };
-    enum class ConstructWithoutPrototypeTag { Tag };
-    enum class ConstructWithPrototypeTag { Tag };
-
-    Object(GlobalObjectTag, Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    Object(ConstructWithoutPrototypeTag, Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    Object(Realm&, Object* prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    Object(ConstructWithPrototypeTag, Object& prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    explicit Object(Shape&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-
-    // [[Extensible]]
-    bool m_is_extensible { true };
-
-    // [[ParameterMap]]
-    bool m_has_parameter_map { false };
-
-    bool m_has_magical_length_property { false };
-
-    bool m_is_typed_array { false };
+    // A field of the runtime's object, which a facade type reads at its Layout.h offset.
+    template<typename Field>
+    Field engine_field(size_t offset) const
+    {
+        Field field;
+        __builtin_memcpy(&field, reinterpret_cast<u8 const*>(this) + offset, sizeof(field));
+        return field;
+    }
 
 private:
-    void set_shape(Shape& shape) { m_shape = &shape; }
+    static_assert(JS_LAYOUT_OBJECT_SHAPE_SIZE == sizeof(void*));
+    static_assert(JS_LAYOUT_CELL_CLASS_SIZE == sizeof(void*));
+    static_assert(JS_LAYOUT_CLASS_ID_SIZE == sizeof(u16));
+    static_assert(JS_LAYOUT_CLASS_PARENT_SIZE == sizeof(void*));
 
-    Object* prototype() { return shape().prototype(); }
+    // The runtime's class of the object, which the first word of every cell points to.
+    u8 const* engine_class() const { return engine_field<u8 const*>(JS_LAYOUT_CELL_CLASS_OFFSET); }
 
-    bool m_may_interfere_with_indexed_property_access { false };
+    static u16 engine_class_id_of(u8 const* engine_class)
+    {
+        u16 class_id;
+        __builtin_memcpy(&class_id, engine_class + JS_LAYOUT_CLASS_ID_OFFSET, sizeof(class_id));
+        return class_id;
+    }
 
-    // True if this object has lazily allocated intrinsic properties.
-    bool m_has_intrinsic_accessors { false };
-
-    GC::Ptr<Shape> m_shape;
-    Vector<Value> m_storage;
-    IndexedProperties m_indexed_properties;
-    OwnPtr<Vector<PrivateElement>> m_private_elements; // [[PrivateElements]]
+    static u8 const* engine_parent_class_of(u8 const* engine_class)
+    {
+        u8 const* parent_class;
+        __builtin_memcpy(&parent_class, engine_class + JS_LAYOUT_CLASS_PARENT_OFFSET, sizeof(parent_class));
+        return parent_class;
+    }
 };
+
+// The table that implements the object's internal methods (see LibJS/HostObjectABI.h), or null for an object that the
+// engine implements.
+JS_API JSHostClass const* host_class_of(Object const&);
 
 }

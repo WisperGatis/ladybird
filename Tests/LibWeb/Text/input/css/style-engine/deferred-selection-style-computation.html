@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style id="rules"></style>
+<div id="container"></div>
+<script>
+    test(() => {
+        for (let index = 0; index < 64; ++index) {
+            const child = container.appendChild(document.createElement("div"));
+            child.textContent = "selectable text";
+        }
+        internals.updateStyle();
+        const before = internals.styleEngineCounters().computedPseudoAssignmentsPublished;
+        rules.sheet.insertRule("*::selection { color: rgb(10, 20, 30); background-color: rgb(40, 50, 60); }");
+        internals.updateStyle();
+        const after = internals.styleEngineCounters().computedPseudoAssignmentsPublished;
+        println(`selection styles deferred: ${after === before}`);
+        const target = container.firstElementChild;
+        println(`unselected query: ${getComputedStyle(target, "::selection").color}`);
+        const afterQuery = internals.styleEngineCounters().computedPseudoAssignmentsPublished;
+        // A highlight pseudo-element inherits from its ancestors', so a query computes that chain and nothing else.
+        println(`query stays local: ${afterQuery - after < container.children.length}`);
+
+        getComputedStyle(container.lastElementChild, "::selection").backgroundColor;
+        target.getBoundingClientRect();
+        const range = document.createRange();
+        range.selectNodeContents(target);
+        document.getSelection().addRange(range);
+        const beforeActivationNodes = internals.styleEngineCounters().invalidatedStyleNodes;
+        const beforeActivation = internals.getStyleInvalidationCounters();
+        internals.updateStyle();
+        target.getBoundingClientRect();
+        const afterActivation = internals.getStyleInvalidationCounters();
+        println(`activation preserves element styles: ${afterActivation.elementStyleRecomputations === beforeActivation.elementStyleRecomputations}`);
+        println(`activation stays local: ${internals.styleEngineCounters().invalidatedStyleNodes - beforeActivationNodes < 16}`);
+        println(`activation preserves layout: ${afterActivation.relayoutsPerformed === beforeActivation.relayoutsPerformed}`);
+        println(`selection styles activated: ${internals.styleEngineCounters().computedPseudoAssignmentsPublished > afterQuery}`);
+        println(`selected query: ${getComputedStyle(target, "::selection").backgroundColor}`);
+
+        internals.updateStyle();
+        const beforeExtension = internals.styleEngineCounters().invalidatedStyleNodes;
+        range.setEnd(target.nextElementSibling.firstChild, 3);
+        internals.updateStyle();
+        const extensionNodes = internals.styleEngineCounters().invalidatedStyleNodes - beforeExtension;
+        println(`extension updates only intersecting subtrees: ${extensionNodes > 0 && extensionNodes < 16}`);
+
+
+        document.getSelection().removeAllRanges();
+        rules.sheet.cssRules[0].style.backgroundColor = "rgb(70, 80, 90)";
+        const beforeDeselectedUpdate = internals.styleEngineCounters().computedPseudoAssignmentsPublished;
+        internals.updateStyle();
+        println(`deselected styles deferred: ${internals.styleEngineCounters().computedPseudoAssignmentsPublished === beforeDeselectedUpdate}`);
+        println(`deselected query: ${getComputedStyle(target, "::selection").backgroundColor}`);
+
+        internals.updateStyle();
+        const beforeReactivation = internals.getStyleInvalidationCounters().elementStyleRecomputations;
+        document.getSelection().addRange(range);
+        internals.updateStyle();
+        println(`reactivation preserves element styles: ${internals.getStyleInvalidationCounters().elementStyleRecomputations === beforeReactivation}`);
+        println(`reactivated query: ${getComputedStyle(target, "::selection").backgroundColor}`);
+        println(`unselected query while active: ${getComputedStyle(container.lastElementChild, "::selection").backgroundColor}`);
+
+        document.getSelection().removeAllRanges();
+        internals.updateStyle();
+        rules.sheet.insertRule(".changed { color: rgb(90, 100, 110); }");
+        target.className = "changed";
+        document.getSelection().addRange(range);
+        internals.updateStyle();
+        println(`activation with pending rule and class changes: ${getComputedStyle(target).color}`);
+
+        document.getSelection().removeAllRanges();
+        internals.updateStyle();
+        target.style.color = "rgb(120, 130, 140)";
+        document.getSelection().addRange(range);
+        internals.updateStyle();
+        println(`activation with pending inline style: ${getComputedStyle(target).color}`);
+    });
+</script>

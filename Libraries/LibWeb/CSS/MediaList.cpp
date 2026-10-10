@@ -1,139 +1,145 @@
 /*
- * Copyright (c) 2021-2023, Sam Atkins <atkinssj@serenityos.org>
+ * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2022-2023, Andreas Kling <andreas@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MediaListPrototype.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/MediaList.h>
-#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/StyleComputeFFI.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/CSS/StyleSheetInvalidation.h>
+#include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/Dump.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(MediaList);
 
-GC::Ref<MediaList> MediaList::create(JS::Realm& realm, Vector<NonnullRefPtr<MediaQuery>>&& media)
+GC::Ref<MediaList> MediaList::create(RustMediaList media)
 {
-    return realm.create<MediaList>(realm, move(media));
+    return GC::Heap::the().allocate<MediaList>(move(media));
 }
 
-MediaList::MediaList(JS::Realm& realm, Vector<NonnullRefPtr<MediaQuery>>&& media)
-    : Bindings::PlatformObject(realm)
-    , m_media(move(media))
+MediaList::MediaList(RustMediaList media)
+    : m_media(move(media))
 {
-    m_legacy_platform_object_flags = LegacyPlatformObjectFlags { .supports_indexed_properties = true };
 }
 
-void MediaList::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(MediaList);
-    Base::initialize(realm);
-}
-
-void MediaList::visit_edges(Visitor& visitor)
+void MediaList::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_associated_style_sheet);
+    visitor.visit(m_associated_cssom_sheet);
+    visitor.visit(m_associated_rule);
 }
 
 // https://www.w3.org/TR/cssom-1/#dom-medialist-mediatext
-String MediaList::media_text() const
+Utf16String MediaList::media_text() const
 {
-    return serialize_a_media_query_list(m_media);
+    return m_media.media_text();
 }
 
-// https://www.w3.org/TR/cssom-1/#dom-medialist-mediatext
-void MediaList::set_media_text(StringView text)
-{
-    ScopeGuard guard = [&] {
-        if (m_associated_style_sheet)
-            as<CSS::CSSStyleSheet>(*m_associated_style_sheet).invalidate_owners(DOM::StyleInvalidationReason::MediaListSetMediaText);
-    };
+MediaList::~MediaList() = default;
 
-    m_media.clear();
-    if (text.is_empty())
+void MediaList::set_associated_style_sheet(NonnullRefPtr<StyleSheetState> sheet)
+{
+    m_associated_cssom_sheet = &sheet->cssom_sheet();
+    m_associated_style_sheet = move(sheet);
+}
+
+// Both owners reach the same place: the sheet whose rules the gate belongs to.
+RefPtr<StyleSheetState> MediaList::owning_style_sheet()
+{
+    if (m_associated_style_sheet)
+        return m_associated_style_sheet;
+    if (m_associated_rule)
+        return m_associated_rule->parent_style_sheet();
+    return {};
+}
+
+void MediaList::invalidate_owners_for_media_change()
+{
+    auto sheet = owning_style_sheet();
+    if (!sheet)
         return;
-    m_media = parse_media_query_list(Parser::ParsingParams { realm() }, text);
+    if (m_associated_rule)
+        stop_sharing_compiled_style_sheet(*sheet);
+    invalidate_style_sheet_for_media_change(*sheet);
+}
+
+void invalidate_style_sheet_for_media_change(StyleSheetState& sheet)
+{
+    sheet.invalidate_owners();
+    sheet.synchronize_fonts_after_rule_change();
+
+    // Which of the sheet's rules are gated is published from here rather than from the transition
+    // `evaluate_media_queries` reports, because a list that has just been reparsed has evaluated
+    // nothing: a freshly parsed query reads as not matching, so turning a condition off looks like
+    // no change at all. Saying the state outright leaves it to the engine to reject what did not
+    // move, which it does.
+    record_stylesheet_rule_conditions(sheet);
+}
+
+void MediaList::set_media_text(Utf16View text)
+{
+    m_media.set_text(text);
+    invalidate_owners_for_media_change();
 }
 
 // https://www.w3.org/TR/cssom-1/#dom-medialist-item
-Optional<String> MediaList::item(u32 index) const
+Optional<Utf16String> MediaList::item(u32 index) const
 {
-    if (index >= m_media.size())
-        return {};
-
-    return m_media[index]->to_string();
+    return m_media.item(index);
 }
 
 // https://www.w3.org/TR/cssom-1/#dom-medialist-appendmedium
-void MediaList::append_medium(StringView medium)
+void MediaList::append_medium(Utf16View medium)
 {
-    // 1. Let m be the result of parsing the given value.
-    auto m = parse_media_query(Parser::ParsingParams { realm() }, medium);
-
-    // 2. If m is null, then return.
-    if (!m)
-        return;
-
-    // 3. If comparing m with any of the media queries in the collection of media queries returns true, then return.
-    auto serialized = m->to_string();
-    for (auto& existing_medium : m_media) {
-        if (existing_medium->to_string() == serialized)
-            return;
-    }
-
-    // 4. Append m to the collection of media queries.
-    m_media.append(m.release_nonnull());
-
-    if (m_associated_style_sheet)
-        as<CSS::CSSStyleSheet>(*m_associated_style_sheet).invalidate_owners(DOM::StyleInvalidationReason::MediaListAppendMedium);
+    if (m_media.append(medium))
+        invalidate_owners_for_media_change();
 }
 
 // https://www.w3.org/TR/cssom-1/#dom-medialist-deletemedium
-void MediaList::delete_medium(StringView medium)
+WebIDL::ExceptionOr<void> MediaList::delete_medium(Utf16View medium)
 {
-    auto m = parse_media_query(Parser::ParsingParams { realm() }, medium);
-    if (!m)
-        return;
-    bool was_removed = m_media.remove_all_matching([&](auto& existing) -> bool {
-        return m->to_string() == existing->to_string();
-    });
-    if (was_removed) {
-        if (m_associated_style_sheet)
-            as<CSS::CSSStyleSheet>(*m_associated_style_sheet).invalidate_owners(DOM::StyleInvalidationReason::MediaListDeleteMedium);
-    }
-    // FIXME: If nothing was removed, then throw a NotFoundError exception.
-}
-
-bool MediaList::evaluate(DOM::Document const& document)
-{
-    for (auto& media : m_media)
-        media->evaluate(document);
-
-    return matches();
-}
-
-bool MediaList::matches() const
-{
-    if (m_media.is_empty())
-        return true;
-
-    for (auto& media : m_media) {
-        if (media->matches())
-            return true;
-    }
-    return false;
-}
-
-Optional<JS::Value> MediaList::item_value(size_t index) const
-{
-    if (index >= m_media.size())
+    auto result = m_media.remove(medium);
+    if (result == Parser::ValueParserFFI::MediaListDeleteResult::Invalid)
         return {};
-    return JS::PrimitiveString::create(vm(), m_media[index]->to_string());
+    if (result == Parser::ValueParserFFI::MediaListDeleteResult::NotFound)
+        return WebIDL::NotFoundError::create("Media query not found in list"_utf16);
+
+    invalidate_owners_for_media_change();
+
+    return {};
+}
+
+MediaEnvironmentSnapshot::MediaEnvironmentSnapshot(DOM::Document const& document)
+{
+    if (!document.window())
+        return;
+
+    m_length_resolution_context = to_ffi_length_resolution_context_with_container_bases(
+        Length::ResolutionContext::for_document(document), all_container_relative_length_units_mask);
+
+    for (size_t index = 0; index < m_values.size(); ++index)
+        m_values[index] = document.window()->query_media_feature(static_cast<MediaFeatureID>(index));
+}
+
+void RustMediaList::dump(StringBuilder& builder, int indent_levels) const
+{
+    dump_indent(builder, indent_levels);
+    builder.appendff("Media list ({}):\n", length());
+    for (size_t index = 0; index < length(); ++index) {
+        dump_indent(builder, indent_levels + 1);
+        builder.appendff("Media query: `{}` (matches = {})\n", *item(index), Parser::ValueParserFFI::rust_media_list_item_matches(m_list, index));
+    }
 }
 
 }

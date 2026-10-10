@@ -6,30 +6,26 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <AK/String.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::Geolocation {
 
 // https://w3c.github.io/geolocation/#dom-geolocationpositionerror
-class GeolocationPositionError : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(GeolocationPositionError, Bindings::PlatformObject);
+class GeolocationPositionError : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(GeolocationPositionError, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(GeolocationPositionError);
 
 public:
-    enum class ErrorCode : WebIDL::UnsignedShort {
-        PermissionDenied = 1,
-        PositionUnavailable = 2,
-        Timeout = 3,
-    };
+    using ErrorCode = GeolocationPositionErrorCode;
 
     ErrorCode code() const { return m_code; }
-    String message() const;
+    Utf16String message() const;
 
 private:
-    GeolocationPositionError(JS::Realm&, ErrorCode);
-
-    virtual void initialize(JS::Realm&) override;
+    explicit GeolocationPositionError(ErrorCode);
 
     ErrorCode m_code { 0 };
 };

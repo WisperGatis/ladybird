@@ -7,101 +7,33 @@
 
 #pragma once
 
-#include <AK/Optional.h>
-#include <AK/String.h>
-#include <AK/StringView.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
-#include <LibGC/CellAllocator.h>
+#include <AK/Utf16View.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
-#include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
-class JS_API PrimitiveString : public Cell {
-    GC_CELL(PrimitiveString, Cell);
-    GC_DECLARE_ALLOCATOR(PrimitiveString);
-
+class JS_API PrimitiveString : public EngineCell {
 public:
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, Utf16String const&);
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, Utf16View const&);
     [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, Utf16FlyString const&);
 
-    [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, String const&);
-    [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, StringView);
-    [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, FlyString const&);
-
-    [[nodiscard]] static GC::Ref<PrimitiveString> create(VM&, PrimitiveString&, PrimitiveString&);
-
     [[nodiscard]] static GC::Ref<PrimitiveString> create_from_unsigned_integer(VM&, u64);
 
-    virtual ~PrimitiveString();
-
-    PrimitiveString(PrimitiveString const&) = delete;
-    PrimitiveString& operator=(PrimitiveString const&) = delete;
-
-    bool is_empty() const;
-
-    [[nodiscard]] String utf8_string() const;
-    [[nodiscard]] StringView utf8_string_view() const;
-    bool has_utf8_string() const { return m_utf8_string.has_value(); }
-
     [[nodiscard]] Utf16String utf16_string() const;
+    // The code units stay valid as long as the string does.
     [[nodiscard]] Utf16View utf16_string_view() const;
-    bool has_utf16_string() const { return m_utf16_string.has_value(); }
 
     size_t length_in_utf16_code_units() const;
 
-    ThrowCompletionOr<Optional<Value>> get(VM&, PropertyKey const&) const;
-
     [[nodiscard]] bool operator==(PrimitiveString const&) const;
-
-protected:
-    enum class RopeTag { Rope };
-    explicit PrimitiveString(RopeTag)
-        : m_is_rope(true)
-    {
-    }
-
-    mutable bool m_is_rope { false };
-
-    mutable Optional<String> m_utf8_string;
-    mutable Optional<Utf16String> m_utf16_string;
-
-    enum class EncodingPreference {
-        UTF8,
-        UTF16,
-    };
-
-private:
-    friend class RopeString;
-
-    explicit PrimitiveString(Utf16String);
-    explicit PrimitiveString(String);
-
-    void resolve_rope_if_needed(EncodingPreference) const;
-};
-
-class RopeString final : public PrimitiveString {
-    GC_CELL(RopeString, PrimitiveString);
-    GC_DECLARE_ALLOCATOR(RopeString);
-
-public:
-    virtual ~RopeString() override;
-
-private:
-    friend class PrimitiveString;
-
-    explicit RopeString(GC::Ref<PrimitiveString>, GC::Ref<PrimitiveString>);
-
-    virtual void visit_edges(Visitor&) override;
-
-    void resolve(EncodingPreference) const;
-
-    mutable GC::Ptr<PrimitiveString> m_lhs;
-    mutable GC::Ptr<PrimitiveString> m_rhs;
 };
 
 }

@@ -9,8 +9,6 @@
 
 #pragma once
 
-#include <LibGfx/Color.h>
-#include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -42,17 +40,16 @@ public:
     }
     virtual ~ShadowStyleValue() override = default;
 
-    ShadowType shadow_type() const { return m_properties.shadow_type; }
+    ShadowType shadow_type() const { return static_cast<ShadowType>(m_value->shadow.shadow_type); }
     ValueComparingNonnullRefPtr<StyleValue const> color() const;
-    ValueComparingNonnullRefPtr<StyleValue const> offset_x() const { return m_properties.offset_x; }
-    ValueComparingNonnullRefPtr<StyleValue const> offset_y() const { return m_properties.offset_y; }
+    ValueComparingRefPtr<StyleValue const> color_or_null() const { return wrap_rust_child_or_null(m_value->shadow.color); }
+    ValueComparingNonnullRefPtr<StyleValue const> offset_x() const { return wrap_rust_child(m_value->shadow.offset_x); }
+    ValueComparingNonnullRefPtr<StyleValue const> offset_y() const { return wrap_rust_child(m_value->shadow.offset_y); }
     ValueComparingNonnullRefPtr<StyleValue const> blur_radius() const;
+    ValueComparingRefPtr<StyleValue const> blur_radius_or_null() const { return wrap_rust_child_or_null(m_value->shadow.blur_radius); }
     ValueComparingNonnullRefPtr<StyleValue const> spread_distance() const;
-    ShadowPlacement placement() const { return m_properties.placement; }
-
-    virtual String to_string(SerializationMode) const override;
-
-    bool properties_equal(ShadowStyleValue const& other) const { return m_properties == other.m_properties; }
+    ValueComparingRefPtr<StyleValue const> spread_distance_or_null() const { return wrap_rust_child_or_null(m_value->shadow.spread_distance); }
+    ShadowPlacement placement() const { return static_cast<ShadowPlacement>(m_value->shadow.placement); }
 
 private:
     ShadowStyleValue(
@@ -63,30 +60,25 @@ private:
         ValueComparingRefPtr<StyleValue const> blur_radius,
         ValueComparingRefPtr<StyleValue const> spread_distance,
         ShadowPlacement placement)
-        : StyleValueWithDefaultOperators(Type::Shadow)
-        , m_properties {
-            .shadow_type = shadow_type,
-            .color = move(color),
-            .offset_x = move(offset_x),
-            .offset_y = move(offset_y),
-            .blur_radius = move(blur_radius),
-            .spread_distance = move(spread_distance),
-            .placement = placement
-        }
+        : StyleValueWithDefaultOperators(Type::Shadow, make_shadow_data(shadow_type, color, offset_x, offset_y, blur_radius, spread_distance, placement))
     {
     }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    struct Properties {
-        ShadowType shadow_type;
-        ValueComparingRefPtr<StyleValue const> color;
-        ValueComparingNonnullRefPtr<StyleValue const> offset_x;
-        ValueComparingNonnullRefPtr<StyleValue const> offset_y;
-        ValueComparingRefPtr<StyleValue const> blur_radius;
-        ValueComparingRefPtr<StyleValue const> spread_distance;
-        ShadowPlacement placement;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    explicit ShadowStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Shadow, data)
+    {
+    }
+
+    static StyleValueFFI::StyleValueData const* make_shadow_data(ShadowType shadow_type, ValueComparingRefPtr<StyleValue const> const& color, ValueComparingNonnullRefPtr<StyleValue const> const& offset_x, ValueComparingNonnullRefPtr<StyleValue const> const& offset_y, ValueComparingRefPtr<StyleValue const> const& blur_radius, ValueComparingRefPtr<StyleValue const> const& spread_distance, ShadowPlacement placement)
+    {
+        auto retain = [](StyleValue const* value) {
+            return value ? StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()) : nullptr;
+        };
+        return StyleValueFFI::rust_style_value_create_shadow(to_underlying(shadow_type), retain(color.ptr()), retain(offset_x.ptr()), retain(offset_y.ptr()), retain(blur_radius.ptr()), retain(spread_distance.ptr()), to_underlying(placement));
+    }
+
+    // NB: StyleValue dispatches operations by type tag, so it may call private impls.
+    friend class StyleValue;
 };
 
 }

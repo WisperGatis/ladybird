@@ -1,0 +1,665 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use core::ffi::c_void;
+use core::ops::ControlFlow;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use ak::ScopeGuard;
+
+use super::vm::Vm;
+use crate::bytecode::executable::Executable;
+use crate::jit::code::EntryStatus;
+use crate::layout::cell::Gc;
+use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
+use crate::layout::function_object::EcmascriptFunctionObject;
+use crate::layout::object::Object;
+use crate::layout::value::Value;
+use crate::runtime::completion::{Throw, ThrowCompletionOr};
+use crate::runtime::environment::Environment;
+use crate::runtime::error::ErrorKind;
+use crate::runtime::error_types::ErrorType;
+use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
+use crate::runtime::source_text_module::SourceTextModule;
+use crate::script::Script;
+use libjs_abi::register;
+
+unsafe extern "C" {
+    /// Defined in the assembly flapc generates from interpreter.flap.
+    fn js_interpreter(bytecode: *const u8, entry_point: u32, values: *mut Value, vm: *const c_void);
+}
+
+/// Bytecode::g_dump_bytecode, which js --dump-bytecode sets.
+static DUMP_BYTECODE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_dump_bytecode(dump_bytecode: bool) {
+    DUMP_BYTECODE.store(dump_bytecode, Ordering::Relaxed);
+}
+
+pub fn should_dump_interpreter_assembly() -> bool {
+    static SHOULD_DUMP: OnceLock<bool> = OnceLock::new();
+    *SHOULD_DUMP.get_or_init(|| {
+        let Some(value) = std::env::var_os("LADYBIRD_JS_INTERPRETER_DUMP") else {
+            return false;
+        };
+        if value == "0" {
+            return false;
+        }
+        if value == "1" {
+            return true;
+        }
+        eprintln!(
+            "Ignoring LADYBIRD_JS_INTERPRETER_DUMP value '{}': expected 0 or 1",
+            value.to_string_lossy()
+        );
+        false
+    })
+}
+
+pub fn should_dump_bytecode() -> bool {
+    DUMP_BYTECODE.load(Ordering::Relaxed) || should_dump_interpreter_assembly()
+}
+
+impl Vm {
+    /// Runs `executable` in `context` from `entry_point` until it returns or throws.
+    pub fn run_executable(
+        &self,
+        context: NonNull<ExecutionContext>,
+        executable: Gc<Executable>,
+        entry_point: u32,
+    ) -> Result<Value, Value> {
+        if self.debugging_enabled() {
+            self.register_executable_with_debugger(executable);
+        }
+
+        // SAFETY: The caller passes a live context and a live executable.
+        let (context_ref, executable_ref) = unsafe { (context.as_ref(), executable.as_non_null().as_ref()) };
+
+        let run_executable_depth = self.run_executable_depth().get();
+        let is_outermost_bytecode_execution = run_executable_depth == 0;
+        self.run_executable_depth().set(run_executable_depth + 1);
+
+        // NOTE: This is how we "push" a new execution context onto the VM's
+        //       execution context stack.
+        let previous_running_execution_context = self.head.running_execution_context.replace(context.as_ptr());
+        // SAFETY: An Executable starts with its head.
+        context_ref
+            .executable
+            .set(Some(unsafe { Gc::from_non_null(executable.as_non_null().cast()) }));
+
+        assert!(
+            executable_ref.head.registers_and_locals_and_constants_count.get()
+                <= context_ref.registers_and_constants_and_locals_and_arguments_count.get()
+        );
+
+        let this_register = context_ref.register(register::THIS_VALUE);
+        if this_register.get() == Value::EMPTY {
+            this_register.set(context_ref.this_value.get());
+        }
+
+        if self.interpreter_stack().is_exhausted() || self.did_reach_stack_space_limit() {
+            let Err(throw) =
+                self.throw_completion::<()>(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[])
+            else {
+                unreachable!("throw_completion always throws");
+            };
+            context_ref.register(register::EXCEPTION).set(throw.value());
+        } else if entry_point == 0 && crate::jit::entry_exit::can_enter_jit_code(self, executable_ref) {
+            let result = crate::jit::entry_exit::enter_jit_code(self, context);
+            match result.status {
+                EntryStatus::Returned => self.return_from_running_frame(Value(result.value)),
+                EntryStatus::Resume => self.run_running_frame_in_interpreter(),
+                EntryStatus::ExitInterpreter => {}
+            }
+        } else {
+            // SAFETY: The interpreter runs the executable in the context, whose slots follow it.
+            unsafe {
+                js_interpreter(
+                    executable_ref.head.bytecode_data.get(),
+                    entry_point,
+                    context_ref.slots().as_ptr().cast_mut().cast(),
+                    core::ptr::from_ref(self).cast(),
+                );
+            }
+        }
+
+        if is_outermost_bytecode_execution && self.debugging_enabled() {
+            self.finish_bytecode_execution_with_debugger();
+        }
+
+        if is_outermost_bytecode_execution && !self.is_executing_module() {
+            self.run_queued_promise_jobs();
+        }
+        self.head
+            .execution_generation
+            .set(self.head.execution_generation.get() + 1);
+
+        let exception = context_ref.register(register::EXCEPTION).get();
+        if exception != Value::EMPTY {
+            crate::embedding::completion::log_exception_if_enabled(self, exception);
+        }
+        let return_value = context_ref.register(register::RETURN_VALUE).get();
+        self.head
+            .running_execution_context
+            .set(previous_running_execution_context);
+        self.run_executable_depth().set(run_executable_depth);
+        if exception != Value::EMPTY {
+            return Err(exception);
+        }
+        Ok(return_value)
+    }
+
+    /// Runs the running execution context in the interpreter from its program counter, until it returns to a caller
+    /// waiting in native code or leaves the interpreter.
+    pub fn run_running_frame_in_interpreter(&self) {
+        let context = self.running_execution_context().expect("a frame is running");
+        // SAFETY: The running context is live.
+        let context = unsafe { context.as_ref() };
+        let executable = Executable::from_head(context.executable.get().expect("the running frame runs an executable"));
+        // SAFETY: The interpreter runs the executable in the context, whose slots follow it.
+        unsafe {
+            js_interpreter(
+                executable.head.bytecode_data.get(),
+                context.program_counter.get(),
+                context.slots().as_ptr().cast_mut().cast(),
+                core::ptr::from_ref(self).cast(),
+            );
+        }
+    }
+
+    /// Finishes the running frame the way the interpreter's Return does: an inline frame stores the return value in
+    /// its caller and is popped, continuing at the caller's return pc; any other frame stores it in its return value
+    /// register.
+    pub fn return_from_running_frame(&self, return_value: Value) {
+        let frame_pointer = self.running_execution_context().expect("a frame is running");
+        // SAFETY: The running context is live until it is deallocated below.
+        let frame = unsafe { frame_pointer.as_ref() };
+        let mut return_value = if return_value == Value::EMPTY {
+            Value::UNDEFINED
+        } else {
+            return_value
+        };
+
+        let caller_frame = frame.caller_frame.get();
+        if caller_frame.is_null() {
+            frame.register(register::RETURN_VALUE).set(return_value);
+            frame.register(register::EXCEPTION).set(Value::EMPTY);
+            return;
+        }
+
+        if frame.caller_is_construct.get() && !return_value.is_object() {
+            return_value = frame.this_value.get();
+        }
+        // SAFETY: A frame's caller outlives it.
+        let caller = unsafe { &*caller_frame };
+        caller.program_counter.set(frame.caller_return_pc.get());
+        caller.slots()[frame.caller_dst_raw.get() as usize].set(return_value);
+        self.head.running_execution_context.set(caller_frame);
+        self.interpreter_stack().deallocate(frame_pointer.as_ptr().cast());
+        self.head
+            .execution_generation
+            .set(self.head.execution_generation.get() + 1);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn register_executable_with_debugger(&self, executable: Gc<Executable>) {
+        if let Some(debugger) = self.debugger() {
+            debugger.register_executable(self, executable);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish_bytecode_execution_with_debugger(&self) {
+        if let Some(debugger) = self.debugger() {
+            debugger.did_finish_bytecode_execution();
+        }
+    }
+
+    /// Runs `executable` like run_executable(), with `initial_accumulator_value` in the accumulator, which is how a
+    /// resumed generator receives itself.
+    pub fn run_executable_with_initial_accumulator_value(
+        &self,
+        context: NonNull<ExecutionContext>,
+        executable: Gc<Executable>,
+        entry_point: u32,
+        initial_accumulator_value: Value,
+    ) -> Result<Value, Value> {
+        // SAFETY: The caller passes a live context.
+        unsafe { context.as_ref() }
+            .register(register::ACCUMULATOR)
+            .set(initial_accumulator_value);
+        self.run_executable(context, executable, entry_point)
+    }
+
+    // 16.1.6 ScriptEvaluation ( scriptRecord ), https://tc39.es/ecma262/#sec-runtime-semantics-scriptevaluation
+    pub fn run_script(
+        &self,
+        script_record: Gc<Script>,
+        lexical_environment_override: Option<Gc<Environment>>,
+    ) -> ThrowCompletionOr<Value> {
+        let vm = self;
+
+        // 1. Let globalEnv be scriptRecord.[[Realm]].[[GlobalEnv]].
+        let global_environment = script_record.realm().global_environment();
+
+        // NOTE: Spec steps are rearranged in order to compute number of registers+constants+locals before construction of the execution context.
+
+        // 12. Let result be Completion(GlobalDeclarationInstantiation(script, globalEnv)).
+        let instantiation_result = script_record.global_declaration_instantiation(vm, global_environment);
+        let mut result = instantiation_result.map(|()| Value::UNDEFINED);
+
+        // 11. Let script be scriptRecord.[[ECMAScriptCode]].
+        let executable = script_record.cached_executable();
+        if should_dump_bytecode() {
+            executable.dump();
+        }
+
+        let registers_and_locals_count = executable.registers_and_locals_count();
+        let constant_count = u32::try_from(executable.constants().len()).expect("constant count fits in u32");
+
+        // 2. Let scriptContext be a new ECMAScript code execution context.
+        let stack = vm.interpreter_stack();
+        let stack_mark = stack.top.get();
+        let Some(script_context) = stack.allocate(registers_and_locals_count, constant_count, 0) else {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        };
+        let _deallocate_guard = ScopeGuard::new(|| stack.deallocate(stack_mark));
+        // SAFETY: The context was just allocated and stays allocated until the guard frees it.
+        let script_context_ref = unsafe { script_context.as_ref() };
+
+        // 3. Set the Function of scriptContext to null.
+        // NOTE: This was done during execution context construction.
+
+        // 4. Set the Realm of scriptContext to scriptRecord.[[Realm]].
+        script_context_ref.realm.set(Some(script_record.realm()));
+
+        // 5. Set the ScriptOrModule of scriptContext to scriptRecord.
+        script_context_ref
+            .script_or_module
+            .set(ScriptOrModule::Script(script_record));
+
+        // 6. Set the VariableEnvironment of scriptContext to globalEnv.
+        script_context_ref
+            .variable_environment
+            .set(Some(global_environment.upcast()));
+
+        // 7. Set the LexicalEnvironment of scriptContext to globalEnv.
+        script_context_ref
+            .lexical_environment
+            .set(Some(global_environment.upcast()));
+
+        // Non-standard: Override the lexical environment if requested.
+        if let Some(lexical_environment_override) = lexical_environment_override {
+            script_context_ref
+                .lexical_environment
+                .set(Some(lexical_environment_override));
+        }
+
+        // 8. Set the PrivateEnvironment of scriptContext to null.
+
+        // 9. Suspend the currently running execution context.
+        // 10. Push scriptContext onto the execution context stack; scriptContext is now the running execution context.
+        vm.push_execution_context_checking_stack_space(script_context)?;
+
+        // 13. If result.[[Type]] is normal, then
+        if result.is_ok() {
+            // a. Set result to Completion(Evaluation of script).
+            result = vm.run_executable(script_context, executable, 0).map_err(Throw::new);
+
+            // b. If result is a normal completion and result.[[Value]] is empty, then
+            if result.is_ok_and(Value::is_empty) {
+                // i. Set result to NormalCompletion(undefined).
+                result = Ok(Value::UNDEFINED);
+            }
+        }
+
+        // 14. Suspend scriptContext and remove it from the execution context stack.
+        vm.pop_execution_context();
+
+        // 15. Assert: The execution context stack is not empty.
+        assert!(!vm.execution_context_stack_is_empty());
+
+        // FIXME: 16. Resume the context that is now on the top of the execution context stack as the running execution context.
+
+        vm.head.execution_generation.set(vm.head.execution_generation.get() + 1);
+
+        // 17. Return ? result.
+        result
+    }
+
+    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Value> {
+        // FIXME: This is not a entry point as defined in the spec, but is convenient.
+        //        To avoid work we use link_and_eval_module however that can already be
+        //        dangerous if the vm loaded other modules.
+        self.link_and_eval_module(module.upcast())?;
+
+        self.run_queued_promise_jobs();
+
+        self.run_queued_finalization_registry_cleanup_jobs();
+
+        Ok(Value::UNDEFINED)
+    }
+
+    /// Enters a frame for a call of `callee_function` that the interpreter runs inline, as Return leaves it: the
+    /// frame is linked to the running one through caller_frame, rather than pushed onto the execution context stack.
+    /// Returns the callee's context, or None if the interpreter stack has no room for it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_inline_frame(
+        &self,
+        callee_function: Gc<EcmascriptFunctionObject>,
+        callee_executable: Gc<Executable>,
+        arguments: &[Value],
+        return_pc: u32,
+        dst_raw: u32,
+        this_value: Value,
+        new_target: Option<Gc<Object>>,
+        is_construct: bool,
+    ) -> Option<NonNull<ExecutionContext>> {
+        let passed_argument_count = u32::try_from(arguments.len()).expect("the argument count fits in u32");
+        let callee_context_pointer = self.push_inline_frame_without_this(
+            callee_function,
+            callee_executable,
+            arguments,
+            passed_argument_count,
+            return_pc,
+            dst_raw,
+            new_target,
+            is_construct,
+        )?;
+        // SAFETY: The context was just pushed.
+        self.bind_this_in_inline_frame(callee_function, unsafe { callee_context_pointer.as_ref() }, this_value);
+        Some(callee_context_pointer)
+    }
+
+    /// The part of push_inline_frame() after pushing the frame.
+    pub fn bind_this_in_inline_frame(
+        &self,
+        callee_function: Gc<EcmascriptFunctionObject>,
+        callee_context: &ExecutionContext,
+        this_value: Value,
+    ) {
+        // Bind this if the function uses it.
+        if callee_function.uses_this() {
+            callee_function.ordinary_call_bind_this(self, callee_context, this_value);
+        }
+
+        // Set this value register.
+        callee_context
+            .register(register::THIS_VALUE)
+            .set(callee_context.this_value.get());
+    }
+
+    /// Like push_inline_frame(), but leaves `this` unbound. The arguments after the supplied ones, up to
+    /// `passed_argument_count` (and the formal parameter count), are undefined.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_inline_frame_without_this(
+        &self,
+        callee_function: Gc<EcmascriptFunctionObject>,
+        callee_executable: Gc<Executable>,
+        arguments: &[Value],
+        passed_argument_count: u32,
+        return_pc: u32,
+        dst_raw: u32,
+        new_target: Option<Gc<Object>>,
+        is_construct: bool,
+    ) -> Option<NonNull<ExecutionContext>> {
+        let callee_context = self.allocate_inline_frame(
+            callee_executable,
+            arguments,
+            passed_argument_count,
+            callee_function.formal_parameter_count(),
+            return_pc,
+            dst_raw,
+        )?;
+        callee_context.caller_is_construct.set(is_construct);
+
+        // Inlined PrepareForOrdinaryCall (avoids function call overhead on hot path).
+        callee_context
+            .function
+            .set(Some(callee_function.as_function_object_gc()));
+        callee_context.realm.set(callee_function.realm());
+        callee_context.script_or_module.set(callee_function.script_or_module());
+        let environment = callee_function.inline_call_environment(self, new_target);
+        callee_context.lexical_environment.set(environment);
+        callee_context.variable_environment.set(environment);
+        callee_context
+            .private_environment
+            .set(callee_function.private_environment());
+
+        Some(self.enter_inline_frame(callee_context, callee_executable))
+    }
+
+    /// Enters a frame for a call of a builtin written in JavaScript that the interpreter runs inline, like
+    /// push_inline_frame() does for ECMAScript functions. The frame is set up like [[Call]] of a built-in function
+    /// object sets up its callee context. The builtin must not need a function environment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_builtin_inline_frame(
+        &self,
+        callee_function: Gc<NativeJavaScriptBackedFunction>,
+        callee_executable: Gc<Executable>,
+        arguments: &[Value],
+        passed_argument_count: u32,
+        return_pc: u32,
+        dst_raw: u32,
+        this_value: Value,
+    ) -> Option<NonNull<ExecutionContext>> {
+        assert!(!callee_function.function_environment_needed());
+        let caller_context = self.running_execution_context_ref();
+        let callee_context = self.allocate_inline_frame(
+            callee_executable,
+            arguments,
+            passed_argument_count,
+            callee_function.shared_data().formal_parameter_count(),
+            return_pc,
+            dst_raw,
+        )?;
+
+        // 10.3.1 [[Call]] ( thisArgument, argumentsList ), https://tc39.es/ecma262/#sec-built-in-function-objects-call-thisargument-argumentslist
+        // 4. Set the Function of calleeContext to F.
+        callee_context
+            .function
+            .set(Some(callee_function.as_function_object_gc()));
+
+        // 5. Let calleeRealm be F.[[Realm]].
+        // 6. Set the Realm of calleeContext to calleeRealm.
+        callee_context.realm.set(Some(callee_function.realm()));
+
+        // 7. Set the ScriptOrModule of calleeContext to null.
+        callee_context.script_or_module.set(ScriptOrModule::Empty);
+
+        // 8. Perform any necessary implementation-defined initialization of calleeContext.
+        // NB: Like NativeFunction's [[Call]], which runs these builtins otherwise.
+        callee_context.this_value.set(this_value);
+        callee_context.register(register::THIS_VALUE).set(this_value);
+        callee_context
+            .lexical_environment
+            .set(caller_context.lexical_environment.get());
+        callee_context
+            .variable_environment
+            .set(caller_context.variable_environment.get());
+        callee_context
+            .private_environment
+            .set(caller_context.private_environment.get());
+
+        Some(self.enter_inline_frame(callee_context, callee_executable))
+    }
+
+    /// Allocates a frame for an inline call of `callee_executable`, with its arguments and its linkage to the running
+    /// frame, which Return uses to get back to it.
+    fn allocate_inline_frame(
+        &self,
+        callee_executable: Gc<Executable>,
+        arguments: &[Value],
+        passed_argument_count: u32,
+        formal_parameter_count: u32,
+        return_pc: u32,
+        dst_raw: u32,
+    ) -> Option<&ExecutionContext> {
+        assert!(arguments.len() <= passed_argument_count as usize);
+        let stack = self.interpreter_stack();
+
+        let registers_and_locals_count = callee_executable.registers_and_locals_count();
+        let constant_count =
+            u32::try_from(callee_executable.constants().len()).expect("the constant count fits in u32");
+        let argument_count = passed_argument_count.max(formal_parameter_count);
+
+        let callee_context_pointer = stack.allocate(registers_and_locals_count, constant_count, argument_count)?;
+        // SAFETY: The context was just allocated, and stays allocated until the interpreter returns from it or
+        // unwinds it.
+        let callee_context = unsafe { callee_context_pointer.as_ref() };
+
+        // Copy the supplied arguments into the callee's argument slots.
+        let callee_argument_values = callee_context.arguments();
+        for (slot, argument) in callee_argument_values.iter().zip(arguments) {
+            slot.set(*argument);
+        }
+        for slot in &callee_argument_values[arguments.len()..] {
+            slot.set(Value::UNDEFINED);
+        }
+        callee_context.passed_argument_count.set(passed_argument_count);
+
+        // Set up caller linkage so Return can restore the caller frame.
+        callee_context
+            .caller_frame
+            .set(self.head.running_execution_context.get());
+        callee_context.caller_dst_raw.set(dst_raw);
+        callee_context.caller_return_pc.set(return_pc);
+        Some(callee_context)
+    }
+
+    /// Makes a frame allocate_inline_frame() allocated the running one.
+    fn enter_inline_frame(
+        &self,
+        callee_context: &ExecutionContext,
+        callee_executable: Gc<Executable>,
+    ) -> NonNull<ExecutionContext> {
+        let callee_context_pointer = NonNull::from(callee_context);
+
+        // Inline JS-to-JS frames stay out of the VM execution context stack and
+        // are tracked through caller_frame instead.
+        self.head.running_execution_context.set(callee_context_pointer.as_ptr());
+
+        // Set up execution context fields that run_executable normally does.
+        // NB: We must use the callee's realm (not the caller's) for global_object
+        //     and global_declarative_environment, since the caller's realm may differ
+        //     in cross-realm calls (e.g. iframe <-> parent).
+        callee_context.executable.set(Some(Executable::head(callee_executable)));
+
+        callee_context_pointer
+    }
+
+    /// Leaves the running frame, which the interpreter entered inline, for the frame that called it.
+    #[inline(never)]
+    pub fn unwind_inline_frame_for_exception(&self) {
+        let callee_frame = self.running_execution_context().expect("an inline frame is running");
+        // SAFETY: The running context is live until it is deallocated below.
+        let caller_frame = unsafe { callee_frame.as_ref() }.caller_frame.get();
+        assert!(!caller_frame.is_null());
+
+        self.interpreter_stack().deallocate(callee_frame.as_ptr().cast());
+        self.head.running_execution_context.set(caller_frame);
+    }
+
+    /// Unwinds to the innermost handler of an exception thrown at `program_counter` in the running frame, leaving
+    /// frames the interpreter entered without returning to the runtime.
+    pub fn handle_exception(&self, mut program_counter: u32, exception: Value) -> HandleExceptionResponse {
+        if let Some(debugger) = self.debugger() {
+            let mut exception_will_be_caught = false;
+            // The caller frame and return offset of the previous frame that runs an executable.
+            let mut previous_context: Option<(*mut ExecutionContext, u32)> = None;
+            self.for_each_execution_context_top_to_bottom(|context| {
+                let Some(executable) = context.executable.get() else {
+                    return ControlFlow::Continue(());
+                };
+
+                let mut context_program_counter = context.program_counter.get();
+                match previous_context {
+                    None => context_program_counter = program_counter,
+                    Some((caller_frame, caller_return_pc)) if core::ptr::eq(caller_frame, context) => {
+                        context_program_counter = caller_return_pc - 1;
+                    }
+                    Some(_) => {}
+                }
+                previous_context = Some((context.caller_frame.get(), context.caller_return_pc.get()));
+
+                let executable = Executable::from_head(executable);
+                let handler = executable.exception_handlers_for_offset(context_program_counter);
+                if handler.is_some_and(|handler| handler.catches_exception) {
+                    exception_will_be_caught = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+
+            debugger.pause_on_exception_if_needed(
+                self,
+                self.current_executable(),
+                program_counter,
+                exception,
+                exception_will_be_caught,
+            );
+        }
+
+        loop {
+            let context_pointer = self
+                .running_execution_context()
+                .expect("an exception is thrown in a running frame");
+            // SAFETY: The running context is live until it is deallocated below.
+            let context = unsafe { context_pointer.as_ref() };
+            let executable = context.executable.get().expect("a running frame has an executable");
+            // SAFETY: Executables start with their head.
+            let executable = unsafe { executable.as_non_null().cast::<Executable>().as_ref() };
+            if let Some(handler) = executable.exception_handlers_for_offset(program_counter) {
+                context.register(register::EXCEPTION).set(exception);
+                context.program_counter.set(handler.handler_offset);
+                if handler.catches_exception
+                    && let Some(debugger) = self.debugger()
+                {
+                    debugger.did_finish_exception_propagation(exception);
+                }
+                return HandleExceptionResponse::ContinueInThisExecutable;
+            }
+
+            // A caller waiting in native code for this frame handles the exception there, after leaving the
+            // interpreter.
+            if context.returns_to_native_caller.get() {
+                context.register(register::EXCEPTION).set(exception);
+                return HandleExceptionResponse::ExitFromExecutable;
+            }
+
+            // If we're in an inline frame, unwind to the caller and try its handlers.
+            let caller_frame = context.caller_frame.get();
+            if !caller_frame.is_null() {
+                let caller_pc = context.caller_return_pc.get();
+                self.interpreter_stack().deallocate(context_pointer.as_ptr().cast());
+                self.head.running_execution_context.set(caller_frame);
+
+                // The caller's return address is one past the Call instruction, and handler ranges exclude their end
+                // offset, so look up the handler for an offset inside the Call.
+                program_counter = caller_pc - 1;
+                continue;
+            }
+
+            context.register(register::EXCEPTION).set(exception);
+            if self.run_executable_depth().get() == 1
+                && let Some(debugger) = self.debugger()
+            {
+                debugger.did_finish_exception_propagation(exception);
+            }
+            return HandleExceptionResponse::ExitFromExecutable;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleExceptionResponse {
+    ExitFromExecutable,
+    ContinueInThisExecutable,
+}

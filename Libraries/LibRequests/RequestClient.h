@@ -7,11 +7,19 @@
 #pragma once
 
 #include <AK/HashMap.h>
-#include <LibHTTP/HeaderMap.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibHTTP/Cache/CacheMode.h>
+#include <LibHTTP/Cache/Utilities.h>
+#include <LibHTTP/Cookie/IncludeCredentials.h>
+#include <LibHTTP/HeaderList.h>
+#include <LibHTTP/NetworkIsolationKey.h>
 #include <LibIPC/ConnectionToServer.h>
+#include <LibRequests/CacheState.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibRequests/RequestTransferLease.h>
 #include <LibRequests/WebSocket.h>
 #include <LibWebSocket/WebSocket.h>
+#include <RequestServer/IsPrivate.h>
 #include <RequestServer/RequestClientEndpoint.h>
 #include <RequestServer/RequestServerEndpoint.h>
 
@@ -27,40 +35,67 @@ class RequestClient final
 public:
     using InitTransport = Messages::RequestServer::InitTransport;
 
+    enum class TransferLease : u8 {
+        No,
+        Yes,
+    };
+
+    enum class CacheMissNotification {
+        No,
+        Yes,
+    };
+
     explicit RequestClient(NonnullOwnPtr<IPC::Transport>);
     virtual ~RequestClient() override;
 
-    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, HTTP::HeaderMap const& request_headers = {}, ReadonlyBytes request_body = {}, Core::ProxyData const& = {});
-
-    RefPtr<WebSocket> websocket_connect(URL::URL const&, ByteString const& origin = {}, Vector<ByteString> const& protocols = {}, Vector<ByteString> const& extensions = {}, HTTP::HeaderMap const& request_headers = {});
-
-    void ensure_connection(URL::URL const&, ::RequestServer::CacheLevel);
-
+    // Best-effort index into the resolved address pool.
+    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, TransferLease = TransferLease::No, Optional<u32> address_selection_hint = {}, CacheMissNotification = CacheMissNotification::No, u64 originating_page_id = 0, Optional<HTTP::NetworkIsolationKey> = {});
+    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id, TransferLease = TransferLease::No);
     bool stop_request(Badge<Request>, Request&);
+    void release_request_transfer_lease(Badge<Request>, Request&, RequestTransferLeaseKey);
+    void release_request_transfer_lease(RequestTransferLeaseKey);
+    void ensure_connection(URL::URL const&, RequestServer::CacheLevel);
+    int request_server_client_id() const { return m_request_server_client_id; }
+
     bool set_certificate(Badge<Request>, Request&, ByteString, ByteString);
+
+    RefPtr<WebSocket> websocket_connect(URL::URL const&, Optional<HTTP::NetworkIsolationKey> const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers);
+
+    ErrorOr<bool> store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const&, URL::URL const&, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData, ReadonlyBytes);
+    ErrorOr<Optional<Core::AnonymousBuffer>> retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const&, URL::URL const&, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData);
+
+    ErrorOr<bool> create_synthetic_cache_entry(Optional<HTTP::NetworkIsolationKey> const&, URL::URL const&, ByteString const& method);
 
     Function<void()> on_request_server_died;
 
 private:
     virtual void die() override;
 
-    virtual void request_started(i32, IPC::File) override;
-    virtual void request_finished(i32, u64, RequestTimingInfo, Optional<NetworkError>) override;
-    virtual void certificate_requested(i32) override;
-    virtual void headers_became_available(i32, HTTP::HeaderMap, Optional<u32>, Optional<String>) override;
+    virtual void request_requires_network(u64 request_id) override;
+    virtual void request_started(u64 request_id, IPC::File) override;
+    virtual void request_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
+    virtual void request_cached_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
+    virtual void request_finished(u64 request_id, u64, RequestTimingInfo, Optional<NetworkError>) override;
+    virtual void headers_became_available(u64 request_id, Vector<HTTP::Header>, Optional<u32>, Optional<String>, Optional<IPC::File>, u64 javascript_bytecode_size, Optional<u64>, CacheState) override;
+    virtual void request_transferred(u64 request_id) override;
 
-    virtual void websocket_connected(i64 websocket_id) override;
-    virtual void websocket_received(i64 websocket_id, bool, ByteBuffer) override;
-    virtual void websocket_errored(i64 websocket_id, i32) override;
-    virtual void websocket_closed(i64 websocket_id, u16, ByteString, bool) override;
-    virtual void websocket_ready_state_changed(i64 websocket_id, u32 ready_state) override;
-    virtual void websocket_subprotocol(i64 websocket_id, ByteString subprotocol) override;
-    virtual void websocket_certificate_requested(i64 websocket_id) override;
+    virtual void certificate_requested(u64 request_id) override;
 
-    HashMap<i32, RefPtr<Request>> m_requests;
-    HashMap<i64, NonnullRefPtr<WebSocket>> m_websockets;
+    virtual void websocket_connected(u64 websocket_id) override;
+    virtual void websocket_received(u64 websocket_id, bool, ByteBuffer) override;
+    virtual void websocket_received_shared(u64 websocket_id, bool, Core::AnonymousBuffer) override;
+    virtual void websocket_errored(u64 websocket_id, i32) override;
+    virtual void websocket_closed(u64 websocket_id, u16, ByteString, bool) override;
+    virtual void websocket_ready_state_changed(u64 websocket_id, u32 ready_state) override;
+    virtual void websocket_subprotocol(u64 websocket_id, ByteString subprotocol) override;
+    virtual void websocket_certificate_requested(u64 websocket_id) override;
 
-    i64 m_next_websocket_id { 0 };
+    HashMap<u64, RefPtr<Request>> m_requests;
+    u64 m_next_request_id { 0 };
+    int m_request_server_client_id { -1 };
+
+    HashMap<u64, NonnullRefPtr<WebSocket>> m_websockets;
+    u64 m_next_websocket_id { 0 };
 };
 
 }

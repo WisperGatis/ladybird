@@ -5,6 +5,7 @@
  */
 
 #include <AK/Format.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/Comment.h>
@@ -13,10 +14,10 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
 #include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/NodeType.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWebCommon/DOM/NodeType.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -36,17 +37,19 @@ static xmlNodePtr mirror_node(xmlDocPtr doc, DOM::Node const& node)
     }
     case DOM::NodeType::ELEMENT_NODE: {
         auto const& element = static_cast<DOM::Element const&>(node);
-        ByteString name = element.local_name().bytes_as_string_view();
+        auto name = element.local_name().view().to_utf8_but_should_be_ported_to_utf16().to_byte_string();
         auto* xml_element = xmlNewDocNode(doc, nullptr, bit_cast<xmlChar const*>(name.characters()), nullptr);
         xml_element->_private = bit_cast<void*>(&node);
         for (size_t i = 0; i < element.attribute_list_size(); ++i) {
             auto const& attribute = *element.attributes()->item(i);
-            ByteString attr_name = attribute.name().bytes_as_string_view();
-            ByteString attr_value = attribute.value().bytes_as_string_view();
+            auto attr_name_utf8 = attribute.name().view().to_utf8_but_should_be_ported_to_utf16();
+            ByteString attr_name = attr_name_utf8.bytes_as_string_view();
+            auto attr_value_utf8 = attribute.value().to_utf8();
+            ByteString attr_value = attr_value_utf8.bytes_as_string_view();
             auto* attr = xmlSetProp(xml_element, bit_cast<xmlChar const*>(attr_name.characters()), bit_cast<xmlChar const*>(attr_value.characters()));
             attr->_private = bit_cast<void*>(&attribute);
 
-            if (attribute.name() == "id") {
+            if (attribute.name() == "id"sv) {
                 xmlAddIDSafe(attr, bit_cast<xmlChar const*>(attr_value.characters()));
             }
         }
@@ -80,7 +83,8 @@ static xmlNodePtr mirror_node(xmlDocPtr doc, DOM::Node const& node)
     }
     case DOM::NodeType::PROCESSING_INSTRUCTION_NODE: {
         auto const& processing_instruction = static_cast<DOM::ProcessingInstruction const&>(node);
-        auto* xml_pi = xmlNewDocPI(doc, bit_cast<xmlChar const*>(processing_instruction.target().to_byte_string().characters()), bit_cast<xmlChar const*>(processing_instruction.data().to_byte_string().characters()));
+        auto target = processing_instruction.target().view().to_utf8_but_should_be_ported_to_utf16().to_byte_string();
+        auto* xml_pi = xmlNewDocPI(doc, bit_cast<xmlChar const*>(target.characters()), bit_cast<xmlChar const*>(processing_instruction.data().to_byte_string().characters()));
         xml_pi->_private = bit_cast<void*>(&node);
         return xml_pi;
     }
@@ -92,7 +96,10 @@ static xmlNodePtr mirror_node(xmlDocPtr doc, DOM::Node const& node)
     }
     case DOM::NodeType::DOCUMENT_NODE: {
         auto const& document = static_cast<DOM::Document const&>(node);
-        return mirror_node(doc, *document.document_element());
+        auto const* document_element = document.document_element();
+        if (!document_element)
+            return nullptr;
+        return mirror_node(doc, *document_element);
     }
     case DOM::NodeType::DOCUMENT_TYPE_NODE: {
         return nullptr; // Unused in libxml2
@@ -115,7 +122,7 @@ static xmlNodePtr mirror_node(xmlDocPtr doc, DOM::Node const& node)
     return nullptr;
 }
 
-static void convert_xpath_result(xmlXPathObjectPtr xpath_result, XPath::XPathResult* result, unsigned short type)
+static void convert_xpath_result(xmlXPathObjectPtr xpath_result, GC::Ptr<XPath::XPathResult> result, unsigned short type)
 {
     if (!xpath_result) {
         return;
@@ -150,7 +157,7 @@ static void convert_xpath_result(xmlXPathObjectPtr xpath_result, XPath::XPathRes
     }
     case XPATH_STRING: {
         ReadonlyBytes bytes(xpath_result->stringval, xmlStrlen(xpath_result->stringval));
-        result->set_string(String::from_utf8_without_validation(bytes));
+        result->set_string(Utf16String::from_utf8_without_validation(bytes));
         break;
     }
     case XPATH_USERS:
@@ -159,18 +166,18 @@ static void convert_xpath_result(xmlXPathObjectPtr xpath_result, XPath::XPathRes
     }
 }
 
-WebIDL::ExceptionOr<GC::Ref<XPathExpression>> create_expression(JS::Realm& realm, String const& expression, GC::Ptr<XPathNSResolver> resolver)
+WebIDL::ExceptionOr<GC::Ref<XPathExpression>> create_expression(Utf16String const& expression, GC::Ptr<XPathNSResolver> resolver)
 {
-    return realm.create<XPathExpression>(realm, expression, resolver);
+    return XPathExpression::create(expression, resolver);
 }
 
-WebIDL::ExceptionOr<GC::Ref<XPathResult>> evaluate(JS::Realm& realm, String const& expression, DOM::Node const& context_node, GC::Ptr<XPathNSResolver> /*resolver*/, unsigned short type, GC::Ptr<XPathResult> result)
+EvaluateResult evaluate(Utf16String const& expression, DOM::Node const& context_node, GC::Ptr<XPathNSResolver> /*resolver*/, unsigned short type, GC::Ptr<XPathResult> result)
 {
     // Parse the expression as xpath
-    ByteString bytes = expression.bytes_as_string_view();
-    auto* xpath_compiled = xmlXPathCompile(bit_cast<xmlChar const*>(bytes.characters()));
+    auto expression_bytes = expression.to_utf8().to_byte_string();
+    auto* xpath_compiled = xmlXPathCompile(bit_cast<xmlChar const*>(expression_bytes.characters()));
     if (!xpath_compiled)
-        return WebIDL::SyntaxError::create(realm, "Invalid XPath expression"_utf16);
+        return EvaluationError::InvalidExpression;
     ScopeGuard xpath_compiled_cleanup = [&] { xmlXPathFreeCompExpr(xpath_compiled); };
 
     auto* xml_document = xmlNewDoc(nullptr);
@@ -184,7 +191,7 @@ WebIDL::ExceptionOr<GC::Ref<XPathResult>> evaluate(JS::Realm& realm, String cons
 
     auto* xml_node = mirror_node(xml_document, context_node);
     if (!xml_node) {
-        return WebIDL::OperationError::create(realm, "XPath evaluation failed"_utf16);
+        return EvaluationError::EvaluationFailed;
     }
 
     xmlDocSetRootElement(xml_document, xml_node);
@@ -200,12 +207,29 @@ WebIDL::ExceptionOr<GC::Ref<XPathResult>> evaluate(JS::Realm& realm, String cons
     };
 
     if (!result) {
-        result = realm.create<XPathResult>(realm);
+        result = XPathResult::create();
     }
 
     convert_xpath_result(xpath_result, result, type);
 
-    return GC::Ref<XPathResult>(*result);
+    return GC::Ref<XPathResult> { *result };
+}
+
+WebIDL::ExceptionOr<GC::Ref<XPathResult>> throw_evaluation_error_if_needed(EvaluateResult result)
+{
+    return result.visit(
+        [](GC::Ref<XPathResult> result) -> WebIDL::ExceptionOr<GC::Ref<XPathResult>> {
+            return result;
+        },
+        [&](EvaluationError error) -> WebIDL::ExceptionOr<GC::Ref<XPathResult>> {
+            switch (error) {
+            case EvaluationError::InvalidExpression:
+                return WebIDL::SyntaxError::create("Invalid XPath expression"_utf16);
+            case EvaluationError::EvaluationFailed:
+                return WebIDL::OperationError::create("XPath evaluation failed"_utf16);
+            }
+            VERIFY_NOT_REACHED();
+        });
 }
 
 }

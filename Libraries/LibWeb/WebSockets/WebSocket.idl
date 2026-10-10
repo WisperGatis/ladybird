@@ -1,6 +1,4 @@
-#import <DOM/EventTarget.idl>
-#import <DOM/EventHandler.idl>
-#import <FileAPI/Blob.idl>
+enum BinaryType { "blob", "arraybuffer" };
 
 // https://websockets.spec.whatwg.org/#websocket
 [Exposed=(Window,Worker)]
@@ -28,6 +26,6 @@ interface WebSocket : EventTarget {
 
     // messaging
     attribute EventHandler onmessage;
-    attribute DOMString binaryType;
+    attribute BinaryType binaryType;
     undefined send((BufferSource or Blob or USVString) data);
 };

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #cached {
+        width: 300px;
+        overflow: hidden;
+    }
+    #inner { width: 120px; height: 40px; }
+</style>
+<div id="cached">
+    <div id="inner"></div>
+</div>
+<script>
+    layoutTest({
+        steps: [
+            {
+                name: "a descendant mutation invalidates the cached run",
+                mutate: () => {
+                    inner.style.height = "70px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(cached.getBoundingClientRect().height, 70, "cached height");
+                },
+            },
+        ],
+    });
+</script>

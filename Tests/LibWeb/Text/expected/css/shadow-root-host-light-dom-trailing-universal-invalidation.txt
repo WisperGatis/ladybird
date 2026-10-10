@@ -1,0 +1,6 @@
+PASS: host child combinator add keeps work scoped
+PASS: host descendant combinator add keeps work scoped
+PASS: broad host-side stylesheet add avoids document-wide work
+PASS: broad host-side sibling escape avoids root-side work
+PASS: broad functional host-side selector avoids document-wide work
+PASS: broad functional host-side sibling escape avoids root-side work

@@ -1,0 +1,5203 @@
+#!/usr/bin/env python3
+#
+# Copyright (c) 2026-present, the Ladybird developers.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+import argparse
+import http.client
+import http.server
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from typing import cast
+
+BLOCKED_RESPONSE_TIMEOUT_SECONDS = 30
+EVENT_TIMEOUT_SECONDS = 30
+WEBDRIVER_REQUEST_TIMEOUT_SECONDS = 60
+WEB_ELEMENT_IDENTIFIER = "element-6066-11e4-a52e-4f735466cecf"
+
+
+class TestPageServer(http.server.ThreadingHTTPServer):
+    def __init__(self, server_address, request_handler_class):
+        super().__init__(server_address, request_handler_class)
+        self.blocked_frame_b_requested = threading.Event()
+        self.frame_b_blocked_document_ran = threading.Event()
+        self.release_blocked_frame_b = threading.Event()
+        self.blocked_reload_requested = threading.Event()
+        self.reload_recovery_requested = threading.Event()
+        self.release_blocked_reload = threading.Event()
+        self.reload_blocked_request_lock = threading.Lock()
+        self.reload_blocked_request_count = 0
+        self.blocked_process_swap_back_requested = threading.Event()
+        self.process_swap_back_recovery_requested = threading.Event()
+        self.process_swap_back_document_ran = threading.Event()
+        self.release_blocked_process_swap_back = threading.Event()
+        self.process_swap_back_blocked_request_lock = threading.Lock()
+        self.process_swap_back_blocked_request_count = 0
+        self.block_forward_load = False
+        self.blocked_forward_requested = threading.Event()
+        self.release_blocked_forward = threading.Event()
+        self.blocked_cross_site_post_requested = threading.Event()
+        self.release_blocked_cross_site_post = threading.Event()
+        self.blocked_same_site_post_requested = threading.Event()
+        self.release_blocked_same_site_post = threading.Event()
+        self.blocked_same_url_post_requested = threading.Event()
+        self.release_blocked_same_url_post = threading.Event()
+        self.block_post_result_load = False
+        self.blocked_post_result_load_requested = threading.Event()
+        self.post_result_load_became_interactive = threading.Event()
+        self.release_blocked_post_result_load = threading.Event()
+        self.held_load_image_requested = threading.Event()
+        self.held_load_document_became_interactive = threading.Event()
+        self.release_held_load_image = threading.Event()
+        self.blocked_navigation_requested = threading.Event()
+        self.release_blocked_navigation = threading.Event()
+        self.blocked_navigation_response_finished = threading.Event()
+        self.navigation_blocked_document_ran = threading.Event()
+        self.blocked_no_content_navigation_requested = threading.Event()
+        self.release_blocked_no_content_navigation = threading.Event()
+        self.a_request_lock = threading.Lock()
+        self.a_request_count = 0
+        self.state_replace_load_document_ran = threading.Event()
+        self.a_document_ran = threading.Event()
+        self.fragment_source_document_ran = threading.Event()
+        self.fragment_target_document_ran = threading.Event()
+        self.b_document_ran = threading.Event()
+        self.c_document_ran = threading.Event()
+        self.d_document_ran = threading.Event()
+        self.post_result_document_ran = threading.Event()
+        self.cross_site_post_result_document_ran = threading.Event()
+        self.same_site_post_result_document_ran = threading.Event()
+        self.same_url_post_result_document_ran = threading.Event()
+        self.reload_blocked_document_ran = threading.Event()
+        self.history_response_redirect = None
+        self.history_response_request_count = 0
+        self.history_response_destination_count = 0
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], BrokenPipeError):
+            return
+        super().handle_error(request, client_address)
+
+
+class TestPageHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        server = cast(TestPageServer, self.server)
+        server_port = server.server_port
+
+        if self.path == "/history-response":
+            server.history_response_request_count += 1
+            self.send_response(302 if server.history_response_redirect else 200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Cache-Control", "no-store")
+            if server.history_response_redirect:
+                self.send_header("Location", server.history_response_redirect)
+            self.end_headers()
+            self.wfile.write(b"<!doctype html><title>History response source</title>")
+            return
+
+        if self.path == "/history-response-destination":
+            server.history_response_destination_count += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<!doctype html><title>History response destination</title>")
+            return
+
+        if self.path == "/a":
+            with server.a_request_lock:
+                server.a_request_count += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>A</title>
+<script>fetch('/document-ran?a');</script>
+<a id="go" href="http://127.0.0.1:{server_port}/b">B</a>
+<a id="redirect" href="http://localhost:{server_port}/redirect-to-b">Redirect to B</a>
+<a id="pending" href="http://localhost:{server_port}/navigation-blocked">Pending</a>
+<a id="pending-redirect" href="http://localhost:{server_port}/redirect-to-navigation-blocked">Pending redirect</a>
+<a id="pending-cross-site" href="http://127.0.0.1:{server_port}/navigation-blocked">Pending cross-site</a>
+<a id="pending-cross-site-no-content" href="http://127.0.0.1:{server_port}/navigation-no-content-blocked">Pending cross-site no content</a>
+<p>A</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?a":
+            server.a_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/fragment-source":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Fragment Source</title>
+<script>fetch('/document-ran?fragment-source');</script>
+<p>Fragment Source</p>""".encode()
+            )
+            return
+
+        if self.path == "/fragment-target":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Fragment Target</title>
+<script>fetch('/document-ran?fragment-target');</script>
+<h2 id="section">Section</h2>
+<p>Fragment Target</p>""".encode()
+            )
+            return
+
+        if self.path == "/webdriver-intercepted-navigation-click":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"""<!doctype html>
+<button id="button">Navigate</button>
+<script>
+window.navigationType = "none";
+navigation.addEventListener("navigate", event => {
+    event.intercept();
+    window.navigationType = event.navigationType;
+});
+button.addEventListener("click", () => {
+    const script = document.createElement("script");
+    script.textContent = 'location.href="?foo"';
+    document.body.append(script);
+});
+</script>"""
+            )
+            return
+
+        if self.path == "/document-ran?fragment-source":
+            server.fragment_source_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?fragment-target":
+            server.fragment_target_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/redirect-to-b":
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{server_port}/b")
+            self.end_headers()
+            return
+
+        if self.path == "/redirect-to-tls-failure":
+            self.send_response(302)
+            self.send_header("Location", f"https://127.0.0.1:{server_port}/tls-failure")
+            self.end_headers()
+            return
+
+        if self.path == "/redirect-to-navigation-blocked":
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{server_port}/navigation-blocked")
+            self.end_headers()
+            return
+
+        if self.path == "/navigation-blocked":
+            server.blocked_navigation_requested.set()
+            if not server.release_blocked_navigation.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock navigation")
+                return
+
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<!doctype html><title>Pending navigation committed</title>"
+                    b"<script>fetch('/document-ran?navigation-blocked');</script>"
+                )
+            finally:
+                server.blocked_navigation_response_finished.set()
+            return
+
+        if self.path == "/document-ran?navigation-blocked":
+            server.navigation_blocked_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/navigation-no-content-blocked":
+            server.blocked_no_content_navigation_requested.set()
+            if not server.release_blocked_no_content_navigation.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock no-content navigation")
+                return
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path.startswith("/nested"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Nested</title>
+<iframe id="frame" src="http://localhost:{server_port}/frame-a"></iframe>
+<p>Nested</p>""".encode()
+            )
+            return
+
+        if self.path.startswith("/state"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            document_ready_script = ""
+            if self.path == "/state?replace-load":
+                document_ready_script = "<script>fetch('/document-ran?state-replace-load');</script>"
+            self.wfile.write(
+                f"""<!doctype html>
+<title>State</title>
+{document_ready_script}
+<p>State</p>""".encode()
+            )
+            return
+
+        if self.path.startswith("/scroll"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Scroll</title>
+<style>
+body {
+    margin: 0;
+    min-height: 4000px;
+}
+</style>
+<p>Scroll</p>""".encode()
+            )
+            return
+
+        if self.path == "/reload-blocked":
+            should_block = False
+            with server.reload_blocked_request_lock:
+                server.reload_blocked_request_count += 1
+                if server.reload_blocked_request_count > 2:
+                    server.reload_recovery_requested.set()
+                should_block = server.reload_blocked_request_count > 1
+
+            if should_block:
+                server.blocked_reload_requested.set()
+                if not server.release_blocked_reload.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"timed out waiting to unblock reload")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Reload Blocked</title>
+<script>fetch('/document-ran?reload-blocked');</script>
+<p>Reload Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/process-swap-back-blocked":
+            should_block = False
+            with server.process_swap_back_blocked_request_lock:
+                server.process_swap_back_blocked_request_count += 1
+                if server.process_swap_back_blocked_request_count > 2:
+                    server.process_swap_back_recovery_requested.set()
+                should_block = server.process_swap_back_blocked_request_count > 1
+
+            if should_block:
+                server.blocked_process_swap_back_requested.set()
+                if not server.release_blocked_process_swap_back.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"timed out waiting to unblock process-swap back")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Process Swap Back Blocked</title>
+<script>fetch('/document-ran?process-swap-back-blocked');</script>
+<a id="go" href="http://127.0.0.1:{server_port}/b">B</a>
+<p>Process Swap Back Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/forward-blocked":
+            if server.block_forward_load:
+                server.blocked_forward_requested.set()
+                if not server.release_blocked_forward.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"timed out waiting to unblock forward")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Forward Blocked</title>
+<p>Forward Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/frame-a":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Frame A</title>
+<p>Frame A</p>""".encode()
+            )
+            return
+
+        if self.path == "/frame-b":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Frame B</title>
+<p>Frame B</p>""".encode()
+            )
+            return
+
+        if self.path == "/frame-b-blocked":
+            server.blocked_frame_b_requested.set()
+            if not server.release_blocked_frame_b.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock frame")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Frame B Blocked</title>
+<script>addEventListener('load', () => fetch('/document-ran?frame-b-blocked'));</script>
+<p>Frame B Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/iframe-deferred-fragment-first":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Deferred Fragment First</title>
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    setTimeout(() => {
+        location.hash = "/all";
+    }, 0);
+});
+</script>""".encode()
+            )
+            return
+
+        if self.path == "/iframe-deferred-fragment-second":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Deferred Fragment Second</title>
+<div id="replacement-ready"></div>""".encode()
+            )
+            return
+
+        if self.path == "/b":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>B</title>
+<script>fetch('/document-ran?b');</script>
+<a id="go" href="http://127.0.0.1:{server_port}/c">C</a>
+<a id="branch" href="http://localhost:{server_port}/d">D</a>
+<p>B</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?b":
+            server.b_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/c":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>C</title>
+<script>fetch('/document-ran?c');</script>
+<a id="go" href="http://localhost:{server_port}/a">A</a>
+<p>C</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?state-replace-load":
+            server.state_replace_load_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?c":
+            server.c_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?process-swap-back-blocked":
+            server.process_swap_back_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?frame-b-blocked":
+            server.frame_b_blocked_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?post-result":
+            server.post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?post-result-load-blocked":
+            server.post_result_load_became_interactive.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/post-result-load-blocked":
+            server.blocked_post_result_load_requested.set()
+            if not server.release_blocked_post_result_load.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to finish POST result load")
+                return
+
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/held-load":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Held Load</title>
+<script>addEventListener('DOMContentLoaded', () => fetch('/document-ran?held-load'));</script>
+<img src="/held-load-image">
+<p>Held Load</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?held-load":
+            server.held_load_document_became_interactive.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/held-load-image":
+            server.held_load_image_requested.set()
+            if not server.release_held_load_image.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to finish held load")
+                return
+
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?cross-site-post-result":
+            server.cross_site_post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?same-site-post-result":
+            server.same_site_post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?same-url-post-result":
+            server.same_url_post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?reload-blocked":
+            server.reload_blocked_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/d":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>D</title>
+<script>fetch('/document-ran?d');</script>
+<script>
+window.initialHistoryLength = history.length;
+window.initialNavigationEntryCount = navigation.entries().length;
+window.initialNavigationCurrentIndex = navigation.currentEntry.index;
+</script>
+<p>D</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?d":
+            server.d_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/post-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Form</title>
+<form id="post-form" method="post" action="/post-result">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Post Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-blocked-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Blocked Form</title>
+<form id="post-form" method="post" action="/post-result-blocked-same-site">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Post Blocked Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-same-url-blocked":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Same URL Blocked Form</title>
+<form id="post-form" method="post" action="/post-same-url-blocked">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Post Same URL Blocked Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/cross-site-post-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Cross-site Post Form</title>
+<form id="post-form" method="post" action="http://127.0.0.1:{server_port}/post-result">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Cross-site Post Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/cross-site-post-blocked-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Cross-site Post Blocked Form</title>
+<form id="post-form" method="post" action="http://127.0.0.1:{server_port}/post-result-blocked">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Cross-site Post Blocked Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-result":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Result GET</title>
+<p id="result">GET</p>""".encode()
+            )
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"not found")
+
+    def do_POST(self):
+        server = cast(TestPageServer, self.server)
+
+        if self.path == "/post-result-blocked":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            server.blocked_cross_site_post_requested.set()
+            if not server.release_blocked_cross_site_post.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock cross-site POST")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Result Blocked POST</title>
+<script>fetch('/document-ran?cross-site-post-result');</script>
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-result-blocked-same-site":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            server.blocked_same_site_post_requested.set()
+            if not server.release_blocked_same_site_post.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock same-site POST")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Result Blocked Same-Site POST</title>
+<script>fetch('/document-ran?same-site-post-result');</script>
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-same-url-blocked":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            server.blocked_same_url_post_requested.set()
+            if not server.release_blocked_same_url_post.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock same-URL POST")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Same URL Blocked POST</title>
+<script>fetch('/document-ran?same-url-post-result');</script>
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-result":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            load_blocker = ""
+            if server.block_post_result_load:
+                load_blocker = """
+<script>addEventListener('DOMContentLoaded', () => fetch('/document-ran?post-result-load-blocked'));</script>
+<img src="/post-result-load-blocked">"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Result POST</title>
+<script>fetch('/document-ran?post-result');</script>
+{load_blocker}
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"not found")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def unused_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_port(port, timeout=EVENT_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(f"Timed out waiting for port {port}")
+
+
+def wait_for_event(event, label, timeout=EVENT_TIMEOUT_SECONDS):
+    if event.wait(timeout=timeout):
+        return
+    raise RuntimeError(f"Timed out waiting for {label}")
+
+
+def count_open_fds(pid):
+    proc_fd = f"/proc/{pid}/fd"
+    if os.path.isdir(proc_fd):
+        return len(os.listdir(proc_fd))
+    try:
+        result = subprocess.run(["lsof", "-p", str(pid)], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return max(0, len(result.stdout.splitlines()) - 1)
+
+
+def request_raw(webdriver_port, method, path, body=None):
+    encoded_body = None
+    headers = {}
+    if body is not None:
+        encoded_body = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+
+    connection = http.client.HTTPConnection("127.0.0.1", webdriver_port, timeout=WEBDRIVER_REQUEST_TIMEOUT_SECONDS)
+    try:
+        connection.request(method, path, encoded_body, headers)
+        response = connection.getresponse()
+        response_body = response.read().decode()
+    finally:
+        connection.close()
+
+    try:
+        payload = json.loads(response_body) if response_body else {}
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{method} {path} returned invalid JSON: {response_body}") from error
+
+    return response.status, payload, response_body
+
+
+def request(webdriver_port, method, path, body=None):
+    status, payload, response_body = request_raw(webdriver_port, method, path, body)
+    if status >= 400 or isinstance(payload.get("value"), dict) and payload["value"].get("error"):
+        raise RuntimeError(f"{method} {path} failed with HTTP {status}: {response_body}")
+
+    return payload
+
+
+def current_url(webdriver_port, session_id):
+    return request(webdriver_port, "GET", f"/session/{session_id}/url")["value"]
+
+
+def execute_script(webdriver_port, session_id, script):
+    return request(
+        webdriver_port,
+        "POST",
+        f"/session/{session_id}/execute/sync",
+        {
+            "script": script,
+            "args": [],
+        },
+    )["value"]
+
+
+def find_element(webdriver_port, session_id, selector):
+    element = request(
+        webdriver_port,
+        "POST",
+        f"/session/{session_id}/element",
+        {
+            "using": "css selector",
+            "value": selector,
+        },
+    )["value"]
+    return element[WEB_ELEMENT_IDENTIFIER]
+
+
+def click_element(webdriver_port, session_id, element_id):
+    request(webdriver_port, "POST", f"/session/{session_id}/element/{element_id}/click", {})
+
+
+def wait_for_script_result(webdriver_port, session_id, label, script, predicate, log, timeout=EVENT_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    result = None
+    while time.monotonic() < deadline:
+        result = execute_script(webdriver_port, session_id, script)
+        if predicate(result):
+            log.append(f"{label}: {result}")
+            return result
+        time.sleep(0.05)
+
+    raise AssertionError(f"Timed out waiting for {label}, got {result}\n" + "\n".join(log))
+
+
+def execute_async_script(webdriver_port, session_id, script):
+    return request(
+        webdriver_port,
+        "POST",
+        f"/session/{session_id}/execute/async",
+        {
+            "script": script,
+            "args": [],
+        },
+    )["value"]
+
+
+def navigate_from_renderer_using_link(
+    webdriver_port,
+    session_id,
+    link_selector,
+    expected_url,
+    log,
+    document_ran_event,
+    document_ran_label,
+    expected_scheduled_url=None,
+):
+    actual_url = execute_script(
+        webdriver_port,
+        session_id,
+        f"""
+const link = document.querySelector({json.dumps(link_selector)});
+if (!link)
+    return null;
+return link.href;
+""",
+    )
+    log.append(f"clicked renderer link to {actual_url}")
+    expected_scheduled_url = expected_scheduled_url or expected_url
+    if actual_url != expected_scheduled_url:
+        raise AssertionError(
+            f"Expected renderer navigation target to be {expected_scheduled_url}, got {actual_url}\n" + "\n".join(log)
+        )
+    document_ran_event.clear()
+    execute_script(
+        webdriver_port,
+        session_id,
+        f"""
+const link = document.querySelector({json.dumps(link_selector)});
+link.click();
+return null;
+""",
+    )
+    wait_for_event(document_ran_event, document_ran_label)
+
+
+def crash_current_page(webdriver_port, session_id, wait_for_navigation_completion=True):
+    request(
+        webdriver_port,
+        "POST",
+        f"/session/{session_id}/ladybird/crash-current-page",
+        {"waitForNavigationCompletion": wait_for_navigation_completion},
+    )
+
+
+def load_url_from_ui(webdriver_port, session_id, url):
+    request(webdriver_port, "POST", f"/session/{session_id}/ladybird/load-url-from-ui", {"url": url})
+
+
+def traverse_history_from_ui(webdriver_port, session_id, delta, wait_for_navigation_completion=True):
+    request(
+        webdriver_port,
+        "POST",
+        f"/session/{session_id}/ladybird/traverse-history-from-ui",
+        {
+            "delta": delta,
+            "waitForNavigationCompletion": wait_for_navigation_completion,
+        },
+    )
+
+
+def refresh(webdriver_port, session_id):
+    request(webdriver_port, "POST", f"/session/{session_id}/refresh", {})
+
+
+def create_session(webdriver_port, enable_test_hooks=True):
+    always_match = {
+        "ladybird:headless": True,
+        "pageLoadStrategy": "normal",
+        "unhandledPromptBehavior": {"beforeUnload": "dismiss"},
+    }
+    if enable_test_hooks:
+        always_match["ladybird:enableTestHooks"] = True
+
+    created = request(
+        webdriver_port,
+        "POST",
+        "/session",
+        {"capabilities": {"alwaysMatch": always_match}},
+    )
+    session_id = created.get("value", {}).get("sessionId") or created.get("sessionId")
+    if not session_id:
+        raise RuntimeError(f"Could not find session id in response: {created}")
+
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 10000})
+    return session_id
+
+
+def expect_ladybird_test_hooks_require_capability(webdriver_port):
+    session_id = create_session(webdriver_port, enable_test_hooks=False)
+    try:
+        status, payload, response_body = request_raw(
+            webdriver_port, "GET", f"/session/{session_id}/ladybird/session-history"
+        )
+        value = payload.get("value")
+        if status != 404 or not isinstance(value, dict) or value.get("error") != "unknown command":
+            raise AssertionError(
+                f"Expected Ladybird test hook to fail with unknown command, got HTTP {status}: {response_body}"
+            )
+    finally:
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def perform_pointer_click(webdriver_port, session_id, x, y, log):
+    request(
+        webdriver_port,
+        "POST",
+        f"/session/{session_id}/actions",
+        {
+            "actions": [
+                {
+                    "type": "pointer",
+                    "id": "activation-pointer",
+                    "parameters": {"pointerType": "mouse"},
+                    "actions": [
+                        {"type": "pointerMove", "origin": "viewport", "x": x, "y": y},
+                        {"type": "pointerDown", "button": 0},
+                        {"type": "pointerUp", "button": 0},
+                    ],
+                }
+            ]
+        },
+    )
+    log.append(f"clicked viewport at {x},{y}")
+
+
+def session_history(webdriver_port, session_id):
+    return request(webdriver_port, "GET", f"/session/{session_id}/ladybird/session-history")["value"]
+
+
+def wait_for_session_history(webdriver_port, session_id, label, predicate, log, timeout=EVENT_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = session_history(webdriver_port, session_id)
+        if predicate(snapshot):
+            log.append(f"{label} history: {summarize_history_snapshot(snapshot)}")
+            return snapshot
+        time.sleep(0.05)
+
+    raise AssertionError(
+        f"Timed out waiting for {label} history, got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def history_entry_urls(history):
+    return [entry["url"] for entry in history["entries"]]
+
+
+def history_used_steps(history):
+    return history_step_values(history["usedSteps"])
+
+
+def history_step_values(steps):
+    return [used_step["step"] for used_step in steps]
+
+
+def history_current_entry(history):
+    current_entries = [entry for entry in history["entries"] if entry["current"]]
+    if len(current_entries) != 1:
+        raise AssertionError(f"Expected exactly one current entry, got {current_entries}")
+    return current_entries[0]
+
+
+def summarize_history_snapshot(snapshot):
+    ui = snapshot["ui"]
+    return {
+        "ui": {
+            "entries": history_entry_urls(ui),
+            "usedSteps": history_used_steps(ui),
+            "currentUsedStepIndex": ui["currentUsedStepIndex"],
+            "back": ui["backButtonEnabled"],
+            "forward": ui["forwardButtonEnabled"],
+            "pendingSessionHistoryTraversal": ui["pendingSessionHistoryTraversal"],
+            "currentResource": history_current_entry(ui).get("resource"),
+        }
+    }
+
+
+def expect_ui_session_history(
+    webdriver_port,
+    session_id,
+    label,
+    expected_entry_urls,
+    expected_used_steps,
+    expected_current_used_step_index,
+    expected_back_enabled,
+    expected_forward_enabled,
+    log,
+    expect_history_idle=None,
+):
+    def ui_history_matches(ui):
+        return (
+            history_entry_urls(ui) == expected_entry_urls
+            and history_used_steps(ui) == expected_used_steps
+            and ui["currentUsedStepIndex"] == expected_current_used_step_index
+            and ui["backButtonEnabled"] is expected_back_enabled
+            and ui["forwardButtonEnabled"] is expected_forward_enabled
+            and (expect_history_idle is None or ui["pendingSessionHistoryTraversal"] is None)
+        )
+
+    def raise_ui_mismatch(snapshot):
+        raise AssertionError(
+            f"Expected {label} UI history to be entries={expected_entry_urls}, usedSteps={expected_used_steps}, "
+            f"currentUsedStepIndex={expected_current_used_step_index}, back={expected_back_enabled}, "
+            f"forward={expected_forward_enabled}, historyIdle={expect_history_idle}, "
+            f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+        )
+
+    deadline = time.monotonic() + EVENT_TIMEOUT_SECONDS
+    while True:
+        snapshot = session_history(webdriver_port, session_id)
+        if ui_history_matches(snapshot["ui"]):
+            break
+        if time.monotonic() >= deadline:
+            raise_ui_mismatch(snapshot)
+        time.sleep(0.05)
+
+    log.append(f"{label} history: {summarize_history_snapshot(snapshot)}")
+    return snapshot
+
+
+def wait_for_ui_session_history(
+    webdriver_port,
+    session_id,
+    label,
+    expected_entry_urls,
+    expected_used_steps,
+    expected_current_used_step_index,
+    expected_back_enabled,
+    expected_forward_enabled,
+    log,
+):
+    def matches_expected_history(snapshot):
+        ui = snapshot["ui"]
+        return (
+            history_entry_urls(ui) == expected_entry_urls
+            and history_used_steps(ui) == expected_used_steps
+            and ui["currentUsedStepIndex"] == expected_current_used_step_index
+            and ui["backButtonEnabled"] is expected_back_enabled
+            and ui["forwardButtonEnabled"] is expected_forward_enabled
+            and ui["pendingSessionHistoryTraversal"] is None
+        )
+
+    return wait_for_session_history(webdriver_port, session_id, label, matches_expected_history, log)
+
+
+def expect_beforeunload_cancels_webdriver_navigation(
+    webdriver_port,
+    session_id,
+    url,
+    label,
+    expected_url,
+    previous_beforeunload_count,
+    expected_history_snapshot,
+    log,
+):
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 1000})
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url})
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 10000})
+    state = execute_script(
+        webdriver_port,
+        session_id,
+        "return [location.href, window.beforeUnloadCount];",
+    )
+    if state[0] != expected_url or state[1] <= previous_beforeunload_count:
+        raise AssertionError(f"Expected beforeunload to cancel {label}, got {state}\n" + "\n".join(log))
+
+    ui_history = expected_history_snapshot["ui"]
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        f"after blocked {label}",
+        history_entry_urls(ui_history),
+        history_used_steps(ui_history),
+        ui_history["currentUsedStepIndex"],
+        ui_history["backButtonEnabled"],
+        ui_history["forwardButtonEnabled"],
+        log,
+        expect_history_idle=True,
+    )
+    return state
+
+
+def expect_javascript_noop_ui_load_does_not_change_history(
+    webdriver_port,
+    session_id,
+    expected_url,
+    expected_history_snapshot,
+    log,
+):
+    load_url_from_ui(webdriver_port, session_id, "javascript:window.uiJavascriptNoopRan=true;void(0)")
+    state = execute_script(
+        webdriver_port,
+        session_id,
+        "return [location.href, window.uiJavascriptNoopRan === true];",
+    )
+    if state != [expected_url, True]:
+        raise AssertionError(
+            f"Expected javascript:void(0) UI load to stay on {expected_url}, got {state}\n" + "\n".join(log)
+        )
+
+    ui_history = expected_history_snapshot["ui"]
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after javascript:void(0) UI load",
+        history_entry_urls(ui_history),
+        history_used_steps(ui_history),
+        ui_history["currentUsedStepIndex"],
+        ui_history["backButtonEnabled"],
+        ui_history["forwardButtonEnabled"],
+        log,
+        expect_history_idle=True,
+    )
+
+
+def expect_javascript_noop_webdriver_navigation_does_not_change_history(
+    webdriver_port,
+    session_id,
+    expected_url,
+    expected_history_snapshot,
+    log,
+):
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 1000})
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": "javascript:void(0)"})
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 10000})
+    state = execute_script(webdriver_port, session_id, "return location.href;")
+    if state != expected_url:
+        raise AssertionError(
+            f"Expected javascript:void(0) WebDriver navigation to stay on {expected_url}, got {state}\n"
+            + "\n".join(log)
+        )
+
+    ui_history = expected_history_snapshot["ui"]
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after javascript:void(0) WebDriver navigation",
+        history_entry_urls(ui_history),
+        history_used_steps(ui_history),
+        ui_history["currentUsedStepIndex"],
+        ui_history["backButtonEnabled"],
+        ui_history["forwardButtonEnabled"],
+        log,
+        expect_history_idle=True,
+    )
+
+
+def expect_beforeunload_cancels_refresh(
+    webdriver_port,
+    session_id,
+    expected_url,
+    previous_beforeunload_count,
+    log,
+):
+    expect_current_ui_entry_reload_pending(webdriver_port, session_id, "before blocked refresh from /b", False, log)
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 1000})
+    try:
+        refresh(webdriver_port, session_id)
+    finally:
+        request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 10000})
+
+    def refresh_was_canceled_by_beforeunload(result):
+        return (
+            isinstance(result, list)
+            and len(result) == 2
+            and result[0] == expected_url
+            and isinstance(result[1], int)
+            and result[1] > previous_beforeunload_count
+        )
+
+    state = wait_for_script_result(
+        webdriver_port,
+        session_id,
+        "beforeunload-canceled refresh from /b",
+        "return [location.href, window.beforeUnloadCount];",
+        refresh_was_canceled_by_beforeunload,
+        log,
+    )
+    expect_current_ui_entry_reload_pending(webdriver_port, session_id, "after blocked refresh from /b", False, log)
+    return state
+
+
+def expect_current_top_level_history_url(webdriver_port, session_id, label, expected_url, log):
+    snapshot = session_history(webdriver_port, session_id)
+    current_entry = history_current_entry(snapshot["ui"])
+    if current_entry["url"] == expected_url:
+        log.append(f"{label} current history URL: {expected_url}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} current history URL to be {expected_url}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_navigation_buttons(webdriver_port, session_id, label, expected_back_enabled, expected_forward_enabled, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui = snapshot["ui"]
+    if ui["backButtonEnabled"] is expected_back_enabled and ui["forwardButtonEnabled"] is expected_forward_enabled:
+        log.append(
+            f"{label} buttons: back={expected_back_enabled}, forward={expected_forward_enabled}, "
+            f"history={summarize_history_snapshot(snapshot)}"
+        )
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} navigation buttons to be back={expected_back_enabled}, "
+        f"forward={expected_forward_enabled}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_session_history_idle(webdriver_port, session_id, label, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui = snapshot["ui"]
+    if ui["pendingSessionHistoryTraversal"] is None:
+        log.append(f"{label} idle history: {summarize_history_snapshot(snapshot)}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} session history to be idle, got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_pending_history_operation_traversal(
+    webdriver_port,
+    session_id,
+    label,
+    expected_entry_urls,
+    expected_used_steps,
+    expected_ui_current_used_step_index,
+    expected_target_used_step_index,
+    log,
+):
+    snapshot = session_history(webdriver_port, session_id)
+    ui = snapshot["ui"]
+    pending_traversal = ui["pendingSessionHistoryTraversal"]
+
+    log.append(f"{label} pending traversal: {summarize_history_snapshot(snapshot)}")
+
+    if history_entry_urls(ui) != expected_entry_urls:
+        raise AssertionError(f"Expected {label} entries to be {expected_entry_urls}\n" + "\n".join(log))
+
+    if history_used_steps(ui) != expected_used_steps:
+        raise AssertionError(f"Expected {label} used steps to be {expected_used_steps}\n" + "\n".join(log))
+
+    if ui["currentUsedStepIndex"] != expected_ui_current_used_step_index:
+        raise AssertionError(
+            f"Expected {label} current used step index to be {expected_ui_current_used_step_index}\n" + "\n".join(log)
+        )
+
+    if pending_traversal is None:
+        raise AssertionError(f"Expected {label} to have a pending session history traversal\n" + "\n".join(log))
+
+    expected_step = expected_used_steps[expected_target_used_step_index]
+    if pending_traversal["targetStep"] != expected_step:
+        raise AssertionError(
+            f"Expected {label} pending traversal target step to be {expected_step}, "
+            f"got {pending_traversal['targetStep']}\n" + "\n".join(log)
+        )
+
+    if pending_traversal["targetStepIndex"] != expected_target_used_step_index:
+        raise AssertionError(
+            f"Expected {label} pending traversal target step index to be {expected_target_used_step_index}, "
+            f"got {pending_traversal['targetStepIndex']}\n" + "\n".join(log)
+        )
+
+    if pending_traversal["stage"] != "applying-in-webcontent":
+        raise AssertionError(
+            f"Expected {label} pending traversal stage to be applying-in-webcontent, "
+            f"got {pending_traversal['stage']}\n" + "\n".join(log)
+        )
+
+    return snapshot
+
+
+def expect_current_entry_nested_history(webdriver_port, session_id, label, expected_url, expected_nested_urls, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui_current_entry = history_current_entry(snapshot["ui"])
+
+    ui_nested_urls = []
+    if ui_current_entry["nestedHistories"]:
+        ui_nested_urls = [entry["url"] for entry in ui_current_entry["nestedHistories"][0]["entries"]]
+
+    if ui_current_entry["url"] == expected_url and ui_nested_urls == expected_nested_urls:
+        log.append(f"{label} nested history: {expected_nested_urls}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} nested history to be {expected_nested_urls} at {expected_url}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_current_ui_entry_reload_pending(webdriver_port, session_id, label, expected_reload_pending, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui_current_entry = history_current_entry(snapshot["ui"])
+    if ui_current_entry["reloadPending"] is expected_reload_pending:
+        log.append(f"{label} UI reload pending: {expected_reload_pending}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} current UI entry reloadPending to be {expected_reload_pending}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def nested_history_urls_for_entry(history, url):
+    matching_entries = [entry for entry in history["entries"] if entry["url"] == url]
+    if len(matching_entries) > 1:
+        raise AssertionError(f"Expected at most one entry for {url}, got {matching_entries}")
+    if not matching_entries:
+        return None
+
+    entry = matching_entries[0]
+    if not entry["nestedHistories"]:
+        return []
+    return [nested_entry["url"] for nested_entry in entry["nestedHistories"][0]["entries"]]
+
+
+def expect_entry_nested_history(webdriver_port, session_id, label, entry_url, expected_nested_urls, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui_nested_urls = nested_history_urls_for_entry(snapshot["ui"], entry_url)
+    if ui_nested_urls == expected_nested_urls:
+        log.append(f"{label} nested history: {expected_nested_urls}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} nested history to be {expected_nested_urls} at {entry_url}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_session_history_synchronized(webdriver_port, session_id, label, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui = snapshot["ui"]
+    if ui["pendingSessionHistoryTraversal"] is None:
+        log.append(f"{label} idle history: {summarize_history_snapshot(snapshot)}")
+        return
+
+    raise AssertionError(
+        f"Expected {label} history to have no operation pending, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_url(webdriver_port, session_id, label, expected_url, log):
+    actual_url = current_url(webdriver_port, session_id)
+    if actual_url == expected_url:
+        log.append(f"{label}: {actual_url}")
+        return
+
+    raise AssertionError(f"Expected {label} to be {expected_url}, got {actual_url}\n" + "\n".join(log))
+
+
+def wait_for_url(webdriver_port, session_id, label, expected_url, log, timeout=EVENT_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    actual_url = None
+    while time.monotonic() < deadline:
+        actual_url = current_url(webdriver_port, session_id)
+        if actual_url == expected_url:
+            log.append(f"{label}: {actual_url}")
+            return
+        time.sleep(0.05)
+
+    raise AssertionError(f"Timed out waiting for {label} to be {expected_url}, got {actual_url}\n" + "\n".join(log))
+
+
+def expect_body_text(webdriver_port, session_id, label, expected_text, log):
+    actual = execute_script(webdriver_port, session_id, "return [document.body.innerText.trim(), document.readyState];")
+    if actual == [expected_text, "complete"]:
+        log.append(f"{label}: {actual[0]}")
+        return
+
+    raise AssertionError(f"Expected {label} body text to be {expected_text}, got {actual}\n" + "\n".join(log))
+
+
+def wait_for_body_text(webdriver_port, session_id, label, expected_text, log, timeout=EVENT_TIMEOUT_SECONDS):
+    # A navigation the page started (a form submission, a link) completes no WebDriver command, so its document is
+    # read once it has finished loading, rather than as soon as the server has seen its script run.
+    deadline = time.monotonic() + timeout
+    actual = None
+    while time.monotonic() < deadline:
+        actual = execute_script(
+            webdriver_port, session_id, "return [document.body.innerText.trim(), document.readyState];"
+        )
+        if actual == [expected_text, "complete"]:
+            log.append(f"{label}: {actual[0]}")
+            return
+        time.sleep(0.05)
+
+    raise AssertionError(
+        f"Timed out waiting for {label} body text to be {expected_text}, got {actual}\n" + "\n".join(log)
+    )
+
+
+def expect_current_entry_resource(webdriver_port, session_id, label, expected_resource, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui_current_entry = history_current_entry(snapshot["ui"])
+    if ui_current_entry["resource"] == expected_resource:
+        log.append(f"{label} current resource: {expected_resource}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} current resource to be {expected_resource}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def expect_current_ui_entry_resource(webdriver_port, session_id, label, expected_resource, log):
+    snapshot = session_history(webdriver_port, session_id)
+    ui_current_entry = history_current_entry(snapshot["ui"])
+    if ui_current_entry["resource"] == expected_resource:
+        log.append(f"{label} current UI resource: {expected_resource}")
+        return snapshot
+
+    raise AssertionError(
+        f"Expected {label} current UI resource to be {expected_resource}, "
+        f"got {summarize_history_snapshot(snapshot)}\n" + "\n".join(log)
+    )
+
+
+def frame_url_matches(webdriver_port, session_id, expected_url, expected_title):
+    result = execute_script(
+        webdriver_port,
+        session_id,
+        """
+const frame = document.getElementById('frame');
+return [frame.contentWindow.location.href, frame.contentDocument.readyState, frame.contentDocument.title];
+""",
+    )
+    actual_url, ready_state, actual_title = result
+    matches = (
+        actual_url == expected_url
+        and ready_state == "complete"
+        and (expected_title is None or actual_title == expected_title)
+    )
+    return matches, actual_url, f"{actual_url} ({actual_title}, {ready_state})"
+
+
+def expect_frame_url(webdriver_port, session_id, label, expected_url, log, expected_title=None):
+    matches, actual_url, actual = frame_url_matches(webdriver_port, session_id, expected_url, expected_title)
+    if matches:
+        log.append(f"{label}: {actual_url}")
+        return
+
+    raise AssertionError(f"Expected {label} to be {expected_url}, got {actual}\n" + "\n".join(log))
+
+
+def wait_for_frame_url(
+    webdriver_port, session_id, label, expected_url, log, expected_title=None, timeout=EVENT_TIMEOUT_SECONDS
+):
+    # A frame navigation completes no WebDriver command, so the frame's document is read once it has finished
+    # loading, rather than as soon as the server has seen its script run.
+    deadline = time.monotonic() + timeout
+    actual = None
+    while time.monotonic() < deadline:
+        matches, actual_url, actual = frame_url_matches(webdriver_port, session_id, expected_url, expected_title)
+        if matches:
+            log.append(f"{label}: {actual_url}")
+            return
+        time.sleep(0.05)
+
+    raise AssertionError(f"Timed out waiting for {label} to be {expected_url}, got {actual}\n" + "\n".join(log))
+
+
+def expect_history_entry_state(
+    webdriver_port,
+    session_id,
+    label,
+    expected_url,
+    expected_classic_state,
+    expected_navigation_state,
+    expected_scroll_restoration,
+    expected_navigation_key,
+    expected_navigation_id,
+    log,
+):
+    result = execute_script(
+        webdriver_port,
+        session_id,
+        """
+return [
+    location.href,
+    JSON.stringify(history.state),
+    JSON.stringify(navigation.currentEntry.getState()),
+    history.scrollRestoration,
+    navigation.currentEntry.key,
+    navigation.currentEntry.id,
+];
+""",
+    )
+
+    log.append(f"{label}: {result}")
+    expected = [
+        expected_url,
+        expected_classic_state,
+        expected_navigation_state,
+        expected_scroll_restoration,
+        expected_navigation_key,
+        expected_navigation_id,
+    ]
+    if result != expected:
+        raise AssertionError(f"Expected {label} to be {expected}, got {result}\n" + "\n".join(log))
+
+
+def expect_window_name(webdriver_port, session_id, label, expected_name, log):
+    actual_name = execute_script(webdriver_port, session_id, "return window.name;")
+    log.append(f"{label}: {actual_name}")
+    if actual_name != expected_name:
+        raise AssertionError(f"Expected {label} to be {expected_name}, got {actual_name}\n" + "\n".join(log))
+
+
+def expect_scroll_position(webdriver_port, session_id, label, expected_x, expected_y, log):
+    actual = execute_script(
+        webdriver_port,
+        session_id,
+        "return [Math.round(scrollX), Math.round(scrollY), document.readyState];",
+    )
+    if actual == [expected_x, expected_y, "complete"]:
+        log.append(f"{label}: {actual}")
+        return
+
+    raise AssertionError(
+        f"Expected {label} to be {[expected_x, expected_y, 'complete']}, got {actual}\n" + "\n".join(log)
+    )
+
+
+def run_blocked_process_swap_ui_forward_crash_recovery_test(
+    webdriver_port,
+    page_server,
+    url_b,
+    url_process_swap_back_blocked,
+):
+    session_id = create_session(webdriver_port)
+    log = [f"blocked process-swap UI forward crash recovery initial: {current_url(webdriver_port, session_id)}"]
+    with page_server.process_swap_back_blocked_request_lock:
+        page_server.process_swap_back_blocked_request_count = 0
+    page_server.blocked_process_swap_back_requested.clear()
+    page_server.process_swap_back_recovery_requested.clear()
+    page_server.release_blocked_process_swap_back.clear()
+    load_url_from_ui(webdriver_port, session_id, url_b)
+    expect_url(webdriver_port, session_id, "after process-swap forward crash recovery setup /b", url_b, log)
+    load_url_from_ui(webdriver_port, session_id, url_process_swap_back_blocked)
+    expect_url(
+        webdriver_port,
+        session_id,
+        "after process-swap forward crash recovery setup /process-swap-back-blocked",
+        url_process_swap_back_blocked,
+        log,
+    )
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after process-swap forward crash recovery setup",
+        [url_b, url_process_swap_back_blocked],
+        [0, 1],
+        1,
+        True,
+        False,
+        log,
+    )
+
+    traverse_history_from_ui(webdriver_port, session_id, -1)
+    expect_url(webdriver_port, session_id, "after process-swap forward crash recovery setup back to /b", url_b, log)
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after process-swap forward crash recovery setup back to /b",
+        [url_b, url_process_swap_back_blocked],
+        [0, 1],
+        0,
+        False,
+        True,
+        log,
+    )
+
+    page_server.blocked_process_swap_back_requested.clear()
+    page_server.process_swap_back_recovery_requested.clear()
+    page_server.release_blocked_process_swap_back.clear()
+    page_server.process_swap_back_document_ran.clear()
+    traverse_history_from_ui(webdriver_port, session_id, 1, wait_for_navigation_completion=False)
+    wait_for_event(
+        page_server.blocked_process_swap_back_requested,
+        "blocked process-swap UI forward before crash",
+    )
+    expect_pending_history_operation_traversal(
+        webdriver_port,
+        session_id,
+        "while process-swap UI forward loads target before crash",
+        [url_b, url_process_swap_back_blocked],
+        [0, 1],
+        0,
+        1,
+        log,
+    )
+    crash_current_page(webdriver_port, session_id, wait_for_navigation_completion=False)
+    wait_for_event(page_server.process_swap_back_recovery_requested, "process-swap forward recovery request")
+    page_server.release_blocked_process_swap_back.set()
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "while process-swap UI forward recovers target after crash",
+        [url_b, url_process_swap_back_blocked],
+        [0, 1],
+        1,
+        True,
+        False,
+        log,
+    )
+    wait_for_event(page_server.process_swap_back_document_ran, "process-swap UI forward recovery document")
+    expect_url(
+        webdriver_port,
+        session_id,
+        "after process-swap UI forward crash recovery completes",
+        url_process_swap_back_blocked,
+        log,
+    )
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after process-swap UI forward crash recovery completes",
+        [url_b, url_process_swap_back_blocked],
+        [0, 1],
+        1,
+        True,
+        False,
+        log,
+    )
+    request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def expect_second_ui_forward_supersedes_pending_forward(
+    webdriver_port,
+    session_id,
+    page_server,
+    url_a,
+    url_forward_blocked,
+    url_c,
+):
+    log = [f"second UI forward during pending forward initial: {current_url(webdriver_port, session_id)}"]
+    page_server.block_forward_load = False
+    page_server.blocked_forward_requested.clear()
+    page_server.release_blocked_forward.clear()
+
+    load_url_from_ui(webdriver_port, session_id, url_a)
+    expect_url(webdriver_port, session_id, "after pending-forward setup /a", url_a, log)
+    load_url_from_ui(webdriver_port, session_id, url_forward_blocked)
+    expect_url(webdriver_port, session_id, "after pending-forward setup /forward-blocked", url_forward_blocked, log)
+    load_url_from_ui(webdriver_port, session_id, url_c)
+    expect_url(webdriver_port, session_id, "after pending-forward setup /c", url_c, log)
+    expect_session_history_idle(webdriver_port, session_id, "after pending-forward setup", log)
+
+    traverse_history_from_ui(webdriver_port, session_id, -1)
+    expect_url(
+        webdriver_port, session_id, "after pending-forward setup back to /forward-blocked", url_forward_blocked, log
+    )
+    traverse_history_from_ui(webdriver_port, session_id, -1)
+    expect_url(webdriver_port, session_id, "after pending-forward setup back to /a", url_a, log)
+
+    page_server.block_forward_load = True
+    page_server.blocked_forward_requested.clear()
+    page_server.release_blocked_forward.clear()
+    traverse_history_from_ui(webdriver_port, session_id, 1, wait_for_navigation_completion=False)
+    wait_for_event(page_server.blocked_forward_requested, "blocked first UI forward")
+    # The changing-job continuation has dispatched once the target request
+    # starts. Supersession must remain safe after that point.
+    expect_navigation_buttons(
+        webdriver_port,
+        session_id,
+        "while first UI forward is pending",
+        True,
+        True,
+        log,
+    )
+
+    second_forward_error = []
+
+    def request_second_forward():
+        try:
+            traverse_history_from_ui(webdriver_port, session_id, 1)
+        except Exception as error:
+            second_forward_error.append(error)
+
+    second_forward_thread = threading.Thread(target=request_second_forward)
+    second_forward_thread.start()
+    second_forward_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+    if second_forward_thread.is_alive():
+        page_server.release_blocked_forward.set()
+        second_forward_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+        raise AssertionError("Timed out waiting for second UI forward during pending forward\n" + "\n".join(log))
+    if second_forward_error:
+        page_server.release_blocked_forward.set()
+        raise AssertionError(
+            f"Second UI forward during pending forward failed: {second_forward_error[0]}\n" + "\n".join(log)
+        )
+    page_server.release_blocked_forward.set()
+    expect_url(webdriver_port, session_id, "after second UI forward during pending forward", url_c, log)
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after second UI forward during pending forward",
+        [url_a, url_forward_blocked, url_c],
+        [0, 1, 2],
+        2,
+        True,
+        False,
+        log,
+    )
+    page_server.block_forward_load = False
+
+
+def expect_sandboxed_history_back_to_be_blocked(webdriver_port, session_id, url_a, url_b, log):
+    sandboxed_history_back_state = execute_async_script(
+        webdriver_port,
+        session_id,
+        """
+const done = arguments[0];
+window.sandboxedHistoryBackResult = null;
+window.addEventListener("message", event => {
+    if (event.data.startsWith("sandboxed-history-back:")) {
+        window.sandboxedHistoryBackResult = event.data;
+        done([location.href, window.sandboxedHistoryBackResult]);
+    }
+}, { once: true });
+const iframe = document.createElement("iframe");
+iframe.sandbox = "allow-same-origin allow-scripts";
+iframe.srcdoc = `
+<script>
+try {
+    history.back();
+    parent.postMessage("sandboxed-history-back:called", "*");
+} catch (e) {
+    parent.postMessage("sandboxed-history-back:threw:" + e.name, "*");
+}
+</scr` + `ipt>`;
+document.body.append(iframe);
+""",
+    )
+    if sandboxed_history_back_state != [url_b, "sandboxed-history-back:called"]:
+        raise AssertionError(
+            f"Expected sandboxed iframe history.back() to be blocked, got {sandboxed_history_back_state}\n"
+            + "\n".join(log)
+        )
+
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after sandboxed iframe history.back() from /b",
+        [url_a, url_b],
+        [0, 1],
+        1,
+        True,
+        False,
+        log,
+    )
+    execute_script(webdriver_port, session_id, "document.querySelector('iframe')?.remove(); return null;")
+
+
+def expect_iframe_replacement_after_deferred_fragment_navigation(
+    webdriver_port, session_id, first_page_url, second_page_url, log
+):
+    result = execute_async_script(
+        webdriver_port,
+        session_id,
+        f"""
+const done = arguments[0];
+const first = document.createElement("iframe");
+first.onload = () => {{
+    const deadline = performance.now() + 5000;
+    const waitForFragmentNavigation = () => {{
+        if (first.contentWindow.location.hash === "#/all") {{
+            requestAnimationFrame(() => {{
+                first.remove();
+                setTimeout(() => {{
+                    const second = document.createElement("iframe");
+                    second.onload = () => {{
+                        done([
+                            second.contentDocument.querySelector("#replacement-ready") !== null,
+                            second.contentWindow.location.href,
+                        ]);
+                    }};
+                    second.src = {json.dumps(second_page_url)};
+                    document.body.append(second);
+                }}, 0);
+            }});
+            return;
+        }}
+        if (performance.now() >= deadline) {{
+            done([false, "timed out waiting for first iframe fragment navigation"]);
+            return;
+        }}
+        setTimeout(waitForFragmentNavigation, 0);
+    }};
+    waitForFragmentNavigation();
+}};
+first.src = {json.dumps(first_page_url)};
+document.body.append(first);
+""",
+    )
+
+    if result != [True, second_page_url]:
+        raise AssertionError(
+            f"Expected replacement iframe to load after deferred fragment navigation, got {result}\n" + "\n".join(log)
+        )
+    log.append("replacement iframe loaded after deferred fragment navigation")
+
+
+def run_iframe_replacement_after_deferred_fragment_navigation_test(
+    webdriver_port, url_a, first_page_url, second_page_url
+):
+    session_id = create_session(webdriver_port)
+    log = [f"iframe replacement after deferred fragment navigation initial: {current_url(webdriver_port, session_id)}"]
+    try:
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_a})
+        expect_url(webdriver_port, session_id, "after iframe replacement setup /a", url_a, log)
+        expect_iframe_replacement_after_deferred_fragment_navigation(
+            webdriver_port, session_id, first_page_url, second_page_url, log
+        )
+    finally:
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def expect_same_url_ui_load_replaces_current_entry(webdriver_port, session_id, url, log):
+    load_url_from_ui(webdriver_port, session_id, url)
+    expect_url(webdriver_port, session_id, "after same-URL UI load setup /a", url, log)
+    load_url_from_ui(webdriver_port, session_id, url)
+    expect_url(webdriver_port, session_id, "after same-URL UI load /a", url, log)
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after same-URL UI load /a",
+        [url],
+        [0],
+        0,
+        False,
+        False,
+        log,
+    )
+
+
+def expect_webdriver_fragment_navigation_completes(webdriver_port, session_id, url, log):
+    fragment_url = f"{url}#fragment"
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 1000})
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": fragment_url})
+    request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 10000})
+    expect_url(webdriver_port, session_id, "after WebDriver fragment navigation", fragment_url, log)
+    expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after WebDriver fragment navigation",
+        [url, fragment_url],
+        [0, 1],
+        1,
+        True,
+        False,
+        log,
+    )
+
+
+def run_webdriver_fragment_navigation_test(webdriver_port, url):
+    session_id = create_session(webdriver_port)
+    log = [f"WebDriver fragment navigation initial: {current_url(webdriver_port, session_id)}"]
+    load_url_from_ui(webdriver_port, session_id, url)
+    expect_url(webdriver_port, session_id, "after WebDriver fragment navigation setup /a", url, log)
+    expect_webdriver_fragment_navigation_completes(webdriver_port, session_id, url, log)
+    request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_webdriver_intercepted_navigation_click_test(webdriver_port, url):
+    session_id = create_session(webdriver_port)
+    try:
+        load_url_from_ui(webdriver_port, session_id, url)
+        element_id = find_element(webdriver_port, session_id, "#button")
+        request(webdriver_port, "POST", f"/session/{session_id}/timeouts", {"pageLoad": 1000})
+
+        click_element(webdriver_port, session_id, element_id)
+        state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.search, window.navigationType];",
+        )
+        if state != ["?foo", "push"]:
+            raise AssertionError(f"Expected intercepted navigation to complete as a push, got {state}")
+    finally:
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_failed_redirected_navigation_shows_failed_url_test(webdriver_port, page_port, url_a):
+    url_redirect_to_tls_failure = f"http://localhost:{page_port}/redirect-to-tls-failure"
+    url_tls_failure = f"https://127.0.0.1:{page_port}/tls-failure"
+    session_id = create_session(webdriver_port)
+    log = [f"failed redirected navigation initial: {current_url(webdriver_port, session_id)}"]
+    load_url_from_ui(webdriver_port, session_id, url_a)
+    expect_url(webdriver_port, session_id, "after failed redirected navigation setup /a", url_a, log)
+
+    load_url_from_ui(webdriver_port, session_id, url_redirect_to_tls_failure)
+    snapshot = expect_ui_session_history(
+        webdriver_port,
+        session_id,
+        "after failed redirected navigation",
+        [url_a, url_tls_failure],
+        [0, 1],
+        1,
+        True,
+        False,
+        log,
+        expect_history_idle=True,
+    )
+
+    ui_current_url = snapshot["ui"]["currentURL"]
+    if ui_current_url != url_tls_failure:
+        raise AssertionError(
+            f"Expected the UI to show the failed URL {url_tls_failure}, got {ui_current_url}\n" + "\n".join(log)
+        )
+
+    request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_self_contained_navigation_tests(webdriver_port, page_port, url_a):
+    run_webdriver_fragment_navigation_test(webdriver_port, url_a)
+    run_webdriver_intercepted_navigation_click_test(
+        webdriver_port,
+        f"http://localhost:{page_port}/webdriver-intercepted-navigation-click",
+    )
+    run_failed_redirected_navigation_shows_failed_url_test(webdriver_port, page_port, url_a)
+
+
+def expect_cross_site_fragment_navigation_from_ui_loads_document(
+    webdriver_port,
+    session_id,
+    page_server,
+    url_source,
+    url_target,
+    log,
+):
+    log.append("cross-site fragment navigation from the UI loads the target document")
+
+    page_server.fragment_source_document_ran.clear()
+    load_url_from_ui(webdriver_port, session_id, url_source)
+    wait_for_event(
+        page_server.fragment_source_document_ran,
+        "source document before cross-site fragment navigation",
+    )
+
+    target_with_fragment = f"{url_target}#section"
+    page_server.fragment_target_document_ran.clear()
+    load_url_from_ui(webdriver_port, session_id, target_with_fragment)
+
+    wait_for_event(
+        page_server.fragment_target_document_ran,
+        "target document after cross-site fragment navigation",
+    )
+
+    actual_url = current_url(webdriver_port, session_id)
+    if actual_url != target_with_fragment:
+        raise AssertionError(f"Expected current URL {target_with_fragment}, got {actual_url}")
+
+
+def run_pending_navigation_browser_ui_back_test(
+    webdriver_port,
+    page_server,
+    url_a,
+    url_navigation_blocked,
+    url_redirect_to_navigation_blocked,
+):
+    session_id = create_session(webdriver_port)
+    log = [f"pending navigation browser UI back initial: {current_url(webdriver_port, session_id)}"]
+    try:
+        with page_server.a_request_lock:
+            initial_a_request_count = page_server.a_request_count
+
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after pending navigation setup /a", url_a, log)
+        with page_server.a_request_lock:
+            a_request_count_after_setup = page_server.a_request_count
+        if a_request_count_after_setup != initial_a_request_count + 1:
+            raise AssertionError(
+                f"Expected one /a request during setup, got {a_request_count_after_setup - initial_a_request_count}\n"
+                + "\n".join(log)
+            )
+
+        execute_script(
+            webdriver_port,
+            session_id,
+            f"""
+window.beforeUnloadCount = 0;
+window.pendingNavigateCount = 0;
+window.pendingNavigateAbortCount = 0;
+addEventListener("beforeunload", () => ++window.beforeUnloadCount);
+navigation.addEventListener("navigate", event => {{
+    if (event.destination.url === {json.dumps(url_navigation_blocked)}
+        || event.destination.url === {json.dumps(url_redirect_to_navigation_blocked)}) {{
+        ++window.pendingNavigateCount;
+        event.signal.addEventListener("abort", () => ++window.pendingNavigateAbortCount, {{ once: true }});
+    }}
+}});
+return null;
+""",
+        )
+
+        def cancel_pending_navigation(label, start_navigation):
+            page_server.blocked_navigation_requested.clear()
+            page_server.release_blocked_navigation.clear()
+            page_server.blocked_navigation_response_finished.clear()
+
+            initial_state = execute_script(
+                webdriver_port,
+                session_id,
+                "return [window.beforeUnloadCount, window.pendingNavigateCount, window.pendingNavigateAbortCount];",
+            )
+
+            start_navigation()
+            wait_for_event(page_server.blocked_navigation_requested, f"{label} request")
+
+            before_cancel_state = execute_script(
+                webdriver_port,
+                session_id,
+                "return [location.href, window.beforeUnloadCount, window.pendingNavigateCount, window.pendingNavigateAbortCount];",
+            )
+            if (
+                before_cancel_state[0] != url_a
+                or before_cancel_state[1] != initial_state[0] + 1
+                or before_cancel_state[2] != initial_state[1] + 1
+                or before_cancel_state[3] != initial_state[2]
+            ):
+                raise AssertionError(
+                    f"Expected {label} to leave canonical history at /a, got {before_cancel_state}\n" + "\n".join(log)
+                )
+
+            pending_history = session_history(webdriver_port, session_id)
+            if pending_history["ui"]["currentURL"] not in (
+                url_navigation_blocked,
+                url_redirect_to_navigation_blocked,
+            ) or history_entry_urls(pending_history["ui"]) != [url_a]:
+                raise AssertionError(
+                    f"Expected {label} to leave canonical history at /a, got "
+                    f"{summarize_history_snapshot(pending_history)}\n" + "\n".join(log)
+                )
+
+            traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+            wait_for_session_history(
+                webdriver_port,
+                session_id,
+                f"after canceling {label}",
+                lambda snapshot: (
+                    snapshot["ui"]["currentURL"] == url_a
+                    and history_entry_urls(snapshot["ui"]) == [url_a]
+                    and snapshot["ui"]["pendingSessionHistoryTraversal"] is None
+                ),
+                log,
+            )
+
+            after_cancel_state = execute_script(
+                webdriver_port,
+                session_id,
+                "return [location.href, window.beforeUnloadCount, window.pendingNavigateCount, window.pendingNavigateAbortCount];",
+            )
+            if (
+                after_cancel_state[0] != url_a
+                or after_cancel_state[1] != before_cancel_state[1]
+                or after_cancel_state[2] != before_cancel_state[2]
+                or after_cancel_state[3] != before_cancel_state[3] + 1
+            ):
+                raise AssertionError(
+                    f"Expected {label} cancellation to abort only the pending navigation, got {after_cancel_state}\n"
+                    + "\n".join(log)
+                )
+
+            with page_server.a_request_lock:
+                if page_server.a_request_count != a_request_count_after_setup:
+                    raise AssertionError(f"{label} reloaded /a instead of preserving it\n" + "\n".join(log))
+
+            page_server.release_blocked_navigation.set()
+            wait_for_event(page_server.blocked_navigation_response_finished, f"{label} canceled response completion")
+            expect_url(webdriver_port, session_id, f"after releasing canceled {label}", url_a, log)
+            expect_ui_session_history(
+                webdriver_port,
+                session_id,
+                f"after releasing canceled {label}",
+                [url_a],
+                [0],
+                0,
+                False,
+                False,
+                log,
+            )
+
+        cancel_pending_navigation(
+            "renderer-initiated navigation",
+            lambda: execute_script(
+                webdriver_port,
+                session_id,
+                'document.querySelector("#pending").click(); return null;',
+            ),
+        )
+        cancel_pending_navigation(
+            "redirected renderer-initiated navigation",
+            lambda: execute_script(
+                webdriver_port,
+                session_id,
+                'document.querySelector("#pending-redirect").click(); return null;',
+            ),
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        expect_url(webdriver_port, session_id, "after redundant back following pending cancellations", url_a, log)
+        expect_navigation_buttons(
+            webdriver_port,
+            session_id,
+            "after redundant back following pending cancellations",
+            False,
+            False,
+            log,
+        )
+
+        page_server.blocked_navigation_requested.clear()
+        page_server.release_blocked_navigation.clear()
+        page_server.blocked_navigation_response_finished.clear()
+        page_server.navigation_blocked_document_ran.clear()
+        execute_script(
+            webdriver_port,
+            session_id,
+            'document.querySelector("#pending").click(); return null;',
+        )
+        wait_for_event(page_server.blocked_navigation_requested, "navigation that will commit request")
+        page_server.release_blocked_navigation.set()
+        wait_for_event(
+            page_server.blocked_navigation_response_finished, "navigation that will commit response completion"
+        )
+        wait_for_event(page_server.navigation_blocked_document_ran, "navigation that will commit document script")
+        expect_url(webdriver_port, session_id, "after pending navigation commits", url_navigation_blocked, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after pending navigation commits",
+            [url_a, url_navigation_blocked],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after back following pending navigation commit", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back following pending navigation commit",
+            [url_a, url_navigation_blocked],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+
+    finally:
+        page_server.release_blocked_navigation.set()
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_pending_navigation_browser_ui_back_with_older_entry_test(
+    webdriver_port,
+    page_server,
+    url_a,
+    url_d,
+):
+    session_id = create_session(webdriver_port)
+    log = [f"pending navigation browser UI back with older entry initial: {current_url(webdriver_port, session_id)}"]
+    try:
+        load_url_from_ui(webdriver_port, session_id, url_d)
+        expect_url(webdriver_port, session_id, "after pending navigation older-entry setup /d", url_d, log)
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after pending navigation older-entry setup /a", url_a, log)
+
+        page_server.blocked_navigation_requested.clear()
+        page_server.release_blocked_navigation.clear()
+        page_server.blocked_navigation_response_finished.clear()
+        execute_script(
+            webdriver_port,
+            session_id,
+            'document.querySelector("#pending-cross-site").click(); return null;',
+        )
+        wait_for_event(page_server.blocked_navigation_requested, "pending navigation with older entry request")
+
+        page_server.d_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        wait_for_event(page_server.d_document_ran, "older /d document after canceling pending navigation")
+        expect_url(webdriver_port, session_id, "after back during pending navigation with older entry", url_d, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back during pending navigation with older entry",
+            [url_d, url_a],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+    finally:
+        page_server.release_blocked_navigation.set()
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_cross_process_pending_navigation_browser_ui_back_test(
+    webdriver_port,
+    page_server,
+    url_a,
+    url_cross_site_navigation_blocked,
+):
+    session_id = create_session(webdriver_port)
+    log = [f"cross-process pending navigation browser UI back initial: {current_url(webdriver_port, session_id)}"]
+    try:
+        with page_server.a_request_lock:
+            initial_a_request_count = page_server.a_request_count
+
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after cross-process pending navigation setup /a", url_a, log)
+        initial_process_id = session_history(webdriver_port, session_id)["ui"]["webContentProcessID"]
+        with page_server.a_request_lock:
+            a_request_count_after_setup = page_server.a_request_count
+        if a_request_count_after_setup != initial_a_request_count + 1:
+            raise AssertionError(
+                f"Expected one /a request during cross-process setup, got "
+                f"{a_request_count_after_setup - initial_a_request_count}\n" + "\n".join(log)
+            )
+
+        page_server.blocked_navigation_requested.clear()
+        page_server.release_blocked_navigation.clear()
+        page_server.blocked_navigation_response_finished.clear()
+        execute_script(
+            webdriver_port,
+            session_id,
+            'document.querySelector("#pending-cross-site").click(); return null;',
+        )
+        wait_for_event(page_server.blocked_navigation_requested, "cross-process pending navigation request")
+
+        pending_history = session_history(webdriver_port, session_id)
+        # The endpoint has not sent response headers yet. Keep the current host until the response URL is known and
+        # process placement can be selected from it.
+        if (
+            pending_history["ui"]["currentURL"] != url_cross_site_navigation_blocked
+            or history_entry_urls(pending_history["ui"]) != [url_a]
+            or pending_history["ui"]["webContentProcessID"] != initial_process_id
+        ):
+            raise AssertionError(
+                "Expected pending cross-site navigation to leave canonical history and its host at /a, got "
+                f"{summarize_history_snapshot(pending_history)}\n" + "\n".join(log)
+            )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        expect_url(webdriver_port, session_id, "after back during cross-process pending navigation", url_a, log)
+        wait_for_session_history(
+            webdriver_port,
+            session_id,
+            "after back during cross-process pending navigation",
+            lambda snapshot: (
+                snapshot["ui"]["currentURL"] == url_a
+                and history_entry_urls(snapshot["ui"]) == [url_a]
+                and snapshot["ui"]["currentUsedStepIndex"] == 0
+                and snapshot["ui"]["backButtonEnabled"] is False
+                and snapshot["ui"]["forwardButtonEnabled"] is False
+                and snapshot["ui"]["pendingSessionHistoryTraversal"] is None
+                and snapshot["ui"]["webContentProcessID"] == initial_process_id
+            ),
+            log,
+        )
+        with page_server.a_request_lock:
+            if page_server.a_request_count != a_request_count_after_setup:
+                raise AssertionError(
+                    "Expected cross-process cancellation to preserve the active /a document\n" + "\n".join(log)
+                )
+
+        page_server.release_blocked_navigation.set()
+        wait_for_event(
+            page_server.blocked_navigation_response_finished,
+            "cross-process canceled response completion",
+        )
+        expect_url(webdriver_port, session_id, "after releasing cross-process canceled response", url_a, log)
+        expect_navigation_buttons(
+            webdriver_port,
+            session_id,
+            "after releasing cross-process canceled response",
+            False,
+            False,
+            log,
+        )
+    finally:
+        page_server.release_blocked_navigation.set()
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_cross_process_no_content_navigation_restore_test(
+    webdriver_port,
+    page_server,
+    url_a,
+    url_cross_site_no_content,
+):
+    session_id = create_session(webdriver_port)
+    log = [f"cross-process no-content navigation restore initial: {current_url(webdriver_port, session_id)}"]
+    try:
+        with page_server.a_request_lock:
+            initial_a_request_count = page_server.a_request_count
+
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after no-content navigation setup /a", url_a, log)
+        initial_process_id = session_history(webdriver_port, session_id)["ui"]["webContentProcessID"]
+        with page_server.a_request_lock:
+            a_request_count_after_setup = page_server.a_request_count
+        if a_request_count_after_setup != initial_a_request_count + 1:
+            raise AssertionError(
+                f"Expected one /a request during no-content setup, got "
+                f"{a_request_count_after_setup - initial_a_request_count}\n" + "\n".join(log)
+            )
+
+        page_server.blocked_no_content_navigation_requested.clear()
+        page_server.release_blocked_no_content_navigation.clear()
+        execute_script(
+            webdriver_port,
+            session_id,
+            'document.querySelector("#pending-cross-site-no-content").click(); return null;',
+        )
+        wait_for_event(page_server.blocked_no_content_navigation_requested, "cross-process no-content request")
+
+        pending_history = session_history(webdriver_port, session_id)
+        if (
+            pending_history["ui"]["currentURL"] != url_cross_site_no_content
+            or history_entry_urls(pending_history["ui"]) != [url_a]
+            or pending_history["ui"]["webContentProcessID"] != initial_process_id
+        ):
+            raise AssertionError(
+                "Expected pending no-content navigation to leave canonical history and its host at /a, got "
+                f"{summarize_history_snapshot(pending_history)}\n" + "\n".join(log)
+            )
+
+        page_server.release_blocked_no_content_navigation.set()
+        restored_history = wait_for_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-process no-content navigation restores /a",
+            lambda snapshot: (
+                snapshot["ui"]["currentURL"] == url_a
+                and history_entry_urls(snapshot["ui"]) == [url_a]
+                and snapshot["ui"]["currentUsedStepIndex"] == 0
+                and snapshot["ui"]["backButtonEnabled"] is False
+                and snapshot["ui"]["forwardButtonEnabled"] is False
+                and snapshot["ui"]["pendingSessionHistoryTraversal"] is None
+            ),
+            log,
+        )
+        if restored_history["ui"]["webContentProcessID"] != initial_process_id:
+            raise AssertionError(
+                "Expected no-content navigation to preserve the active WebContent process\n" + "\n".join(log)
+            )
+        with page_server.a_request_lock:
+            if page_server.a_request_count != a_request_count_after_setup:
+                raise AssertionError(
+                    "Expected no-content navigation to preserve the active /a document\n" + "\n".join(log)
+                )
+    finally:
+        page_server.release_blocked_no_content_navigation.set()
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_uncommitted_navigation_browser_ui_back_tests(
+    webdriver_port,
+    page_server,
+    url_a,
+    url_d,
+    url_navigation_blocked,
+    url_redirect_to_navigation_blocked,
+    url_cross_site_navigation_blocked,
+):
+    run_pending_navigation_browser_ui_back_test(
+        webdriver_port,
+        page_server,
+        url_a,
+        url_navigation_blocked,
+        url_redirect_to_navigation_blocked,
+    )
+    run_pending_navigation_browser_ui_back_with_older_entry_test(
+        webdriver_port,
+        page_server,
+        url_a,
+        url_d,
+    )
+    run_cross_process_pending_navigation_browser_ui_back_test(
+        webdriver_port,
+        page_server,
+        url_a,
+        url_cross_site_navigation_blocked,
+    )
+    run_cross_process_no_content_navigation_restore_test(
+        webdriver_port,
+        page_server,
+        url_a,
+        f"http://127.0.0.1:{page_server.server_port}/navigation-no-content-blocked",
+    )
+
+
+def expect_post_crash_recovery_waits_for_load(webdriver_port, session_id, page_server, url_post_result, log):
+    page_server.block_post_result_load = True
+    page_server.blocked_post_result_load_requested.clear()
+    page_server.post_result_load_became_interactive.clear()
+    page_server.release_blocked_post_result_load.clear()
+    post_crash_recovery_error = []
+
+    def request_post_crash_recovery():
+        try:
+            crash_current_page(webdriver_port, session_id)
+        except Exception as error:
+            post_crash_recovery_error.append(error)
+
+    post_crash_recovery_thread = threading.Thread(target=request_post_crash_recovery)
+    post_crash_recovery_thread.start()
+    wait_for_event(page_server.blocked_post_result_load_requested, "blocked POST crash recovery load")
+    wait_for_event(page_server.post_result_load_became_interactive, "interactive POST crash recovery document")
+    post_crash_recovery_thread.join(timeout=0.25)
+    completed_before_load = not post_crash_recovery_thread.is_alive()
+    page_server.release_blocked_post_result_load.set()
+    post_crash_recovery_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+    page_server.block_post_result_load = False
+    if completed_before_load:
+        raise AssertionError("POST crash recovery completed before the document finished loading\n" + "\n".join(log))
+    if post_crash_recovery_thread.is_alive():
+        raise AssertionError("Timed out waiting for POST crash recovery to finish loading\n" + "\n".join(log))
+    if post_crash_recovery_error:
+        raise post_crash_recovery_error[0]
+    expect_url(webdriver_port, session_id, "after POST crash recovery", url_post_result, log)
+    expect_body_text(webdriver_port, session_id, "after POST crash recovery", "POST:name=ladybird", log)
+    expect_current_entry_resource(webdriver_port, session_id, "after POST crash recovery", "post", log)
+
+
+def expect_back_waits_for_restored_document_load(webdriver_port, session_id, page_server, url_held_load, url_away, log):
+    # Back traverses to a document whose load the server holds back: the command must not complete while the restored
+    # document is still loading, and must complete once it has loaded. Step 7 of the spec's Back has it wait for the
+    # restored document's pageshow event, which follows its load event: https://w3c.github.io/webdriver/#dfn-back
+    page_server.release_held_load_image.set()
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_held_load})
+    expect_url(webdriver_port, session_id, "after held load setup", url_held_load, log)
+    request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_away})
+    expect_url(webdriver_port, session_id, "after leaving held load page", url_away, log)
+
+    page_server.held_load_image_requested.clear()
+    page_server.held_load_document_became_interactive.clear()
+    page_server.release_held_load_image.clear()
+    back_error = []
+
+    def request_back():
+        try:
+            request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        except Exception as error:
+            back_error.append(error)
+
+    back_thread = threading.Thread(target=request_back)
+    back_thread.start()
+    wait_for_event(page_server.held_load_image_requested, "held restored document load")
+    wait_for_event(page_server.held_load_document_became_interactive, "interactive restored document")
+    back_thread.join(timeout=0.25)
+    completed_before_load = not back_thread.is_alive()
+    page_server.release_held_load_image.set()
+    back_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+    if completed_before_load:
+        raise AssertionError(
+            "WebDriver back completed before the restored document finished loading\n" + "\n".join(log)
+        )
+    if back_thread.is_alive():
+        raise AssertionError(
+            "Timed out waiting for WebDriver back to finish loading the restored document\n" + "\n".join(log)
+        )
+    if back_error:
+        raise back_error[0]
+    expect_url(webdriver_port, session_id, "after back to held load page", url_held_load, log)
+    expect_body_text(webdriver_port, session_id, "after back to held load page", "Held Load", log)
+
+
+def run_navigation_response_process_selection_test(webdriver_port, url_a, url_b, url_d, url_redirect_to_b):
+    for label, target_url, expected_url, should_swap in [
+        ("same-site navigation", url_d, url_d, False),
+        ("cross-site navigation", url_b, url_b, True),
+        ("same-site URL redirecting cross-site", url_redirect_to_b, url_b, True),
+    ]:
+        session_id = create_session(webdriver_port)
+        log = []
+        try:
+            load_url_from_ui(webdriver_port, session_id, url_a)
+            expect_url(webdriver_port, session_id, "process selection source", url_a, log)
+            source_process_id = session_history(webdriver_port, session_id)["ui"]["webContentProcessID"]
+
+            execute_script(webdriver_port, session_id, f"location.href = {json.dumps(target_url)}; return null;")
+            wait_for_script_result(
+                webdriver_port,
+                session_id,
+                label,
+                "return location.href;",
+                lambda url, expected_url=expected_url: url == expected_url,
+                log,
+            )
+            destination_process_id = session_history(webdriver_port, session_id)["ui"]["webContentProcessID"]
+            did_swap = source_process_id != destination_process_id
+            if did_swap != should_swap:
+                raise AssertionError(
+                    f"Expected process swap={should_swap} for {label}, "
+                    f"got WebContent PID {source_process_id} -> {destination_process_id}"
+                )
+        finally:
+            request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_history_response_process_selection_tests(webdriver_port, page_server):
+    local_base = f"http://localhost:{page_server.server_port}"
+    remote_base = f"http://127.0.0.1:{page_server.server_port}"
+    for operation, stored_base, destination_base, should_swap in [
+        ("back", local_base, remote_base, True),
+        ("back", remote_base, local_base, False),
+        ("forward", local_base, remote_base, True),
+        ("reload", local_base, remote_base, True),
+        ("reload", local_base, local_base, False),
+    ]:
+        session_id = create_session(webdriver_port)
+        log = []
+        page_server.history_response_redirect = None
+        try:
+            if operation == "forward":
+                load_url_from_ui(webdriver_port, session_id, local_base + "/a")
+            load_url_from_ui(webdriver_port, session_id, stored_base + "/history-response")
+            if operation == "back":
+                load_url_from_ui(webdriver_port, session_id, local_base + "/d")
+            elif operation == "forward":
+                traverse_history_from_ui(webdriver_port, session_id, -1)
+
+            before = session_history(webdriver_port, session_id)["ui"]
+            requests_before = page_server.history_response_request_count
+            destinations_before = page_server.history_response_destination_count
+            destination = destination_base + "/history-response-destination"
+            page_server.history_response_redirect = destination
+            if operation == "reload":
+                refresh(webdriver_port, session_id)
+            else:
+                traverse_history_from_ui(webdriver_port, session_id, -1 if operation == "back" else 1)
+            label = f"{operation} redirect from {stored_base} to {destination_base}"
+            expect_url(webdriver_port, session_id, label, destination, log)
+            after = session_history(webdriver_port, session_id)["ui"]
+            did_swap = before["webContentProcessID"] != after["webContentProcessID"]
+            if did_swap != should_swap:
+                raise AssertionError(f"Expected process swap={should_swap} for {label}: {before} -> {after}")
+            if page_server.history_response_request_count != requests_before + 1:
+                raise AssertionError(f"Refetched the history entry during {label}")
+            if page_server.history_response_destination_count != destinations_before + 1:
+                raise AssertionError(f"Refetched the redirect destination during {label}")
+            expected_index = before["currentUsedStepIndex"] + {"back": -1, "forward": 1, "reload": 0}[operation]
+            if after["currentUsedStepIndex"] != expected_index or len(after["entries"]) != len(before["entries"]):
+                raise AssertionError(f"Changed the history operation during {label}: {before} -> {after}")
+            expect_session_history_idle(webdriver_port, session_id, label, log)
+        finally:
+            page_server.history_response_redirect = None
+            request(webdriver_port, "DELETE", f"/session/{session_id}")
+
+
+def run_test(webdriver_binary):
+    page_server = TestPageServer(("0.0.0.0", 0), TestPageHandler)
+    page_server_thread = threading.Thread(target=page_server.serve_forever, daemon=True)
+    page_server_thread.start()
+
+    webdriver_port = unused_port()
+    env = os.environ.copy()
+    env["LADYBIRD_SESSION_HISTORY_DEBUG"] = "1"
+
+    webdriver_stdout = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    webdriver_stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    expect_reload_pending_history_log = False
+    expect_no_entry_history_log = False
+
+    webdriver = subprocess.Popen(
+        [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(webdriver_port)],
+        stdout=webdriver_stdout,
+        stderr=webdriver_stderr,
+        text=True,
+        env=env,
+    )
+
+    session_id = None
+    failed = False
+    try:
+        wait_for_port(webdriver_port)
+
+        baseline_open_fds = count_open_fds(webdriver.pid)
+        page_port = page_server.server_port
+        url_a = f"http://localhost:{page_port}/a"
+        url_b = f"http://127.0.0.1:{page_port}/b"
+        url_c = f"http://127.0.0.1:{page_port}/c"
+        url_d = f"http://localhost:{page_port}/d"
+        url_redirect_to_b = f"http://localhost:{page_port}/redirect-to-b"
+        url_navigation_blocked = f"http://localhost:{page_port}/navigation-blocked"
+        url_cross_site_navigation_blocked = f"http://127.0.0.1:{page_port}/navigation-blocked"
+        url_redirect_to_navigation_blocked = f"http://localhost:{page_port}/redirect-to-navigation-blocked"
+        url_nested = f"http://localhost:{page_port}/nested"
+        url_state = f"http://localhost:{page_port}/state"
+        url_state_replace_load = f"http://localhost:{page_port}/state?replace-load"
+        url_state_replace = f"http://localhost:{page_port}/state?replace"
+        url_state_push = f"http://localhost:{page_port}/state?push"
+        url_scroll = f"http://localhost:{page_port}/scroll"
+        url_scroll_saved = f"http://localhost:{page_port}/scroll?saved"
+        url_held_load = f"http://localhost:{page_port}/held-load"
+        url_reload_blocked = f"http://localhost:{page_port}/reload-blocked"
+        url_process_swap_back_blocked = f"http://localhost:{page_port}/process-swap-back-blocked"
+        url_forward_blocked = f"http://127.0.0.1:{page_port}/forward-blocked"
+        url_frame_a = f"http://localhost:{page_port}/frame-a"
+        url_frame_b_blocked = f"http://localhost:{page_port}/frame-b-blocked"
+        url_iframe_deferred_fragment_first = f"http://localhost:{page_port}/iframe-deferred-fragment-first"
+        url_iframe_deferred_fragment_second = f"http://localhost:{page_port}/iframe-deferred-fragment-second"
+        url_nested_same_document = f"http://localhost:{page_port}/nested?same-document"
+        url_post_form = f"http://localhost:{page_port}/post-form"
+        url_post_result = f"http://localhost:{page_port}/post-result"
+        url_post_blocked_form = f"http://localhost:{page_port}/post-blocked-form"
+        url_post_blocked_result = f"http://localhost:{page_port}/post-result-blocked-same-site"
+        url_post_same_url_blocked = f"http://localhost:{page_port}/post-same-url-blocked"
+        url_cross_site_post_form = f"http://localhost:{page_port}/cross-site-post-form"
+        url_cross_site_post_blocked_form = f"http://localhost:{page_port}/cross-site-post-blocked-form"
+        url_cross_site_post_blocked_result = f"http://127.0.0.1:{page_port}/post-result-blocked"
+        url_cross_site_post_result = f"http://127.0.0.1:{page_port}/post-result"
+        url_fragment_source = f"http://localhost:{page_port}/fragment-source"
+        url_fragment_target = f"http://127.0.0.1:{page_port}/fragment-target"
+
+        expect_ladybird_test_hooks_require_capability(webdriver_port)
+
+        run_iframe_replacement_after_deferred_fragment_navigation_test(
+            webdriver_port,
+            url_a,
+            url_iframe_deferred_fragment_first,
+            url_iframe_deferred_fragment_second,
+        )
+
+        run_navigation_response_process_selection_test(webdriver_port, url_a, url_b, url_d, url_redirect_to_b)
+        run_history_response_process_selection_tests(webdriver_port, page_server)
+
+        run_uncommitted_navigation_browser_ui_back_tests(
+            webdriver_port,
+            page_server,
+            url_a,
+            url_d,
+            url_navigation_blocked,
+            url_redirect_to_navigation_blocked,
+            url_cross_site_navigation_blocked,
+        )
+
+        session_id = create_session(webdriver_port)
+        expect_second_ui_forward_supersedes_pending_forward(
+            webdriver_port,
+            session_id,
+            page_server,
+            url_a,
+            url_forward_blocked,
+            url_c,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"first-entry replace initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after first-entry replace test /a", url_a, log)
+        page_server.state_replace_load_document_ran.clear()
+        execute_script(
+            webdriver_port, session_id, f"location.replace({json.dumps(url_state_replace_load)}); return null;"
+        )
+        wait_for_event(page_server.state_replace_load_document_ran, "state replace-load document script")
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after first-entry location.replace() to /state?replace-load",
+            url_state_replace_load,
+            log,
+        )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after first-entry location.replace() to /state?replace-load",
+            [url_state_replace_load],
+            [0],
+            0,
+            False,
+            False,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"same-URL UI load initial: {current_url(webdriver_port, session_id)}"]
+        expect_same_url_ui_load_replaces_current_entry(webdriver_port, session_id, url_a, log)
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        run_self_contained_navigation_tests(webdriver_port, page_port, url_a)
+
+        session_id = create_session(webdriver_port)
+        log = [f"duplicate URL crash recovery initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after duplicate URL setup /a", url_a, log)
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after first duplicate URL setup /b", url_b, log)
+        load_url_from_ui(webdriver_port, session_id, url_c)
+        expect_url(webdriver_port, session_id, "after duplicate URL setup /c", url_c, log)
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after second duplicate URL setup /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after duplicate URL setup",
+            [url_a, url_b, url_c, url_b],
+            [0, 1, 2, 3],
+            3,
+            True,
+            False,
+            log,
+        )
+
+        crash_current_page(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after duplicate URL crash recovery", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after duplicate URL crash recovery",
+            [url_a, url_b, url_c, url_b],
+            [0, 1, 2, 3],
+            3,
+            True,
+            False,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after duplicate URL crash recovery back", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after duplicate URL crash recovery back",
+            [url_a, url_b, url_c, url_b],
+            [0, 1, 2, 3],
+            2,
+            True,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after duplicate URL crash recovery second back", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after duplicate URL crash recovery second back",
+            [url_a, url_b, url_c, url_b],
+            [0, 1, 2, 3],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after duplicate URL crash recovery third back", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after duplicate URL crash recovery third back",
+            [url_a, url_b, url_c, url_b],
+            [0, 1, 2, 3],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_no_entry_history_log = True
+        expect_url(webdriver_port, session_id, "after duplicate URL crash recovery back past start", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after duplicate URL crash recovery back past start",
+            [url_a, url_b, url_c, url_b],
+            [0, 1, 2, 3],
+            0,
+            False,
+            True,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked cross-site POST process swap initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_cross_site_post_blocked_form)
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked cross-site POST form load",
+            url_cross_site_post_blocked_form,
+            log,
+        )
+        post_form_submit_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const button = document.getElementById('submit');
+const rect = button.getBoundingClientRect();
+return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)];
+""",
+        )
+        page_server.blocked_cross_site_post_requested.clear()
+        page_server.release_blocked_cross_site_post.clear()
+        page_server.cross_site_post_result_document_ran.clear()
+
+        def request_blocked_cross_site_post():
+            perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
+
+        blocked_cross_site_post_thread = threading.Thread(target=request_blocked_cross_site_post)
+        blocked_cross_site_post_thread.start()
+        wait_for_event(page_server.blocked_cross_site_post_requested, "blocked cross-site POST")
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "while cross-site POST process swap is blocked",
+            [url_cross_site_post_blocked_form],
+            [0],
+            0,
+            False,
+            False,
+            log,
+        )
+        page_server.release_blocked_cross_site_post.set()
+        blocked_cross_site_post_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+        if blocked_cross_site_post_thread.is_alive():
+            raise AssertionError("Timed out waiting for blocked cross-site POST request to finish\n" + "\n".join(log))
+        wait_for_event(page_server.cross_site_post_result_document_ran, "blocked cross-site POST result document")
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked cross-site POST form submit",
+            url_cross_site_post_blocked_result,
+            log,
+        )
+        wait_for_body_text(
+            webdriver_port, session_id, "after blocked cross-site POST form submit", "POST:name=ladybird", log
+        )
+        expect_current_entry_resource(
+            webdriver_port, session_id, "after blocked cross-site POST form submit", "post", log
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"cross-site POST process swap initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_cross_site_post_form)
+        expect_url(webdriver_port, session_id, "after cross-site POST form load", url_cross_site_post_form, log)
+        post_form_submit_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const button = document.getElementById('submit');
+const rect = button.getBoundingClientRect();
+return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)];
+""",
+        )
+        page_server.post_result_document_ran.clear()
+        perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
+        wait_for_event(page_server.post_result_document_ran, "cross-site POST result document")
+        expect_url(webdriver_port, session_id, "after cross-site POST form submit", url_cross_site_post_result, log)
+        wait_for_body_text(webdriver_port, session_id, "after cross-site POST form submit", "POST:name=ladybird", log)
+        expect_current_entry_resource(webdriver_port, session_id, "after cross-site POST form submit", "post", log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site POST form submit",
+            [url_cross_site_post_form, url_cross_site_post_result],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked process-swap UI back initial: {current_url(webdriver_port, session_id)}"]
+        with page_server.process_swap_back_blocked_request_lock:
+            page_server.process_swap_back_blocked_request_count = 0
+        page_server.blocked_process_swap_back_requested.clear()
+        page_server.release_blocked_process_swap_back.clear()
+        load_url_from_ui(webdriver_port, session_id, url_process_swap_back_blocked)
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap setup /process-swap-back-blocked",
+            url_process_swap_back_blocked,
+            log,
+        )
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after blocked process-swap setup /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap setup",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        page_server.process_swap_back_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        wait_for_event(page_server.blocked_process_swap_back_requested, "blocked process-swap UI back")
+        expect_pending_history_operation_traversal(
+            webdriver_port,
+            session_id,
+            "while process-swap UI back loads target",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            1,
+            0,
+            log,
+        )
+        page_server.release_blocked_process_swap_back.set()
+        wait_for_event(page_server.process_swap_back_document_ran, "process-swap UI back document")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap UI back converges",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap UI back completes",
+            url_process_swap_back_blocked,
+            log,
+        )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap UI back completes",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked process-swap WebDriver back initial: {current_url(webdriver_port, session_id)}"]
+        with page_server.process_swap_back_blocked_request_lock:
+            page_server.process_swap_back_blocked_request_count = 0
+        page_server.blocked_process_swap_back_requested.clear()
+        page_server.release_blocked_process_swap_back.clear()
+        load_url_from_ui(webdriver_port, session_id, url_process_swap_back_blocked)
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap WebDriver setup /process-swap-back-blocked",
+            url_process_swap_back_blocked,
+            log,
+        )
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after blocked process-swap WebDriver setup /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap WebDriver setup",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        webdriver_back_error = []
+
+        def request_webdriver_back():
+            try:
+                request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+            except Exception as error:
+                webdriver_back_error.append(error)
+
+        webdriver_back_thread = threading.Thread(target=request_webdriver_back)
+        page_server.process_swap_back_document_ran.clear()
+        webdriver_back_thread.start()
+        wait_for_event(page_server.blocked_process_swap_back_requested, "blocked process-swap WebDriver back")
+        page_server.release_blocked_process_swap_back.set()
+        wait_for_event(page_server.process_swap_back_document_ran, "process-swap WebDriver back document")
+        webdriver_back_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+        if webdriver_back_thread.is_alive():
+            raise AssertionError("Timed out waiting for WebDriver back request to finish\n" + "\n".join(log))
+        if webdriver_back_error:
+            raise webdriver_back_error[0]
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap WebDriver back completes",
+            url_process_swap_back_blocked,
+            log,
+        )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap WebDriver back completes",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked process-swap WebDriver back beforeunload initial: {current_url(webdriver_port, session_id)}"]
+        with page_server.process_swap_back_blocked_request_lock:
+            page_server.process_swap_back_blocked_request_count = 0
+        page_server.blocked_process_swap_back_requested.clear()
+        page_server.release_blocked_process_swap_back.clear()
+        load_url_from_ui(webdriver_port, session_id, url_process_swap_back_blocked)
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap WebDriver beforeunload setup /process-swap-back-blocked",
+            url_process_swap_back_blocked,
+            log,
+        )
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after blocked process-swap WebDriver beforeunload setup /b", url_b, log)
+        before_blocked_process_swap_webdriver_back = expect_session_history_idle(
+            webdriver_port, session_id, "before blocked process-swap WebDriver back from /b", log
+        )
+        beforeunload_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+window.beforeUnloadCount = 0;
+window.onbeforeunload = event => {
+    ++window.beforeUnloadCount;
+    event.preventDefault();
+    event.returnValue = "blocked";
+    return "blocked";
+};
+return [location.href, window.beforeUnloadCount];
+""",
+        )
+        if beforeunload_setup != [url_b, 0]:
+            raise AssertionError(
+                f"Expected process-swap WebDriver beforeunload setup on /b to be {[url_b, 0]}, "
+                f"got {beforeunload_setup}\n" + "\n".join(log)
+            )
+        inert_click_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const rect = document.querySelector("p").getBoundingClientRect();
+return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.height / 2)];
+""",
+        )
+        perform_pointer_click(webdriver_port, session_id, inert_click_point[0], inert_click_point[1], log)
+
+        webdriver_back_error = []
+
+        def request_blocked_webdriver_back():
+            try:
+                request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+            except Exception as error:
+                webdriver_back_error.append(error)
+
+        webdriver_back_thread = threading.Thread(target=request_blocked_webdriver_back)
+        webdriver_back_thread.start()
+        webdriver_back_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+        if page_server.blocked_process_swap_back_requested.is_set():
+            page_server.release_blocked_process_swap_back.set()
+            webdriver_back_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+            raise AssertionError(
+                "Expected beforeunload to cancel process-swap WebDriver back before loading target\n" + "\n".join(log)
+            )
+        if webdriver_back_thread.is_alive():
+            raise AssertionError(
+                "Timed out waiting for blocked process-swap WebDriver back request to finish\n" + "\n".join(log)
+            )
+        if webdriver_back_error:
+            raise webdriver_back_error[0]
+        blocked_process_swap_webdriver_back_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.beforeUnloadCount];",
+        )
+        if blocked_process_swap_webdriver_back_state != [url_b, 1]:
+            raise AssertionError(
+                f"Expected beforeunload to cancel process-swap WebDriver back from /b, "
+                f"got {blocked_process_swap_webdriver_back_state}\n" + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap WebDriver back from /b",
+            history_entry_urls(before_blocked_process_swap_webdriver_back["ui"]),
+            history_used_steps(before_blocked_process_swap_webdriver_back["ui"]),
+            before_blocked_process_swap_webdriver_back["ui"]["currentUsedStepIndex"],
+            before_blocked_process_swap_webdriver_back["ui"]["backButtonEnabled"],
+            before_blocked_process_swap_webdriver_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked process-swap UI back crash recovery initial: {current_url(webdriver_port, session_id)}"]
+        with page_server.process_swap_back_blocked_request_lock:
+            page_server.process_swap_back_blocked_request_count = 0
+        page_server.blocked_process_swap_back_requested.clear()
+        page_server.process_swap_back_recovery_requested.clear()
+        page_server.release_blocked_process_swap_back.clear()
+        load_url_from_ui(webdriver_port, session_id, url_process_swap_back_blocked)
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after process-swap crash recovery setup /process-swap-back-blocked",
+            url_process_swap_back_blocked,
+            log,
+        )
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after process-swap crash recovery setup /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after process-swap crash recovery setup",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        page_server.process_swap_back_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        wait_for_event(
+            page_server.blocked_process_swap_back_requested,
+            "blocked process-swap UI back before crash",
+        )
+        expect_pending_history_operation_traversal(
+            webdriver_port,
+            session_id,
+            "while process-swap UI back loads target before crash",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            1,
+            0,
+            log,
+        )
+        crash_current_page(webdriver_port, session_id, wait_for_navigation_completion=False)
+        wait_for_event(page_server.process_swap_back_recovery_requested, "process-swap back recovery request")
+        page_server.release_blocked_process_swap_back.set()
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "while process-swap UI back recovers target after crash",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        wait_for_event(page_server.process_swap_back_document_ran, "process-swap UI back recovery document")
+        expect_url(
+            webdriver_port,
+            session_id,
+            "after process-swap UI back crash recovery completes",
+            url_process_swap_back_blocked,
+            log,
+        )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after process-swap UI back crash recovery completes",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        run_blocked_process_swap_ui_forward_crash_recovery_test(
+            webdriver_port,
+            page_server,
+            url_b,
+            url_process_swap_back_blocked,
+        )
+
+        session_id = create_session(webdriver_port)
+        log = [f"nested restore crash recovery initial: {current_url(webdriver_port, session_id)}"]
+        page_server.release_blocked_frame_b.set()
+        page_server.blocked_frame_b_requested.clear()
+        load_url_from_ui(webdriver_port, session_id, url_nested)
+        expect_url(webdriver_port, session_id, "after nested restore crash setup /nested", url_nested, log)
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after nested restore crash setup initial frame",
+            url_frame_a,
+            log,
+            "Frame A",
+        )
+        page_server.frame_b_blocked_document_ran.clear()
+        execute_script(
+            webdriver_port,
+            session_id,
+            f"document.getElementById('frame').contentWindow.location.href = '{url_frame_b_blocked}'; return null;",
+        )
+        wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame setup document")
+        wait_for_frame_url(
+            webdriver_port,
+            session_id,
+            "after nested restore crash setup frame navigation",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested restore crash setup",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        load_url_from_ui(webdriver_port, session_id, url_b)
+        expect_url(webdriver_port, session_id, "after nested restore crash setup /b", url_b, log)
+        expect_session_history_idle(webdriver_port, session_id, "before nested restore crash recovery", log)
+
+        page_server.release_blocked_frame_b.clear()
+        page_server.blocked_frame_b_requested.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "while nested restore crash recovery loads /nested", url_nested, log)
+        wait_for_event(page_server.blocked_frame_b_requested, "blocked nested frame restore before crash")
+        expect_session_history_synchronized(
+            webdriver_port, session_id, "while nested restore crash recovery waits for frame", log
+        )
+        crash_current_page(webdriver_port, session_id, wait_for_navigation_completion=False)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "while nested restore crash recovery reloads current entry",
+            [url_nested, url_b],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+        page_server.frame_b_blocked_document_ran.clear()
+        page_server.release_blocked_frame_b.set()
+        wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame restore document")
+        expect_url(webdriver_port, session_id, "after nested restore crash recovery", url_nested, log)
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after nested restore crash recovery restores iframe",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested restore crash recovery",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        expect_session_history_synchronized(webdriver_port, session_id, "after nested restore crash recovery", log)
+        expect_session_history_idle(webdriver_port, session_id, "after nested restore crash recovery", log)
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked same-site POST initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_post_blocked_form)
+        expect_url(webdriver_port, session_id, "after blocked same-site POST form load", url_post_blocked_form, log)
+        post_form_submit_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const button = document.getElementById('submit');
+const rect = button.getBoundingClientRect();
+return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)];
+""",
+        )
+        page_server.blocked_same_site_post_requested.clear()
+        page_server.release_blocked_same_site_post.clear()
+        page_server.same_site_post_result_document_ran.clear()
+
+        def request_blocked_same_site_post():
+            perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
+
+        blocked_same_site_post_thread = threading.Thread(target=request_blocked_same_site_post)
+        blocked_same_site_post_thread.start()
+        wait_for_event(page_server.blocked_same_site_post_requested, "blocked same-site POST")
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "while same-site POST is blocked",
+            [url_post_blocked_form],
+            [0],
+            0,
+            False,
+            False,
+            log,
+        )
+        page_server.release_blocked_same_site_post.set()
+        blocked_same_site_post_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+        if blocked_same_site_post_thread.is_alive():
+            raise AssertionError("Timed out waiting for blocked same-site POST request to finish\n" + "\n".join(log))
+        wait_for_event(page_server.same_site_post_result_document_ran, "blocked same-site POST result document")
+        expect_url(webdriver_port, session_id, "after blocked same-site POST submit", url_post_blocked_result, log)
+        wait_for_body_text(webdriver_port, session_id, "after blocked same-site POST submit", "POST:name=ladybird", log)
+        expect_current_entry_resource(webdriver_port, session_id, "after blocked same-site POST submit", "post", log)
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"blocked same-URL POST initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_post_same_url_blocked)
+        expect_url(webdriver_port, session_id, "after blocked same-URL POST form load", url_post_same_url_blocked, log)
+        post_form_submit_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const button = document.getElementById('submit');
+const rect = button.getBoundingClientRect();
+return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)];
+""",
+        )
+        page_server.blocked_same_url_post_requested.clear()
+        page_server.release_blocked_same_url_post.clear()
+        page_server.same_url_post_result_document_ran.clear()
+
+        def request_blocked_same_url_post():
+            perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
+
+        blocked_same_url_post_thread = threading.Thread(target=request_blocked_same_url_post)
+        blocked_same_url_post_thread.start()
+        wait_for_event(page_server.blocked_same_url_post_requested, "blocked same-URL POST")
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "while same-URL POST is blocked",
+            [url_post_same_url_blocked],
+            [0],
+            0,
+            False,
+            False,
+            log,
+        )
+        page_server.release_blocked_same_url_post.set()
+        blocked_same_url_post_thread.join(timeout=EVENT_TIMEOUT_SECONDS)
+        if blocked_same_url_post_thread.is_alive():
+            raise AssertionError("Timed out waiting for blocked same-URL POST request to finish\n" + "\n".join(log))
+        wait_for_event(page_server.same_url_post_result_document_ran, "blocked same-URL POST result document")
+        expect_url(webdriver_port, session_id, "after blocked same-URL POST submit", url_post_same_url_blocked, log)
+        wait_for_body_text(webdriver_port, session_id, "after blocked same-URL POST submit", "POST:name=ladybird", log)
+        expect_current_entry_resource(webdriver_port, session_id, "after blocked same-URL POST submit", "post", log)
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"POST crash recovery initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_post_form)
+        expect_url(webdriver_port, session_id, "after POST form load", url_post_form, log)
+        post_form_submit_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const button = document.getElementById('submit');
+const rect = button.getBoundingClientRect();
+return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)];
+""",
+        )
+        page_server.post_result_document_ran.clear()
+        perform_pointer_click(webdriver_port, session_id, post_form_submit_point[0], post_form_submit_point[1], log)
+        wait_for_event(page_server.post_result_document_ran, "POST result document")
+        expect_url(webdriver_port, session_id, "after POST form submit", url_post_result, log)
+        wait_for_body_text(webdriver_port, session_id, "after POST form submit", "POST:name=ladybird", log)
+        expect_current_entry_resource(webdriver_port, session_id, "after POST form submit", "post", log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after POST form submit",
+            [url_post_form, url_post_result],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        refresh(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after POST reload", url_post_result, log)
+        expect_body_text(webdriver_port, session_id, "after POST reload", "POST:name=ladybird", log)
+        expect_current_entry_resource(webdriver_port, session_id, "after POST reload", "post", log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after POST reload",
+            [url_post_form, url_post_result],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        expect_post_crash_recovery_waits_for_load(
+            webdriver_port,
+            session_id,
+            page_server,
+            url_post_result,
+            log,
+        )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after POST crash recovery",
+            [url_post_form, url_post_result],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = None
+
+        session_id = create_session(webdriver_port)
+        log = [f"initial: {current_url(webdriver_port, session_id)}"]
+        load_url_from_ui(webdriver_port, session_id, url_a)
+        expect_url(webdriver_port, session_id, "after /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after /a",
+            [url_a],
+            [0],
+            0,
+            False,
+            False,
+            log,
+        )
+
+        load_url_from_ui(webdriver_port, session_id, url_redirect_to_b)
+        expect_url(webdriver_port, session_id, "after UI redirect navigation to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after UI redirect navigation to /b",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after back from UI redirect navigation", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back from UI redirect navigation",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        navigate_from_renderer_using_link(
+            webdriver_port,
+            session_id,
+            "#redirect",
+            url_b,
+            log,
+            page_server.b_document_ran,
+            "B document after renderer redirect link",
+            expected_scheduled_url=url_redirect_to_b,
+        )
+        expect_url(webdriver_port, session_id, "after renderer redirect navigation to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after renderer redirect navigation to /b",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after back from renderer redirect navigation", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back from renderer redirect navigation",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after forward from renderer redirect navigation", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after forward from renderer redirect navigation",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after returning to /a from renderer redirect navigation", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after returning to /a from renderer redirect navigation",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        navigate_from_renderer_using_link(
+            webdriver_port, session_id, "#go", url_b, log, page_server.b_document_ran, "B document after link"
+        )
+        expect_url(webdriver_port, session_id, "after renderer navigation to /b", url_b, log)
+        after_renderer_navigation_to_b = expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after renderer navigation to /b",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        page_server.a_document_ran.clear()
+        execute_script(webdriver_port, session_id, "history.back(); return location.href;")
+        wait_for_event(page_server.a_document_ran, "A document after page-initiated history.back()")
+        expect_url(webdriver_port, session_id, "after page-initiated history.back() to /a", url_a, log)
+        after_page_initiated_history_back_to_a = expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after page-initiated history.back() to /a",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        if (
+            after_page_initiated_history_back_to_a["ui"]["webContentProcessID"]
+            == after_renderer_navigation_to_b["ui"]["webContentProcessID"]
+        ):
+            raise AssertionError(
+                "Expected page-initiated cross-site history.back() to swap processes\n" + "\n".join(log)
+            )
+
+        page_server.b_document_ran.clear()
+        execute_script(webdriver_port, session_id, "history.forward(); return location.href;")
+        wait_for_event(page_server.b_document_ran, "B document after page-initiated history.forward()")
+        expect_url(webdriver_port, session_id, "after page-initiated history.forward() to /b", url_b, log)
+        after_page_initiated_history_forward_to_b = expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after page-initiated history.forward() to /b",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+        if (
+            after_page_initiated_history_forward_to_b["ui"]["webContentProcessID"]
+            == after_page_initiated_history_back_to_a["ui"]["webContentProcessID"]
+        ):
+            raise AssertionError(
+                "Expected page-initiated cross-site history.forward() to swap processes\n" + "\n".join(log)
+            )
+
+        expect_sandboxed_history_back_to_be_blocked(webdriver_port, session_id, url_a, url_b, log)
+
+        before_script_initiated_blocked_back = after_page_initiated_history_forward_to_b
+        perform_pointer_click(webdriver_port, session_id, 5, 5, log)
+        script_beforeunload_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+window.scriptBeforeUnloadCount = 0;
+window.onbeforeunload = event => {
+    ++window.scriptBeforeUnloadCount;
+    event.preventDefault();
+    event.returnValue = "blocked";
+    return "blocked";
+};
+return [location.href, window.scriptBeforeUnloadCount, navigator.userActivation.hasBeenActive];
+""",
+        )
+        if script_beforeunload_setup != [url_b, 0, True]:
+            raise AssertionError(
+                f"Expected script beforeunload setup on /b to be {[url_b, 0, True]}, "
+                f"got {script_beforeunload_setup}\n" + "\n".join(log)
+            )
+        execute_script(webdriver_port, session_id, "history.back(); return location.href;")
+
+        def script_back_canceled_by_beforeunload(result):
+            return (
+                isinstance(result, list)
+                and len(result) == 2
+                and result[0] == url_b
+                and isinstance(result[1], int)
+                and result[1] >= 1
+            )
+
+        script_blocked_back_state = wait_for_script_result(
+            webdriver_port,
+            session_id,
+            "blocked script-initiated cross-site history.back() from /b",
+            "return [location.href, window.scriptBeforeUnloadCount];",
+            script_back_canceled_by_beforeunload,
+            log,
+        )
+        if script_blocked_back_state != [url_b, 1]:
+            raise AssertionError(
+                f"Expected beforeunload to cancel script-initiated cross-site history.back(), "
+                f"got {script_blocked_back_state}\n" + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked script-initiated cross-site history.back()",
+            history_entry_urls(before_script_initiated_blocked_back["ui"]),
+            history_used_steps(before_script_initiated_blocked_back["ui"]),
+            before_script_initiated_blocked_back["ui"]["currentUsedStepIndex"],
+            before_script_initiated_blocked_back["ui"]["backButtonEnabled"],
+            before_script_initiated_blocked_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+        execute_script(webdriver_port, session_id, "window.onbeforeunload = null; return null;")
+
+        page_server.a_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        wait_for_event(page_server.a_document_ran, "A document after browser back")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site browser back to /a converges",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+        expect_url(webdriver_port, session_id, "after cross-site browser back to /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site browser back to /a",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        page_server.b_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, 1, wait_for_navigation_completion=False)
+        wait_for_event(page_server.b_document_ran, "B document after browser forward")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site browser forward to /b converges",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+        expect_url(webdriver_port, session_id, "after cross-site browser forward to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site browser forward to /b",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+        )
+
+        navigate_from_renderer_using_link(
+            webdriver_port, session_id, "#go", url_c, log, page_server.c_document_ran, "C document after link"
+        )
+        expect_url(webdriver_port, session_id, "after renderer navigation to /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after renderer navigation to /c",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        page_server.b_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+        wait_for_event(page_server.b_document_ran, "B document after browser back")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after browser back to /b converges",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+        expect_url(webdriver_port, session_id, "after browser back to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after browser back to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        page_server.c_document_ran.clear()
+        traverse_history_from_ui(webdriver_port, session_id, 1, wait_for_navigation_completion=False)
+        wait_for_event(page_server.c_document_ran, "C document after browser forward")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after browser forward to /c converges",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+        expect_url(webdriver_port, session_id, "after browser forward to /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after browser forward to /c",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after back to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after back to /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back to /a",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after back no-op at start", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after back no-op at start",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after second back no-op at start", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after second back no-op at start",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after forward to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after forward to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after forward to /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after forward to /c",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after forward no-op at end", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after forward no-op at end",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        crash_current_page(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after crash recovery at /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery at /c",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        page_server.b_document_ran.clear()
+        execute_script(webdriver_port, session_id, "history.back(); return location.href;")
+        wait_for_event(page_server.b_document_ran, "B document after crash-recovered page history.back()")
+        expect_url(webdriver_port, session_id, "after crash recovery page-initiated back to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery page-initiated back to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        page_server.c_document_ran.clear()
+        execute_script(webdriver_port, session_id, "history.forward(); return location.href;")
+        wait_for_event(page_server.c_document_ran, "C document after crash-recovered page history.forward()")
+        expect_url(webdriver_port, session_id, "after crash recovery page-initiated forward to /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery page-initiated forward to /c",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after crash recovery browser UI back to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery browser UI back to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after crash recovery back to /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery back to /a",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after crash recovery forward to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery forward to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after crash recovery forward to /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery forward to /c",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after crash recovery branch back to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after crash recovery branch back to /b",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        navigate_from_renderer_using_link(
+            webdriver_port, session_id, "#branch", url_d, log, page_server.d_document_ran, "D document after link"
+        )
+        expect_url(webdriver_port, session_id, "after renderer branch navigation to /d", url_d, log)
+        initial_history_state_after_branch = execute_script(
+            webdriver_port,
+            session_id,
+            """
+return [
+    window.initialHistoryLength,
+    window.initialNavigationEntryCount,
+    window.initialNavigationCurrentIndex,
+];
+""",
+        )
+        # history.length counts all entries, but navigation.entries() only
+        # exposes the same-origin contiguous entries around the current entry.
+        expected_initial_history_state_after_branch = [3, 1, 0]
+        if initial_history_state_after_branch != expected_initial_history_state_after_branch:
+            raise AssertionError(
+                f"Expected /d initial history state to be {expected_initial_history_state_after_branch}, "
+                f"got {initial_history_state_after_branch}\n" + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after renderer branch navigation to /d",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        crash_current_page(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after /d crash recovery", url_d, log)
+        initial_history_state_after_branch_crash_recovery = execute_script(
+            webdriver_port,
+            session_id,
+            """
+return [
+    window.initialHistoryLength,
+    window.initialNavigationEntryCount,
+    window.initialNavigationCurrentIndex,
+];
+""",
+        )
+        if initial_history_state_after_branch_crash_recovery != expected_initial_history_state_after_branch:
+            raise AssertionError(
+                f"Expected /d crash recovery initial history state to be {expected_initial_history_state_after_branch}, "
+                f"got {initial_history_state_after_branch_crash_recovery}\n" + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after /d crash recovery",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after UI back from /d to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after UI back from /d to /b",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after UI back from /b to /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after UI back from /b to /a",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after UI back no-op at /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after UI back no-op at /a",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after second UI back no-op at /a", url_a, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after second UI back no-op at /a",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            0,
+            False,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, 1)
+        expect_url(webdriver_port, session_id, "after UI forward from /a to /b", url_b, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after UI forward from /a to /b",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, 1)
+        expect_url(webdriver_port, session_id, "after UI forward from /b to /d", url_d, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after UI forward from /b to /d",
+            [url_a, url_b, url_d],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_state})
+        expect_url(webdriver_port, session_id, "after /state", url_state, log)
+        state_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+window.name = "ladybird-history-name";
+history.scrollRestoration = "manual";
+history.replaceState({ classic: "replace" }, "", "/state?replace");
+navigation.updateCurrentEntry({ state: { navigation: "replace" } });
+const replaceKey = navigation.currentEntry.key;
+const replaceId = navigation.currentEntry.id;
+history.pushState({ classic: "push" }, "", "/state?push");
+navigation.updateCurrentEntry({ state: { navigation: "push" } });
+return [
+    location.href,
+    JSON.stringify(history.state),
+    JSON.stringify(navigation.currentEntry.getState()),
+    history.scrollRestoration,
+    replaceKey,
+    replaceId,
+    navigation.currentEntry.key,
+    navigation.currentEntry.id,
+    window.name,
+];
+""",
+        )
+        expected_state_setup = [
+            url_state_push,
+            '{"classic":"push"}',
+            '{"navigation":"push"}',
+            "manual",
+        ]
+        if state_setup[:4] != expected_state_setup:
+            raise AssertionError(
+                f"Expected state setup to start with {expected_state_setup}, got {state_setup}\n" + "\n".join(log)
+            )
+        replace_key, replace_id, push_key, push_id, window_name = state_setup[4:]
+        if window_name != "ladybird-history-name":
+            raise AssertionError(f"Expected window.name setup to survive setup, got {window_name}\n" + "\n".join(log))
+
+        def ui_history_is_at_state_push(snapshot):
+            ui_history = snapshot["ui"]
+            current_index = ui_history["currentUsedStepIndex"]
+            if current_index < 0 or current_index >= len(ui_history["entries"]):
+                return False
+            return (
+                history_entry_urls(ui_history)[current_index] == url_state_push
+                and ui_history["pendingSessionHistoryTraversal"] is None
+            )
+
+        wait_for_session_history(
+            webdriver_port,
+            session_id,
+            "before state crash recovery",
+            ui_history_is_at_state_push,
+            log,
+        )
+        crash_current_page(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after state crash recovery", url_state_push, log)
+        expect_window_name(
+            webdriver_port,
+            session_id,
+            "after state crash restores window name",
+            "ladybird-history-name",
+            log,
+        )
+        expect_history_entry_state(
+            webdriver_port,
+            session_id,
+            "after state crash restores current entry state",
+            url_state_push,
+            '{"classic":"push"}',
+            '{"navigation":"push"}',
+            "manual",
+            push_key,
+            push_id,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after state crash recovery back", url_state_replace, log)
+        expect_history_entry_state(
+            webdriver_port,
+            session_id,
+            "after state crash restores previous entry state",
+            url_state_replace,
+            '{"classic":"replace"}',
+            '{"navigation":"replace"}',
+            "manual",
+            replace_key,
+            replace_id,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after state crash recovery forward", url_state_push, log)
+        expect_history_entry_state(
+            webdriver_port,
+            session_id,
+            "after state crash restores forward entry state",
+            url_state_push,
+            '{"classic":"push"}',
+            '{"navigation":"push"}',
+            "manual",
+            push_key,
+            push_id,
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_scroll})
+        expect_url(webdriver_port, session_id, "after /scroll", url_scroll, log)
+        scroll_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+history.scrollRestoration = "auto";
+scrollTo(0, 1200);
+history.replaceState({ scroll: "saved" }, "", "/scroll?saved");
+return [location.href, Math.round(scrollX), Math.round(scrollY)];
+""",
+        )
+        expected_scroll_setup = [url_scroll_saved, 0, 1200]
+        if scroll_setup != expected_scroll_setup:
+            raise AssertionError(
+                f"Expected scroll setup to be {expected_scroll_setup}, got {scroll_setup}\n" + "\n".join(log)
+            )
+        expect_url(webdriver_port, session_id, "after scroll setup", url_scroll_saved, log)
+
+        crash_current_page(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after scroll crash recovery", url_scroll_saved, log)
+        expect_scroll_position(webdriver_port, session_id, "after scroll crash restores viewport", 0, 1200, log)
+
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_b})
+        expect_url(webdriver_port, session_id, "after leaving scrolled page", url_b, log)
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after restoring scrolled page", url_scroll_saved, log)
+        expect_scroll_position(webdriver_port, session_id, "after back restores viewport", 0, 1200, log)
+
+        crash_current_page(webdriver_port, session_id)
+        expect_url(webdriver_port, session_id, "after restored scroll crash recovery", url_scroll_saved, log)
+        expect_scroll_position(
+            webdriver_port,
+            session_id,
+            "after restored scroll crash recovery keeps viewport",
+            0,
+            1200,
+            log,
+        )
+
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = create_session(webdriver_port)
+        log.append(f"back waits for restored document load initial: {current_url(webdriver_port, session_id)}")
+        expect_back_waits_for_restored_document_load(webdriver_port, session_id, page_server, url_held_load, url_b, log)
+
+        request(webdriver_port, "DELETE", f"/session/{session_id}")
+        session_id = create_session(webdriver_port)
+        log.append(f"intercepted same-document scroll initial: {current_url(webdriver_port, session_id)}")
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_scroll})
+        expect_url(webdriver_port, session_id, "before intercepted scroll setup", url_scroll, log)
+
+        intercepted_scroll_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+navigation.onnavigate = null;
+history.scrollRestoration = "auto";
+scrollTo(0, 900);
+history.replaceState({ scroll: "intercept-source" }, "", "/scroll?intercept-source");
+history.pushState({ scroll: "intercept-current" }, "", "/scroll?intercept-current");
+scrollTo(0, 0);
+navigation.onnavigate = event => {
+    if (event.navigationType === "traverse")
+        event.intercept({ scroll: "manual", handler: () => Promise.resolve() });
+};
+return [location.href, Math.round(scrollX), Math.round(scrollY)];
+""",
+        )
+        url_scroll_intercept_source = f"http://localhost:{page_port}/scroll?intercept-source"
+        url_scroll_intercept_current = f"http://localhost:{page_port}/scroll?intercept-current"
+        expected_intercepted_scroll_setup = [url_scroll_intercept_current, 0, 0]
+        if intercepted_scroll_setup != expected_intercepted_scroll_setup:
+            raise AssertionError(
+                f"Expected intercepted scroll setup to be {expected_intercepted_scroll_setup}, got {intercepted_scroll_setup}\n"
+                + "\n".join(log)
+            )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        wait_for_url(webdriver_port, session_id, "after intercepted scroll back", url_scroll_intercept_source, log)
+        expect_scroll_position(
+            webdriver_port, session_id, "after intercepted back suppresses scroll restore", 0, 0, log
+        )
+
+        browser_ui_traverse_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+navigation.onnavigate = null;
+history.pushState({ cancel: "current" }, "", "/scroll?cancel-current");
+window.canceledTraverseCount = 0;
+navigation.onnavigate = event => {
+    if (event.navigationType === "traverse") {
+        ++window.canceledTraverseCount;
+        event.preventDefault();
+    }
+};
+return [location.href, window.canceledTraverseCount];
+""",
+        )
+        url_scroll_cancel_current = f"http://localhost:{page_port}/scroll?cancel-current"
+        expected_browser_ui_traverse_setup = [url_scroll_cancel_current, 0]
+        if browser_ui_traverse_setup != expected_browser_ui_traverse_setup:
+            raise AssertionError(
+                f"Expected browser UI traverse setup to be {expected_browser_ui_traverse_setup}, got {browser_ui_traverse_setup}\n"
+                + "\n".join(log)
+            )
+
+        def browser_ui_traverse_setup_is_idle(snapshot):
+            ui_history = snapshot["ui"]
+            if ui_history["pendingSessionHistoryTraversal"] is not None:
+                return False
+            return history_current_entry(ui_history)["url"] == url_scroll_cancel_current
+
+        history_before_browser_ui_traverse = wait_for_session_history(
+            webdriver_port,
+            session_id,
+            "before browser UI traverse with navigate cancel handler",
+            browser_ui_traverse_setup_is_idle,
+            log,
+        )
+        if history_before_browser_ui_traverse["ui"]["currentUsedStepIndex"] == 0:
+            raise AssertionError(
+                "Expected browser UI traverse setup to have a previous history entry\n" + "\n".join(log)
+            )
+        expected_browser_ui_traverse_url = history_entry_urls(history_before_browser_ui_traverse["ui"])[
+            history_before_browser_ui_traverse["ui"]["currentUsedStepIndex"] - 1
+        ]
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        browser_ui_traverse_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.canceledTraverseCount];",
+        )
+        if browser_ui_traverse_state != [expected_browser_ui_traverse_url, 1]:
+            raise AssertionError(
+                f"Expected browser UI traverse to ignore non-cancelable preventDefault() and move to "
+                f"{[expected_browser_ui_traverse_url, 1]}, got {browser_ui_traverse_state}\n" + "\n".join(log)
+            )
+        history_after_browser_ui_traverse = expect_session_history_idle(
+            webdriver_port, session_id, "after browser UI traverse with navigate cancel handler", log
+        )
+        log.append(f"after browser UI traverse: {summarize_history_snapshot(history_after_browser_ui_traverse)}")
+
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_nested})
+        expect_url(webdriver_port, session_id, "after /nested", url_nested, log)
+        expect_frame_url(webdriver_port, session_id, "after initial frame load", url_frame_a, log, "Frame A")
+        expect_current_entry_nested_history(webdriver_port, session_id, "after /nested", url_nested, [url_frame_a], log)
+
+        page_server.release_blocked_frame_b.set()
+        page_server.frame_b_blocked_document_ran.clear()
+        execute_script(
+            webdriver_port,
+            session_id,
+            f"document.getElementById('frame').contentWindow.location.href = '{url_frame_b_blocked}'; return null;",
+        )
+        wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame document")
+        wait_for_frame_url(
+            webdriver_port, session_id, "after nested frame navigation", url_frame_b_blocked, log, "Frame B Blocked"
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested frame navigation",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+
+        page_server.frame_b_blocked_document_ran.clear()
+        crash_current_page(webdriver_port, session_id)
+        wait_for_event(page_server.frame_b_blocked_document_ran, "nested frame document after crash recovery")
+        expect_url(webdriver_port, session_id, "after nested crash recovery", url_nested, log)
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after nested crash restores iframe",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested crash recovery",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        expect_session_history_synchronized(webdriver_port, session_id, "after nested crash recovery", log)
+        expect_session_history_idle(webdriver_port, session_id, "after nested crash recovery", log)
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after nested crash recovery frame back", url_nested, log)
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after nested crash recovery frame back",
+            url_frame_a,
+            log,
+            "Frame A",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested crash recovery frame back",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        expect_session_history_idle(webdriver_port, session_id, "after nested crash recovery frame back", log)
+
+        request(webdriver_port, "POST", f"/session/{session_id}/forward", {})
+        expect_url(webdriver_port, session_id, "after nested crash recovery frame forward", url_nested, log)
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after nested crash recovery frame forward",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested crash recovery frame forward",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        expect_session_history_idle(webdriver_port, session_id, "after nested crash recovery frame forward", log)
+
+        same_document_nested_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+history.pushState({ nested: "same-document" }, "", "/nested?same-document");
+return location.href;
+""",
+        )
+        if same_document_nested_setup != url_nested_same_document:
+            raise AssertionError(
+                f"Expected same-document nested setup to be {url_nested_same_document}, "
+                f"got {same_document_nested_setup}\n" + "\n".join(log)
+            )
+        wait_for_session_history(
+            webdriver_port,
+            session_id,
+            "after same-document nested setup reaches UI",
+            lambda snapshot: history_current_entry(snapshot["ui"])["url"] == url_nested_same_document,
+            log,
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after same-document nested setup",
+            url_nested_same_document,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+
+        page_server.frame_b_blocked_document_ran.clear()
+        crash_current_page(webdriver_port, session_id)
+        wait_for_event(
+            page_server.frame_b_blocked_document_ran,
+            "same-document nested frame document after crash recovery",
+        )
+        expect_url(
+            webdriver_port, session_id, "after same-document nested crash recovery", url_nested_same_document, log
+        )
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after same-document nested crash restores iframe",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after same-document nested crash recovery",
+            url_nested_same_document,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        expect_session_history_synchronized(
+            webdriver_port, session_id, "after same-document nested crash recovery", log
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after same-document nested back", url_nested, log)
+        expect_frame_url(
+            webdriver_port,
+            session_id,
+            "after same-document nested back keeps iframe history",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after same-document nested back",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_b})
+        expect_url(webdriver_port, session_id, "after cross-site /b", url_b, log)
+        expect_current_top_level_history_url(webdriver_port, session_id, "after cross-site /b", url_b, log)
+        expect_navigation_buttons(webdriver_port, session_id, "after cross-site /b", True, False, log)
+        expect_session_history_idle(webdriver_port, session_id, "after cross-site /b process swap", log)
+
+        before_blocked_browser_ui_back = expect_session_history_idle(
+            webdriver_port, session_id, "before blocked browser UI back from /b", log
+        )
+        navigate_event_cancel_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+window.canceledCrossSiteNavigateCount = 0;
+navigation.onnavigate = event => {
+    if (event.navigationType === "push") {
+        ++window.canceledCrossSiteNavigateCount;
+        event.preventDefault();
+    }
+};
+return [location.href, window.canceledCrossSiteNavigateCount];
+""",
+        )
+        if navigate_event_cancel_setup != [url_b, 0]:
+            raise AssertionError(
+                f"Expected navigate event cancel setup on /b to be {[url_b, 0]}, got {navigate_event_cancel_setup}\n"
+                + "\n".join(log)
+            )
+        cross_site_navigate_event_click_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const rect = document.querySelector("#branch").getBoundingClientRect();
+return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.height / 2)];
+""",
+        )
+        perform_pointer_click(
+            webdriver_port,
+            session_id,
+            cross_site_navigate_event_click_point[0],
+            cross_site_navigate_event_click_point[1],
+            log,
+        )
+        canceled_cross_site_navigate_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.canceledCrossSiteNavigateCount];",
+        )
+        if canceled_cross_site_navigate_state != [url_b, 1]:
+            raise AssertionError(
+                f"Expected navigate event to cancel cross-site link navigation from /b, got {canceled_cross_site_navigate_state}\n"
+                + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after navigate event canceled cross-site link navigation from /b",
+            history_entry_urls(before_blocked_browser_ui_back["ui"]),
+            history_used_steps(before_blocked_browser_ui_back["ui"]),
+            before_blocked_browser_ui_back["ui"]["currentUsedStepIndex"],
+            before_blocked_browser_ui_back["ui"]["backButtonEnabled"],
+            before_blocked_browser_ui_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+        execute_script(webdriver_port, session_id, "navigation.onnavigate = null; return null;")
+
+        expect_javascript_noop_webdriver_navigation_does_not_change_history(
+            webdriver_port,
+            session_id,
+            url_b,
+            before_blocked_browser_ui_back,
+            log,
+        )
+
+        expect_javascript_noop_ui_load_does_not_change_history(
+            webdriver_port,
+            session_id,
+            url_b,
+            before_blocked_browser_ui_back,
+            log,
+        )
+
+        beforeunload_setup = execute_script(
+            webdriver_port,
+            session_id,
+            """
+window.beforeUnloadCount = 0;
+window.onbeforeunload = event => {
+    ++window.beforeUnloadCount;
+    event.preventDefault();
+    event.returnValue = "blocked";
+    return "blocked";
+};
+return [location.href, window.beforeUnloadCount];
+""",
+        )
+        if beforeunload_setup != [url_b, 0]:
+            raise AssertionError(
+                f"Expected beforeunload setup on /b to be {[url_b, 0]}, got {beforeunload_setup}\n" + "\n".join(log)
+            )
+        link_click_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const rect = document.querySelector("#go").getBoundingClientRect();
+return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.height / 2)];
+""",
+        )
+        perform_pointer_click(webdriver_port, session_id, link_click_point[0], link_click_point[1], log)
+        user_activation = execute_script(webdriver_port, session_id, "return navigator.userActivation.hasBeenActive;")
+        if user_activation is not True:
+            raise AssertionError("Expected pointer click to give /b sticky activation\n" + "\n".join(log))
+
+        blocked_link_navigation_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.beforeUnloadCount];",
+        )
+        if blocked_link_navigation_state[0] != url_b or blocked_link_navigation_state[1] < 1:
+            raise AssertionError(
+                f"Expected beforeunload to cancel link navigation from /b, got {blocked_link_navigation_state}\n"
+                + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked link navigation from /b",
+            history_entry_urls(before_blocked_browser_ui_back["ui"]),
+            history_used_steps(before_blocked_browser_ui_back["ui"]),
+            before_blocked_browser_ui_back["ui"]["currentUsedStepIndex"],
+            before_blocked_browser_ui_back["ui"]["backButtonEnabled"],
+            before_blocked_browser_ui_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+
+        blocked_webdriver_navigate_state = expect_beforeunload_cancels_webdriver_navigation(
+            webdriver_port,
+            session_id,
+            url_c,
+            "WebDriver navigation from /b",
+            url_b,
+            blocked_link_navigation_state[1],
+            before_blocked_browser_ui_back,
+            log,
+        )
+
+        blocked_cross_site_webdriver_navigate_state = expect_beforeunload_cancels_webdriver_navigation(
+            webdriver_port,
+            session_id,
+            url_d,
+            "cross-site WebDriver navigation from /b",
+            url_b,
+            blocked_webdriver_navigate_state[1],
+            before_blocked_browser_ui_back,
+            log,
+        )
+
+        blocked_refresh_state = expect_beforeunload_cancels_refresh(
+            webdriver_port,
+            session_id,
+            url_b,
+            blocked_cross_site_webdriver_navigate_state[1],
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        blocked_beforeunload_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.beforeUnloadCount];",
+        )
+        if blocked_beforeunload_state[0] != url_b or blocked_beforeunload_state[1] <= blocked_refresh_state[1]:
+            raise AssertionError(
+                f"Expected beforeunload to cancel browser UI back from /b, got {blocked_beforeunload_state}\n"
+                + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked browser UI back from /b",
+            history_entry_urls(before_blocked_browser_ui_back["ui"]),
+            history_used_steps(before_blocked_browser_ui_back["ui"]),
+            before_blocked_browser_ui_back["ui"]["currentUsedStepIndex"],
+            before_blocked_browser_ui_back["ui"]["backButtonEnabled"],
+            before_blocked_browser_ui_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        blocked_webdriver_back_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.beforeUnloadCount];",
+        )
+        if blocked_webdriver_back_state[0] != url_b or blocked_webdriver_back_state[1] <= blocked_beforeunload_state[1]:
+            raise AssertionError(
+                f"Expected beforeunload to cancel WebDriver back from /b, got {blocked_webdriver_back_state}\n"
+                + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked WebDriver back from /b",
+            history_entry_urls(before_blocked_browser_ui_back["ui"]),
+            history_used_steps(before_blocked_browser_ui_back["ui"]),
+            before_blocked_browser_ui_back["ui"]["currentUsedStepIndex"],
+            before_blocked_browser_ui_back["ui"]["backButtonEnabled"],
+            before_blocked_browser_ui_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+
+        traverse_history_from_ui(webdriver_port, session_id, -1, wait_for_navigation_completion=False)
+
+        def browser_back_was_canceled_by_beforeunload(result):
+            return (
+                isinstance(result, list)
+                and len(result) == 2
+                and result[0] == url_b
+                and isinstance(result[1], int)
+                and result[1] > blocked_webdriver_back_state[1]
+            )
+
+        blocked_browser_back_state = wait_for_script_result(
+            webdriver_port,
+            session_id,
+            "beforeunload-canceled browser back from /b",
+            "return [location.href, window.beforeUnloadCount];",
+            browser_back_was_canceled_by_beforeunload,
+            log,
+        )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked browser back from /b",
+            history_entry_urls(before_blocked_browser_ui_back["ui"]),
+            history_used_steps(before_blocked_browser_ui_back["ui"]),
+            before_blocked_browser_ui_back["ui"]["currentUsedStepIndex"],
+            before_blocked_browser_ui_back["ui"]["backButtonEnabled"],
+            before_blocked_browser_ui_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+
+        cross_site_link_click_point = execute_script(
+            webdriver_port,
+            session_id,
+            """
+const rect = document.querySelector("#branch").getBoundingClientRect();
+return [Math.floor(rect.left + rect.width / 2), Math.floor(rect.top + rect.height / 2)];
+""",
+        )
+        perform_pointer_click(
+            webdriver_port, session_id, cross_site_link_click_point[0], cross_site_link_click_point[1], log
+        )
+        blocked_cross_site_link_navigation_state = execute_script(
+            webdriver_port,
+            session_id,
+            "return [location.href, window.beforeUnloadCount];",
+        )
+        if (
+            blocked_cross_site_link_navigation_state[0] != url_b
+            or blocked_cross_site_link_navigation_state[1] <= blocked_browser_back_state[1]
+        ):
+            raise AssertionError(
+                f"Expected beforeunload to cancel cross-site link navigation from /b, got {blocked_cross_site_link_navigation_state}\n"
+                + "\n".join(log)
+            )
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked cross-site link navigation from /b",
+            history_entry_urls(before_blocked_browser_ui_back["ui"]),
+            history_used_steps(before_blocked_browser_ui_back["ui"]),
+            before_blocked_browser_ui_back["ui"]["currentUsedStepIndex"],
+            before_blocked_browser_ui_back["ui"]["backButtonEnabled"],
+            before_blocked_browser_ui_back["ui"]["forwardButtonEnabled"],
+            log,
+        )
+        execute_script(webdriver_port, session_id, "window.onbeforeunload = null; return null;")
+
+        page_server.release_blocked_frame_b.clear()
+        page_server.blocked_frame_b_requested.clear()
+        traverse_history_from_ui(webdriver_port, session_id, -1)
+        expect_url(webdriver_port, session_id, "after browser UI back to nested", url_nested, log)
+        expect_navigation_buttons(webdriver_port, session_id, "after browser UI back to nested", True, True, log)
+        wait_for_event(page_server.blocked_frame_b_requested, "blocked nested frame restore")
+        expect_session_history_synchronized(
+            webdriver_port, session_id, "while browser UI back restores nested frame navigation", log
+        )
+        page_server.frame_b_blocked_document_ran.clear()
+        page_server.release_blocked_frame_b.set()
+        wait_for_event(
+            page_server.frame_b_blocked_document_ran,
+            "nested frame document after browser UI back",
+        )
+        wait_for_frame_url(
+            webdriver_port,
+            session_id,
+            "after browser UI back restores nested frame navigation",
+            url_frame_b_blocked,
+            log,
+            "Frame B Blocked",
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after browser UI back to nested",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+        expect_session_history_synchronized(
+            webdriver_port, session_id, "after browser UI back restores nested frame navigation", log
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/back", {})
+        expect_url(webdriver_port, session_id, "after nested frame back", url_nested, log)
+        expect_navigation_buttons(webdriver_port, session_id, "after nested frame back", True, True, log)
+        expect_frame_url(
+            webdriver_port, session_id, "after nested frame back restores previous entry", url_frame_a, log, "Frame A"
+        )
+        expect_current_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after nested frame back",
+            url_nested,
+            [url_frame_a, url_frame_b_blocked],
+            log,
+        )
+
+        request(webdriver_port, "POST", f"/session/{session_id}/url", {"url": url_b})
+        expect_url(webdriver_port, session_id, "after branching from nested frame history", url_b, log)
+        expect_entry_nested_history(
+            webdriver_port,
+            session_id,
+            "after branching from nested frame history",
+            url_nested,
+            [url_frame_a],
+            log,
+        )
+
+        before_location_replace = expect_session_history_idle(
+            webdriver_port, session_id, "before location.replace()", log
+        )
+        replace_current_index = before_location_replace["ui"]["currentUsedStepIndex"]
+        expected_urls_after_replace = history_entry_urls(before_location_replace["ui"])
+        expected_urls_after_replace[replace_current_index] = url_c
+        page_server.c_document_ran.clear()
+        execute_script(webdriver_port, session_id, f"location.replace({json.dumps(url_c)}); return null;")
+        wait_for_event(page_server.c_document_ran, "C document script after location.replace()")
+        expect_url(webdriver_port, session_id, "after location.replace() to /c", url_c, log)
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after location.replace() to /c",
+            expected_urls_after_replace,
+            history_used_steps(before_location_replace["ui"]),
+            replace_current_index,
+            before_location_replace["ui"]["backButtonEnabled"],
+            before_location_replace["ui"]["forwardButtonEnabled"],
+            log,
+        )
+
+        load_url_from_ui(webdriver_port, session_id, url_reload_blocked)
+        expect_url(webdriver_port, session_id, "after /reload-blocked", url_reload_blocked, log)
+        expect_current_ui_entry_reload_pending(webdriver_port, session_id, "before blocked reload", False, log)
+        page_server.blocked_reload_requested.clear()
+        page_server.reload_recovery_requested.clear()
+        page_server.release_blocked_reload.clear()
+        page_server.reload_blocked_document_ran.clear()
+        execute_script(webdriver_port, session_id, "location.reload(); return null;")
+        expect_reload_pending_history_log = True
+        wait_for_event(page_server.blocked_reload_requested, "blocked reload")
+        # Applying the history step clears reload pending before attempting to populate the entry's document.
+        expect_current_ui_entry_reload_pending(webdriver_port, session_id, "during blocked reload", False, log)
+        page_server.release_blocked_reload.set()
+        wait_for_event(page_server.reload_blocked_document_ran, "blocked reload document")
+        expect_url(webdriver_port, session_id, "after blocked reload completes", url_reload_blocked, log)
+        expect_current_ui_entry_reload_pending(webdriver_port, session_id, "after blocked reload completes", False, log)
+        before_blocked_reload_crash_recovery = expect_session_history_idle(
+            webdriver_port, session_id, "before blocked reload crash recovery", log
+        )
+
+        page_server.blocked_reload_requested.clear()
+        page_server.reload_recovery_requested.clear()
+        page_server.release_blocked_reload.clear()
+        page_server.reload_blocked_document_ran.clear()
+        execute_script(webdriver_port, session_id, "location.reload(); return null;")
+        wait_for_event(page_server.blocked_reload_requested, "blocked reload before crash")
+        expect_current_ui_entry_reload_pending(
+            webdriver_port, session_id, "during blocked reload before crash", False, log
+        )
+        crash_current_page(webdriver_port, session_id, wait_for_navigation_completion=False)
+        wait_for_event(page_server.reload_recovery_requested, "reload recovery request")
+        expect_ui_session_history(
+            webdriver_port,
+            session_id,
+            "while blocked crash recovery reloads current entry",
+            history_entry_urls(before_blocked_reload_crash_recovery["ui"]),
+            history_used_steps(before_blocked_reload_crash_recovery["ui"]),
+            before_blocked_reload_crash_recovery["ui"]["currentUsedStepIndex"],
+            before_blocked_reload_crash_recovery["ui"]["backButtonEnabled"],
+            before_blocked_reload_crash_recovery["ui"]["forwardButtonEnabled"],
+            log,
+        )
+        page_server.release_blocked_reload.set()
+        wait_for_event(page_server.reload_blocked_document_ran, "reload document after crash recovery")
+        expect_url(webdriver_port, session_id, "after blocked reload crash recovery", url_reload_blocked, log)
+        wait_for_session_history(
+            webdriver_port,
+            session_id,
+            "reload pending clears after blocked reload crash recovery",
+            lambda snapshot: not history_current_entry(snapshot["ui"])["reloadPending"],
+            log,
+        )
+
+        expect_cross_site_fragment_navigation_from_ui_loads_document(
+            webdriver_port, session_id, page_server, url_fragment_source, url_fragment_target, log
+        )
+
+        if baseline_open_fds is not None:
+            open_fds = count_open_fds(webdriver.pid)
+            if open_fds is not None and open_fds - baseline_open_fds > 64:
+                raise AssertionError(
+                    f"WebDriver leaked file descriptors: {baseline_open_fds} before the test, {open_fds} after"
+                )
+    except Exception:
+        failed = True
+        raise
+    finally:
+        if session_id is not None:
+            try:
+                request(webdriver_port, "DELETE", f"/session/{session_id}")
+            except Exception:
+                pass
+
+        webdriver.terminate()
+        try:
+            webdriver.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            webdriver.kill()
+            webdriver.wait()
+
+        webdriver_stdout.seek(0)
+        webdriver_stderr.seek(0)
+        stdout = webdriver_stdout.read()
+        stderr = webdriver_stderr.read()
+        webdriver_stdout.close()
+        webdriver_stderr.close()
+
+        page_server.release_blocked_frame_b.set()
+        page_server.release_blocked_reload.set()
+        page_server.release_blocked_process_swap_back.set()
+        page_server.release_blocked_forward.set()
+        page_server.release_blocked_navigation.set()
+        page_server.release_blocked_no_content_navigation.set()
+        page_server.shutdown()
+        page_server.server_close()
+
+        if not failed and expect_reload_pending_history_log and "reload_pending=true" not in stderr:
+            print(stdout, file=sys.stdout)
+            print(stderr, file=sys.stderr)
+            raise AssertionError("Expected session history debug log to include reload_pending=true")
+
+        if not failed and expect_no_entry_history_log and "reason=traverse-no-entry" not in stderr:
+            print(stdout, file=sys.stdout)
+            print(stderr, file=sys.stderr)
+            raise AssertionError("Expected session history debug log to include reason=traverse-no-entry")
+
+        if failed or webdriver.returncode not in (0, -15):
+            print(stdout, file=sys.stdout)
+            print(stderr, file=sys.stderr)
+        if webdriver.returncode not in (0, -15):
+            raise RuntimeError(f"WebDriver exited with status {webdriver.returncode}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("webdriver_binary")
+    args = parser.parse_args()
+
+    run_test(args.webdriver_binary)
+
+
+if __name__ == "__main__":
+    main()

@@ -9,21 +9,35 @@
 
 namespace Web::DOM {
 
-DocumentLoadEventDelayer::DocumentLoadEventDelayer(Document& document)
-    : m_document(GC::make_root(document))
+DocumentLoadEventDelayer::DocumentLoadEventDelayer(Document& document, DocumentLoadEventDelayerReason reason)
+    : m_document(document)
+    , m_reason(reason)
 {
     m_document->increment_number_of_things_delaying_the_load_event({});
+    if (m_reason == DocumentLoadEventDelayerReason::StyleSheetRequest)
+        m_document->increment_number_of_pending_style_sheet_requests({});
 }
 
 DocumentLoadEventDelayer::DocumentLoadEventDelayer(DocumentLoadEventDelayer&& delayer)
     : m_document(move(delayer.m_document))
+    , m_reason(delayer.m_reason)
 {
     delayer.m_document = nullptr;
 }
 
 DocumentLoadEventDelayer& DocumentLoadEventDelayer::operator=(DocumentLoadEventDelayer&& delayer)
 {
+    if (this == &delayer)
+        return *this;
+
+    if (m_document) {
+        if (m_reason == DocumentLoadEventDelayerReason::StyleSheetRequest)
+            m_document->decrement_number_of_pending_style_sheet_requests({});
+        m_document->decrement_number_of_things_delaying_the_load_event({});
+    }
+
     m_document = move(delayer.m_document);
+    m_reason = delayer.m_reason;
     delayer.m_document = nullptr;
 
     return *this;
@@ -31,8 +45,11 @@ DocumentLoadEventDelayer& DocumentLoadEventDelayer::operator=(DocumentLoadEventD
 
 DocumentLoadEventDelayer::~DocumentLoadEventDelayer()
 {
-    if (m_document)
+    if (m_document && !m_document->has_been_destroyed()) {
+        if (m_reason == DocumentLoadEventDelayerReason::StyleSheetRequest)
+            m_document->decrement_number_of_pending_style_sheet_requests({});
         m_document->decrement_number_of_things_delaying_the_load_event({});
+    }
 }
 
 }

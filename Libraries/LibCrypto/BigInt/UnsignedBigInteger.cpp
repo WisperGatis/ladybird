@@ -11,22 +11,27 @@
 
 #include <AK/BuiltinWrappers.h>
 #include <AK/FloatingPoint.h>
-#include <AK/NonnullOwnPtr.h>
 #include <AK/StringBuilder.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibCrypto/BigInt/Tommath.h>
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
 
 namespace Crypto {
 
+// Tommath's mp_init() reserves MP_PREC digits, which is 256 zeroed bytes for a value that is usually a handful of
+// bits wide. Ask for the smallest amount it accepts instead, covering values up to two digits before anything has to
+// grow.
+static constexpr int initial_digit_count = 2;
+
 UnsignedBigInteger::UnsignedBigInteger(ReadonlyBytes data)
 {
-    MP_MUST(mp_init(&m_mp));
+    MP_MUST(mp_init_size(&m_mp, initial_digit_count));
     MP_MUST(mp_from_ubin(&m_mp, data.data(), data.size()));
 }
 
 UnsignedBigInteger::UnsignedBigInteger(Vector<u32> const& words)
 {
-    MP_MUST(mp_init(&m_mp));
+    MP_MUST(mp_init_size(&m_mp, initial_digit_count));
     MP_MUST(mp_unpack(&m_mp, words.size(), MP_LSB_FIRST, sizeof(u32), MP_NATIVE_ENDIAN, 0, words.data()));
 }
 
@@ -39,13 +44,13 @@ UnsignedBigInteger::UnsignedBigInteger(double value)
     VERIFY(trunc(value) == value);
     VERIFY(value >= 0.0);
 
-    MP_MUST(mp_init(&m_mp));
+    MP_MUST(mp_init_size(&m_mp, initial_digit_count));
     MP_MUST(mp_set_double(&m_mp, value));
 }
 
 UnsignedBigInteger::UnsignedBigInteger(u64 value)
 {
-    MP_MUST(mp_init(&m_mp));
+    MP_MUST(mp_init_size(&m_mp, initial_digit_count));
     mp_set_u64(&m_mp, value);
 }
 
@@ -92,7 +97,7 @@ UnsignedBigInteger& UnsignedBigInteger::operator=(UnsignedBigInteger&& other)
 
 UnsignedBigInteger::UnsignedBigInteger()
 {
-    MP_MUST(mp_init(&m_mp));
+    MP_MUST(mp_init_size(&m_mp, initial_digit_count));
 }
 
 UnsignedBigInteger::~UnsignedBigInteger()
@@ -131,6 +136,33 @@ ErrorOr<UnsignedBigInteger> UnsignedBigInteger::from_base(u16 N, StringView str)
     return result;
 }
 
+ErrorOr<UnsignedBigInteger> UnsignedBigInteger::from_base(u16 N, Utf16View str)
+{
+    VERIFY(N <= 36);
+    if (str.is_empty())
+        return UnsignedBigInteger(0);
+
+    auto buffer = TRY(ByteBuffer::create_zeroed(str.length_in_code_units() + 1));
+
+    size_t idx = 0;
+    for (size_t i = 0; i < str.length_in_code_units(); ++i) {
+        auto code_unit = str.code_unit_at(i);
+        if (code_unit > NumericLimits<u8>::max())
+            return Error::from_string_literal("Invalid number");
+        if (code_unit == '_') {
+            // Skip underscores
+            continue;
+        }
+
+        buffer[idx++] = static_cast<u8>(code_unit);
+    }
+
+    UnsignedBigInteger result;
+    if (mp_read_radix(&result.m_mp, reinterpret_cast<char const*>(buffer.data()), N) != MP_OKAY)
+        return Error::from_string_literal("Invalid number");
+    return result;
+}
+
 ErrorOr<String> UnsignedBigInteger::to_base(u16 N) const
 {
     VERIFY(N <= 36);
@@ -145,6 +177,42 @@ ErrorOr<String> UnsignedBigInteger::to_base(u16 N) const
     MP_MUST(mp_to_radix(&m_mp, reinterpret_cast<char*>(buffer.data()), size, &written, N));
 
     return StringView(buffer.bytes().slice(0, written - 1)).to_ascii_lowercase_string();
+}
+
+ErrorOr<Utf16String> UnsignedBigInteger::to_base_utf16(u16 N) const
+{
+    VERIFY(N <= 36);
+    if (is_zero())
+        return "0"_utf16;
+
+    int size = 0;
+    MP_MUST(mp_radix_size(&m_mp, N, &size));
+    auto buffer = TRY(ByteBuffer::create_zeroed(size));
+
+    size_t written = 0;
+    MP_MUST(mp_to_radix(&m_mp, reinterpret_cast<char*>(buffer.data()), size, &written, N));
+
+    Utf16StringBuilder builder(written - 1);
+    for (auto character : buffer.bytes().slice(0, written - 1)) {
+        if (character >= 'A' && character <= 'Z')
+            character += 'a' - 'A';
+        builder.append_code_unit(character);
+    }
+    return builder.to_string();
+}
+
+size_t UnsignedBigInteger::count_digits_in_base(u16 base) const
+{
+    VERIFY(base <= 36);
+
+    if (is_zero())
+        return 1;
+
+    int size = 0;
+    MP_MUST(mp_radix_size(&m_mp, base, &size));
+
+    // mp_radix_size includes a null byte.
+    return static_cast<size_t>(size) - 1;
 }
 
 u64 UnsignedBigInteger::to_u64() const
@@ -333,7 +401,21 @@ FLATTEN UnsignedDivisionResult UnsignedBigInteger::divided_by(UnsignedBigInteger
     UnsignedBigInteger quotient;
     UnsignedBigInteger remainder;
     MP_MUST(mp_div(&m_mp, &divisor.m_mp, &quotient.m_mp, &remainder.m_mp));
-    return UnsignedDivisionResult { quotient, remainder };
+    return UnsignedDivisionResult { move(quotient), move(remainder) };
+}
+
+FLATTEN UnsignedBigInteger UnsignedBigInteger::quotient(UnsignedBigInteger const& divisor) const
+{
+    UnsignedBigInteger result;
+    MP_MUST(mp_div(&m_mp, &divisor.m_mp, &result.m_mp, nullptr));
+    return result;
+}
+
+FLATTEN UnsignedBigInteger UnsignedBigInteger::remainder(UnsignedBigInteger const& divisor) const
+{
+    UnsignedBigInteger result;
+    MP_MUST(mp_div(&m_mp, &divisor.m_mp, nullptr, &result.m_mp));
+    return result;
 }
 
 FLATTEN UnsignedBigInteger UnsignedBigInteger::pow(u32 exponent) const

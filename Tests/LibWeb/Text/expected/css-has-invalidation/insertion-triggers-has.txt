@@ -1,0 +1,2 @@
+[insert <span class='match'> into anchor subtree]
+[remove the matching span]

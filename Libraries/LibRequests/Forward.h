@@ -10,6 +10,8 @@ namespace Requests {
 
 class Request;
 class RequestClient;
+class RequestControlClient;
+class ResponseData;
 class WebSocket;
 struct RequestTimingInfo;
 

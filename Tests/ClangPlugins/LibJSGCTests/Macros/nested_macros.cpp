@@ -6,17 +6,17 @@
 
 // RUN: %clang++ -Xclang -verify %plugin_opts% -c %s -o %t 2>&1
 
-#include <LibJS/Runtime/Object.h>
+#include <LibJS/Heap/Cell.h>
 
-class TestClass : JS::Object {
-    JS_OBJECT(TestClass, JS::Object);
+class TestClass : JS::Cell {
+    GC_CELL(TestClass, JS::Cell);
 
     struct NestedClassOk : JS::Cell {
         GC_CELL(NestedClassOk, JS::Cell);
     };
 
-    // expected-error@+1 {{Expected record to have a JS_OBJECT macro invocation}}
-    struct NestedClassBad : JS::Object {
+    // expected-error@+1 {{Expected record to have a GC_CELL macro invocation}}
+    struct NestedClassBad : JS::Cell {
     };
 
     struct NestedClassNonCell {
@@ -29,8 +29,8 @@ class TestClass2 {
         GC_CELL(NestedClassOk, JS::Cell);
     };
 
-    // expected-error@+1 {{Expected record to have a JS_OBJECT macro invocation}}
-    struct NestedClassBad : JS::Object {
+    // expected-error@+1 {{Expected record to have a GC_CELL macro invocation}}
+    struct NestedClassBad : JS::Cell {
     };
 
     struct NestedClassNonCell {

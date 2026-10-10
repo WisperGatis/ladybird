@@ -8,7 +8,10 @@
 #pragma once
 
 #include <AK/String.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -18,27 +21,26 @@ namespace Web::CSS {
 
 // https://drafts.csswg.org/cssom/#css-declaration-blocks
 class CSSStyleDeclaration
-    : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(CSSStyleDeclaration, Bindings::PlatformObject);
+    : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(CSSStyleDeclaration, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(CSSStyleDeclaration);
 
 public:
     virtual ~CSSStyleDeclaration() = default;
-    virtual void initialize(JS::Realm&) override;
 
     virtual size_t length() const = 0;
-    virtual String item(size_t index) const = 0;
+    virtual Utf16String item(size_t index) const = 0;
 
-    virtual WebIDL::ExceptionOr<void> set_property(FlyString const& property_name, StringView css_text, StringView priority) = 0;
-    virtual WebIDL::ExceptionOr<String> remove_property(FlyString const& property_name) = 0;
+    virtual WebIDL::ExceptionOr<void> set_property(Utf16FlyString const& property_name, Utf16View css_text, Utf16View priority) = 0;
+    virtual WebIDL::ExceptionOr<Utf16String> remove_property(Utf16FlyString const& property_name) = 0;
 
-    virtual String get_property_value(FlyString const& property_name) const = 0;
-    virtual StringView get_property_priority(FlyString const& property_name) const = 0;
+    virtual Utf16String get_property_value(Utf16FlyString const& property_name) const = 0;
+    virtual Utf16String get_property_priority(Utf16FlyString const& property_name) const = 0;
 
-    String css_text() const;
-    virtual WebIDL::ExceptionOr<void> set_css_text(StringView) = 0;
+    Utf16String css_text() const;
+    virtual WebIDL::ExceptionOr<void> set_css_text(Utf16View) = 0;
 
-    virtual String serialized() const = 0;
+    virtual Utf16String serialized() const = 0;
 
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-computed-flag
     [[nodiscard]] bool is_computed() const { return m_computed; }
@@ -49,6 +51,7 @@ public:
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-parent-css-rule
     GC::Ptr<CSSRule> parent_rule() const { return m_parent_rule; }
     void set_parent_rule(GC::Ptr<CSSRule> parent) { m_parent_rule = parent; }
+    static constexpr size_t parent_rule_offset() { return offsetof(CSSStyleDeclaration, m_parent_rule); }
 
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-owner-node
     Optional<DOM::AbstractElement> owner_node() const { return m_owner_node; }
@@ -71,16 +74,14 @@ protected:
         No,
         Yes,
     };
-    explicit CSSStyleDeclaration(JS::Realm&, Computed, Readonly);
+    explicit CSSStyleDeclaration(Computed, Readonly);
 
-    virtual void visit_edges(Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
+    void prepare_to_update_style_attribute();
     void update_style_attribute();
 
 private:
-    // ^PlatformObject
-    virtual Optional<JS::Value> item_value(size_t index) const override;
-
     // https://drafts.csswg.org/cssom/#cssstyledeclaration-parent-css-rule
     GC::Ptr<CSSRule> m_parent_rule { nullptr };
 

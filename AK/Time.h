@@ -8,12 +8,12 @@
 
 #include <AK/Array.h>
 #include <AK/Assertions.h>
-#include <AK/Badge.h>
 #include <AK/Checked.h>
 #include <AK/Platform.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Types.h>
+#include <math.h>
 
 #ifdef AK_OS_WINDOWS
 #    include <time.h>
@@ -60,10 +60,12 @@ unsigned day_of_week(int year, unsigned month, int day);
 // can be negative.
 constexpr int day_of_year(int year, unsigned month, int day)
 {
-    if (is_constant_evaluated())
+    if consteval {
         VERIFY(month >= 1 && month <= 12); // Note that this prevents bad constexpr months, but never actually prints anything.
-    else if (!(month >= 1 && month <= 12))
-        return 0;
+    } else {
+        if (!(month >= 1 && month <= 12))
+            return 0;
+    }
 
     constexpr Array seek_table = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
     int day_of_year = seek_table[month - 1] + day - 1;
@@ -167,20 +169,8 @@ public:
     constexpr Duration() = default;
     constexpr Duration(Duration const&) = default;
     constexpr Duration& operator=(Duration const&) = default;
-
-    constexpr Duration(Duration&& other)
-        : m_seconds(exchange(other.m_seconds, 0))
-        , m_nanoseconds(exchange(other.m_nanoseconds, 0))
-    {
-    }
-    constexpr Duration& operator=(Duration&& other)
-    {
-        if (this != &other) {
-            m_seconds = exchange(other.m_seconds, 0);
-            m_nanoseconds = exchange(other.m_nanoseconds, 0);
-        }
-        return *this;
-    }
+    constexpr Duration(Duration&&) = default;
+    constexpr Duration& operator=(Duration&&) = default;
 
 private:
     // This must be part of the header in order to make the various 'from_*' functions constexpr.
@@ -213,6 +203,27 @@ private:
 
 public:
     [[nodiscard]] constexpr static Duration from_seconds(i64 seconds) { return Duration(seconds, 0); }
+    [[nodiscard]] constexpr static Duration from_seconds_f64(f64 seconds)
+    {
+        VERIFY(!isnan(seconds));
+        if (seconds >= static_cast<f64>(NumericLimits<i64>::max()))
+            return from_seconds(NumericLimits<i64>::max());
+        if (seconds <= static_cast<f64>(NumericLimits<i64>::min()))
+            return from_seconds(NumericLimits<i64>::min());
+        i64 integer_seconds = static_cast<i64>(seconds);
+        if (static_cast<f64>(integer_seconds) > seconds)
+            integer_seconds--;
+
+        f64 fractional_nanoseconds = (seconds - static_cast<f64>(integer_seconds)) * 1'000'000'000;
+        u32 integer_nanoseconds = static_cast<u32>(fractional_nanoseconds);
+        if (fractional_nanoseconds - static_cast<f64>(integer_nanoseconds) >= 0.5)
+            integer_nanoseconds++;
+        if (integer_nanoseconds == 1'000'000'000) {
+            integer_seconds++;
+            integer_nanoseconds = 0;
+        }
+        return Duration(integer_seconds, integer_nanoseconds);
+    }
     [[nodiscard]] constexpr static Duration from_nanoseconds(i64 nanoseconds)
     {
         i64 seconds = sane_mod(nanoseconds, 1'000'000'000);
@@ -231,6 +242,8 @@ public:
     [[nodiscard]] static Duration from_ticks(clock_t, time_t);
     [[nodiscard]] static Duration from_timespec(const struct timespec&);
     [[nodiscard]] static Duration from_timeval(const struct timeval&);
+    [[nodiscard]] static Duration from_time_units(i64 units, u32 numerator, u32 denominator);
+    [[nodiscard]] Duration scaled_by(u32 numerator, u32 denominator) const;
     // We don't pull in <stdint.h> for the pretty min/max definitions because this file is also included in the Kernel
     [[nodiscard]] constexpr static Duration min() { return Duration(-__INT64_MAX__ - 1LL, 0); }
     [[nodiscard]] constexpr static Duration zero() { return Duration(0, 0); }
@@ -249,6 +262,7 @@ public:
     [[nodiscard]] timespec to_timespec() const;
     // Rounds towards -inf (it was the easiest to implement).
     [[nodiscard]] timeval to_timeval() const;
+    [[nodiscard]] i64 to_time_units(u32 numerator, u32 denominator) const;
 
     [[nodiscard]] bool is_zero() const { return (m_seconds == 0) && (m_nanoseconds == 0); }
     [[nodiscard]] bool is_negative() const { return m_seconds < 0; }
@@ -339,6 +353,8 @@ public:
     }
 
 private:
+    friend struct Formatter<Duration>;
+
     constexpr explicit Duration(i64 seconds, u32 nanoseconds)
         : m_seconds(seconds)
         , m_nanoseconds(nanoseconds)
@@ -349,6 +365,13 @@ private:
 
     i64 m_seconds { 0 };
     u32 m_nanoseconds { 0 }; // Always less than 1'000'000'000
+};
+
+static_assert(IsTriviallyCopyable<Duration>);
+
+template<>
+struct Formatter<Duration> : StandardFormatter {
+    ErrorOr<void> format(FormatBuilder&, Duration);
 };
 
 namespace Detail {
@@ -422,6 +445,11 @@ public:
     [[nodiscard]] constexpr static UnixDateTime from_milliseconds_since_epoch(i64 milliseconds)
     {
         return UnixDateTime { Duration::from_milliseconds(milliseconds) };
+    }
+
+    [[nodiscard]] constexpr static UnixDateTime from_microseconds_since_epoch(i64 microseconds)
+    {
+        return UnixDateTime { Duration::from_microseconds(microseconds) };
     }
 
     [[nodiscard]] constexpr static UnixDateTime from_nanoseconds_since_epoch(i64 nanoseconds)

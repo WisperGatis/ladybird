@@ -1,6 +1,3 @@
-#import <DOM/Event.idl>
-#import <HTML/Storage.idl>
-
 // https://html.spec.whatwg.org/multipage/webstorage.html#storageevent
 [Exposed=Window]
 interface StorageEvent : Event {
@@ -10,9 +7,9 @@ interface StorageEvent : Event {
     readonly attribute DOMString? oldValue;
     readonly attribute DOMString? newValue;
     readonly attribute USVString url;
-    readonly attribute Storage? storageArea;
+    [DirectGetter] readonly attribute Storage? storageArea;
 
-    undefined initStorageEvent(DOMString type, optional boolean bubbles = false, optional boolean cancelable = false, optional DOMString? key = null, optional DOMString? oldValue = null, optional DOMString? newValue = null, optional USVString url = "", optional Storage? storageArea = null);
+    undefined initStorageEvent([FlyString] DOMString type, optional boolean bubbles = false, optional boolean cancelable = false, optional DOMString? key = null, optional DOMString? oldValue = null, optional DOMString? newValue = null, optional USVString url = "", optional Storage? storageArea = null);
 };
 
 // https://html.spec.whatwg.org/multipage/webstorage.html#storageeventinit

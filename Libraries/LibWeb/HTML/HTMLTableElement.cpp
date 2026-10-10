@@ -5,14 +5,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLTableElementPrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
+#include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/HTMLCollection.h>
@@ -35,12 +36,6 @@ HTMLTableElement::HTMLTableElement(DOM::Document& document, DOM::QualifiedName q
 
 HTMLTableElement::~HTMLTableElement() = default;
 
-void HTMLTableElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLTableElement);
-    Base::initialize(realm);
-}
-
 void HTMLTableElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -48,12 +43,12 @@ void HTMLTableElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_t_bodies);
 }
 
-static unsigned parse_border(StringView value)
+static unsigned parse_border(Utf16View value)
 {
-    return value.to_number<unsigned>().value_or(0);
+    return parse_non_negative_integer(value).value_or(0);
 }
 
-bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
+bool HTMLTableElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -70,60 +65,59 @@ bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
         HTML::AttributeNames::width);
 }
 
-void HTMLTableElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    for_each_attribute([&](auto& name, auto& value) {
+    Base::apply_presentational_hints(properties);
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
         if (name == HTML::AttributeNames::width) {
             if (auto parsed_value = parse_nonzero_dimension_value(value))
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Width, parsed_value.release_nonnull());
+                properties.append({ .property_id = CSS::PropertyID::Width, .value = parsed_value.release_nonnull() });
             return;
         }
         if (name == HTML::AttributeNames::height) {
             if (auto parsed_value = parse_dimension_value(value))
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Height, parsed_value.release_nonnull());
+                properties.append({ .property_id = CSS::PropertyID::Height, .value = parsed_value.release_nonnull() });
             return;
         }
         if (name == HTML::AttributeNames::align) {
-            if (value.equals_ignoring_ascii_case("center"sv)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginLeft, CSS::KeywordStyleValue::create(CSS::Keyword::Auto));
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::MarginRight, CSS::KeywordStyleValue::create(CSS::Keyword::Auto));
+            if (value.equals_ignoring_ascii_case(u"center"sv)) {
+                properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Auto) });
+                properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Auto) });
             } else if (auto parsed_value = parse_css_value(CSS::Parser::ParsingParams { document() }, value, CSS::PropertyID::Float)) {
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Float, parsed_value.release_nonnull());
+                properties.append({ .property_id = CSS::PropertyID::Float, .value = parsed_value.release_nonnull() });
             }
             return;
         }
         if (name == HTML::AttributeNames::background) {
             // https://html.spec.whatwg.org/multipage/rendering.html#tables-2:encoding-parsing-and-serializing-a-url
             if (auto parsed_value = document().encoding_parse_url(value); parsed_value.has_value())
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BackgroundImage, CSS::ImageStyleValue::create(*parsed_value));
+                properties.append({ .property_id = CSS::PropertyID::BackgroundImage, .value = CSS::StyleValueList::create({ CSS::ImageStyleValue::create(*parsed_value) }, CSS::StyleValueList::Separator::Comma) });
             return;
         }
         if (name == HTML::AttributeNames::bgcolor) {
             // https://html.spec.whatwg.org/multipage/rendering.html#tables-2:rules-for-parsing-a-legacy-colour-value
             auto color = parse_legacy_color_value(value);
             if (color.has_value())
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BackgroundColor, CSS::ColorStyleValue::create_from_color(color.value(), CSS::ColorSyntax::Legacy));
+                properties.append({ .property_id = CSS::PropertyID::BackgroundColor, .value = CSS::ColorStyleValue::create_from_color(color.value(), CSS::ColorSyntax::Legacy) });
             return;
         }
         if (name == HTML::AttributeNames::cellspacing) {
             if (auto parsed_value = parse_dimension_value(value))
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderSpacing, parsed_value.release_nonnull());
+                properties.append({ .property_id = CSS::PropertyID::BorderSpacing, .value = parsed_value.release_nonnull() });
             return;
         }
         if (name == HTML::AttributeNames::border) {
             auto border = parse_border(value);
             if (!border)
                 return;
-            auto apply_border_style = [&](CSS::PropertyID style_property, CSS::PropertyID width_property, CSS::PropertyID color_property) {
-                auto legacy_line_style = CSS::KeywordStyleValue::create(CSS::Keyword::Outset);
-                cascaded_properties->set_property_from_presentational_hint(style_property, legacy_line_style);
-                cascaded_properties->set_property_from_presentational_hint(width_property, CSS::LengthStyleValue::create(CSS::Length::make_px(border)));
-                cascaded_properties->set_property_from_presentational_hint(color_property, CSS::ColorStyleValue::create_from_color(Color(128, 128, 128), CSS::ColorSyntax::Legacy));
+            auto apply_border_style = [&](CSS::PropertyID style_property, CSS::PropertyID width_property) {
+                properties.append({ .property_id = style_property, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Outset) });
+                properties.append({ .property_id = width_property, .value = CSS::LengthStyleValue::create(CSS::Length::make_px(border)) });
             };
-            apply_border_style(CSS::PropertyID::BorderLeftStyle, CSS::PropertyID::BorderLeftWidth, CSS::PropertyID::BorderLeftColor);
-            apply_border_style(CSS::PropertyID::BorderTopStyle, CSS::PropertyID::BorderTopWidth, CSS::PropertyID::BorderTopColor);
-            apply_border_style(CSS::PropertyID::BorderRightStyle, CSS::PropertyID::BorderRightWidth, CSS::PropertyID::BorderRightColor);
-            apply_border_style(CSS::PropertyID::BorderBottomStyle, CSS::PropertyID::BorderBottomWidth, CSS::PropertyID::BorderBottomColor);
+            apply_border_style(CSS::PropertyID::BorderLeftStyle, CSS::PropertyID::BorderLeftWidth);
+            apply_border_style(CSS::PropertyID::BorderTopStyle, CSS::PropertyID::BorderTopWidth);
+            apply_border_style(CSS::PropertyID::BorderRightStyle, CSS::PropertyID::BorderRightWidth);
+            apply_border_style(CSS::PropertyID::BorderBottomStyle, CSS::PropertyID::BorderBottomWidth);
         }
         if (name == HTML::AttributeNames::bordercolor) {
             // https://html.spec.whatwg.org/multipage/rendering.html#tables-2:attr-table-bordercolor
@@ -132,16 +126,16 @@ void HTMLTableElement::apply_presentational_hints(GC::Ref<CSS::CascadedPropertie
             // 'border-top-color', 'border-right-color', 'border-bottom-color', and 'border-left-color' properties to the resulting color.
             if (auto parsed_color = parse_legacy_color_value(value); parsed_color.has_value()) {
                 auto color_value = CSS::ColorStyleValue::create_from_color(parsed_color.value(), CSS::ColorSyntax::Legacy);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderTopColor, color_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderRightColor, color_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderBottomColor, color_value);
-                cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::BorderLeftColor, color_value);
+                properties.append({ .property_id = CSS::PropertyID::BorderTopColor, .value = color_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderRightColor, .value = color_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderBottomColor, .value = color_value });
+                properties.append({ .property_id = CSS::PropertyID::BorderLeftColor, .value = color_value });
             }
         }
     });
 }
 
-void HTMLTableElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLTableElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -153,10 +147,10 @@ void HTMLTableElement::attribute_changed(FlyString const& name, Optional<String>
             m_cellpadding = 1;
 
         // NOTE: cellpadding is magical, it applies to the cells inside this table, not the table itself.
-        //       When it changes, we need new style for the cells.
+        //       When it changes, the cells' hints move.
         if (old_cellpadding != m_cellpadding) {
             for_each_in_subtree_of_type<HTMLTableCellElement>([&](auto& cell) {
-                cell.set_needs_style_update(true);
+                CSS::republish_presentational_hints(cell);
                 return TraversalDecision::Continue;
             });
         }
@@ -227,7 +221,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::set_t_head(HTMLTableSectionElement* 
 {
     // If the new value is neither null nor a thead element, then a "HierarchyRequestError" DOMException must be thrown instead.
     if (thead && thead->local_name() != TagNames::thead)
-        return WebIDL::HierarchyRequestError::create(realm(), "Element is not thead"_utf16);
+        return WebIDL::HierarchyRequestError::create("Element is not thead"_utf16);
 
     // On setting, if the new value is null or a thead element, the first thead element child of the table element,
     // if any, must be removed,
@@ -322,7 +316,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::set_t_foot(HTMLTableSectionElement* 
 {
     // If the new value is neither null nor a tfoot element, then a "HierarchyRequestError" DOMException must be thrown instead.
     if (tfoot && tfoot->local_name() != TagNames::tfoot)
-        return WebIDL::HierarchyRequestError::create(realm(), "Element is not tfoot"_utf16);
+        return WebIDL::HierarchyRequestError::create("Element is not tfoot"_utf16);
 
     // On setting, if the new value is null or a tfoot element, the first tfoot element child of the table element,
     // if any, must be removed,
@@ -363,9 +357,7 @@ GC::Ref<DOM::HTMLCollection> HTMLTableElement::t_bodies()
     // The tBodies attribute must return an HTMLCollection rooted at the table node,
     // whose filter matches only tbody elements that are children of the table element.
     if (!m_t_bodies) {
-        m_t_bodies = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Children, [](DOM::Element const& element) {
-            return element.local_name() == TagNames::tbody;
-        });
+        m_t_bodies = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Children, [](DOM::Element const& element) { return element.local_name() == TagNames::tbody; }, DOM::HTMLCollection::AttributeInvalidationType::None);
     }
     return *m_t_bodies;
 }
@@ -398,30 +390,47 @@ GC::Ref<HTMLTableSectionElement> HTMLTableElement::create_t_body()
 GC::Ref<DOM::HTMLCollection> HTMLTableElement::rows()
 {
     HTMLTableElement* table_node = this;
-    // FIXME:  The elements in the collection must be ordered such that those elements whose parent is a thead are
-    //         included first, in tree order, followed by those elements whose parent is either a table or tbody
-    //         element, again in tree order, followed finally by those elements whose parent is a tfoot element,
-    //         still in tree order.
-    // How do you sort HTMLCollection?
-
+    // The elements in the collection must be ordered such that those elements whose parent is a thead are included
+    // first, in tree order, followed by those elements whose parent is either a table or tbody element, again in tree
+    // order, followed finally by those elements whose parent is a tfoot element, still in tree order.
     if (!m_rows) {
-        m_rows = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [table_node](DOM::Element const& element) {
+        m_rows = DOM::HTMLCollection::create(
+            *this,
+            DOM::HTMLCollection::Scope::Descendants,
+            [table_node](DOM::Element const& element) {
             // Only match TR elements which are:
             // * children of the table element
             // * children of the thead, tbody, or tfoot elements that are themselves children of the table element
             if (!is<HTMLTableRowElement>(element)) {
                 return false;
             }
-            if (element.parent_element() == table_node)
+            if (element.parent_element().ptr() == table_node)
                 return true;
 
-            if (element.parent_element() && (element.parent_element()->local_name() == TagNames::thead || element.parent_element()->local_name() == TagNames::tbody || element.parent_element()->local_name() == TagNames::tfoot)
-                && element.parent()->parent() == table_node) {
+            if (element.parent_element() && element.parent_element()->local_name().is_one_of(TagNames::thead, TagNames::tbody, TagNames::tfoot) && element.parent()->parent() == table_node)
                 return true;
-            }
 
-            return false;
-        });
+            return false; },
+            DOM::HTMLCollection::AttributeInvalidationType::None,
+            [](Element const& a, Element const& b) -> bool {
+                auto static sort_priority = [](Element const& element) {
+                    auto const& parent_tag = element.parent_element()->local_name();
+                    if (parent_tag == TagNames::thead)
+                        return 1;
+                    if (parent_tag == TagNames::table || parent_tag == TagNames::tbody)
+                        return 2;
+                    if (parent_tag == TagNames::tfoot)
+                        return 3;
+                    VERIFY_NOT_REACHED();
+                };
+
+                auto prio_a = sort_priority(a);
+                auto prio_b = sort_priority(b);
+
+                if (prio_a != prio_b)
+                    return prio_a < prio_b;
+
+                return false; });
     }
     return *m_rows;
 }
@@ -432,23 +441,45 @@ WebIDL::ExceptionOr<GC::Ref<HTMLTableRowElement>> HTMLTableElement::insert_row(W
     auto rows = this->rows();
     auto rows_length = rows->length();
 
+    // 1. If index is less than -1 or greater than the number of elements in the rows collection, then throw an
+    //    "IndexSizeError" DOMException.
     if (index < -1 || index > (long)rows_length) {
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than the number of rows"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than the number of rows"_utf16);
     }
+
+    // 2. Let tr be the result of creating a table element given this and "tr".
     auto& tr = static_cast<HTMLTableRowElement&>(*TRY(DOM::create_element(document(), TagNames::tr, Namespace::HTML)));
-    if (rows_length == 0 && !has_child_of_type<HTMLTableRowElement>()) {
+
+    auto t_bodies = this->t_bodies();
+    auto t_bodies_length = t_bodies->length();
+
+    // 3. If the rows collection has zero elements in it, and this has no tbody elements in it:
+    if (rows_length == 0 && t_bodies_length == 0) {
+        // 1. Let tbody be the result of creating a table element given this and "tbody".
         auto tbody = TRY(DOM::create_element(document(), TagNames::tbody, Namespace::HTML));
+
+        // 2. Append tr to tbody.
         TRY(tbody->append_child(tr));
+
+        // 3. Append tbody to this.
         TRY(append_child(tbody));
-    } else if (rows_length == 0) {
-        auto tbody = last_child_of_type<HTMLTableRowElement>();
-        TRY(tbody->append_child(tr));
-    } else if (index == -1 || index == (long)rows_length) {
+    }
+    // 4. Otherwise, if the rows collection has zero elements in it, then append tr to the last tbody element in this.
+    else if (rows_length == 0) {
+        TRY(t_bodies->item(t_bodies_length - 1)->append_child(tr));
+    }
+    // 5. Otherwise, if index is -1 or equal to the number of items in the rows collection, then append tr to the
+    //    parent of the last tr element in the rows collection.
+    else if (index == -1 || index == (long)rows_length) {
         auto parent_of_last_tr = rows->item(rows_length - 1)->parent_element();
         TRY(parent_of_last_tr->append_child(tr));
-    } else {
+    }
+    // 6. Otherwise, insert tr immediately before the indexth tr element in the rows collection, in the same parent.
+    else {
         rows->item(index)->parent_element()->insert_before(tr, rows->item(index));
     }
+
+    // 7. Return tr.
     return GC::Ref(tr);
 }
 
@@ -460,7 +491,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::delete_row(WebIDL::Long index)
 
     // 1. If index is less than −1 or greater than or equal to the number of elements in the rows collection, then throw an "IndexSizeError" DOMException.
     if (index < -1 || index >= (long)rows_length)
-        return WebIDL::IndexSizeError::create(realm(), "Index is negative or greater than or equal to the number of rows"_utf16);
+        return WebIDL::IndexSizeError::create("Index is negative or greater than or equal to the number of rows"_utf16);
 
     // 2. If index is −1, then remove the last element in the rows collection from its parent, or do nothing if the rows collection is empty.
     if (index == -1) {
@@ -480,7 +511,7 @@ WebIDL::ExceptionOr<void> HTMLTableElement::delete_row(WebIDL::Long index)
 
 unsigned int HTMLTableElement::border() const
 {
-    return parse_border(get_attribute_value(HTML::AttributeNames::border));
+    return parse_border(attribute(HTML::AttributeNames::border).value_or({}));
 }
 
 Optional<u32> HTMLTableElement::cellpadding() const

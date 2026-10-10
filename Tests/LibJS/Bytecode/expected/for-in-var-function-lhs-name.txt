@@ -1,0 +1,47 @@
+$d0083583 for-in-var-function-lhs-name.js:7:1
+  Registers: 7
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] GetGlobal value_feedback:0, dst:reg6, `fn`
+  [  18] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, fn
+  [  38] End value:reg5
+
+
+fn$c0513fc2 for-in-var-function-lhs-name.js:4:19
+  Registers: 11
+  Blocks:    6
+  Locals:    f~0
+  Constants:
+    [0] = Undefined
+    [1] = Int32(0)
+
+block0:
+  [   0] Enter
+  [   8] MovSrcUndefined dst:f~0
+  [  10] NewFunction dst:reg5, shared_function_data_index:0 (f)
+  [  28] Mov dst:f~0, src:reg5
+  [  38] NewObject dst:reg5
+  [  48] JumpNullish condition:reg5, true_target:block3, false_target:block4
+
+block1:
+  [  58] End value:Undefined
+
+block2:
+  [  60] ObjectPropertyIteratorNext dst_value:reg9, dst_done:reg10, receiver:reg6, keys:reg7, cursor:reg8
+  [  78] JumpIfLoop condition:reg10, true_target:block1, false_target:block5
+
+block3:
+  [  88] JumpLoop target:block1
+
+block4:
+  [  90] GetObjectPropertyIterator dst_keys:reg7, dst_receiver:reg6, object:reg5
+  [  a8] Mov dst:reg8, src:Int32(0)
+  [  b8] JumpLoop target:block2
+
+block5:
+  [  c0] Mov dst:f~0, src:reg9
+  [  d0] JumpLoop target:block2

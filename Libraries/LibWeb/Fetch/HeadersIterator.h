@@ -7,25 +7,29 @@
 #pragma once
 
 #include <LibGC/Ptr.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibWeb/Fetch/Headers.h>
 
 namespace Web::Fetch {
 
-class HeadersIterator final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(HeadersIterator, Bindings::PlatformObject);
+// The state of a Headers iterator. The iterator's JS object is a host object that carries this cell as its host data.
+class HeadersIterator final : public JS::Cell {
+    GC_CELL(HeadersIterator, JS::Cell);
     GC_DECLARE_ALLOCATOR(HeadersIterator);
 
 public:
-    [[nodiscard]] static GC::Ref<HeadersIterator> create(Headers const&, JS::Object::PropertyKind iteration_kind);
+    using JSValueConversionIsForbidden = void;
+
+    [[nodiscard]] static GC::Ref<JS::HostObject> create(JS::Realm&, Headers const&, JS::Object::PropertyKind iteration_kind);
 
     virtual ~HeadersIterator() override;
 
-    GC::Ref<JS::Object> next();
+    GC::Ref<JS::Object> next(JS::Realm&);
 
 private:
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     HeadersIterator(Headers const&, JS::Object::PropertyKind iteration_kind);
 

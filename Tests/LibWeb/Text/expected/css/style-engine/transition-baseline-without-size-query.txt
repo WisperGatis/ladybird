@@ -1,0 +1,3 @@
+feedback used provisional passes: false
+one transition started: true
+transition midpoint width: 20px

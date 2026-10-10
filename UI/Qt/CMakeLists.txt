@@ -1,25 +1,156 @@
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+find_package(Qt6 6.10 REQUIRED COMPONENTS Core Widgets)
+
+if (NOT APPLE)
+    find_package(Qt6 6.10 REQUIRED COMPONENTS Positioning)
+endif()
+
+if (APPLE OR (LINUX AND NOT ANDROID) OR HAS_DIRECTX)
+    # The native presentation paths use platform GPU buffer handles directly instead of copying frames through CPU memory.
+    # Wayland activation also uses Qt platform APIs.
+    set(QT_NO_PRIVATE_MODULE_WARNING ON)
+    find_package(Qt6 6.10 REQUIRED COMPONENTS GuiPrivate)
+endif()
+
+if (LINUX AND NOT ANDROID)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
+endif()
+
 qt_add_executable(ladybird main.cpp)
 target_sources(ladybird PRIVATE
     Application.cpp
     Autocomplete.cpp
+    BookmarkDialog.cpp
+    BookmarksBar.cpp
     BrowserWindow.cpp
+    ChromeStyle.cpp
+    CrashReportNotifier.cpp
+    CrashReportReviewWidget.cpp
+    DevToolsBanner.cpp
+    EventLoopImplementationQt.cpp
+    EventLoopImplementationQtEventTarget.cpp
     FindInPageWidget.cpp
     Icon.cpp
+    HiddenPageSizing.cpp
+    InputMethodUtils.cpp
+    JavaScriptDialog.cpp
     LocationEdit.cpp
     Menu.cpp
+    NativeWindowContainer.cpp
+    ProcessManagerWindow.cpp
+    PerformanceMonitorWidget.cpp
+    Popover.cpp
+    SelectDropdown.cpp
     Settings.cpp
     StringUtils.cpp
     Tab.cpp
     TabBar.cpp
-    TVGIconEngine.cpp
     WebContentView.cpp
+    WindowControlButton.cpp
     ladybird.qrc
 )
+if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
+    target_sources(ladybird PRIVATE
+        AccessibilityInterface.cpp
+    )
+endif()
+
 target_link_libraries(ladybird PRIVATE Qt::Core Qt::Gui Qt::Widgets)
-lagom_copy_runtime_dlls(ladybird)
+
+if (TARGET Qt6::Positioning)
+    target_sources(ladybird PRIVATE GeolocationProviderQt.cpp GeolocationProviderQt.h)
+    target_link_libraries(ladybird PRIVATE Qt::Positioning)
+    target_compile_definitions(ladybird PRIVATE LADYBIRD_QT_HAVE_POSITIONING=1)
+endif()
+
+if (LINUX AND NOT ANDROID)
+    target_sources(ladybird PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp)
+    target_link_libraries(ladybird PRIVATE LibThreading PkgConfig::GIO Qt::GuiPrivate)
+endif()
+
+if (APPLE)
+    target_sources(ladybird PRIVATE
+        ApplicationIcon.mm
+        Conversions.mm
+        DictionaryLookup.mm
+        ExternalURLHandler.mm
+        LadybirdAccessibilityElement.mm
+        MacWindow.mm
+        Menu.mm
+        WebContentViewAccessibility.mm
+        WebContentViewMac.mm
+    )
+    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    set_source_files_properties(
+        LadybirdAccessibilityElement.mm
+        WebContentViewAccessibility.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+    )
+endif()
+
+if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES)
+    set(WEB_CONTENT_VIEW_LINUX_VERT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/WebContentViewLinux.vert")
+    set(WEB_CONTENT_VIEW_LINUX_FRAG_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/WebContentViewLinux.frag")
+    set(WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/WebContentViewLinuxVertShader.h")
+    set(WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/WebContentViewLinuxFragShader.h")
+
+    add_custom_command(
+        OUTPUT "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER}"
+        COMMAND ${CMAKE_COMMAND}
+            -DLOG=${CMAKE_CURRENT_BINARY_DIR}/glslang-webcontent-vert.log
+            -P "${LADYBIRD_SOURCE_DIR}/Meta/CMake/run_quiet.cmake"
+            --
+            "${GLSLANG_VALIDATOR}"
+            -V
+            --vn webcontent_vert_shader_spv
+            -o "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER}"
+            "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER}"
+        DEPENDS "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER}"
+        COMMAND ${CMAKE_COMMAND}
+            -DLOG=${CMAKE_CURRENT_BINARY_DIR}/glslang-webcontent-frag.log
+            -P "${LADYBIRD_SOURCE_DIR}/Meta/CMake/run_quiet.cmake"
+            --
+            "${GLSLANG_VALIDATOR}"
+            -V
+            --vn webcontent_frag_shader_spv
+            -o "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER}"
+            "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER}"
+        DEPENDS "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER}"
+        VERBATIM
+    )
+    add_custom_target(generate_web_content_view_linux_shaders
+        DEPENDS
+            "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER}"
+            "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER}"
+    )
+
+    target_sources(ladybird PRIVATE
+        WebContentViewLinux.cpp
+        "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER}"
+        "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER}"
+    )
+    target_include_directories(ladybird PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(ladybird PRIVATE Vulkan::Vulkan)
+    add_dependencies(ladybird generate_web_content_view_linux_shaders)
+endif()
+
+if (HAS_DIRECTX)
+    target_sources(ladybird PRIVATE WebContentViewWindows.cpp)
+    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate d3d11)
+endif()
+
 create_ladybird_bundle(ladybird)
 
 if (WIN32)
+    ladybird_windows_bin(ladybird CONSOLE)
     qt_generate_deploy_script(
         TARGET ladybird
         OUTPUT_SCRIPT ladybird_deploy_script
@@ -27,6 +158,7 @@ if (WIN32)
 qt_deploy_runtime_dependencies(
     EXECUTABLE $<TARGET_FILE:ladybird>
     PLUGINS_DIR $<TARGET_FILE_DIR:ladybird>
+    NO_TRANSLATIONS
 )
 ")
 
@@ -35,4 +167,16 @@ qt_deploy_runtime_dependencies(
             -P ${ladybird_deploy_script}
         COMMAND_EXPAND_LISTS
     )
+endif()
+
+if (BUILD_TESTING)
+    add_executable(TestPerformanceMonitorWidget
+        ${LADYBIRD_SOURCE_DIR}/Tests/LibWebView/TestPerformanceMonitorWidget.cpp
+        PerformanceMonitorWidget.cpp
+        StringUtils.cpp
+    )
+    target_include_directories(TestPerformanceMonitorWidget PRIVATE ${LADYBIRD_SOURCE_DIR})
+    target_link_libraries(TestPerformanceMonitorWidget PRIVATE Qt6::Widgets LibWebView LibURL AK)
+    add_test(NAME TestPerformanceMonitorWidget COMMAND TestPerformanceMonitorWidget)
+    set_tests_properties(TestPerformanceMonitorWidget PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

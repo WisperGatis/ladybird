@@ -1,10 +1,3 @@
-#import <CSS/ElementCSSInlineStyle.idl>
-#import <HTML/DOMStringMap.idl>
-#import <HTML/ElementInternals.idl>
-#import <HTML/HTMLOrSVGElement.idl>
-#import <DOM/Element.idl>
-#import <DOM/EventHandler.idl>
-
 // https://html.spec.whatwg.org/multipage/semantics.html#htmlelement
 [Exposed=Window]
 interface HTMLElement : Element {
@@ -29,16 +22,20 @@ interface HTMLElement : Element {
     [CEReactions] attribute DOMString autocapitalize;
     [CEReactions] attribute boolean autocorrect;
 
-    [LegacyNullToEmptyString, CEReactions] attribute Utf16DOMString innerText;
-    [LegacyNullToEmptyString, CEReactions] attribute Utf16DOMString outerText;
+    [LegacyNullToEmptyString, CEReactions] attribute DOMString innerText;
+    [LegacyNullToEmptyString, CEReactions] attribute DOMString outerText;
 
     ElementInternals attachInternals();
 
     // The popover API
-    [ImplementedAs=show_popover_for_bindings] undefined showPopover(optional ShowPopoverOptions options = {});
+    undefined showPopover(optional ShowPopoverOptions options = {});
     [ImplementedAs=hide_popover_for_bindings] undefined hidePopover();
     boolean togglePopover(optional (TogglePopoverOptions or boolean) options = {});
     [CEReactions] attribute DOMString? popover;
+
+    // FIXME: Should be `[CEReactions, Reflect, ReflectRange=(0, 8)]`
+    [CEReactions, Reflect, ReflectRange=(0, 8)] attribute unsigned long headingOffset;
+    [CEReactions, Reflect] attribute boolean headingReset;
 
     // https://drafts.csswg.org/cssom-view/#extensions-to-the-htmlelement-interface
     readonly attribute Element? scrollParent;
@@ -48,6 +45,12 @@ interface HTMLElement : Element {
     readonly attribute long offsetWidth;
     readonly attribute long offsetHeight;
 
+};
+
+// https://html.spec.whatwg.org/multipage/interaction.html#focusoptions
+dictionary FocusOptions {
+    boolean preventScroll = false;
+    boolean focusVisible;
 };
 
 // https://html.spec.whatwg.org/multipage/dom.html#showpopoveroptions
@@ -62,7 +65,7 @@ dictionary TogglePopoverOptions : ShowPopoverOptions {
 
 HTMLElement includes GlobalEventHandlers;
 HTMLElement includes ElementContentEditable;
-HTMLElement includes HTMLOrSVGElement;
+HTMLElement includes HTMLOrSVGOrMathMLElement;
 
 // https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint
 enum EnterKeyHint {
@@ -89,7 +92,7 @@ enum InputMode {
 
 // https://html.spec.whatwg.org/multipage/interaction.html#elementcontenteditable
 interface mixin ElementContentEditable {
-    [CEReactions] attribute DOMString contentEditable;
+    [CEReactions] attribute [FlyString] DOMString contentEditable;
     [Reflect=enterkeyhint, Enumerated=EnterKeyHint, CEReactions] attribute DOMString enterKeyHint;
     readonly attribute boolean isContentEditable;
     [Reflect=inputmode, Enumerated=InputMode, CEReactions] attribute DOMString inputMode;

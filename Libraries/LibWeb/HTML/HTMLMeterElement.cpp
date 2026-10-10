@@ -5,8 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLMeterElementPrototype.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
@@ -25,12 +26,6 @@ HTMLMeterElement::HTMLMeterElement(DOM::Document& document, DOM::QualifiedName q
 }
 
 HTMLMeterElement::~HTMLMeterElement() = default;
-
-void HTMLMeterElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLMeterElement);
-    Base::initialize(realm);
-}
 
 void HTMLMeterElement::visit_edges(Cell::Visitor& visitor)
 {
@@ -54,11 +49,10 @@ double HTMLMeterElement::value() const
     return clamp(candidate_value, min(), max());
 }
 
-WebIDL::ExceptionOr<void> HTMLMeterElement::set_value(double value)
+void HTMLMeterElement::set_value(double value)
 {
-    TRY(set_attribute(HTML::AttributeNames::value, String::number(value)));
+    set_attribute_value(HTML::AttributeNames::value, Utf16String::number(value));
     update_meter_value_element();
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-meter-minimum
@@ -72,11 +66,10 @@ double HTMLMeterElement::min() const
     return 0;
 }
 
-WebIDL::ExceptionOr<void> HTMLMeterElement::set_min(double value)
+void HTMLMeterElement::set_min(double value)
 {
-    TRY(set_attribute(HTML::AttributeNames::min, String::number(value)));
+    set_attribute_value(HTML::AttributeNames::min, Utf16String::number(value));
     update_meter_value_element();
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-meter-maximum
@@ -93,11 +86,10 @@ double HTMLMeterElement::max() const
     return AK::max(candidate_max, min());
 }
 
-WebIDL::ExceptionOr<void> HTMLMeterElement::set_max(double value)
+void HTMLMeterElement::set_max(double value)
 {
-    TRY(set_attribute(HTML::AttributeNames::max, String::number(value)));
+    set_attribute_value(HTML::AttributeNames::max, Utf16String::number(value));
     update_meter_value_element();
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-meter-low
@@ -116,11 +108,10 @@ double HTMLMeterElement::low() const
     return clamp(candidate_low, min(), max());
 }
 
-WebIDL::ExceptionOr<void> HTMLMeterElement::set_low(double value)
+void HTMLMeterElement::set_low(double value)
 {
-    TRY(set_attribute(HTML::AttributeNames::low, String::number(value)));
+    set_attribute_value(HTML::AttributeNames::low, Utf16String::number(value));
     update_meter_value_element();
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-meter-high
@@ -139,11 +130,10 @@ double HTMLMeterElement::high() const
     return clamp(candidate_high, low(), max());
 }
 
-WebIDL::ExceptionOr<void> HTMLMeterElement::set_high(double value)
+void HTMLMeterElement::set_high(double value)
 {
-    TRY(set_attribute(HTML::AttributeNames::high, String::number(value)));
+    set_attribute_value(HTML::AttributeNames::high, Utf16String::number(value));
     update_meter_value_element();
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-meter-optimum
@@ -162,11 +152,10 @@ double HTMLMeterElement::optimum() const
     return clamp(candidate_optimum, min(), max());
 }
 
-WebIDL::ExceptionOr<void> HTMLMeterElement::set_optimum(double value)
+void HTMLMeterElement::set_optimum(double value)
 {
-    TRY(set_attribute(HTML::AttributeNames::optimum, String::number(value)));
+    set_attribute_value(HTML::AttributeNames::optimum, Utf16String::number(value));
     update_meter_value_element();
-    return {};
 }
 
 void HTMLMeterElement::inserted()
@@ -175,28 +164,22 @@ void HTMLMeterElement::inserted()
     create_shadow_tree_if_needed();
 }
 
-void HTMLMeterElement::adjust_computed_style(CSS::ComputedProperties& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-}
-
 void HTMLMeterElement::create_shadow_tree_if_needed()
 {
     if (shadow_root())
         return;
 
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
+    shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
     auto meter_bar_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    meter_bar_element->set_use_pseudo_element(CSS::PseudoElement::SliderTrack);
     MUST(shadow_root->append_child(*meter_bar_element));
+    meter_bar_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderTrack);
 
     m_meter_value_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    m_meter_value_element->set_use_pseudo_element(CSS::PseudoElement::SliderFill);
     MUST(meter_bar_element->append_child(*m_meter_value_element));
+    m_meter_value_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderFill);
     update_meter_value_element();
 }
 
@@ -234,11 +217,16 @@ void HTMLMeterElement::update_meter_value_element()
             m_cached_value_state = ValueState::EvenLessGood;
     }
 
+    // The state is decided here, and the element published the facts it arrived with before this
+    // ever ran, so the engine hears it from here or not at all.
+    CSS::Invalidation::invalidate_style_after_meter_value_state_change(*this);
+
     if (!m_meter_value_element)
         return;
 
     double position = (value - min) / (max - min) * 100;
-    MUST(m_meter_value_element->style_for_bindings()->set_property(CSS::PropertyID::Width, MUST(String::formatted("{}%", position))));
+    auto width = Utf16String::formatted("{}%", position);
+    MUST(m_meter_value_element->style()->set_property(CSS::PropertyID::Width, width.utf16_view()));
 }
 
 }

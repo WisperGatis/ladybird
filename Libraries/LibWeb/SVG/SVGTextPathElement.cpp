@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibURL/URL.h>
-#include <LibWeb/Bindings/SVGTextPathElementPrototype.h>
-#include <LibWeb/Layout/SVGTextPathBox.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGTextPathElement.h>
 
@@ -19,18 +19,19 @@ SVGTextPathElement::SVGTextPathElement(DOM::Document& document, DOM::QualifiedNa
 {
 }
 
-GC::Ptr<SVGGeometryElement const> SVGTextPathElement::path_or_shape() const
+void SVGTextPathElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
-    auto href = get_attribute(AttributeNames::href);
-    if (!href.has_value())
-        return {};
-    return try_resolve_url_to<SVGGeometryElement const>(*href);
+    Base::attribute_changed(name, old_value, value, namespace_);
+
+    if (name == SVG::AttributeNames::startOffset)
+        m_start_offset = parse_number_percentage(value.value_or({}));
 }
 
-void SVGTextPathElement::initialize(JS::Realm& realm)
+Optional<Utf16String> SVGTextPathElement::href_attribute_value() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTextPathElement);
-    Base::initialize(realm);
+    if (has_attribute(AttributeNames::href))
+        return get_attribute(AttributeNames::href);
+    return get_attribute(AttributeNames::xlink_href);
 }
 
 void SVGTextPathElement::visit_edges(Cell::Visitor& visitor)
@@ -39,9 +40,9 @@ void SVGTextPathElement::visit_edges(Cell::Visitor& visitor)
     SVGURIReferenceMixin::visit_edges(visitor);
 }
 
-GC::Ptr<Layout::Node> SVGTextPathElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+CSS::ElementBoxKind SVGTextPathElement::box_kind() const
 {
-    return heap().allocate<Layout::SVGTextPathBox>(document(), *this, move(style));
+    return CSS::ElementBoxKind::SvgTextPath;
 }
 
 };

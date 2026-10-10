@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/InternalAnimationTimelinePrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/Animations/Animation.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Internals/InternalAnimationTimeline.h>
@@ -14,31 +14,32 @@ namespace Web::Internals {
 
 GC_DEFINE_ALLOCATOR(InternalAnimationTimeline);
 
-void InternalAnimationTimeline::set_current_time(Optional<double> current_time)
+GC::Ref<InternalAnimationTimeline> InternalAnimationTimeline::create(GC::Ref<DOM::Document> document)
 {
-    // Do nothing
-    (void)current_time;
+    return GC::Heap::the().allocate<InternalAnimationTimeline>(document);
+}
+
+void InternalAnimationTimeline::update_current_time(double)
+{
+    update_associated_animations();
 }
 
 void InternalAnimationTimeline::set_time(Optional<double> time)
 {
-    Base::set_current_time(time);
+    set_current_time(time.map([](double value) -> Animations::TimeValue { return { Animations::TimeValue::Type::Milliseconds, value }; }));
 }
 
-InternalAnimationTimeline::InternalAnimationTimeline(JS::Realm& realm)
-    : AnimationTimeline(realm)
+void InternalAnimationTimeline::set_time_for_observation(double time)
 {
-    m_current_time = 0.0;
+    m_time_for_observation = Animations::TimeValue { Animations::TimeValue::Type::Milliseconds, time };
+    m_last_current_time_update_task_generation = {};
+}
+
+InternalAnimationTimeline::InternalAnimationTimeline(GC::Ref<DOM::Document> document)
+    : AnimationTimeline(document)
+{
+    m_current_time = { Animations::TimeValue::Type::Milliseconds, 0.0 };
     m_is_monotonically_increasing = true;
-
-    auto& document = as<HTML::Window>(HTML::relevant_global_object(*this)).associated_document();
-    document.associate_with_timeline(*this);
-}
-
-void InternalAnimationTimeline::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(InternalAnimationTimeline);
-    Base::initialize(realm);
 }
 
 }

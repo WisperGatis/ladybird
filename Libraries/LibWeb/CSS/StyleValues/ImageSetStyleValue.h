@@ -1,0 +1,76 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Optional.h>
+#include <AK/Utf16String.h>
+#include <AK/Vector.h>
+#include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
+
+namespace Web::CSS {
+
+class ImageSetStyleValue final : public AbstractImageStyleValue {
+    using Base = AbstractImageStyleValue;
+
+public:
+    struct Option {
+        NonnullRefPtr<AbstractImageStyleValue const> image;
+        NonnullRefPtr<StyleValue const> resolution;
+        Optional<Utf16String> type;
+    };
+
+    virtual ~ImageSetStyleValue() override = default;
+
+    virtual void load_any_resources(DOM::Document&) override;
+
+    virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
+    virtual bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override;
+    virtual SizeWithAspectRatio natural_size(HTML::DecodedImageData const&) const override;
+
+    AbstractImageStyleValue const* selected_image() const;
+    Optional<size_t> selected_option_index() const { return m_selected_option_index; }
+
+private:
+    explicit ImageSetStyleValue(StyleValueFFI::StyleValueData const*);
+
+    // NB: StyleValue dispatches operations by type tag, so it may call private impls.
+    friend class StyleValue;
+    void set_style_sheet(StyleSheetState*);
+
+    Optional<size_t> select_option_index(double device_pixels_per_css_pixel) const;
+
+    Vector<Option> const& options() const
+    {
+        if (m_options.has_value())
+            return *m_options;
+        auto const& list = m_value->image_set.options;
+        Vector<Option> options;
+        options.ensure_capacity(list.length);
+        for (size_t i = 0; i < list.length; ++i) {
+            auto const& option = list.pointer[i];
+            Optional<Utf16String> type;
+            if (option.has_type)
+                type = css_string_from_rust(&option.type_string).to_utf16_string();
+            options.unchecked_append(Option {
+                .image = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+                                                                     static_cast<StyleValueFFI::StyleValueData const*>(option.image.pointer)))
+                    ->as_abstract_image(),
+                .resolution = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+                    static_cast<StyleValueFFI::StyleValueData const*>(option.resolution.pointer))),
+                .type = move(type),
+            });
+        }
+        m_options = move(options);
+        return *m_options;
+    }
+
+    mutable Optional<Vector<Option>> m_options;
+    mutable Optional<size_t> m_selected_option_index;
+    mutable double m_selected_resolution { 1 };
+};
+
+}

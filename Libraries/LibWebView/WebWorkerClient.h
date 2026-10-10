@@ -1,0 +1,82 @@
+/*
+ * Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteString.h>
+#include <AK/StringView.h>
+#include <AK/Types.h>
+#include <AK/Utf16String.h>
+#include <LibHTTP/Cookie/Cookie.h>
+#include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
+#include <LibIPC/ConnectionToServer.h>
+#include <LibIPC/TransportHandle.h>
+#include <LibMediaClient/Client.h>
+#include <LibWebCommon/HTML/BroadcastChannelMessage.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
+#include <LibWebView/BlobURLStore.h>
+#include <LibWebView/BrowsingSession.h>
+#include <LibWebView/Export.h>
+#include <LibWebView/RequestServerSiteBindings.h>
+#include <WebWorker/WebWorkerClientEndpoint.h>
+#include <WebWorker/WebWorkerServerEndpoint.h>
+
+namespace WebView {
+
+class WEBVIEW_API WebWorkerClient final
+    : public IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>
+    , public WebWorkerClientEndpoint {
+    C_OBJECT_ABSTRACT(WebWorkerClient);
+
+public:
+    using InitTransport = Messages::WebWorkerServer::InitTransport;
+
+    WebWorkerClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::HTML::WorkerAgentId agent_id);
+    ~WebWorkerClient();
+
+    RefPtr<BrowsingSession> session() const { return m_session.strong_ref(); }
+    IsPrivate is_private() const { return m_is_private; }
+    RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
+    void remove_blob_url_entries();
+
+    pid_t pid() const { return m_pid; }
+    void terminate_process();
+
+    Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
+    void set_pid(pid_t pid) { m_pid = pid; }
+
+    virtual void did_close_worker() override;
+    virtual void did_finish_loading_worker_script(bool worker_is_secure_context) override;
+    virtual void did_fail_loading_worker_script() override;
+    virtual void did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
+    virtual Messages::WebWorkerClient::DidRequestCookieResponse did_request_cookie(URL::URL, HTTP::Cookie::Source) override;
+    virtual Messages::WebWorkerClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
+    virtual void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) override;
+    virtual Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
+    virtual void did_request_file(ByteString path, i32 request_id) override;
+    virtual Messages::WebWorkerClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String domain) override;
+    virtual Messages::WebWorkerClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
+    virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage) override;
+    virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
+    virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
+
+private:
+    virtual void did_misbehave(StringView message_name, StringView reason) override;
+
+    virtual void die() override;
+
+    IsPrivate m_is_private { IsPrivate::No };
+    WeakPtr<BrowsingSession> m_session;
+    RequestServerSiteBindings m_request_server_site_bindings;
+
+    pid_t m_pid { -1 };
+    Web::HTML::WorkerAgentId m_agent_id { 0 };
+
+    // The controller connection to the MediaServer spawned for this process, from its first media use until it exits.
+    RefPtr<MediaClient::Client> m_media_server_client;
+};
+
+}

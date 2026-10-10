@@ -11,6 +11,7 @@
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/ProcessType.h>
 
 namespace WebView {
@@ -19,15 +20,11 @@ enum class HeadlessMode {
     Screenshot,
     LayoutTree,
     Text,
+    Manual,
     Test,
 };
 
 enum class NewWindow {
-    No,
-    Yes,
-};
-
-enum class ForceNewProcess {
     No,
     Yes,
 };
@@ -68,41 +65,60 @@ using DNSSettings = Variant<SystemDNS, DNSOverTLS, DNSOverUDP>;
 
 constexpr inline u16 default_devtools_port = 6000;
 
-enum class EnableContentFilter {
+enum class EnableContentBlocker {
     No,
     Yes,
+};
+
+enum class DisableSandbox {
+    No,
+    Yes,
+};
+
+enum class ProfileTool {
+    Callgrind,
+    CPU,
 };
 
 struct BrowserOptions {
+    Vector<String> additional_font_directories {};
     Vector<URL::URL> urls;
     Vector<ByteString> raw_urls;
     Optional<HeadlessMode> headless_mode;
+    Optional<ByteString> screenshot_path {};
+    u32 screenshot_delay { 1 };
     int window_width { 800 };
     int window_height { 600 };
     NewWindow new_window { NewWindow::No };
-    ForceNewProcess force_new_process { ForceNewProcess::No };
     AllowPopups allow_popups { AllowPopups::No };
     DisableScripting disable_scripting { DisableScripting::No };
     DisableSQLDatabase disable_sql_database { DisableSQLDatabase::No };
-    Optional<ProcessType> debug_helper_process {};
+    Vector<ProcessType> debug_helper_processes {};
     Optional<ProcessType> profile_helper_process {};
-    Optional<ByteString> webdriver_content_ipc_path {};
+    ProfileTool profile_tool { ProfileTool::Callgrind };
+    Optional<ByteString> profile_output {};
+    Optional<ByteString> webdriver_browser_endpoint {};
     Optional<DNSSettings> dns_settings {};
     Optional<u16> devtools_port;
-    EnableContentFilter enable_content_filter { EnableContentFilter::Yes };
+    EnableContentBlocker enable_content_blocker { EnableContentBlocker::Yes };
+    DisableSandbox disable_sandbox { DisableSandbox::No };
+    Vector<ByteString> content_blocker_list_paths {};
 };
 
-enum class EnableHTTPDiskCache {
-    No,
-    Yes,
+enum class HTTPDiskCacheMode {
+    Disabled,
+    Enabled,
+    Testing,
 };
 
 struct RequestServerOptions {
     Vector<ByteString> certificates;
-    EnableHTTPDiskCache enable_http_disk_cache { EnableHTTPDiskCache::No };
+    ByteString cache_path;
+    HTTPDiskCacheMode http_disk_cache_mode { HTTPDiskCacheMode::Disabled };
+    Optional<ByteString> resource_substitution_map_path;
 };
 
-enum class IsLayoutTestMode {
+enum class IsTestMode {
     No,
     Yes,
 };
@@ -112,17 +128,12 @@ enum class LogAllJSExceptions {
     Yes,
 };
 
-enum class EnableIDLTracing {
+enum class EnableMemoryHTTPCache {
     No,
     Yes,
 };
 
-enum class EnableHTTPCache {
-    No,
-    Yes,
-};
-
-enum class DisableSiteIsolation {
+enum class ExposeExperimentalInterfaces {
     No,
     Yes,
 };
@@ -152,16 +163,19 @@ enum class PaintViewportScrollbars {
     No,
 };
 
+enum class FileSchemeUrlsHaveTupleOrigins {
+    No,
+    Yes,
+};
+
 struct WebContentOptions {
-    String command_line;
-    String executable_path;
-    Optional<ByteString> config_path {};
+    Optional<ByteString> cache_path {};
     Optional<StringView> user_agent_preset {};
-    IsLayoutTestMode is_layout_test_mode { IsLayoutTestMode::No };
+    IsTestMode is_test_mode { IsTestMode::No };
     LogAllJSExceptions log_all_js_exceptions { LogAllJSExceptions::No };
-    DisableSiteIsolation disable_site_isolation { DisableSiteIsolation::No };
-    EnableIDLTracing enable_idl_tracing { EnableIDLTracing::No };
-    EnableHTTPCache enable_http_cache { EnableHTTPCache::No };
+    SiteIsolationMode site_isolation_mode { SiteIsolationMode::TopLevel };
+    EnableMemoryHTTPCache enable_http_memory_cache { EnableMemoryHTTPCache::No };
+    ExposeExperimentalInterfaces expose_experimental_interfaces { ExposeExperimentalInterfaces::No };
     ExposeInternalsObject expose_internals_object { ExposeInternalsObject::No };
     ForceCPUPainting force_cpu_painting { ForceCPUPainting::No };
     ForceFontconfig force_fontconfig { ForceFontconfig::No };
@@ -169,6 +183,7 @@ struct WebContentOptions {
     CollectGarbageOnEveryAllocation collect_garbage_on_every_allocation { CollectGarbageOnEveryAllocation::No };
     Optional<u16> echo_server_port {};
     PaintViewportScrollbars paint_viewport_scrollbars { PaintViewportScrollbars::Yes };
+    FileSchemeUrlsHaveTupleOrigins file_scheme_urls_have_tuple_origins { FileSchemeUrlsHaveTupleOrigins::No };
     Optional<StringView> default_time_zone {};
 };
 

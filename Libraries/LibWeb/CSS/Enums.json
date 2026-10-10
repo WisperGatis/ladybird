@@ -71,6 +71,11 @@
     "self-inline",
     "width"
   ],
+  "animation-composition": [
+    "replace",
+    "add",
+    "accumulate"
+  ],
   "animation-direction": [
     "alternate",
     "alternate-reverse",
@@ -105,6 +110,16 @@
     "textarea",
     "textfield"
   ],
+  "axis": [
+    "block",
+    "inline",
+    "x",
+    "y"
+  ],
+  "backface-visibility": [
+    "visible",
+    "hidden"
+  ],
   "background-attachment": [
     "fixed",
     "local",
@@ -116,6 +131,16 @@
     "padding-box",
     "text"
   ],
+  "baseline-metric": [
+    "text-bottom",
+    "alphabetic",
+    "ideographic",
+    "middle",
+    "central",
+    "mathematical",
+    "hanging",
+    "text-top"
+  ],
   "border-collapse": [
     "separate",
     "collapse"
@@ -126,13 +151,53 @@
     "round",
     "space"
   ],
+  "box-decoration-break": [
+    "slice",
+    "clone"
+  ],
   "box-sizing": [
     "border-box",
     "content-box"
   ],
+  "break-between": [
+    "auto",
+    "avoid",
+    "avoid-page",
+    "page",
+    "left",
+    "right",
+    "recto",
+    "verso",
+    "avoid-column",
+    "column",
+    "avoid-region",
+    "region"
+  ],
+  "break-inside": [
+    "auto",
+    "avoid",
+    "avoid-page",
+    "avoid-column",
+    "avoid-region"
+  ],
   "caption-side": [
     "top",
     "bottom"
+  ],
+  "channel-keyword": [
+    "r",
+    "g",
+    "b",
+    "h",
+    "s",
+    "l",
+    "w",
+    "c",
+    "a",
+    "alpha",
+    "x",
+    "y",
+    "z"
   ],
   "clear": [
     "none",
@@ -147,9 +212,18 @@
     "linearrgb",
     "srgb"
   ],
+  "column-fill": [
+    "auto",
+    "balance",
+    "balance-all"
+  ],
   "column-span": [
     "none",
     "all"
+  ],
+  "common-lig-value": [
+    "common-ligatures",
+    "no-common-ligatures"
   ],
   "compositing-operator": [
     "add",
@@ -172,6 +246,16 @@
     "auto",
     "hidden"
   ],
+  "contextual-alt-value": [
+    "contextual",
+    "no-contextual"
+  ],
+  "continue-value": [
+    "auto",
+    "discard",
+    "collapse",
+    "-webkit-legacy"
+  ],
   "coord-box": [
     "content-box",
     "padding-box",
@@ -181,21 +265,201 @@
     "view-box"
   ],
   "counter-style-name-keyword": [
+    "adlam",
+    "afar",
+    "agaw",
+    "ancient-tamil",
+    "arabic-abjad",
+    "arabic-indic",
+    "ari",
+    "armenian",
+    "balinese",
+    "bamum",
+    "bangla",
+    "bengali",
+    "binary",
+    "blin",
+    "bodo",
+    "cambodian",
     "circle",
+    "circled-decimal",
+    "circled-ideograph",
+    "circled-katakana",
+    "circled-korean-consonant",
+    "circled-korean-syllable",
+    "circled-lower-latin",
+    "circled-upper-latin",
+    "cjk-decimal",
+    "cjk-earthly-branch",
+    "cjk-heavenly-stem",
+    "cjk-ideographic",
+    "cjk-stem-branch",
+    "cjk-tally-mark",
     "decimal",
     "decimal-leading-zero",
+    "devanagari",
     "disc",
     "disclosure-closed",
     "disclosure-open",
+    "dizi",
+    "dogri",
+    "dotted-decimal",
+    "double-circled-decimal",
+    "ethiopic-halehame-am",
+    "ethiopic-halehame-ti-er",
+    "ethiopic-halehame-ti-et",
+    "ethiopic-halehame",
+    "ethiopic-numeric",
+    "filled-circled-decimal",
+    "fullwidth-decimal",
+    "fullwidth-lower-alpha",
+    "fullwidth-upper-alpha",
+    "fullwidth-upper-roman",
+    "gedeo",
+    "georgian",
+    "greek-lower-ancient",
+    "greek-lower-modern",
+    "greek-upper-ancient",
+    "greek-upper-modern",
+    "gujarati-alpha",
+    "gujarati",
+    "gumuz",
+    "gurmukhi",
+    "hadiyaa",
+    "hangul-consonant",
+    "hangul",
+    "hanifi-rohingya",
+    "harari",
+    "hebrew",
+    "hindi",
+    "hiragana-iroha",
+    "hiragana",
+    "japanese-formal",
+    "japanese-informal",
+    "javanese",
+    "kaffa",
+    "kannada-alpha",
+    "kannada",
+    "kashmiri",
+    "katakana-iroha",
+    "katakana",
+    "kayah-li",
+    "kebena",
+    "kembata",
+    "khmer-consonant",
+    "khmer",
+    "konkani",
+    "konso",
+    "korean-consonant",
+    "korean-hangul-formal",
+    "korean-hanja-formal",
+    "korean-hanja-informal",
+    "korean-syllable",
+    "kunama",
+    "lanna-hora",
+    "lanna-tham",
+    "lao",
+    "lepcha",
+    "limbu",
+    "lower-alpha-symbolic",
     "lower-alpha",
+    "lower-armenian",
+    "lower-belorussian",
+    "lower-bulgarian",
     "lower-greek",
+    "lower-hexadecimal",
     "lower-latin",
+    "lower-macedonian",
+    "lower-oromo-qubee",
     "lower-roman",
-    "none",
+    "lower-russian-full",
+    "lower-russian",
+    "lower-serbian",
+    "lower-ukrainian-full",
+    "lower-ukrainian",
+    "maghrebi-abjad",
+    "maithili",
+    "malayalam-alpha",
+    "malayalam",
+    "manipuri",
+    "marathi",
+    "meen",
+    "meetei",
+    "mongolian",
+    "mro",
+    "myanmar",
+    "nag-mundari",
+    "new-base-60",
+    "newa",
+    "nko-cardinal",
+    "octal",
+    "odia",
+    "ol-chiki",
+    "oriya",
+    "oromo",
+    "parenthesized-decimal",
+    "parenthesized-hangul-consonant",
+    "parenthesized-hangul-syllable",
+    "parenthesized-ideograph",
+    "parenthesized-lower-latin",
+    "persian-abjad",
+    "persian-alphabetic",
+    "persian",
+    "punjabi",
+    "saho",
+    "sanskrit",
+    "santali",
+    "shan",
+    "sidama",
+    "silti",
+    "simp-chinese-formal",
+    "simp-chinese-informal",
+    "simple-lower-roman",
+    "simple-upper-roman",
+    "sindhi",
     "square",
+    "sundanese",
+    "super-decimal",
+    "tai-lue",
+    "tally-mark",
+    "tamil",
+    "telugu-alpha",
+    "telugu",
+    "thai-alpha",
+    "thai",
+    "tibetan",
+    "tigre",
+    "trad-chinese-formal",
+    "trad-chinese-informal",
+    "upper-alpha-symbolic",
     "upper-alpha",
+    "upper-armenian",
+    "upper-belorussian",
+    "upper-bulgarian",
+    "upper-hexadecimal",
     "upper-latin",
-    "upper-roman"
+    "upper-macedonian",
+    "upper-oromo-qubee",
+    "upper-roman",
+    "upper-russian-full",
+    "upper-russian",
+    "upper-serbian",
+    "upper-ukrainian-full",
+    "upper-ukrainian",
+    "urdu-abjad",
+    "urdu-alphabetic",
+    "urdu",
+    "warang-citi",
+    "wolaita",
+    "yemsa",
+    "zhuyin"
+  ],
+  "counter-style-system": [
+    "cyclic",
+    "numeric",
+    "alphabetic",
+    "symbolic",
+    "additive"
   ],
   "cross-origin-modifier-value": [
     "anonymous",
@@ -243,6 +507,10 @@
     "ltr",
     "rtl"
   ],
+  "discretionary-lig-value": [
+    "discretionary-ligatures",
+    "no-discretionary-ligatures"
+  ],
   "display-box": [
     "contents",
     "none"
@@ -254,7 +522,8 @@
     "flex",
     "grid",
     "ruby",
-    "math"
+    "math",
+    "-webkit-box"
   ],
   "display-internal": [
     "table-row-group",
@@ -274,7 +543,10 @@
     "inline-block",
     "inline-table",
     "inline-flex",
-    "inline-grid"
+    "inline-grid",
+    "-webkit-flex",
+    "-webkit-inline-box",
+    "-webkit-inline-flex"
   ],
   "display-outside": [
     "block",
@@ -287,6 +559,18 @@
     "ease-in",
     "ease-out",
     "ease-in-out"
+  ],
+  "east-asian-variant": [
+    "jis78",
+    "jis83",
+    "jis90",
+    "jis04",
+    "simplified",
+    "traditional"
+  ],
+  "east-asian-width": [
+    "full-width",
+    "proportional-width"
   ],
   "empty-cells": [
     "show",
@@ -326,7 +610,17 @@
     "normal",
     "none"
   ],
-  "font-style": [
+  "font-optical-sizing": [
+    "auto",
+    "none"
+  ],
+  "font-smoothing": [
+    "auto",
+    "none",
+    "antialiased",
+    "subpixel-antialiased"
+  ],
+  "font-style-keyword": [
     "normal",
     "italic",
     "left",
@@ -347,10 +641,6 @@
     "palettes",
     "variations"
   ],
-  "font-variant-alternates": [
-    "normal",
-    "historical-forms"
-  ],
   "font-variant-caps": [
     "normal",
     "small-caps",
@@ -360,46 +650,11 @@
     "unicase",
     "titling-caps"
   ],
-  "font-variant-east-asian": [
-    "normal",
-    "ruby",
-    "jis78",
-    "jis83",
-    "jis90",
-    "jis04",
-    "simplified",
-    "traditional",
-    "full-width",
-    "proportional-width"
-  ],
   "font-variant-emoji": [
     "normal",
     "text",
     "emoji",
     "unicode"
-  ],
-  "font-variant-ligatures": [
-    "normal",
-    "none",
-    "common-ligatures",
-    "no-common-ligatures",
-    "discretionary-ligatures",
-    "no-discretionary-ligatures",
-    "historical-ligatures",
-    "no-historical-ligatures",
-    "contextual",
-    "no-contextual"
-  ],
-  "font-variant-numeric": [
-    "normal",
-    "ordinal",
-    "slashed-zero",
-    "lining-nums",
-    "oldstyle-nums",
-    "proportional-nums",
-    "tabular-nums",
-    "diagonal-fractions",
-    "stacked-fractions"
   ],
   "font-variant-position": [
     "normal",
@@ -423,11 +678,16 @@
     "cursive",
     "fantasy",
     "monospace",
+    "system-ui",
     "math",
     "ui-serif",
     "ui-sans-serif",
     "ui-monospace",
     "ui-rounded"
+  ],
+  "historical-lig-value": [
+    "historical-ligatures",
+    "no-historical-ligatures"
   ],
   "hue-interpolation-method": [
     "shorter",
@@ -441,8 +701,8 @@
     "high-quality",
     "pixelated",
     "smooth",
-    "optimizespeed=pixelated",
-    "optimizequality=smooth"
+    "optimizespeed",
+    "optimizequality"
   ],
   "isolation": [
     "auto",
@@ -554,6 +814,18 @@
     "plus-darker",
     "plus-lighter"
   ],
+  "numeric-figure-value": [
+    "lining-nums",
+    "oldstyle-nums"
+  ],
+  "numeric-fraction-value": [
+    "diagonal-fractions",
+    "stacked-fractions"
+  ],
+  "numeric-spacing-value": [
+    "proportional-nums",
+    "tabular-nums"
+  ],
   "object-fit": [
     "fill",
     "contain",
@@ -579,6 +851,11 @@
     "hidden",
     "scroll",
     "visible"
+  ],
+  "overflow-wrap": [
+    "normal",
+    "break-word",
+    "anywhere"
   ],
   "page-size": [
     "a5",
@@ -674,6 +951,26 @@
     "static",
     "sticky"
   ],
+  "radial-extent": [
+    "closest-corner",
+    "closest-side",
+    "farthest-corner",
+    "farthest-side"
+  ],
+  "rectangular-color-space": [
+    "srgb",
+    "srgb-linear",
+    "display-p3",
+    "display-p3-linear",
+    "a98-rgb",
+    "prophoto-rgb",
+    "rec2020",
+    "lab",
+    "oklab",
+    "xyz",
+    "xyz-d50",
+    "xyz-d65"
+  ],
   "referrer-policy-modifier-value": [
     "no-referrer",
     "no-referrer-when-downgrade",
@@ -694,11 +991,45 @@
     "round",
     "space"
   ],
+  "resize": [
+    "none",
+    "both",
+    "horizontal",
+    "vertical",
+    "inline",
+    "block"
+  ],
   "rounding-strategy": [
     "down",
     "nearest",
     "to-zero",
     "up"
+  ],
+  "scroll-behavior": [
+    "auto",
+    "smooth"
+  ],
+  "scroll-snap-align": [
+    "none",
+    "start",
+    "end",
+    "center"
+  ],
+  "scroll-snap-axis": [
+    "x",
+    "y",
+    "block",
+    "inline",
+    "both"
+  ],
+  "scroll-snap-stop": [
+    "normal",
+    "always"
+  ],
+  "scroll-snap-strictness": [
+    "none",
+    "proximity",
+    "mandatory"
   ],
   "scrollbar-gutter": [
     "auto",
@@ -709,6 +1040,11 @@
     "auto",
     "thin",
     "none"
+  ],
+  "scroller": [
+    "root",
+    "nearest",
+    "self"
   ],
   "shape-box": [
     "content-box",
@@ -740,6 +1076,13 @@
     "round",
     "bevel"
   ],
+  "symbols-type": [
+    "cyclic",
+    "numeric",
+    "alphabetic",
+    "symbolic",
+    "fixed"
+  ],
   "table-layout": [
     "auto",
     "fixed"
@@ -770,6 +1113,11 @@
     "blink",
     "spelling-error",
     "grammar-error"
+  ],
+  "text-decoration-skip-ink": [
+    "all",
+    "auto",
+    "none"
   ],
   "text-decoration-style": [
     "dashed",
@@ -832,14 +1180,19 @@
     "pan-right",
     "pan-up",
     "pan-x",
-    "pan-y"
+    "pan-y",
+    "pinch-zoom"
   ],
   "transform-box": [
     "content-box",
     "border-box",
     "fill-box",
     "stroke-box",
-    "view-box "
+    "view-box"
+  ],
+  "transform-style": [
+    "flat",
+    "preserve-3d"
   ],
   "transition-behavior": [
     "normal",
@@ -871,6 +1224,10 @@
     "none",
     "text"
   ],
+  "vector-effect": [
+    "none",
+    "non-scaling-stroke"
+  ],
   "vertical-align": [
     "baseline",
     "bottom",
@@ -885,6 +1242,10 @@
     "collapse",
     "hidden",
     "visible"
+  ],
+  "webkit-box-orient": [
+    "horizontal",
+    "vertical"
   ],
   "white-space": [
     "normal",

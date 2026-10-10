@@ -6,27 +6,31 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibWeb/XHR/FormData.h>
 
 namespace Web::XHR {
 
-class FormDataIterator : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(FormDataIterator, Bindings::PlatformObject);
+// The state of a FormData iterator. The iterator's JS object is a host object that carries this cell as its host data.
+class FormDataIterator final : public JS::Cell {
+    GC_CELL(FormDataIterator, JS::Cell);
     GC_DECLARE_ALLOCATOR(FormDataIterator);
 
 public:
-    [[nodiscard]] static GC::Ref<FormDataIterator> create(FormData const&, JS::Object::PropertyKind iterator_kind);
+    using JSValueConversionIsForbidden = void;
+
+    [[nodiscard]] static GC::Ref<JS::HostObject> create(JS::Realm&, FormData const&, JS::Object::PropertyKind iterator_kind);
 
     virtual ~FormDataIterator() override;
 
-    JS::Object* next();
+    GC::Ref<JS::Object> next(JS::Realm&);
 
 private:
     FormDataIterator(FormData const&, JS::Object::PropertyKind iterator_kind);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     GC::Ref<FormData const> m_form_data;
     JS::Object::PropertyKind m_iterator_kind;

@@ -1,0 +1,52 @@
+/*
+ * Copyright (c) 2025, Gregory Bertilson <gregory@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibMedia/AudioDecoder.h>
+#include <LibMedia/AudioDiscardIntervals.h>
+#include <LibMedia/CodecID.h>
+#include <LibMedia/CodecParameters.h>
+#include <LibMedia/DecoderCapabilities.h>
+#include <LibMedia/Export.h>
+#include <LibMedia/FFmpeg/FFmpegForward.h>
+
+namespace Media::FFmpeg {
+
+class MEDIA_API FFmpegAudioDecoder final : public AudioDecoder {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    static Optional<DecoderCapabilities> capabilities(FFmpegFunctions const&, ParsedCodec const&);
+    static Optional<DecoderCapabilities> capabilities(ParsedCodec const&);
+    static DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> try_create(FFmpegFunctions const&, CodecID, Audio::SampleSpecification const&, ReadonlyBytes codec_initialization_data);
+    static DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> try_create(CodecID, Audio::SampleSpecification const&, ReadonlyBytes codec_initialization_data);
+    FFmpegAudioDecoder(FFmpegFunctions const&, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame);
+    virtual ~FFmpegAudioDecoder() override;
+
+    virtual DecoderErrorOr<void> receive_coded_data(CodedFrame const&) override;
+    virtual void signal_end_of_stream() override;
+    // Writes buffered audio samples to the provided block, up to its capacity.
+    virtual DecoderErrorOr<void> write_next_block(AudioBlock&) override;
+
+    virtual void flush() override;
+
+private:
+    DecoderErrorOr<void> receive_next_frame();
+    DecoderErrorOr<void> write_block_up_to_next_discard_boundary(AudioBlock&);
+
+    FFmpegFunctions const& m_functions;
+    AVCodecContext* m_codec_context;
+    AVPacket* m_packet;
+    AVFrame* m_frame;
+    size_t m_frame_read_offset { 0 };
+    // The frame's own sample rate and channel layout sit at positions that change between libavcodec majors,
+    // so they are taken from the codec context as each frame arrives.
+    Audio::SampleSpecification m_frame_sample_specification;
+    AudioDiscardIntervals m_discard_intervals;
+};
+
+}

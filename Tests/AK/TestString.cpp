@@ -11,12 +11,23 @@
 
 #include <LibTest/TestCase.h>
 
+#include <AK/Array.h>
 #include <AK/MemoryStream.h>
 #include <AK/StringBuilder.h>
 #include <AK/Try.h>
+#include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <LibThreading/Thread.h>
 #include <ctype.h>
+
+TEST_CASE(short_ascii_literal_is_constexpr)
+{
+    // The _string UDL folds short ASCII literals to a compile-time constant.
+    static constexpr String s = "foo"_string;
+    EXPECT_EQ(s, "foo"sv);
+    EXPECT_EQ(s.bytes().size(), 3u);
+}
 
 TEST_CASE(construct_empty)
 {
@@ -195,6 +206,14 @@ TEST_CASE(with_replacement_character)
     EXPECT_EQ(string7, "\ufffdWHF!"sv);
 }
 
+TEST_CASE(from_utf16_with_replacement_character)
+{
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(Utf16View { "hello!"sv })), "hello!"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(u"hello 😀!"sv)), "hello 😀!"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(u"hello \xd800!"sv)), "hello �!"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(u""sv)), ""sv);
+}
+
 TEST_CASE(from_code_points)
 {
     for (u32 code_point = 0; code_point < 0x80; ++code_point) {
@@ -233,6 +252,57 @@ TEST_CASE(substring_with_shared_superstring)
     EXPECT_EQ(substring2, "Hello I am"sv);
 }
 
+TEST_CASE(copies_on_several_threads_keep_an_exact_reference_count)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto string = "Hello I am a long string"_string;
+
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t i = 0; i < 8; ++i) {
+        auto thread = Threading::Thread::construct("StringCopier"sv, [&string]() {
+            Vector<String> copies;
+            copies.ensure_capacity(1000);
+            for (size_t batch = 0; batch < 1000; ++batch) {
+                for (size_t copy = 0; copy < 1000; ++copy)
+                    copies.unchecked_append(string);
+                copies.clear_with_capacity();
+            }
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    // One reference belongs to the string itself, and one to the raw value we read it through.
+    auto raw = string.to_raw_leaked();
+    EXPECT_EQ(bit_cast<AK::Detail::StringData const*>(raw)->ref_count(), 2u);
+    String::unref_raw(raw);
+}
+
+// Only ThreadSanitizer can catch a regression here, since every thread computes and caches the same hash.
+TEST_CASE(hash_one_string_on_several_threads)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto string = "Hello I am a long string that nobody has hashed yet"_string;
+    auto expected_hash = "Hello I am a long string that nobody has hashed yet"_string.hash();
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<unsigned, 8> hashes {};
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t i = 0; i < hashes.size(); ++i) {
+        auto thread = Threading::Thread::construct("StringHasher"sv, [&string, &hashes, i]() {
+            hashes[i] = string.hash();
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    for (auto hash : hashes)
+        EXPECT_EQ(hash, expected_hash);
+}
+
 TEST_CASE(code_points)
 {
     auto string = "🦬🪒"_string;
@@ -254,6 +324,21 @@ TEST_CASE(string_builder)
     auto string = MUST(builder.to_string());
     EXPECT_EQ(string, "🦬🪒"sv);
     EXPECT_EQ(string.bytes().size(), 8u);
+}
+
+TEST_CASE(string_builder_outlined_to_string)
+{
+    StringBuilder builder;
+    builder.append_repeated("abcd"sv, 100);
+
+    auto string = MUST(builder.to_string());
+    EXPECT_EQ(string.bytes_as_string_view().length(), 400u);
+    EXPECT(string.starts_with_bytes("abcd"sv));
+    EXPECT(string.ends_with_bytes("abcd"sv));
+
+    builder.append("reused"sv);
+    auto reused_string = MUST(builder.to_string());
+    EXPECT_EQ(reused_string, "reused"sv);
 }
 
 TEST_CASE(ak_format)

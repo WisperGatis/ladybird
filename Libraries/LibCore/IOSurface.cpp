@@ -11,6 +11,7 @@
 static_assert(false, "This file must only be used for macOS");
 #endif
 
+#import <CoreGraphics/CoreGraphics.h>
 #import <IOSurface/IOSurface.h>
 
 namespace Core {
@@ -39,6 +40,8 @@ private:
 };
 
 struct IOSurfaceHandle::IOSurfaceRefWrapper {
+    AK_ALLOC_WITH_KMALLOC;
+
     IOSurfaceRef ref;
 };
 
@@ -56,6 +59,19 @@ IOSurfaceHandle::~IOSurfaceHandle()
         CFRelease(m_ref_wrapper->ref);
 }
 
+// A consumer that displays the surface directly, such as a CALayer, takes its color space from this property and
+// would otherwise treat the sRGB pixels as being in the display's color space.
+static CFPropertyListRef srgb_color_space_property_list()
+{
+    static CFPropertyListRef property_list = [] {
+        auto* color_space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        auto* list = CGColorSpaceCopyPropertyList(color_space);
+        CGColorSpaceRelease(color_space);
+        return list;
+    }();
+    return property_list;
+}
+
 IOSurfaceHandle IOSurfaceHandle::create(int width, int height)
 {
     size_t bytes_per_element = 4;
@@ -66,19 +82,25 @@ IOSurfaceHandle IOSurfaceHandle::create(int width, int height)
     RefAutoRelease<CFNumberRef> bytes_per_element_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bytes_per_element);
     RefAutoRelease<CFNumberRef> pixel_format_number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format);
 
-    CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault,
+    RefAutoRelease<CFMutableDictionaryRef> props = CFDictionaryCreateMutable(kCFAllocatorDefault,
         0,
         &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
 
-    CFDictionarySetValue(props, kIOSurfaceWidth, width_number.ref());
-    CFDictionarySetValue(props, kIOSurfaceHeight, height_number.ref());
-    CFDictionarySetValue(props, kIOSurfaceBytesPerElement, bytes_per_element_number.ref());
-    CFDictionarySetValue(props, kIOSurfacePixelFormat, pixel_format_number.ref());
+    CFDictionarySetValue(props.ref(), kIOSurfaceWidth, width_number.ref());
+    CFDictionarySetValue(props.ref(), kIOSurfaceHeight, height_number.ref());
+    CFDictionarySetValue(props.ref(), kIOSurfaceBytesPerElement, bytes_per_element_number.ref());
+    CFDictionarySetValue(props.ref(), kIOSurfacePixelFormat, pixel_format_number.ref());
 
-    auto* ref = IOSurfaceCreate(props);
+    auto* ref = IOSurfaceCreate(props.ref());
     VERIFY(ref);
+    IOSurfaceSetValue(ref, CFSTR("IOSurfaceColorSpace"), srgb_color_space_property_list());
     return IOSurfaceHandle(make<IOSurfaceRefWrapper>(ref));
+}
+
+u32 IOSurfaceHandle::id() const
+{
+    return IOSurfaceGetID(m_ref_wrapper->ref);
 }
 
 MachPort IOSurfaceHandle::create_mach_port() const
@@ -87,11 +109,35 @@ MachPort IOSurfaceHandle::create_mach_port() const
     return MachPort::adopt_right(port, MachPort::PortRight::Send);
 }
 
-IOSurfaceHandle IOSurfaceHandle::from_mach_port(MachPort const& port)
+IOSurfaceHandle IOSurfaceHandle::from_ref(void* io_surface_ref)
+{
+    auto* ref = static_cast<IOSurfaceRef>(io_surface_ref);
+    VERIFY(ref);
+    CFRetain(ref);
+    return IOSurfaceHandle(make<IOSurfaceRefWrapper>(ref));
+}
+
+void IOSurfaceHandle::increment_use_count()
+{
+    IOSurfaceIncrementUseCount(m_ref_wrapper->ref);
+}
+
+void IOSurfaceHandle::decrement_use_count()
+{
+    IOSurfaceDecrementUseCount(m_ref_wrapper->ref);
+}
+
+bool IOSurfaceHandle::is_in_use() const
+{
+    return IOSurfaceIsInUse(m_ref_wrapper->ref);
+}
+
+ErrorOr<IOSurfaceHandle> IOSurfaceHandle::from_mach_port(MachPort const& port)
 {
     // NOTE: This call does not destroy the port
     auto* ref = IOSurfaceLookupFromMachPort(port.port());
-    VERIFY(ref);
+    if (!ref)
+        return Error::from_string_literal("Port is not an IOSurface send right");
     return IOSurfaceHandle(make<IOSurfaceRefWrapper>(ref));
 }
 
@@ -103,6 +149,26 @@ size_t IOSurfaceHandle::width() const
 size_t IOSurfaceHandle::height() const
 {
     return IOSurfaceGetHeight(m_ref_wrapper->ref);
+}
+
+u32 IOSurfaceHandle::pixel_format() const
+{
+    return IOSurfaceGetPixelFormat(m_ref_wrapper->ref);
+}
+
+size_t IOSurfaceHandle::plane_count() const
+{
+    return IOSurfaceGetPlaneCount(m_ref_wrapper->ref);
+}
+
+size_t IOSurfaceHandle::plane_width(size_t plane) const
+{
+    return IOSurfaceGetWidthOfPlane(m_ref_wrapper->ref, plane);
+}
+
+size_t IOSurfaceHandle::plane_height(size_t plane) const
+{
+    return IOSurfaceGetHeightOfPlane(m_ref_wrapper->ref, plane);
 }
 
 size_t IOSurfaceHandle::bytes_per_element() const
@@ -118,6 +184,26 @@ size_t IOSurfaceHandle::bytes_per_row() const
 void* IOSurfaceHandle::data() const
 {
     return IOSurfaceGetBaseAddress(m_ref_wrapper->ref);
+}
+
+size_t IOSurfaceHandle::bytes_per_row_of_plane(size_t plane) const
+{
+    return IOSurfaceGetBytesPerRowOfPlane(m_ref_wrapper->ref, plane);
+}
+
+void* IOSurfaceHandle::data_of_plane(size_t plane) const
+{
+    return IOSurfaceGetBaseAddressOfPlane(m_ref_wrapper->ref, plane);
+}
+
+bool IOSurfaceHandle::lock_read_only() const
+{
+    return IOSurfaceLock(m_ref_wrapper->ref, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess;
+}
+
+void IOSurfaceHandle::unlock_read_only() const
+{
+    IOSurfaceUnlock(m_ref_wrapper->ref, kIOSurfaceLockReadOnly, nullptr);
 }
 
 void* IOSurfaceHandle::core_foundation_pointer() const

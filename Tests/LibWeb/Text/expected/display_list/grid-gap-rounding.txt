@@ -1,11 +1,14 @@
-Save
-  ApplyTransform matrix=[1 0 0 1 0 0]
-  SaveLayer
-    FillRect rect=[8,8 29x30] color=rgb(0, 0, 0)
-    FillRect rect=[38,8 28x30] color=rgb(0, 0, 0)
-    FillRect rect=[67,8 29x30] color=rgb(0, 0, 0)
-    FillRect rect=[97,8 28x30] color=rgb(0, 0, 0)
-    FillRect rect=[126,8 29x30] color=rgb(0, 0, 0)
-  Restore
-Restore
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+
+DisplayList:
+FillRect@s1/e0 rect=[8,8 29x30] color=rgb(0, 0, 0)
+FillRect@s1/e0 rect=[38,8 28x30] color=rgb(0, 0, 0)
+FillRect@s1/e0 rect=[67,8 29x30] color=rgb(0, 0, 0)
+FillRect@s1/e0 rect=[97,8 28x30] color=rgb(0, 0, 0)
+FillRect@s1/e0 rect=[126,8 29x30] color=rgb(0, 0, 0)
 

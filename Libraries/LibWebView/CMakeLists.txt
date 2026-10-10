@@ -1,106 +1,149 @@
-include(fontconfig)
-
 set(SOURCES
+    AccessibilityTreeManager.cpp
     Application.cpp
-    Attribute.cpp
+    ApplyHistoryStep.cpp
     Autocomplete.cpp
+    AutocompleteMuxer.cpp
+    AutocompleteRanker.cpp
+    AutocompleteService.cpp
+    BlobURLStore.cpp
+    BrowsingSession.cpp
+    BookmarkStore.cpp
+    CanonicalBrowsingContext.cpp
+    CanonicalBrowsingContextGroup.cpp
+    CanonicalDocument.cpp
+    CanonicalEnvironmentSettingsObject.cpp
+    CanonicalNavigable.cpp
+    CanonicalSessionHistoryEntry.cpp
+    CanonicalTraversable.cpp
+    CanonicalWindow.cpp
     BrowserProcess.cpp
-    ConsoleOutput.cpp
+    CompositorClient.cpp
     CookieJar.cpp
-    DOMNodeProperties.cpp
+    CrashReport.cpp
+    CrashReportDiagnostics.cpp
+    CrashReportReview.cpp
+    CrashReportStore.cpp
+    CrashReportSubmission.cpp
+    DownloadPresentation.cpp
+    DownloadSegmentation.cpp
+    DownloadStore.cpp
+    ExternalURLHandler.cpp
+    FaviconStore.cpp
+    FileDownloader.cpp
+    FontService.cpp
+    FontServiceHost.cpp
+    GamepadManager.cpp
     HeadlessWebView.cpp
     HelperProcess.cpp
+    HistoryDebug.cpp
+    HistoryStore.cpp
+    HSTSStore.cpp
     Menu.cpp
-    Mutation.cpp
-    Plugins/FontPlugin.cpp
-    Plugins/ImageCodecPlugin.cpp
+    NavigationLoader.cpp
+    Omnibox.cpp
+    OmniboxEngagement.cpp
     Process.cpp
-    ProcessHandle.cpp
     ProcessManager.cpp
+    TabPerformanceStats.cpp
+    TabPerformanceMonitor.cpp
+    ProcessMonitor.cpp
+    Profile.cpp
+    RequestServerSiteBindings.cpp
     SearchEngine.cpp
+    SessionHistory.cpp
+    SessionHistorySnapshotStorage.cpp
+    SessionHistoryTraversalQueue.cpp
+    SessionStore.cpp
     Settings.cpp
-    SiteIsolation.cpp
-    SourceHighlighter.cpp
+    SiteCompatibility.cpp
     StorageJar.cpp
     URL.cpp
     UserAgent.cpp
     Utilities.cpp
     ViewImplementation.cpp
     WebContentClient.cpp
+    WebContentPage.cpp
+    WebContentTestClient.cpp
+    WebDriverBrowserConnection.cpp
     WebUI.cpp
-    WebUI/ProcessesUI.cpp
+    WebUI/BookmarksUI.cpp
+    WebUI/DownloadsUI.cpp
+    WebUI/HistoryUI.cpp
     WebUI/SettingsUI.cpp
+    WebUI/VersionUI.cpp
+    WebWorkerClient.cpp
+    WorkerProcessManager.cpp
 )
 
 if (APPLE)
-    list(APPEND SOURCES MachPortServer.cpp)
+    list(APPEND SOURCES
+        CrashReportPOSIX.cpp
+        LaunchURLsMacOS.cpp
+        PlatformColorsMacOS.cpp
+        ProcessReaper.cpp
+    )
+elseif (LINUX)
+    list(APPEND SOURCES CrashReportPOSIX.cpp)
 endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 
-embed_as_string(
-    "NativeStyleSheetSource.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Native.css"
-    "NativeStyleSheetSource.cpp"
-    "native_stylesheet_source"
-    NAMESPACE "WebView"
-)
-
 compile_ipc(UIProcessServer.ipc UIProcessServerEndpoint.h)
 compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
-
-if (NOT APPLE AND NOT CMAKE_INSTALL_LIBEXECDIR STREQUAL "libexec")
-    set_source_files_properties(Utilities.cpp PROPERTIES COMPILE_DEFINITIONS LADYBIRD_LIBEXECDIR="${CMAKE_INSTALL_LIBEXECDIR}")
-endif()
 
 set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
-    ../../Services/WebContent/WebContentClientEndpoint.h
-    ../../Services/WebContent/WebContentServerEndpoint.h
-    ../../Services/WebContent/WebDriverClientEndpoint.h
-    ../../Services/WebContent/WebDriverServerEndpoint.h
-    ../../Services/WebContent/WebUIClientEndpoint.h
-    ../../Services/WebContent/WebUIServerEndpoint.h
-    NativeStyleSheetSource.cpp
     UIProcessClientEndpoint.h
     UIProcessServerEndpoint.h
 )
 
+set(build_information_header "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.h")
+set(build_information_stamp "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.stamp")
+set(build_information_depfile "${CMAKE_CURRENT_BINARY_DIR}/BuildInformation.d")
+set(build_information_generator "${LADYBIRD_SOURCE_DIR}/Meta/Generators/generate-build-information.py")
+
+add_custom_command(
+    COMMAND
+        "${Python3_EXECUTABLE}" "${build_information_generator}"
+        "${LADYBIRD_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" "${build_information_header}"
+        "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+        --depfile "${build_information_depfile}"
+        --stamp "${build_information_stamp}"
+    COMMAND
+        ${CMAKE_COMMAND} -E touch "${build_information_stamp}"
+    DEPENDS
+        "${build_information_generator}"
+        "${LADYBIRD_BUILD_HEAD}"
+        "${LADYBIRD_BUILD_HEAD_LOG}"
+        "${CMAKE_BINARY_DIR}/CMakeCache.txt"
+        "${CMAKE_BINARY_DIR}/compile_commands.json"
+    DEPFILE "${build_information_depfile}"
+    OUTPUT "${build_information_stamp}"
+    BYPRODUCTS "${build_information_header}"
+    VERBATIM
+)
+add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
+
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWebView PRIVATE LibCore LibDatabase LibDevTools LibFileSystem LibGfx LibImageDecoderClient LibIPC LibRequests LibJS LibWeb LibUnicode LibURL LibSyntax LibTextCodec)
+add_dependencies(LibWebView generate_build_information)
+target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
+target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading SDL3::SDL3)
+
+if (ENABLE_CRANELIFT_JIT)
+    target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)
+    target_compile_definitions(LibWebView PUBLIC HAVE_WASM_COMPILER_SERVICE=1)
+endif()
 
 if (APPLE)
-    target_link_libraries(LibWebView PRIVATE LibThreading)
+    target_link_libraries(LibWebView PRIVATE "-framework Carbon")
 endif()
 
 # Third-party
 if (HAS_FONTCONFIG)
     target_link_libraries(LibWebView PRIVATE Fontconfig::Fontconfig)
-endif()
-
-add_library(LibWebViewPlatform INTERFACE)
-if (ENABLE_QT)
-    add_library(LibWebViewQt STATIC
-        EventLoop/EventLoopImplementationQt.cpp
-        EventLoop/EventLoopImplementationQtEventTarget.cpp
-    )
-
-    set_target_properties(LibWebViewQt PROPERTIES AUTOMOC ON AUTORCC OFF AUTOUIC OFF)
-    find_package(Qt6 REQUIRED COMPONENTS Core)
-    target_link_libraries(LibWebViewQt PUBLIC Qt::Core)
-    if (WIN32)
-        find_package(pthread REQUIRED)
-        target_include_directories(LibWebViewQt PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
-    endif()
-    target_link_libraries(LibWebViewPlatform INTERFACE LibWebViewQt)
-elseif (APPLE)
-    add_library(LibWebViewCocoa STATIC
-        EventLoop/EventLoopImplementationMacOS.mm
-    )
-    target_link_libraries(LibWebViewCocoa PUBLIC "-framework Cocoa")
-    target_link_libraries(LibWebViewPlatform INTERFACE LibWebViewCocoa)
 endif()
 
 if (ENABLE_INSTALL_HEADERS)

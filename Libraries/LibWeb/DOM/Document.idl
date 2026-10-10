@@ -1,180 +1,148 @@
-#import <Animations/DocumentTimeline.idl>
-#import <CSS/FontFaceSet.idl>
-#import <CSS/StyleSheetList.idl>
-#import <DOM/CDATASection.idl>
-#import <DOM/Comment.idl>
-#import <DOM/DOMImplementation.idl>
-#import <DOM/DocumentFragment.idl>
-#import <DOM/DocumentOrShadowRoot.idl>
-#import <DOM/DocumentType.idl>
-#import <DOM/Element.idl>
-#import <DOM/Event.idl>
-#import <DOM/EventHandler.idl>
-#import <DOM/HTMLCollection.idl>
-#import <DOM/Node.idl>
-#import <DOM/NodeFilter.idl>
-#import <DOM/NodeIterator.idl>
-#import <DOM/NodeList.idl>
-#import <DOM/ParentNode.idl>
-#import <DOM/ProcessingInstruction.idl>
-#import <DOM/Range.idl>
-#import <DOM/Text.idl>
-#import <DOM/TreeWalker.idl>
-#import <HTML/HTMLAllCollection.idl>
-#import <HTML/HTMLElement.idl>
-#import <HTML/HTMLHeadElement.idl>
-#import <HTML/HTMLScriptElement.idl>
-#import <HTML/Location.idl>
-#import <Selection/Selection.idl>
-#import <ViewTransition/ViewTransition.idl>
-#import <XPath/XPathResult.idl>
-#import <XPath/XPathExpression.idl>
-
 // https://dom.spec.whatwg.org/#document
-// https://html.spec.whatwg.org/multipage/dom.html#the-document-object
-[Exposed=Window, LegacyOverrideBuiltins]
+[Exposed=Window]
 interface Document : Node {
     constructor();
 
-    [ImplementedAs=has_focus_for_bindings] boolean hasFocus();
-
-    [PutForwards=href, LegacyUnforgeable] readonly attribute Location? location;
-    attribute USVString domain;
-
-    readonly attribute DOMImplementation implementation;
-
-    [ImplementedAs=url_string] readonly attribute USVString URL;
+    [SameObject] readonly attribute DOMImplementation implementation;
+    [ImplementedAs=url_string_for_bindings] readonly attribute USVString URL;
     readonly attribute USVString documentURI;
-
+    readonly attribute [FlyString] DOMString compatMode;
     readonly attribute DOMString characterSet;
-    readonly attribute DOMString charset;
-    readonly attribute DOMString inputEncoding;
+    readonly attribute DOMString charset; // legacy alias of .characterSet
+    readonly attribute DOMString inputEncoding; // legacy alias of .characterSet
     readonly attribute DOMString contentType;
 
-    readonly attribute WindowProxy? defaultView;
-
-    [CEReactions] Document open(optional DOMString unused1, optional DOMString unused2);
-    WindowProxy? open(USVString url, DOMString name, DOMString features);
-    [CEReactions] undefined close();
-    // FIXME: [CEReactions] undefined write((TrustedHTML or DOMString)... text);
-    [CEReactions] undefined write(DOMString... text);
-    // FIXME: [CEReactions] undefined writeln((TrustedHTML or DOMString)... text);
-    [CEReactions] undefined writeln(DOMString... text);
-
-    // FIXME: static Document parseHTMLUnsafe((TrustedHTML or DOMString) html);
-    static Document parseHTMLUnsafe(DOMString html);
-
-    attribute DOMString cookie;
-
-    // https://html.spec.whatwg.org/multipage/obsolete.html#Document-partial
-    [CEReactions, LegacyNullToEmptyString] attribute DOMString fgColor;
-    [CEReactions, LegacyNullToEmptyString] attribute DOMString linkColor;
-    [CEReactions, LegacyNullToEmptyString] attribute DOMString vlinkColor;
-    [CEReactions, LegacyNullToEmptyString] attribute DOMString alinkColor;
-    [CEReactions, LegacyNullToEmptyString] attribute DOMString bgColor;
-
-    readonly attribute USVString referrer;
-
-
-    Element? getElementById(DOMString id);
-    NodeList getElementsByName([FlyString] DOMString name);
+    readonly attribute DocumentType? doctype;
+    readonly attribute Element? documentElement;
     HTMLCollection getElementsByTagName([FlyString] DOMString tagName);
     HTMLCollection getElementsByTagNameNS([FlyString] DOMString? namespace, [FlyString] DOMString localName);
-    HTMLCollection getElementsByClassName(DOMString className);
+    HTMLCollection getElementsByClassName(DOMString classNames);
 
-    [SameObject] readonly attribute HTMLCollection applets;
-    [SameObject] readonly attribute HTMLCollection anchors;
+    [CEReactions, NewObject] Element createElement([FlyString] DOMString localName, optional (DOMString or ElementCreationOptions) options = {});
+    [CEReactions, NewObject] Element createElementNS([FlyString] DOMString? namespace, DOMString qualifiedName, optional (DOMString or ElementCreationOptions) options = {});
+    [NewObject] DocumentFragment createDocumentFragment();
+    [NewObject] Text createTextNode(DOMString data);
+    [NewObject] CDATASection createCDATASection(DOMString data);
+    [NewObject] Comment createComment(DOMString data);
+    [NewObject] ProcessingInstruction createProcessingInstruction([FlyString] DOMString target, DOMString data);
+
+    [CEReactions, NewObject] Node importNode(Node node, optional (boolean or ImportNodeOptions) options = false);
+    [CEReactions] Node adoptNode(Node node);
+
+    [NewObject] Attr createAttribute([FlyString] DOMString localName);
+    [NewObject] Attr createAttributeNS([FlyString] DOMString? namespace, [FlyString] DOMString qualifiedName);
+
+    [NewObject] Event createEvent([FlyString] DOMString interface); // legacy
+
+    [NewObject] Range createRange();
+
+    // NodeFilter.SHOW_ALL = 0xFFFFFFFF
+    [NewObject] NodeIterator createNodeIterator(Node root, optional unsigned long whatToShow = 0xFFFFFFFF, optional NodeFilter? filter = null);
+    [NewObject] TreeWalker createTreeWalker(Node root, optional unsigned long whatToShow = 0xFFFFFFFF, optional NodeFilter? filter = null);
+};
+
+// https://dom.spec.whatwg.org/#dictdef-elementcreationoptions
+dictionary ElementCreationOptions {
+    CustomElementRegistry? customElementRegistry;
+    [FlyString] DOMString is;
+};
+
+// https://dom.spec.whatwg.org/#dictdef-importnodeoptions
+dictionary ImportNodeOptions {
+    CustomElementRegistry customElementRegistry;
+    boolean selfOnly = false;
+};
+
+// https://html.spec.whatwg.org/multipage/dom.html#document
+[LegacyOverrideBuiltIns]
+partial interface Document {
+    // FIXME: parseHTMLUnsafe is missing the ParseHTMLUnsafeOptions parameter.
+    [NeedsCallerRealm, ImplementedInBindings] static Document parseHTMLUnsafe((TrustedHTML or DOMString) html);
+    [FIXME] static Document parseHTML(DOMString html, optional SetHTMLOptions options = {});
+
+    // resource metadata management
+    [PutForwards=href, LegacyUnforgeable] readonly attribute Location? location;
+    attribute USVString domain;
+    readonly attribute USVString referrer;
+    attribute USVString cookie;
+    readonly attribute DOMString lastModified;
+    [ImplementedAs=readiness] readonly attribute DocumentReadyState readyState;
+
+    // DOM tree accessors
+    getter object (DOMString name);
+    [CEReactions] attribute DOMString title;
+    [CEReactions] attribute DOMString dir;
+    [CEReactions] attribute HTMLElement? body;
+    readonly attribute HTMLHeadElement? head;
     [SameObject] readonly attribute HTMLCollection images;
     [SameObject] readonly attribute HTMLCollection embeds;
     [SameObject] readonly attribute HTMLCollection plugins;
     [SameObject] readonly attribute HTMLCollection links;
     [SameObject] readonly attribute HTMLCollection forms;
     [SameObject] readonly attribute HTMLCollection scripts;
+    NodeList getElementsByName(DOMString elementName);
+    // FIXME: currentScript should be a HTMLOrSVGScriptElement.
+    [DirectGetter] readonly attribute HTMLScriptElement? currentScript; // classic scripts in a document tree only
 
-    readonly attribute HTMLAllCollection all;
+    // dynamic markup insertion
+    [CEReactions] Document open(optional DOMString unused1, optional DOMString unused2); // both arguments are ignored
+    WindowProxy? open(USVString url, DOMString name, DOMString features);
+    [CEReactions] undefined close();
+    [CEReactions, ImplementedInBindings] undefined write((TrustedHTML or DOMString)... text);
+    [CEReactions, ImplementedInBindings] undefined writeln((TrustedHTML or DOMString)... text);
 
-    undefined clear();
-    undefined captureEvents();
-    undefined releaseEvents();
-
-    [CEReactions, NewObject] Element createElement(DOMString tagName, optional (DOMString or ElementCreationOptions) options = {});
-    [CEReactions, NewObject] Element createElementNS([FlyString] DOMString? namespace, DOMString qualifiedName, optional (DOMString or ElementCreationOptions) options = {});
-    DocumentFragment createDocumentFragment();
-    Text createTextNode(Utf16DOMString data);
-    [NewObject] CDATASection createCDATASection(Utf16DOMString data);
-    Comment createComment(Utf16DOMString data);
-    [NewObject] ProcessingInstruction createProcessingInstruction(DOMString target, Utf16DOMString data);
-
-    [NewObject] Attr createAttribute(DOMString localName);
-    [NewObject] Attr createAttributeNS([FlyString] DOMString? namespace, DOMString qualifiedName);
-
-    Range createRange();
-    Event createEvent(DOMString interface);
-
-    [CEReactions, NewObject] Node importNode(Node node, optional boolean deep = false);
-    [CEReactions, ImplementedAs=adopt_node_binding] Node adoptNode(Node node);
-
-    readonly attribute DOMString compatMode;
-    readonly attribute DocumentType? doctype;
-
-    readonly attribute Element? documentElement;
-    [CEReactions] attribute DOMString dir;
-    [CEReactions] attribute HTMLElement? body;
-    readonly attribute HTMLHeadElement? head;
-    readonly attribute HTMLScriptElement? currentScript;
-
-    readonly attribute DOMString lastModified;
-    readonly attribute DOMString readyState;
-
-    [CEReactions] attribute Utf16DOMString title;
-
-    readonly attribute boolean hidden;
-    readonly attribute DOMString visibilityState;
-
-    [NewObject] NodeIterator createNodeIterator(Node root, optional unsigned long whatToShow = 0xFFFFFFFF, optional NodeFilter? filter = null);
-    [NewObject] TreeWalker createTreeWalker(Node root, optional unsigned long whatToShow = 0xFFFFFFFF, optional NodeFilter? filter = null);
-
-    Selection? getSelection();
-
+    // user interaction
+    readonly attribute WindowProxy? defaultView;
+    [ImplementedAs=has_focus_for_bindings] boolean hasFocus();
     [CEReactions] attribute DOMString designMode;
-
-    // https://www.w3.org/TR/web-animations-1/#extensions-to-the-document-interface
-    readonly attribute DocumentTimeline timeline;
-
-    // https://drafts.csswg.org/cssom-view/#extensions-to-the-document-interface
-    Element? elementFromPoint(double x, double y);
-    sequence<Element> elementsFromPoint(double x, double y);
-    readonly attribute Element? scrollingElement;
-
-    // https://w3c.github.io/editing/docs/execCommand/
-    // FIXME: [CEReactions] boolean execCommand(DOMString commandId, optional boolean showUI = false, optional (TrustedHTML or DOMString) value = "");
-    [CEReactions] boolean execCommand(DOMString commandId, optional boolean showUI = false, optional Utf16DOMString value = "");
-    boolean queryCommandEnabled(DOMString commandId);
-    boolean queryCommandIndeterm(DOMString commandId);
-    boolean queryCommandState(DOMString commandId);
-    boolean queryCommandSupported(DOMString commandId);
-    DOMString queryCommandValue(DOMString commandId);
-
-    // XPath
-    [NewObject] XPathExpression createExpression(DOMString expression, optional XPathNSResolver? resolver = null);
-    XPathResult evaluate(DOMString expression, Node contextNode, optional XPathNSResolver? resolver = null, optional unsigned short type = 0, optional XPathResult? result = null);
-    Node createNSResolver(Node nodeResolver); // legacy
+    [CEReactions] boolean execCommand([FlyString] DOMString commandId, optional boolean showUI = false, optional DOMString value = "");
+    boolean queryCommandEnabled([FlyString] DOMString commandId);
+    boolean queryCommandIndeterm([FlyString] DOMString commandId);
+    boolean queryCommandState([FlyString] DOMString commandId);
+    boolean queryCommandSupported([FlyString] DOMString commandId);
+    DOMString queryCommandValue([FlyString] DOMString commandId);
+    readonly attribute boolean hidden;
+    readonly attribute DocumentVisibilityState visibilityState;
 
     // special event handler IDL attributes that only apply to Document objects
     [LegacyLenientThis] attribute EventHandler onreadystatechange;
     attribute EventHandler onvisibilitychange;
 
-    // https://drafts.csswg.org/css-view-transitions-1/#additions-to-document-api
-    ViewTransition startViewTransition(optional ViewTransitionUpdateCallback updateCallback);
-
-    // https://www.w3.org/TR/SVG2/struct.html#InterfaceDocumentExtensions
-    readonly attribute SVGSVGElement? rootElement;
+    // also has obsolete members
 };
 
-dictionary ElementCreationOptions {
-    DOMString is;
+enum DocumentReadyState { "loading", "interactive", "complete" };
+enum DocumentVisibilityState { "visible", "hidden" };
+
+// https://html.spec.whatwg.org/multipage/obsolete.html#Document-partial
+partial interface Document {
+    // FIXME: The LegacyNullToEmptyString attribute belongs on the DOMString type.
+    [CEReactions, LegacyNullToEmptyString] attribute DOMString fgColor;
+    [CEReactions, LegacyNullToEmptyString] attribute DOMString linkColor;
+    [CEReactions, LegacyNullToEmptyString] attribute DOMString vlinkColor;
+    [CEReactions, LegacyNullToEmptyString] attribute DOMString alinkColor;
+    [CEReactions, LegacyNullToEmptyString] attribute DOMString bgColor;
+
+    [SameObject] readonly attribute HTMLCollection anchors;
+    [SameObject] readonly attribute HTMLCollection applets;
+
+    undefined clear();
+    undefined captureEvents();
+    undefined releaseEvents();
+
+    [SameObject] readonly attribute HTMLAllCollection all;
 };
-Document includes ParentNode;
-Document includes GlobalEventHandlers;
+
+// https://w3c.github.io/pointerlock/#extensions-to-the-document-interface
+// FIXME: Move this to a proper home when we have a pointerlock spec folder.
+partial interface Document {
+    [FIXME] attribute EventHandler onpointerlockchange;
+    [FIXME] attribute EventHandler onpointerlockerror;
+    undefined exitPointerLock();
+};
+
 Document includes DocumentOrShadowRoot;
 Document includes FontFaceSource;
+Document includes GlobalEventHandlers;
+Document includes NonElementParentNode;
+Document includes ParentNode;

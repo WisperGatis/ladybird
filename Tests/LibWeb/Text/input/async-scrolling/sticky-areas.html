@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    body {
+        margin: 0;
+    }
+
+    #outer {
+        position: sticky;
+        top: 0;
+    }
+
+    #inner {
+        position: sticky;
+        top: 20px;
+    }
+
+    #spacer {
+        height: 2000px;
+    }
+</style>
+<div id="outer">
+    <div id="inner">sticky</div>
+</div>
+<div id="spacer"></div>
+<script>
+    test(() => {
+        const state = internals.asyncScrollingState();
+        const viewportNode = state.scrollNodes.find(node => node.isViewport);
+        const displayList = internals.dumpDisplayList();
+        const stickyNodes = [...displayList.matchAll(/\[s(\d+)\] sticky scroller=s(\d+)(?: parent_sticky=s(\d+))?.*? insets=\[([^\]]*)\]/g)]
+            .map(match => ({
+                index: Number(match[1]),
+                scroller: Number(match[2]),
+                parentSticky: match[3] === undefined ? null : Number(match[3]),
+                insets: match[4],
+            }));
+        const outer = stickyNodes.find(node => node.parentSticky === null);
+        const inner = stickyNodes.find(node => node.parentSticky === outer.index);
+
+        println(`scroll nodes: ${state.scrollNodeCount}`);
+        println(`sticky nodes: ${stickyNodes.length}`);
+        println(`inner parent sticky is outer: ${inner.parentSticky === outer.index}`);
+        println(`outer scroller is viewport: ${outer.scroller === viewportNode.scrollNodeIndex}`);
+        println(`inner scroller is viewport: ${inner.scroller === viewportNode.scrollNodeIndex}`);
+        println(`outer insets: ${outer.insets}`);
+        println(`inner insets: ${inner.insets}`);
+        println("display list:");
+        println(displayList);
+    });
+</script>

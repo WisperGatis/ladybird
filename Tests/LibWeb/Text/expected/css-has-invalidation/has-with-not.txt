@@ -1,0 +1,2 @@
+[add .x (anchor should stop being styled)]
+[remove .x (anchor should be styled again)]

@@ -15,16 +15,39 @@
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCore/Promise.h>
+#include <LibCore/Timer.h>
+#include <LibGfx/Bitmap.h>
 #include <LibGfx/Forward.h>
 
 namespace TestWeb {
 
 enum class TestMode {
+    Accessibility,
     Layout,
     Text,
     Ref,
+    Screenshot,
     Crash,
 };
+
+constexpr StringView test_mode_to_string(TestMode mode)
+{
+    switch (mode) {
+    case TestMode::Accessibility:
+        return "Accessibility"sv;
+    case TestMode::Layout:
+        return "Layout"sv;
+    case TestMode::Text:
+        return "Text"sv;
+    case TestMode::Ref:
+        return "Ref"sv;
+    case TestMode::Screenshot:
+        return "Screenshot"sv;
+    case TestMode::Crash:
+        return "Crash"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
 
 enum class TestResult {
     Pass,
@@ -34,9 +57,40 @@ enum class TestResult {
     Crashed,
 };
 
+enum class ExpectedOutcome {
+    Normal,
+    WebContentTermination,
+    WebContentCrash,
+};
+
+constexpr StringView web_content_termination_marker = "WebContent helper process terminated after rejected IPC."sv;
+constexpr StringView web_content_crash_marker = "WebContent process crashed."sv;
+
+constexpr StringView test_result_to_string(TestResult result)
+{
+    switch (result) {
+    case TestResult::Pass:
+        return "Pass"sv;
+    case TestResult::Fail:
+        return "Fail"sv;
+    case TestResult::Skipped:
+        return "Skipped"sv;
+    case TestResult::Timeout:
+        return "Timeout"sv;
+    case TestResult::Crashed:
+        return "Crashed"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 enum class RefTestExpectationType {
     Match,
     Mismatch,
+};
+
+struct RefTestExpectation {
+    RefTestExpectationType type;
+    URL::URL url;
 };
 
 struct Test {
@@ -45,26 +99,49 @@ struct Test {
     ByteString input_path {};
     ByteString expectation_path {};
     ByteString relative_path {};
+    ByteString safe_relative_path {};
+    Optional<String> variant {};
 
     UnixDateTime start_time {};
     UnixDateTime end_time {};
     size_t index { 0 };
+    size_t run_index { 1 };
+    size_t total_runs { 1 };
 
     String text {};
+    bool did_start_test { false };
     bool did_finish_test { false };
     bool did_finish_loading { false };
+    bool did_inject_js { false };
 
-    Optional<RefTestExpectationType> ref_test_expectation_type {};
+    Vector<RefTestExpectation> ref_test_expectations {};
+    size_t ref_test_expectation_index { 0 };
     Vector<FuzzyMatch> fuzzy_matches {};
 
     RefPtr<Gfx::Bitmap const> actual_screenshot {};
     RefPtr<Gfx::Bitmap const> expectation_screenshot {};
+
+    u64 diff_pixel_error_count { 0 };
+    u8 diff_maximum_error { 0 };
+
+    RefPtr<Core::Timer> timeout_timer {};
+    ExpectedOutcome expected_outcome { ExpectedOutcome::Normal };
 };
 
 struct TestCompletion {
-    Test& test;
+    size_t test_index;
     TestResult result;
 };
+
+struct ViewDisplayState {
+    pid_t pid { 0 };
+    ByteString test_name;
+    UnixDateTime start_time;
+    bool active { false };
+};
+
+Vector<ViewDisplayState>& view_states();
+size_t total_tests();
 
 using TestPromise = Core::Promise<TestCompletion>;
 

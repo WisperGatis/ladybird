@@ -1,0 +1,1 @@
+PASS: viewport resize reuses the independent subtree (work + checks)

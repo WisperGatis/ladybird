@@ -1,5 +1,3 @@
-#import <DOM/Event.idl>
-
 // https://html.spec.whatwg.org/multipage/interaction.html#toggleevent
 [Exposed=Window]
 interface ToggleEvent : Event {
@@ -10,6 +8,7 @@ interface ToggleEvent : Event {
 };
 
 dictionary ToggleEventInit : EventInit {
-    DOMString oldState = "";
-    DOMString newState = "";
+    [FlyString] DOMString oldState = "";
+    [FlyString] DOMString newState = "";
+    Element? source = null;
 };

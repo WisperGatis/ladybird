@@ -1,0 +1,26 @@
+[package]
+name = "libunicode_rust"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+allocator = ["dep:ladybird_allocator"]
+idna = []
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# After changing dependencies, regenerate the Flatpak sources:
+#   python3 Meta/CMake/flatpak/generate-cargo-sources.py
+[dependencies]
+calendrical_calculations = "=0.2.4"
+icu_calendar = { version = "=2.2.1", features = ["compiled_data"] }
+ladybird_allocator = { path = "../../RustAllocator", optional = true }
+rustc-demangle = "0.1"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[lints]
+workspace = true

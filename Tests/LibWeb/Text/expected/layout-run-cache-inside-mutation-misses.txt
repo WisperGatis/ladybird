@@ -1,0 +1,1 @@
+PASS: a descendant mutation invalidates the cached run (work + checks)

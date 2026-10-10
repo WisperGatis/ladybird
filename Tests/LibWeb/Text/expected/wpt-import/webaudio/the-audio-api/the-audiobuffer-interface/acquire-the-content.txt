@@ -1,0 +1,8 @@
+Harness status: OK
+
+Found 3 tests
+
+3 Pass
+Pass	AudioBufferSourceNode setter set with non-null buffer
+Pass	AudioBufferSourceNode buffer setter set with null
+Pass	ConvolverNode

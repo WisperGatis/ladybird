@@ -9,8 +9,12 @@
 *.cflags
 *.cxxflags
 *.autosave
-build*/
-Build*/
+# Build directories live at the root of the tree (see Meta/CMake/presets), and source directories may have such names.
+/build*/
+/Build*/
+target/
+# ...but Flap's backend sources live in a directory of that name.
+!Libraries/LibJS/Flap/src/target/
 Toolchain/Tarballs
 Toolchain/Build
 Toolchain/Local
@@ -20,7 +24,6 @@ Toolchain/Local
 compile_commands.json
 .cache
 .clang_complete
-.clangd
 .idea/
 cmake-build-debug/
 output/
@@ -47,6 +50,9 @@ Libraries/LibWasm/Tests/Spec
 Tests/LibWeb/WPT/wpt
 Tests/LibWeb/WPT/metadata
 Tests/LibWeb/WPT/MANIFEST.json
+
+test-dumps
+*.log
 
 # HTTP Test server artifacts from ./Tests/LibWeb/Fixtures/http-test-server.py
 http-test-server.pid.txt

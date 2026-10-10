@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -8,6 +9,8 @@
 #include <LibCore/StandardPaths.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
+#include <LibGfx/Font/SystemFallbackFonts.h>
+#include <LibGfx/Font/TypefaceSkia.h>
 
 #if defined(AK_OS_HAIKU)
 #    include <FindDirectory.h>
@@ -19,33 +22,71 @@
 
 namespace Gfx {
 
+RefPtr<Typeface> SystemFontProvider::get_typeface_by_local_name(String const&)
+{
+    return {};
+}
+
+RefPtr<Typeface> FontDatabase::get_typeface_by_local_name(String const& name)
+{
+    return m_system_font_provider->get_typeface_by_local_name(name);
+}
+
 // Key function for SystemFontProvider to emit the vtable here
 SystemFontProvider::~SystemFontProvider() = default;
 
+RefPtr<Typeface> SystemFontProvider::get_typeface_by_id(u64, u64)
+{
+    return nullptr;
+}
+
+RefPtr<Gfx::Font> SystemFontProvider::get_font_for_code_point(u32 code_point, float point_size, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
+{
+    auto typeface_or_error = TypefaceSkia::find_typeface_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
+    if (typeface_or_error.is_error() || !typeface_or_error.value())
+        return nullptr;
+    return typeface_or_error.release_value()->font(point_size, {});
+}
+
+Optional<FlyString> SystemFontProvider::resolve_generic_family(StringView family_name, u16 weight, u8 slope)
+{
+    return TypefaceSkia::resolve_generic_family(family_name, weight, slope);
+}
+
 FontDatabase& FontDatabase::the()
 {
-    static FontDatabase s_the;
-    return s_the;
+    static FontDatabase& database = *new FontDatabase;
+    return database;
 }
 
 SystemFontProvider& FontDatabase::install_system_font_provider(NonnullOwnPtr<SystemFontProvider> provider)
 {
     VERIFY(!m_system_font_provider);
+    clear_system_fallback_font_cache();
     m_system_font_provider = move(provider);
     return *m_system_font_provider;
 }
 
-StringView FontDatabase::system_font_provider_name() const
-{
-    VERIFY(m_system_font_provider);
-    return m_system_font_provider->name();
-}
-
 FontDatabase::FontDatabase() = default;
 
-RefPtr<Gfx::Font> FontDatabase::get(FlyString const& family, float point_size, unsigned weight, unsigned width, unsigned slope)
+RefPtr<Gfx::Font> FontDatabase::get(FlyString const& family, float point_size, unsigned weight, unsigned width, unsigned slope, Optional<FontVariationSettings> const& font_variation_settings, Optional<Gfx::ShapeFeatures> const& shape_features)
 {
-    return m_system_font_provider->get_font(family, point_size, weight, width, slope);
+    return m_system_font_provider->get_font(family, point_size, weight, width, slope, font_variation_settings, shape_features);
+}
+
+RefPtr<Gfx::Font> FontDatabase::get_font_for_code_point(u32 code_point, float point_size, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
+{
+    return m_system_font_provider->get_font_for_code_point(code_point, point_size, weight, width, slope, prefer_color_emoji);
+}
+
+RefPtr<Typeface> FontDatabase::get_typeface_by_id(u64 generation, u64 face_id)
+{
+    return m_system_font_provider->get_typeface_by_id(generation, face_id);
+}
+
+Optional<FlyString> FontDatabase::resolve_generic_family(StringView family_name, u16 weight, u8 slope)
+{
+    return m_system_font_provider->resolve_generic_family(family_name, weight, slope);
 }
 
 void FontDatabase::for_each_typeface_with_family_name(FlyString const& family_name, Function<void(Typeface const&)> callback)

@@ -1,38 +1,101 @@
 set(TEST_SOURCES
+    BenchmarkDisplayListRecording.cpp
+    TestAudioWorkletPipe.cpp
+    TestContentBlocker.cpp
+    TestControlMessageQueue.cpp
     TestCSSIDSpeed.cpp
     TestCSSInheritedProperty.cpp
-    TestCSSPixels.cpp
-    TestCSSSyntaxParser.cpp
-    TestCSSTokenStream.cpp
-    TestFetchInfrastructure.cpp
+    TestCSSPropertyList.cpp
+    TestCSSDecodeBytes.cpp
+    TestDownloadReader.cpp
+    TestDump.cpp
+    TestEventLoop.cpp
+    TestFaviconDecoding.cpp
+    TestFetchResponse.cpp
     TestFetchURL.cpp
     TestHTMLTokenizer.cpp
+    TestHighResolutionTime.cpp
+    TestImageData.cpp
+    TestInitialLoadTracker.cpp
+    TestInlineStyle.cpp
     TestMicrosyntax.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
-    TestStrings.cpp
+    TestSecureContexts.cpp
+    TestSessionHistoryEntry.cpp
+    TestSharedCompiledStyleSheet.cpp
+    TestSimpleRealm.cpp
+    TestSourceHighlighter.cpp
+    TestStructuredSerializeCorpus.cpp
+    TestStructuredSerializeDurability.cpp
+    TestStructuredSerializeFormat.cpp
+    TestStructuredSerializeHardening.cpp
+    TestStructuredSerializeSharedArrayBuffer.cpp
+    TestStyleEngineBridge.cpp
+    TestWebGLSpanWithStorage.cpp
+    TestWebIDLBuffers.cpp
+    TestWindowProxyWorld.cpp
+    TestWorldCallback.cpp
+    TestWrapperWorld.cpp
 )
 
-foreach(source IN LISTS TEST_SOURCES)
-    ladybird_test("${source}" LibWeb LIBS LibWeb)
-endforeach()
-
-target_link_libraries(TestFetchURL PRIVATE LibURL)
-
-if (ENABLE_SWIFT)
-    find_package(SwiftTesting REQUIRED)
-
-    add_executable(TestLibWebSwift
-        TestLibWebSwiftBindings.swift
-        TestHTMLTokenizerSwift.swift
+if (NOT WIN32)
+    list(APPEND TEST_SOURCES
+        # These call Rust FFI symbols directly, which the lagom-web DLL does not export.
+        TestCSSSyntaxParser.cpp
+        TestLengthAbsolutizeParity.cpp
+        TestStylePropertyMetadataParity.cpp
+        TestStyleStructRef.cpp
+        TestStyleValueEquality.cpp
     )
-
-    # FIXME: Swift doesn't seem to like object libraries for @main
-    target_sources(TestLibWebSwift PRIVATE ../Resources/SwiftTestMain.swift)
-
-    set_target_properties(TestLibWebSwift PROPERTIES SUFFIX .swift-testing)
-    target_link_libraries(TestLibWebSwift PRIVATE AK LibWeb LibGC SwiftTesting::SwiftTesting)
-    add_test(NAME TestLibWebSwift COMMAND TestLibWebSwift)
 endif()
 
+foreach(source IN LISTS TEST_SOURCES)
+    set(test_libraries LibCompositing LibWeb)
+    if (source STREQUAL "TestSimpleRealm.cpp")
+        list(APPEND test_libraries LibGC LibJS)
+    endif()
+    ladybird_test("${source}" LibWeb LIBS ${test_libraries})
+endforeach()
+
+
+target_link_libraries(BenchmarkDisplayListRecording PRIVATE LibGC LibGfx LibIPC LibJS LibURL LibWebView)
+target_link_libraries(TestAudioWorkletPipe PRIVATE LibCore LibThreading)
+target_link_libraries(TestContentBlocker PRIVATE LibURL)
+if (NOT WIN32)
+    target_link_libraries(TestCSSSyntaxParser PRIVATE LibThreading)
+endif()
+target_link_libraries(TestDownloadReader PRIVATE LibGC LibJS LibURL)
+target_link_libraries(TestFaviconDecoding PRIVATE LibCore LibGC LibGfx LibJS)
+target_link_libraries(TestFetchResponse PRIVATE LibGC LibHTTP LibJS LibRequests LibURL)
+target_link_libraries(TestFetchURL PRIVATE LibURL)
+target_link_libraries(TestImageData PRIVATE LibGC LibJS)
+target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
+target_link_libraries(TestWebGLSpanWithStorage PRIVATE LibGC LibJS)
+target_link_libraries(TestStructuredSerializeCorpus PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
+target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
+target_link_libraries(TestStructuredSerializeFormat PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
+target_link_libraries(TestStructuredSerializeHardening PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
+target_link_libraries(TestStructuredSerializeSharedArrayBuffer PRIVATE LibGC LibJS LibIPC)
+target_link_libraries(TestSecureContexts PRIVATE LibURL)
+target_link_libraries(TestSessionHistoryEntry PRIVATE LibJS LibURL)
+target_link_libraries(TestSourceHighlighter PRIVATE LibURL)
+target_link_libraries(TestWrapperWorld PRIVATE LibGC LibJS LibURL)
+target_link_libraries(TestSharedCompiledStyleSheet PRIVATE LibGC LibJS LibURL)
+target_sources(TestWorldCallback PRIVATE
+    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/DOM/IDLEventListener.cpp
+    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/WebIDL/CallbackType.cpp
+)
+target_link_libraries(TestWorldCallback PRIVATE LibGC LibJS LibWeb)
+target_sources(TestWindowProxyWorld PRIVATE
+    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/DOM/IDLEventListener.cpp
+    ${ladybird_SOURCE_DIR}/Libraries/LibWeb/WebIDL/CallbackType.cpp
+)
+target_link_libraries(TestWindowProxyWorld PRIVATE LibGC LibJS LibWeb)
+
 add_subdirectory("test-web")
+
+target_link_libraries(TestInlineStyle PRIVATE LibCore LibGC LibGfx LibJS LibURL)
+
+add_subdirectory("AccessibilityBridge")
+add_subdirectory("AccessibilityBridgeMac")

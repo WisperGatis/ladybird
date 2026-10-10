@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/CSS/URL.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
@@ -11,6 +12,18 @@
 namespace Web::CSS {
 
 URL::URL(String url, Type type, Vector<RequestURLModifier> request_url_modifiers)
+    : m_type(type)
+    , m_url(Utf16String::from_utf8(url))
+    , m_request_url_modifiers(move(request_url_modifiers))
+{
+}
+
+URL::URL(Utf16View url, Type type, Vector<RequestURLModifier> request_url_modifiers)
+    : URL(Utf16String::from_utf16(url), type, move(request_url_modifiers))
+{
+}
+
+URL::URL(Utf16String url, Type type, Vector<RequestURLModifier> request_url_modifiers)
     : m_type(type)
     , m_url(move(url))
     , m_request_url_modifiers(move(request_url_modifiers))
@@ -20,38 +33,39 @@ URL::URL(String url, Type type, Vector<RequestURLModifier> request_url_modifiers
 // https://drafts.csswg.org/cssom-1/#serialize-a-url
 String URL::to_string() const
 {
-    // To serialize a URL means to create a string represented by "url(", followed by the serialization of the URL as a
-    // string, followed by ")".
-    // AD-HOC: Serialize as src() if it was declared as that.
-    StringBuilder builder;
-    switch (m_type) {
-    case Type::Url:
-        builder.append("url("sv);
-        break;
-    case Type::Src:
-        builder.append("src("sv);
-        break;
-    }
-    serialize_a_string(builder, m_url);
-
-    // AD-HOC: Serialize the RequestURLModifiers
-    // Spec issue: https://github.com/w3c/csswg-drafts/issues/12057
-    for (auto const& modifier : m_request_url_modifiers)
-        builder.appendff(" {}", modifier.to_string());
-
-    builder.append(')');
-
-    return builder.to_string_without_validation();
+    return to_utf16_string().to_utf8();
 }
 
-bool URL::operator==(URL const&) const = default;
+// https://drafts.csswg.org/cssom-1/#serialize-a-url
+Utf16String URL::to_utf16_string() const
+{
+    Utf16StringBuilder builder;
+    switch (m_type) {
+    case Type::Url:
+        builder.append_ascii("url("sv);
+        break;
+    case Type::Src:
+        builder.append_ascii("src("sv);
+        break;
+    }
+
+    serialize_a_string(builder, m_url);
+
+    for (auto const& modifier : m_request_url_modifiers) {
+        builder.append_ascii(' ');
+        builder.append(modifier.to_utf16_string());
+    }
+
+    builder.append_ascii(')');
+    return builder.to_string();
+}
 
 RequestURLModifier RequestURLModifier::create_cross_origin(CrossOriginModifierValue value)
 {
     return RequestURLModifier { Type::CrossOrigin, value };
 }
 
-RequestURLModifier RequestURLModifier::create_integrity(FlyString value)
+RequestURLModifier RequestURLModifier::create_integrity(Utf16FlyString value)
 {
     return RequestURLModifier { Type::Integrity, move(value) };
 }
@@ -92,7 +106,7 @@ void RequestURLModifier::modify_request(GC::Ref<Fetch::Infrastructure::Request> 
 
         // The URL request modifier steps for this modifier given request req are to set request’s integrity metadata to
         // the given <string>.
-        request->set_integrity_metadata(m_value.get<FlyString>().to_string());
+        request->set_integrity_metadata(m_value.get<Utf16FlyString>().to_utf16_string());
         break;
     }
     case Type::ReferrerPolicy: {
@@ -128,17 +142,28 @@ void RequestURLModifier::modify_request(GC::Ref<Fetch::Infrastructure::Request> 
 
 String RequestURLModifier::to_string() const
 {
-    switch (m_type) {
-    case Type::CrossOrigin:
-        return MUST(String::formatted("cross-origin({})", CSS::to_string(m_value.get<CrossOriginModifierValue>())));
-    case Type::Integrity:
-        return MUST(String::formatted("integrity({})", serialize_a_string(m_value.get<FlyString>())));
-    case Type::ReferrerPolicy:
-        return MUST(String::formatted("referrer-policy({})", CSS::to_string(m_value.get<ReferrerPolicyModifierValue>())));
-    }
-    VERIFY_NOT_REACHED();
+    return to_utf16_string().to_utf8();
 }
 
-bool RequestURLModifier::operator==(RequestURLModifier const&) const = default;
+Utf16String RequestURLModifier::to_utf16_string() const
+{
+    Utf16StringBuilder builder;
+    switch (m_type) {
+    case Type::CrossOrigin:
+        builder.append_ascii("cross-origin("sv);
+        builder.append_ascii(CSS::to_string(m_value.get<CrossOriginModifierValue>()));
+        break;
+    case Type::Integrity:
+        builder.append_ascii("integrity("sv);
+        serialize_a_string(builder, m_value.get<Utf16FlyString>());
+        break;
+    case Type::ReferrerPolicy:
+        builder.append_ascii("referrer-policy("sv);
+        builder.append_ascii(CSS::to_string(m_value.get<ReferrerPolicyModifierValue>()));
+        break;
+    }
+    builder.append_ascii(')');
+    return builder.to_string();
+}
 
 }

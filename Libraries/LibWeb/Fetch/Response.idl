@@ -1,7 +1,3 @@
-#import <Fetch/Body.idl>
-#import <Fetch/BodyInit.idl>
-#import <Fetch/Headers.idl>
-
 // https://fetch.spec.whatwg.org/#response-class
 [Exposed=(Window,Worker)]
 interface Response {
@@ -9,7 +5,7 @@ interface Response {
 
     [NewObject] static Response error();
     [NewObject] static Response redirect(USVString url, optional unsigned short status = 302);
-    [NewObject] static Response json(any data, optional ResponseInit init = {});
+    [NeedsCallerRealm, NewObject] static Response json(any data, optional ResponseInit init = {});
 
     readonly attribute ResponseType type;
 
@@ -20,7 +16,7 @@ interface Response {
     readonly attribute ByteString statusText;
     [SameObject] readonly attribute Headers headers;
 
-    [NewObject] Response clone();
+    [NeedsCallerRealm, NewObject] Response clone();
 };
 Response includes Body;
 

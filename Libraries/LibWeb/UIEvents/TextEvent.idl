@@ -1,8 +1,7 @@
-#import <UIEvents/UIEvent.idl>
-
 // https://w3c.github.io/uievents/#textevent
 [Exposed=Window]
 interface TextEvent : UIEvent {
     readonly attribute DOMString data;
-    undefined initTextEvent(DOMString type, optional boolean bubbles = false, optional boolean cancelable = false, optional WindowProxy? view = null, optional DOMString data = "undefined");
+    // FIXME: Spec issue: We use a WindowProxy instead of a Window: https://github.com/w3c/uievents/issues/388
+    undefined initTextEvent([FlyString] DOMString type, optional boolean bubbles = false, optional boolean cancelable = false, optional WindowProxy? view = null, optional DOMString data = "undefined");
 };

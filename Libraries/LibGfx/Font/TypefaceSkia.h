@@ -8,13 +8,40 @@
 
 #include <LibGfx/Font/Typeface.h>
 
+#ifdef AK_OS_MACOS
+#    include <CoreText/CoreText.h>
+#endif
+
+template<typename T>
+class sk_sp;
+
 namespace Gfx {
+
+enum class SystemUIFontKind : u8 {
+    System,
+    Serif,
+    Monospace,
+    Rounded,
+};
+
+struct SystemUIFontStyle {
+    SystemUIFontKind kind;
+    u16 weight;
+    u16 width;
+    u8 slope;
+};
 
 class TypefaceSkia : public Gfx::Typeface {
     AK_MAKE_NONCOPYABLE(TypefaceSkia);
 
 public:
-    static ErrorOr<NonnullRefPtr<TypefaceSkia>> load_from_buffer(ReadonlyBytes, int index = 0);
+    static ErrorOr<NonnullRefPtr<TypefaceSkia>> load_from_buffer(ReadonlyBytes, u32 ttc_index, NonnullRefPtr<FontDataBacking>);
+    static ErrorOr<RefPtr<TypefaceSkia>> match_system_ui(SystemUIFontKind, float point_size, u16 weight, u16 width, u8 slope);
+    static ErrorOr<RefPtr<TypefaceSkia>> match_family_style(StringView family_name, u16 weight, u16 width, u8 slope);
+    static ErrorOr<RefPtr<TypefaceSkia>> find_typeface_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji);
+    static Optional<FlyString> resolve_generic_family(StringView family_name, u16 weight, u8 slope);
+
+    RefPtr<TypefaceSkia const> clone_with_variations(Vector<FontVariationAxis> const& axes) const;
 
     virtual u32 glyph_count() const override;
     virtual u16 units_per_em() const override;
@@ -25,35 +52,49 @@ public:
     virtual u8 slope() const override;
 
     virtual ReadonlyBytes buffer() const LIFETIME_BOUND override { return m_buffer; }
-    virtual unsigned ttc_index() const override { return m_ttc_index; }
+    virtual u32 ttc_index() const override { return m_ttc_index; }
 
     SkTypeface const* sk_typeface() const;
+    u32 platform_typeface_id() const;
+
+    // How many glyph pages the calling thread has filled in, for tests of its glyph page caches.
+    static u64 glyph_pages_populated_on_this_thread();
+
+protected:
+    virtual void encode_font_data_for_ipc(IPC::Encoder&) const override;
+    virtual hb_face_t* create_harfbuzz_face() const override;
 
 private:
     struct Impl;
     Impl& impl() const { return *m_impl; }
     NonnullOwnPtr<Impl> m_impl;
 
-    explicit TypefaceSkia(NonnullOwnPtr<Impl>, ReadonlyBytes, int ttc_index = 0);
+    static ErrorOr<RefPtr<TypefaceSkia>> typeface_from_skia_typeface(sk_sp<SkTypeface>, Optional<SystemUIFontStyle> = {});
+#ifdef AK_OS_MACOS
+    static ErrorOr<RefPtr<TypefaceSkia>> typeface_from_core_text_typeface(sk_sp<SkTypeface>, CTFontRef, SystemUIFontStyle);
+#endif
+
+    TypefaceSkia(NonnullOwnPtr<Impl>, ReadonlyBytes, u32 ttc_index = 0);
 
     virtual bool is_skia() const override { return true; }
 
     ReadonlyBytes m_buffer;
-    unsigned m_ttc_index { 0 };
+    u32 m_ttc_index { 0 };
 
+    mutable OnceFlag m_family_once;
     mutable Optional<FlyString> m_family;
 
     // This cache stores information per code point.
     // It's segmented into pages with data about 256 code points each.
     struct GlyphPage {
+        AK_ALLOC_WITH_KMALLOC;
+
         static constexpr size_t glyphs_per_page = 256;
         u16 glyph_ids[glyphs_per_page];
     };
 
-    // Fast cache for GlyphPage #0 (code points 0-255) to avoid hash lookups for all of ASCII and Latin-1.
-    OwnPtr<GlyphPage> mutable m_glyph_page_zero;
-
-    HashMap<size_t, NonnullOwnPtr<GlyphPage>> mutable m_glyph_pages;
+    // Addresses can be reused after destruction, so per-thread caches use a monotonic identity.
+    u64 m_glyph_cache_id { 0 };
 
     [[nodiscard]] GlyphPage const& glyph_page(size_t page_index) const;
     void populate_glyph_page(GlyphPage&, size_t page_index) const;
@@ -61,5 +102,15 @@ private:
 
 template<>
 inline bool Typeface::fast_is<TypefaceSkia>() const { return is_skia(); }
+
+}
+
+namespace IPC {
+
+template<>
+ErrorOr<void> encode(Encoder&, Gfx::SystemUIFontStyle const&);
+
+template<>
+ErrorOr<Gfx::SystemUIFontStyle> decode(Decoder&);
 
 }

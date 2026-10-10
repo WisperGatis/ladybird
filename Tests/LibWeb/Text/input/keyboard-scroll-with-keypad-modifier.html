@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+
+    div {
+        height: 2000px;
+    }
+</style>
+<div></div>
+<script src="include.js"></script>
+<script>
+    promiseTest(async () => {
+        println(`before: ${window.scrollY}`);
+        await scrollSettled(document, () => internals.sendKey(document.body, "Down", internals.MOD_KEYPAD));
+        println(`after: ${window.scrollY}`);
+    });
+</script>

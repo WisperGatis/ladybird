@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, Ladybird contributors
+ * Copyright (c) 2025-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -12,34 +12,26 @@ namespace Web::CSS {
 
 class ColorSchemeStyleValue final : public StyleValueWithDefaultOperators<ColorSchemeStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<ColorSchemeStyleValue const> create(Vector<String> schemes, bool only)
-    {
-        return adopt_ref(*new (nothrow) ColorSchemeStyleValue(move(schemes), only));
-    }
-    static ValueComparingNonnullRefPtr<ColorSchemeStyleValue const> normal()
-    {
-        return adopt_ref(*new (nothrow) ColorSchemeStyleValue({}, false));
-    }
     virtual ~ColorSchemeStyleValue() override = default;
 
-    Vector<String> const& schemes() const { return m_properties.schemes; }
-    bool const& only() const { return m_properties.only; }
-    virtual String to_string(SerializationMode) const override;
-
-    bool properties_equal(ColorSchemeStyleValue const& other) const { return m_properties == other.m_properties; }
+    Vector<Utf16FlyString> schemes() const
+    {
+        auto const& list = m_value->color_scheme.schemes;
+        Vector<Utf16FlyString> schemes;
+        schemes.ensure_capacity(list.length);
+        for (size_t i = 0; i < list.length; ++i)
+            schemes.unchecked_append(css_string_from_rust(&list.pointer[i]));
+        return schemes;
+    }
+    bool only() const { return m_value->color_scheme.only; }
 
 private:
-    ColorSchemeStyleValue(Vector<String> schemes, bool only)
-        : StyleValueWithDefaultOperators(Type::ColorScheme)
-        , m_properties { .schemes = move(schemes), .only = only }
+    friend class StyleValue;
+
+    explicit ColorSchemeStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::ColorScheme, data)
     {
     }
-
-    struct Properties {
-        Vector<String> schemes;
-        bool only;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

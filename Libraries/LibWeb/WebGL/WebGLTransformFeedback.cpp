@@ -6,29 +6,24 @@
 
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/WebGLTransformFeedbackPrototype.h>
+#include <LibWeb/Bindings/WebGLTransformFeedback.h>
 #include <LibWeb/WebGL/WebGLTransformFeedback.h>
 
 namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(WebGLTransformFeedback);
 
-GC::Ref<WebGLTransformFeedback> WebGLTransformFeedback::create(JS::Realm& realm, WebGLRenderingContextBase& context, GLuint handle)
+GC::Ref<WebGLTransformFeedback> WebGLTransformFeedback::create(GC::Ref<WebGLRenderingContextBase> context, GLuint handle)
 {
+    auto& realm = context->realm();
     return realm.create<WebGLTransformFeedback>(realm, context, handle);
 }
 
-WebGLTransformFeedback::WebGLTransformFeedback(JS::Realm& realm, WebGLRenderingContextBase& context, GLuint handle)
+WebGLTransformFeedback::WebGLTransformFeedback(JS::Realm& realm, GC::Ref<WebGLRenderingContextBase> context, GLuint handle)
     : WebGLObject(realm, context, handle)
 {
 }
 
 WebGLTransformFeedback::~WebGLTransformFeedback() = default;
-
-void WebGLTransformFeedback::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(WebGLTransformFeedback);
-    Base::initialize(realm);
-}
 
 }

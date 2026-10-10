@@ -5,8 +5,7 @@
  */
 
 #include "CSSUnitValue.h"
-#include <LibWeb/Bindings/CSSUnitValuePrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
@@ -27,16 +26,15 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSUnitValue);
 
-GC::Ref<CSSUnitValue> CSSUnitValue::create(JS::Realm& realm, double value, FlyString unit)
+GC::Ref<CSSUnitValue> CSSUnitValue::create(double value, Utf16FlyString unit)
 {
     // The type of a CSSUnitValue is the result of creating a type from its unit internal slot.
     // https://drafts.css-houdini.org/css-typed-om-1/#type-of-a-cssunitvalue
     auto numeric_type = NumericType::create_from_unit(unit);
-    return realm.create<CSSUnitValue>(realm, value, move(unit), numeric_type.release_value());
+    return GC::Heap::the().allocate<CSSUnitValue>(value, move(unit), numeric_type.release_value());
 }
 
-// https://drafts.css-houdini.org/css-typed-om-1/#create-a-cssunitvalue-from-a-sum-value-item
-GC::Ptr<CSSUnitValue> CSSUnitValue::create_from_sum_value_item(JS::Realm& realm, SumValueItem const& item)
+GC::Ptr<CSSUnitValue> CSSUnitValue::create_from_sum_value_item(SumValueItem const& item)
 {
     // 1. If item has more than one entry in its unit map, return failure.
     if (item.unit_map.size() > 1)
@@ -45,7 +43,7 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::create_from_sum_value_item(JS::Realm& realm,
     // 2. If item has no entries in its unit map, return a new CSSUnitValue whose unit internal slot is set to
     //    "number", and whose value internal slot is set to item’s value.
     if (item.unit_map.is_empty())
-        return CSSUnitValue::create(realm, item.value, "number"_fly_string);
+        return CSSUnitValue::create(item.value, "number"_utf16_fly_string);
 
     // 3. Otherwise, item has a single entry in its unit map. If that entry’s value is anything other than 1, return
     //    failure.
@@ -55,33 +53,28 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::create_from_sum_value_item(JS::Realm& realm,
 
     // 4. Otherwise, return a new CSSUnitValue whose unit internal slot is set to that entry’s key, and whose value
     //    internal slot is set to item’s value.
-    return CSSUnitValue::create(realm, item.value, single_type_entry->key);
+    return CSSUnitValue::create(item.value, single_type_entry->key);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-cssunitvalue-cssunitvalue
-WebIDL::ExceptionOr<GC::Ref<CSSUnitValue>> CSSUnitValue::construct_impl(JS::Realm& realm, double value, FlyString unit)
+WebIDL::ExceptionOr<GC::Ref<CSSUnitValue>> CSSUnitValue::construct_impl(double value, Utf16String unit)
 {
     // 1. If creating a type from unit returns failure, throw a TypeError and abort this algorithm.
-    auto numeric_type = NumericType::create_from_unit(unit);
+    auto fly_unit = Utf16FlyString { move(unit) };
+    auto numeric_type = NumericType::create_from_unit(fly_unit);
     if (!numeric_type.has_value())
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Cannot create CSSUnitValue with unrecognized unit '{}'", unit)) };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Cannot create CSSUnitValue with unrecognized unit"_utf16 };
 
     // 2. Return a new CSSUnitValue with its value internal slot set to value and its unit set to unit.
-    return realm.create<CSSUnitValue>(realm, value, move(unit), numeric_type.release_value());
+    return GC::Heap::the().allocate<CSSUnitValue>(value, move(fly_unit), numeric_type.release_value());
 }
 
-CSSUnitValue::CSSUnitValue(JS::Realm& realm, double value, FlyString unit, NumericType type)
-    : CSSNumericValue(realm, move(type))
+CSSUnitValue::CSSUnitValue(double value, Utf16FlyString unit, NumericType type)
+    : CSSNumericValue(move(type))
     , m_value(value)
     // AD-HOC: WPT expects the unit to be lowercase but this doesn't seem to be specified anywhere.
     , m_unit(unit.to_ascii_lowercase())
 {
-}
-
-void CSSUnitValue::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSUnitValue);
-    Base::initialize(realm);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-cssunitvalue-value
@@ -92,47 +85,50 @@ void CSSUnitValue::set_value(double value)
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#serialize-a-cssunitvalue
-String CSSUnitValue::serialize_unit_value(Optional<double> minimum, Optional<double> maximum) const
+void CSSUnitValue::serialize_unit_value(Utf16StringBuilder& builder, Optional<double> minimum, Optional<double> maximum) const
 {
     // To serialize a CSSUnitValue this, with optional arguments minimum, a numeric value, and maximum, a numeric value:
 
     // 1. Let value and unit be this‘s value and unit internal slots.
 
+    // 4. If minimum was passed and this is less than minimum, or if maximum was passed and this is greater than
+    //    maximum, or either minimum and/or maximum were passed and the relative size of this and minimum/maximum can’t
+    //    be determined with the available information at this time, prepend "calc(" to s, then append ")" to s.
+    // NB: This step is done first to avoid prepending to the StringBuilder.
+    // FIXME: "or either minimum and/or maximum were passed and the relative size of this and minimum/maximum can't be determined with the available information at this time"
+    bool needs_calc_wrapper = (minimum.has_value() && m_value < minimum.value())
+        || (maximum.has_value() && m_value > maximum.value());
+
+    if (needs_calc_wrapper)
+        builder.append_ascii("calc("sv);
+
     // 2. Set s to the result of serializing a <number> from value, per CSSOM §6.7.2 Serializing CSS Values.
-    StringBuilder s;
-    serialize_a_number(s, m_value);
+    serialize_a_number(builder, m_value);
 
     // 3. If unit is:
     // -> "number"
-    if (m_unit == "number"_fly_string) {
+    if (m_unit == "number"_utf16_fly_string) {
         // Do nothing.
     }
     // -> "percent"
-    else if (m_unit == "percent"_fly_string) {
+    else if (m_unit == "percent"_utf16_fly_string) {
         // Append "%" to s.
-        s.append("%"sv);
+        builder.append_ascii('%');
     }
     // -> anything else
     else {
         // Append unit to s.
-        s.append(m_unit.to_ascii_lowercase());
+        builder.append(m_unit.to_ascii_lowercase());
     }
 
-    // 4. If minimum was passed and this is less than minimum, or if maximum was passed and this is greater than
-    //    maximum, or either minimum and/or maximum were passed and the relative size of this and minimum/maximum can’t
-    //    be determined with the available information at this time, prepend "calc(" to s, then append ")" to s.
-    if ((minimum.has_value() && m_value < minimum.value())
-        || (maximum.has_value() && m_value > maximum.value())) {
-        // FIXME: "or either minimum and/or maximum were passed and the relative size of this and minimum/maximum can’t be determined with the available information at this time"
-        return MUST(String::formatted("calc({})", s.string_view()));
-    }
+    if (needs_calc_wrapper)
+        builder.append_ascii(')');
 
     // 5. Return s.
-    return s.to_string_without_validation();
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#convert-a-cssunitvalue
-GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(FlyString const& unit) const
+GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(Utf16FlyString const& unit) const
 {
     // 1. Let old unit be the value of this’s unit internal slot, and old value be the value of this’s value internal
     //    slot.
@@ -147,22 +143,22 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(FlyString const& unit) con
         auto old_dimension_type = dimension_for_unit(old_unit);
         auto new_dimension_type = dimension_for_unit(unit);
         if (!new_dimension_type.has_value() || old_dimension_type != new_dimension_type)
-            return {};
+            return nullptr;
 
         switch (*new_dimension_type) {
         case DimensionType::Angle: {
             auto from = string_to_angle_unit(old_unit).release_value();
             auto to = string_to_angle_unit(unit).release_value();
             if (!units_are_compatible(from, to))
-                return {};
+                return nullptr;
             ratio = ratio_between_units(from, to);
             break;
         }
         case DimensionType::Flex: {
-            auto from = string_to_angle_unit(old_unit).release_value();
-            auto to = string_to_angle_unit(unit).release_value();
+            auto from = string_to_flex_unit(old_unit).release_value();
+            auto to = string_to_flex_unit(unit).release_value();
             if (!units_are_compatible(from, to))
-                return {};
+                return nullptr;
             ratio = ratio_between_units(from, to);
             break;
         }
@@ -170,7 +166,7 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(FlyString const& unit) con
             auto from = string_to_frequency_unit(old_unit).release_value();
             auto to = string_to_frequency_unit(unit).release_value();
             if (!units_are_compatible(from, to))
-                return {};
+                return nullptr;
             ratio = ratio_between_units(from, to);
             break;
         }
@@ -178,7 +174,7 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(FlyString const& unit) con
             auto from = string_to_length_unit(old_unit).release_value();
             auto to = string_to_length_unit(unit).release_value();
             if (!units_are_compatible(from, to))
-                return {};
+                return nullptr;
             ratio = ratio_between_units(from, to);
             break;
         }
@@ -186,7 +182,7 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(FlyString const& unit) con
             auto from = string_to_resolution_unit(old_unit).release_value();
             auto to = string_to_resolution_unit(unit).release_value();
             if (!units_are_compatible(from, to))
-                return {};
+                return nullptr;
             ratio = ratio_between_units(from, to);
             break;
         }
@@ -194,16 +190,14 @@ GC::Ptr<CSSUnitValue> CSSUnitValue::converted_to_unit(FlyString const& unit) con
             auto from = string_to_time_unit(old_unit).release_value();
             auto to = string_to_time_unit(unit).release_value();
             if (!units_are_compatible(from, to))
-                return {};
+                return nullptr;
             ratio = ratio_between_units(from, to);
             break;
         }
         }
     }
 
-    // 3. Return a new CSSUnitValue whose unit internal slot is set to unit, and whose value internal slot is set to
-    //    old value multiplied by the conversation ratio between old unit and unit.
-    return CSSUnitValue::create(realm(), old_value * ratio, unit);
+    return CSSUnitValue::create(old_value * ratio, unit);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#equal-numeric-value
@@ -290,19 +284,19 @@ Optional<SumValue> CSSUnitValue::create_a_sum_value() const
     }
 
     // 3. If unit is "number", return «(value, «[ ]»)».
-    if (unit == "number"_fly_string)
+    if (unit == "number"_utf16_fly_string)
         return SumValue { SumValueItem { value, {} } };
 
     // 4. Otherwise, return «(value, «[unit → 1]»)».
     return SumValue { SumValueItem { value, { { unit, 1 } } } };
 }
 
-static Optional<CalculationNode::NumericValue> create_numeric_value(double value, FlyString const& unit)
+static Optional<CalcNodeRef::NumericValue> create_numeric_value(double value, Utf16FlyString const& unit)
 {
-    if (unit == "number"_fly_string)
+    if (unit == "number"_utf16_fly_string)
         return Number { Number::Type::Number, value };
 
-    if (unit == "percent"_fly_string)
+    if (unit == "percent"_utf16_fly_string)
         return Percentage { value };
 
     if (auto dimension_type = dimension_for_unit(unit); dimension_type.has_value()) {
@@ -339,26 +333,22 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSUnitValue::create_an_int
 
     // NB: We store all custom properties as UnresolvedStyleValue, so we always need to create one here.
     if (perform_type_check == PerformTypeCheck::Yes && property.is_custom_property()) {
-        auto token = [this]() {
-            if (m_unit == "number"_fly_string)
-                return Parser::Token::create_number(Number { Number::Type::Number, m_value });
-            if (m_unit == "percent"_fly_string)
-                return Parser::Token::create_percentage(Number { Number::Type::Number, m_value });
-            return Parser::Token::create_dimension(m_value, m_unit);
-        }();
-        return UnresolvedStyleValue::create({ Parser::ComponentValue { move(token) } }, Parser::SubstitutionFunctionsPresence {});
+        Utf16StringBuilder builder;
+        serialize_unit_value(builder, {}, {});
+        return UnresolvedStyleValue::create(builder.to_string(), Parser::SubstitutionFunctionsPresence {});
     }
 
     auto wrap_in_math_sum = [this, &property](auto&& value) -> NonnullRefPtr<StyleValue const> {
         auto context = CalculationContext::for_property(property);
-        auto numeric_node = NumericCalculationNode::create(value, context);
-        auto math_sum_node = SumCalculationNode::create({ move(numeric_node) });
+        Vector<CalcNodeRef> children;
+        children.append(CalcNodeRef::numeric(value));
+        auto math_sum_node = CalcNodeRef::sum(move(children));
         return CalculatedStyleValue::create(move(math_sum_node), NumericType::create_from_unit(m_unit).release_value(), context);
     };
 
     auto value = create_numeric_value(m_value, m_unit);
     if (!value.has_value()) {
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Unrecognized unit '{}'.", m_unit)) };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Unrecognized unit."_utf16 };
     }
 
     if (perform_type_check == PerformTypeCheck::No) {
@@ -401,8 +391,7 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSUnitValue::create_an_int
             }
 
             if (property_accepts_type(property.id(), ValueType::Integer)) {
-                // NB: Same rounding as CalculatedStyleValue::resolve_integer(). Maybe this should go somewhere central?
-                auto integer = llround(number.value());
+                auto integer = round_to_nearest_integer(number.value());
                 if (property_accepts_integer(property.id(), integer))
                     return IntegerStyleValue::create(integer);
                 return wrap_in_math_sum(number);
@@ -469,17 +458,17 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSUnitValue::create_an_int
         });
 
     if (!style_value)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Property does not accept values of this type."sv };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Property does not accept values of this type."_utf16 };
     return style_value.release_nonnull();
 }
 
-WebIDL::ExceptionOr<NonnullRefPtr<CalculationNode const>> CSSUnitValue::create_calculation_node(CalculationContext const& context) const
+WebIDL::ExceptionOr<CalcNodeRef> CSSUnitValue::create_calculation_node(CalculationContext const&) const
 {
     auto value = create_numeric_value(m_value, m_unit);
     if (!value.has_value())
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Unable to create calculation node from `{}{}`.", m_value, m_unit)) };
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Unable to create calculation node."_utf16 };
 
-    return NumericCalculationNode::create(value.release_value(), context);
+    return CalcNodeRef::numeric(value.release_value());
 }
 
 }

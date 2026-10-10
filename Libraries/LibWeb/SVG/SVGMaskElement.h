@@ -6,18 +6,21 @@
 
 #pragma once
 
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibGfx/Forward.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 
 namespace Web::SVG {
 
 class SVGMaskElement final : public SVGGraphicsElement {
 
-    WEB_PLATFORM_OBJECT(SVGMaskElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGMaskElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGMaskElement);
 
 public:
     virtual ~SVGMaskElement() override;
+
+    virtual bool is_svg_mask_element() const final { return true; }
 
     virtual Optional<ViewBox> active_view_box() const override
     {
@@ -28,21 +31,35 @@ public:
         return {};
     }
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
-    CSSPixelRect resolve_masking_area(CSSPixelRect const& mask_target) const;
+    CSSPixelRect resolve_masking_area(CSSPixelRect const& target_object_bounding_box, Gfx::FloatSize const& viewport_size, Gfx::AffineTransform const& user_space_to_css_pixels) const;
 
     MaskContentUnits mask_content_units() const;
     MaskUnits mask_units() const;
+    NumberPercentage mask_x() const;
+    NumberPercentage mask_y() const;
+    NumberPercentage mask_width() const;
+    NumberPercentage mask_height() const;
 
 private:
     SVGMaskElement(DOM::Document&, DOM::QualifiedName);
-    virtual void initialize(JS::Realm&) override;
 
     Optional<MaskContentUnits> m_mask_content_units = {};
     Optional<MaskUnits> m_mask_units = {};
+    Optional<NumberPercentage> m_x = {};
+    Optional<NumberPercentage> m_y = {};
+    Optional<NumberPercentage> m_width = {};
+    Optional<NumberPercentage> m_height = {};
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGMaskElement>() const { return is_svg_mask_element(); }
 
 }

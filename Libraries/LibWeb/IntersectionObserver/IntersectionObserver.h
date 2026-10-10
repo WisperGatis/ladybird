@@ -6,45 +6,36 @@
 
 #pragma once
 
-#include <LibGC/Root.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <AK/Optional.h>
+#include <AK/Variant.h>
+#include <LibJS/Forward.h>
+#include <LibWeb/Bindings/IntersectionObserver.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Forward.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserverEntry.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::IntersectionObserver {
 
-struct IntersectionObserverInit {
-    Optional<Variant<GC::Root<DOM::Element>, GC::Root<DOM::Document>>> root;
-    String root_margin { "0px"_string };
-    String scroll_margin { "0px"_string };
-    Variant<double, Vector<double>> threshold { 0 };
-    long delay = 0;
-    bool track_visibility = false;
-};
+using NullableIntersectionObserverRoot = Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::Document>, Empty>;
+using IntersectionObserverRoot = NullableIntersectionObserverRoot;
 
-// https://www.w3.org/TR/intersection-observer/#intersectionobserverregistration
-struct IntersectionObserverRegistration {
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverregistration-observer
-    // [A]n observer property holding an IntersectionObserver.
-    GC::Ref<IntersectionObserver> observer;
+using IntersectionObserverOptions = Bindings::IntersectionObserverInit;
 
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverregistration-observer
-    // NOTE: Optional is used in place of the spec using -1 to indicate no previous index.
-    // [A] previousThresholdIndex property holding a number between -1 and the length of the observer’s thresholds property (inclusive).
+struct ObservationTarget {
+    GC::Ref<DOM::Element> target;
     Optional<size_t> previous_threshold_index;
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverregistration-previousisintersecting
-    // [A] previousIsIntersecting property holding a boolean.
     bool previous_is_intersecting { false };
 };
 
 // https://w3c.github.io/IntersectionObserver/#intersection-observer-interface
-class IntersectionObserver final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(IntersectionObserver, Bindings::PlatformObject);
+class IntersectionObserver final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(IntersectionObserver, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(IntersectionObserver);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<IntersectionObserver>> construct_impl(JS::Realm&, GC::Ptr<WebIDL::CallbackType> callback, IntersectionObserverInit const& options = {});
+    static WebIDL::ExceptionOr<GC::Ref<IntersectionObserver>> create_with_implicit_root_document(GC::Ptr<WebIDL::CallbackType> callback, IntersectionObserverOptions, DOM::Document& implicit_root_document);
+    static WebIDL::ExceptionOr<GC::Ref<IntersectionObserver>> create_for_constructor(JS::Object&, GC::Ptr<WebIDL::CallbackType>, IntersectionObserverOptions);
 
     virtual ~IntersectionObserver() override;
 
@@ -53,30 +44,32 @@ public:
     void disconnect();
     Vector<GC::Root<IntersectionObserverEntry>> take_records();
 
-    Vector<GC::Ref<DOM::Element>> const& observation_targets() const { return m_observation_targets; }
+    Vector<ObservationTarget>& observation_targets() { return m_observation_targets; }
+    Vector<ObservationTarget> const& observation_targets() const { return m_observation_targets; }
+    WebIDL::CallbackType& callback() { return *m_callback; }
 
-    Variant<GC::Root<DOM::Element>, GC::Root<DOM::Document>, Empty> root() const;
-    String root_margin() const;
-    String scroll_margin() const;
+    NullableIntersectionObserverRoot root() const;
+    Utf16String root_margin() const;
+    Utf16String scroll_margin() const;
+    Vector<CSS::LengthPercentage> const& scroll_margin_values() const { return m_scroll_margin; }
     Vector<double> const& thresholds() const { return m_thresholds; }
     long delay() const { return m_delay; }
     bool track_visibility() const { return m_track_visibility; }
 
-    Variant<GC::Root<DOM::Element>, GC::Root<DOM::Document>> intersection_root() const;
-    CSSPixelRect root_intersection_rectangle() const;
+    Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::Document>> intersection_root() const;
+    GC::Ref<DOM::Node> intersection_root_node() const;
+    bool is_implicit_root() const { return !m_root; }
+    CSSPixelRect root_intersection_rectangle(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const* = nullptr) const;
 
     void queue_entry(Badge<DOM::Document>, GC::Ref<IntersectionObserverEntry>);
 
-    WebIDL::CallbackType& callback() { return *m_callback; }
-
 private:
-    explicit IntersectionObserver(JS::Realm&, GC::Ptr<WebIDL::CallbackType> callback, Optional<Variant<GC::Root<DOM::Element>, GC::Root<DOM::Document>>> const& root, Vector<CSS::LengthPercentage> root_margin, Vector<CSS::LengthPercentage> scroll_margin, Vector<double>&& thresholds, double debug, bool track_visibility);
+    explicit IntersectionObserver(GC::Ptr<WebIDL::CallbackType> callback, IntersectionObserverRoot const& root, GC::Ref<DOM::Document> implicit_root_document, Vector<CSS::LengthPercentage> root_margin, Vector<CSS::LengthPercentage> scroll_margin, Vector<double>&& thresholds, double delay, bool track_visibility);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
     virtual void finalize() override;
 
-    static Optional<Vector<CSS::LengthPercentage>> parse_a_margin(JS::Realm&, String);
+    static Optional<Vector<CSS::LengthPercentage>> parse_a_margin(String);
 
     // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserver-callback-slot
     GC::Ptr<WebIDL::CallbackType> m_callback;
@@ -103,10 +96,13 @@ private:
     Vector<GC::Ref<IntersectionObserverEntry>> m_queued_entries;
 
     // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserver-observationtargets-slot
-    Vector<GC::Ref<DOM::Element>> m_observation_targets;
+    Vector<ObservationTarget> m_observation_targets;
 
     // AD-HOC: This is the document where we've registered the IntersectionObserver.
     GC::Weak<DOM::Document> m_document;
 };
+
+GC::Ref<WebIDL::CallbackType> create_lazy_load_intersection_observer_callback(DOM::Document&);
+void invoke_intersection_observer_callback(IntersectionObserver&, Vector<GC::Root<IntersectionObserverEntry>>&);
 
 }

@@ -1,0 +1,80 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Span.h>
+#include <LibMedia/DecoderError.h>
+#include <LibMedia/MediaStream.h>
+
+namespace Media {
+
+class ReadonlyBytesCursor final : public MediaStreamCursor {
+public:
+    ReadonlyBytesCursor(ReadonlyBytes data)
+        : m_data(data)
+    {
+    }
+
+    virtual void set_is_blocking(bool) override { }
+
+    virtual DecoderErrorOr<void> seek(i64 offset, AK::SeekMode mode) override
+    {
+        auto target_position = [&] -> size_t {
+            switch (mode) {
+            case AK::SeekMode::SetPosition:
+                return offset;
+            case AK::SeekMode::FromCurrentPosition:
+                return m_position + offset;
+            case AK::SeekMode::FromEndPosition:
+                return m_data.size() + offset;
+            }
+            VERIFY_NOT_REACHED();
+        }();
+        if (target_position > m_data.size())
+            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
+
+        m_position = target_position;
+        return {};
+    }
+
+    virtual DecoderErrorOr<size_t> read_into(Bytes bytes) override
+    {
+        if (m_position >= m_data.size())
+            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
+
+        auto to_read = min(bytes.size(), m_data.size() - m_position);
+        m_data.slice(m_position, to_read).copy_to(bytes);
+        m_position += to_read;
+        VERIFY(m_position <= m_data.size());
+        return to_read;
+    }
+
+    virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) override
+    {
+        if (size == 0)
+            return FixedArray<u8>();
+
+        if (m_position >= m_data.size() || size > m_data.size() - m_position)
+            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
+
+        auto buffer = DECODER_TRY_ALLOC(FixedArray<u8>::create(m_data.slice(m_position, size)));
+        m_position += size;
+        return buffer;
+    }
+
+    virtual size_t position() const override { return m_position; }
+    virtual Optional<u64> size() const override { return m_data.size(); }
+    virtual size_t blocking_size() const override { return m_data.size(); }
+
+    void set_data(ReadonlyBytes data) { m_data = data; }
+
+private:
+    ReadonlyBytes m_data;
+    size_t m_position { 0 };
+};
+
+}

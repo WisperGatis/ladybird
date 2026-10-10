@@ -1,0 +1,1 @@
+PASS: growing a sibling reuses and moves the subtree (work + checks)

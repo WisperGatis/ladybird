@@ -20,12 +20,10 @@
 
 namespace JS {
 
+// An Array exotic object, or an object of a class that extends Array, such as a host array.
 class JS_API Array : public Object {
-    JS_OBJECT(Array, Object);
-    GC_DECLARE_ALLOCATOR(Array);
-
 public:
-    static ThrowCompletionOr<GC::Ref<Array>> create(Realm&, u64 length, Object* prototype = nullptr);
+    static ThrowCompletionOr<GC::Ref<Array>> create(Realm&, u64 length, GC::Ptr<Object> prototype = nullptr);
     static GC::Ref<Array> create_from(Realm&, ReadonlySpan<Value>);
 
     template<size_t N>
@@ -38,7 +36,7 @@ public:
     template<typename T>
     static GC::Ref<Array> create_from(Realm& realm, ReadonlySpan<T> elements, Function<Value(T const&)> map_fn)
     {
-        auto values = GC::RootVector<Value> { realm.heap() };
+        GC::RootVector<Value> values;
         values.ensure_capacity(elements.size());
         for (auto const& element : elements)
             values.append(map_fn(element));
@@ -46,46 +44,8 @@ public:
         return Array::create_from(realm, values);
     }
 
-    virtual ~Array() override = default;
-
-    virtual ThrowCompletionOr<Optional<PropertyDescriptor>> internal_get_own_property(PropertyKey const&) const override final;
-    virtual ThrowCompletionOr<bool> internal_set(PropertyKey const&, Value value, Value receiver, CacheableSetPropertyMetadata*, PropertyLookupPhase) override;
-    virtual ThrowCompletionOr<bool> internal_define_own_property(PropertyKey const&, PropertyDescriptor&, Optional<PropertyDescriptor>* precomputed_get_own_property = nullptr) override final;
-    virtual ThrowCompletionOr<bool> internal_has_property(PropertyKey const&) const override final;
-    virtual ThrowCompletionOr<bool> internal_delete(PropertyKey const&) override;
-    virtual ThrowCompletionOr<GC::RootVector<Value>> internal_own_property_keys() const override final;
-
-    [[nodiscard]] bool length_is_writable() const { return m_length_writable; }
-
-    bool is_proxy_target() const { return m_is_proxy_target; }
-    void set_is_proxy_target(bool is_proxy_target) { m_is_proxy_target = is_proxy_target; }
-
-    bool default_prototype_chain_intact() const;
-
-    virtual void visit_edges(Cell::Visitor& visitor) override;
-
-protected:
-    explicit Array(Realm& realm, Object& prototype);
-
-private:
-    virtual bool is_array_exotic_object() const final { return true; }
-
-    ThrowCompletionOr<bool> set_length(PropertyDescriptor const&);
-
-    GC::Ref<Realm> m_realm;
-    bool m_length_writable { true };
-    bool m_is_proxy_target { false };
+    // The runtime gives exactly the Array exotic objects, host arrays included, the magical length property.
+    static bool is_engine_class_of(Object const& object) { return object.has_magical_length_property(); }
 };
-
-template<>
-inline bool Object::fast_is<Array>() const { return is_array_exotic_object(); }
-
-enum class Holes {
-    SkipHoles,
-    ReadThroughHoles,
-};
-
-ThrowCompletionOr<GC::RootVector<Value>> sort_indexed_properties(VM&, Object const&, size_t length, Function<ThrowCompletionOr<double>(Value, Value)> const& sort_compare, Holes holes);
-ThrowCompletionOr<double> compare_array_elements(VM&, Value x, Value y, FunctionObject* comparefn);
 
 }

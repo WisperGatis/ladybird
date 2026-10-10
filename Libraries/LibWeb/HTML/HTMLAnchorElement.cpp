@@ -6,16 +6,12 @@
  */
 
 #include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/Bindings/HTMLAnchorElementPrototype.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
-#include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
-#include <LibWeb/UIEvents/MouseEvent.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
@@ -28,114 +24,32 @@ HTMLAnchorElement::HTMLAnchorElement(DOM::Document& document, DOM::QualifiedName
 
 HTMLAnchorElement::~HTMLAnchorElement() = default;
 
-void HTMLAnchorElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLAnchorElement);
-    Base::initialize(realm);
-}
-
 void HTMLAnchorElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_rel_list);
 }
 
-void HTMLAnchorElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLAnchorElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == HTML::AttributeNames::href) {
-        set_the_url();
+        href_content_attribute_changed();
     } else if (name == HTML::AttributeNames::rel) {
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.value_or(String {}));
+            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
     }
-}
-
-Optional<String> HTMLAnchorElement::hyperlink_element_utils_href() const
-{
-    return attribute(HTML::AttributeNames::href);
-}
-
-WebIDL::ExceptionOr<void> HTMLAnchorElement::set_hyperlink_element_utils_href(String href)
-{
-    return set_attribute(HTML::AttributeNames::href, move(href));
-}
-
-Optional<String> HTMLAnchorElement::hyperlink_element_utils_referrerpolicy() const
-{
-    return attribute(HTML::AttributeNames::referrerpolicy);
 }
 
 bool HTMLAnchorElement::has_activation_behavior() const
 {
-    return true;
+    return creates_a_hyperlink();
 }
 
-// https://html.spec.whatwg.org/multipage/links.html#links-created-by-a-and-area-elements
 void HTMLAnchorElement::activation_behavior(Web::DOM::Event const& event)
 {
-    // The activation behavior of an a or area element element given an event event is:
-
-    // 1. If element has no href attribute, then return.
-    if (href().is_empty())
-        return;
-
-    // AD-HOC: Do not activate the element for clicks with the ctrl/cmd modifier present. This lets
-    //         the browser process open the link in a new tab.
-    if (is<UIEvents::MouseEvent>(event)) {
-        auto const& mouse_event = static_cast<UIEvents::MouseEvent const&>(event);
-        if (mouse_event.platform_ctrl_key())
-            return;
-    }
-
-    // 2. Let hyperlinkSuffix be null.
-    Optional<String> hyperlink_suffix {};
-
-    // 3. If element is an a element, and event's target is an img with an ismap attribute specified, then:
-    if (event.target() && is<HTMLImageElement>(*event.target()) && static_cast<HTMLImageElement const&>(*event.target()).has_attribute(AttributeNames::ismap)) {
-        // 1. Let x and y be 0.
-        CSSPixels x { 0 };
-        CSSPixels y { 0 };
-
-        // 2. If event's isTrusted attribute is initialized to true, then set x to the distance in CSS pixels from the left edge of the image
-        //    to the location of the click, and set y to the distance in CSS pixels from the top edge of the image to the location of the click.
-        if (event.is_trusted() && is<UIEvents::MouseEvent>(event)) {
-            auto const& mouse_event = static_cast<UIEvents::MouseEvent const&>(event);
-            x = CSSPixels { mouse_event.offset_x() };
-            y = CSSPixels { mouse_event.offset_y() };
-        }
-
-        // 3. If x is negative, set x to 0.
-        x = max(x, 0);
-
-        // 4. If y is negative, set y to 0.
-        y = max(y, 0);
-
-        // 5. Set hyperlinkSuffix to the concatenation of U+003F (?), the value of x expressed as a base-ten integer using ASCII digits,
-        //    U+002C (,), and the value of y expressed as a base-ten integer using ASCII digits.
-        hyperlink_suffix = MUST(String::formatted("?{},{}", x.to_int(), y.to_int()));
-    }
-
-    // 4. Let userInvolvement be event's user navigation involvement.
-    auto user_involvement = user_navigation_involvement(event);
-
-    // 5. If the user has expressed a preference to download the hyperlink, then set userInvolvement to "browser UI".
-    // NOTE: That is, if the user has expressed a specific preference for downloading, this no longer counts as merely "activation".
-    if (has_download_preference())
-        user_involvement = UserNavigationInvolvement::BrowserUI;
-
-    // FIXME: 6. If element has a download attribute, or if the user has expressed a preference to download the
-    //     hyperlink, then download the hyperlink created by element with hyperlinkSuffix set to hyperlinkSuffix and
-    //     userInvolvement set to userInvolvement.
-
-    // 7. Otherwise, follow the hyperlink created by element with hyperlinkSuffix set to hyperlinkSuffix and userInvolvement set to userInvolvement.
-    follow_the_hyperlink(hyperlink_suffix, user_involvement);
-}
-
-bool HTMLAnchorElement::has_download_preference() const
-{
-    return has_attribute(HTML::AttributeNames::download);
+    activate_the_hyperlink(event);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
@@ -171,7 +85,7 @@ Utf16String HTMLAnchorElement::text() const
 }
 
 // https://html.spec.whatwg.org/multipage/text-level-semantics.html#dom-a-text
-void HTMLAnchorElement::set_text(Utf16String const& text)
+void HTMLAnchorElement::set_text(Utf16View text)
 {
     // The text attribute's setter must string replace all with the given value within this element.
     string_replace_all(text);

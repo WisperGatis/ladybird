@@ -1,43 +1,58 @@
 /*
  * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/CSSStyleRulePrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/CSS/CSSRuleList.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
+#include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/Dump.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSStyleRule);
 
-GC::Ref<CSSStyleRule> CSSStyleRule::create(JS::Realm& realm, SelectorList&& selectors, CSSStyleProperties& declaration, CSSRuleList& nested_rules)
+GC::Ref<CSSStyleRule> CSSStyleRule::create(RustRule rule, CSSRuleList& nested_rules)
 {
-    return realm.create<CSSStyleRule>(realm, move(selectors), declaration, nested_rules);
+    return GC::Heap::the().allocate<CSSStyleRule>(move(rule), nested_rules);
 }
 
-CSSStyleRule::CSSStyleRule(JS::Realm& realm, SelectorList&& selectors, CSSStyleProperties& declaration, CSSRuleList& nested_rules)
-    : CSSGroupingRule(realm, nested_rules, Type::Style)
-    , m_selectors(move(selectors))
-    , m_declaration(declaration)
+CSSStyleRule::CSSStyleRule(RustRule rule, CSSRuleList& nested_rules)
+    : CSSGroupingRule(nested_rules, move(rule))
+    , m_declarations(Parser::ValueParserFFI::rust_rule_declarations(native_rule().handle()))
 {
-    m_declaration->set_parent_rule(*this);
 }
 
-void CSSStyleRule::initialize(JS::Realm& realm)
+SelectorList const& CSSStyleRule::selectors() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSStyleRule);
-    Base::initialize(realm);
+    if (!m_selectors.has_value())
+        m_selectors = selector_list_from_rust(static_cast<SelectorFFI::RustParsedSelectorList const*>(Parser::ValueParserFFI::rust_rule_selectors(native_rule().handle())));
+    return *m_selectors;
 }
 
-void CSSStyleRule::visit_edges(Cell::Visitor& visitor)
+size_t CSSStyleRule::external_memory_size() const
+{
+    return JS::saturating_add_external_memory_size(Base::external_memory_size(), m_declarations.external_memory_size());
+}
+
+GC::Ref<CSSStyleProperties> CSSStyleRule::ensure_style_properties() const
+{
+    if (!m_declaration) {
+        m_declaration = CSSStyleProperties::create(m_declarations.retain());
+        m_declaration->set_parent_rule(const_cast<CSSStyleRule&>(*this));
+    }
+    return *m_declaration;
+}
+
+void CSSStyleRule::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_declaration);
@@ -45,56 +60,56 @@ void CSSStyleRule::visit_edges(Cell::Visitor& visitor)
 }
 
 // https://drafts.csswg.org/cssom-1/#dom-cssstylerule-style
-GC::Ref<CSSStyleProperties> CSSStyleRule::style()
+GC::Ref<CSSStyleProperties> CSSStyleRule::style() const
 {
-    return m_declaration;
+    return ensure_style_properties();
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-cssstylerule-stylemap
 GC::Ref<StylePropertyMap> CSSStyleRule::style_map()
 {
     if (!m_style_map)
-        m_style_map = StylePropertyMap::create(realm(), m_declaration);
+        m_style_map = StylePropertyMap::create(ensure_style_properties());
     return *m_style_map;
 }
 
 // https://drafts.csswg.org/cssom-1/#serialize-a-css-rule
-String CSSStyleRule::serialized() const
+Utf16String CSSStyleRule::serialized() const
 {
-    StringBuilder builder;
+    Utf16StringBuilder builder;
 
     // 1. Let s initially be the result of performing serialize a group of selectors on the rule’s associated selectors,
     //    followed by the string " {", i.e., a single SPACE (U+0020), followed by LEFT CURLY BRACKET (U+007B).
-    builder.append(serialize_a_group_of_selectors(selectors()));
-    builder.append(" {"sv);
+    builder.append(selector_text());
+    builder.append_ascii(" {"sv);
 
     // 2. Let decls be the result of performing serialize a CSS declaration block on the rule’s associated declarations,
     //    or null if there are no such declarations.
-    auto decls = declaration().length() > 0 ? declaration().serialized() : Optional<String>();
+    auto decls = !m_declarations.is_empty() ? Optional<Utf16String> { ensure_style_properties()->serialized() } : Optional<Utf16String> {};
 
     // 3. Let rules be the result of performing serialize a CSS rule on each rule in the rule’s cssRules list,
     //    or null if there are no such rules.
-    Vector<String> rules;
+    Vector<Utf16String> rules;
     for (auto& rule : css_rules()) {
         rules.append(rule->serialized());
     }
 
     // 4. If decls and rules are both null, append " }" to s (i.e. a single SPACE (U+0020) followed by RIGHT CURLY BRACKET (U+007D)) and return s.
     if (!decls.has_value() && rules.is_empty()) {
-        builder.append(" }"sv);
-        return builder.to_string_without_validation();
+        builder.append_ascii(" }"sv);
+        return builder.to_string();
     }
 
     // 5. If rules is null:
     if (rules.is_empty()) {
         // 1. Append a single SPACE (U+0020) to s
-        builder.append(' ');
+        builder.append_ascii(' ');
         // 2. Append decls to s
         builder.append(*decls);
         // 3. Append " }" to s (i.e. a single SPACE (U+0020) followed by RIGHT CURLY BRACKET (U+007D)).
-        builder.append(" }"sv);
+        builder.append_ascii(" }"sv);
         // 4. Return s.
-        return builder.to_string_without_validation();
+        return builder.to_string();
     }
 
     // 6. Otherwise:
@@ -116,46 +131,33 @@ String CSSStyleRule::serialized() const
         }
 
         // 3. Append a newline followed by RIGHT CURLY BRACKET (U+007D) to s.
-        builder.append("\n}"sv);
+        builder.append_ascii("\n}"sv);
 
         // 4. Return s.
-        return builder.to_string_without_validation();
+        return builder.to_string();
     }
 }
 
 // https://drafts.csswg.org/cssom-1/#dom-cssstylerule-selectortext
-String CSSStyleRule::selector_text() const
+Utf16String CSSStyleRule::selector_text() const
 {
     // The selectorText attribute, on getting, must return the result of serializing the associated group of selectors.
-    return serialize_a_group_of_selectors(selectors());
+    return serialize_a_group_of_selectors(selectors(), parent_style_sheet());
 }
 
 // https://drafts.csswg.org/cssom-1/#dom-cssstylerule-selectortext
-void CSSStyleRule::set_selector_text(StringView selector_text)
+void CSSStyleRule::set_selector_text(Utf16View selector_text)
 {
-    clear_caches();
-
     // 1. Run the parse a group of selectors algorithm on the given value.
-    Parser::ParsingParams parsing_params { realm() };
-
-    if (m_parent_style_sheet)
-        parsing_params.declared_namespaces = m_parent_style_sheet->declared_namespaces();
-
-    Optional<SelectorList> parsed_selectors;
-    if (parent_style_rule()) {
-        // AD-HOC: If we're a nested style rule, then we need to parse the selector as relative and then adapt it with implicit &s.
-        parsed_selectors = parse_selector_for_nested_style_rule(parsing_params, selector_text);
-    } else {
-        parsed_selectors = parse_selector(parsing_params, selector_text);
-    }
+    auto* sheet = parent_style_sheet();
 
     // 2. If the algorithm returns a non-null value replace the associated group of selectors with the returned value.
-    if (parsed_selectors.has_value()) {
-        // NOTE: If we have a parent style rule, we need to update the selectors to add any implicit `&`s
-
-        m_selectors = parsed_selectors.release_value();
-        if (auto* sheet = parent_style_sheet()) {
-            sheet->invalidate_owners(DOM::StyleInvalidationReason::SetSelectorText);
+    if (Parser::ValueParserFFI::rust_rule_set_selector_text(native_rule().handle(), Parser::ffi_utf16_view(selector_text), sheet ? sheet->native_rules().handle() : nullptr)) {
+        m_selectors.clear();
+        clear_caches();
+        if (sheet) {
+            record_style_rule_selector_changed(*this);
+            sheet->invalidate_owners();
         }
     }
 
@@ -167,50 +169,7 @@ SelectorList const& CSSStyleRule::absolutized_selectors() const
     if (m_cached_absolutized_selectors.has_value())
         return m_cached_absolutized_selectors.value();
 
-    // Replace all occurrences of `&` with the nearest ancestor style rule's selector list wrapped in `:is(...)`,
-    // or if we have no such ancestor, with `:scope`.
-
-    // If we don't have any nesting selectors, we can just use our selectors as they are.
-    bool has_any_nesting = false;
-    for (auto const& selector : selectors()) {
-        if (selector->contains_the_nesting_selector()) {
-            has_any_nesting = true;
-            break;
-        }
-    }
-
-    if (!has_any_nesting) {
-        m_cached_absolutized_selectors = m_selectors;
-        return m_cached_absolutized_selectors.value();
-    }
-
-    // Otherwise, build up a new list of selectors with the `&` replaced.
-
-    // First, figure out what we should replace `&` with.
-    // "When used in the selector of a nested style rule, the nesting selector represents the elements matched by the parent rule.
-    // When used in any other context, it represents the same elements as :scope in that context (unless otherwise defined)."
-    // https://drafts.csswg.org/css-nesting-1/#nest-selector
-    if (auto const* parent_style_rule = this->parent_style_rule()) {
-        // TODO: If there's only 1, we don't have to use `:is()` for it
-        Selector::SimpleSelector parent_selector = {
-            .type = Selector::SimpleSelector::Type::PseudoClass,
-            .value = Selector::SimpleSelector::PseudoClassSelector {
-                .type = PseudoClass::Is,
-                .argument_selector_list = parent_style_rule->absolutized_selectors(),
-            },
-        };
-        SelectorList absolutized_selectors;
-        for (auto const& selector : selectors()) {
-            if (auto absolutized = selector->absolutized(parent_selector))
-                absolutized_selectors.append(absolutized.release_nonnull());
-        }
-        m_cached_absolutized_selectors = move(absolutized_selectors);
-    } else {
-        // NOTE: We can't actually replace & with :scope, because & has to have 0 specificity.
-        //       So we leave it, and treat & like :scope during matching.
-        m_cached_absolutized_selectors = m_selectors;
-    }
-
+    m_cached_absolutized_selectors = matching_selectors_for_rule(native_rule());
     return m_cached_absolutized_selectors.value();
 }
 
@@ -220,23 +179,24 @@ void CSSStyleRule::clear_caches()
     m_cached_absolutized_selectors.clear();
 }
 
-void CSSStyleRule::set_parent_style_sheet(CSSStyleSheet* parent_style_sheet)
+void CSSStyleRule::dump(StringBuilder& builder, int indent_levels) const
 {
-    Base::set_parent_style_sheet(parent_style_sheet);
+    Base::dump(builder, indent_levels);
 
-    // This is annoying: Style values that request resources need to know their CSSStyleSheet in order to fetch them.
-    for (auto const& property : m_declaration->properties()) {
-        const_cast<StyleValue&>(*property.value).set_style_sheet(parent_style_sheet);
+    for (auto& selector : selectors()) {
+        dump_selector(builder, selector, indent_levels + 1);
     }
-}
+    dump_indent(builder, indent_levels + 1);
+    builder.appendff("Absolutized selectors:\n");
+    for (auto& selector : absolutized_selectors()) {
+        dump_selector(builder, selector, indent_levels + 2);
+    }
+    dump_style_properties(builder, *ensure_style_properties(), indent_levels + 1);
 
-CSSStyleRule const* CSSStyleRule::parent_style_rule() const
-{
-    for (auto* parent = parent_rule(); parent; parent = parent->parent_rule()) {
-        if (parent->type() == CSSStyleRule::Type::Style)
-            return static_cast<CSSStyleRule const*>(parent);
-    }
-    return nullptr;
+    dump_indent(builder, indent_levels + 1);
+    builder.appendff("Child rules ({}):\n", css_rules().length());
+    for (auto& child_rule : css_rules())
+        dump_rule(builder, child_rule, indent_levels + 2);
 }
 
 }

@@ -15,34 +15,27 @@ namespace Web::CSS {
 
 class ContentStyleValue final : public StyleValueWithDefaultOperators<ContentStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<ContentStyleValue const> create(ValueComparingNonnullRefPtr<StyleValueList const> content, ValueComparingRefPtr<StyleValueList const> alt_text)
-    {
-        return adopt_ref(*new (nothrow) ContentStyleValue(move(content), move(alt_text)));
-    }
     virtual ~ContentStyleValue() override = default;
 
-    StyleValueList const& content() const { return *m_properties.content; }
-    bool has_alt_text() const { return !m_properties.alt_text.is_null(); }
-    StyleValueList const* alt_text() const { return m_properties.alt_text; }
+    StyleValueList const& content() const { return m_content; }
+    StyleValueList const* alt_text() const { return m_alt_text.ptr(); }
 
-    virtual String to_string(SerializationMode) const override;
-
-    bool properties_equal(ContentStyleValue const& other) const { return m_properties == other.m_properties; }
-
-    virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
+    void set_style_sheet(StyleSheetState*);
 
 private:
-    ContentStyleValue(ValueComparingNonnullRefPtr<StyleValueList const> content, ValueComparingRefPtr<StyleValueList const> alt_text)
-        : StyleValueWithDefaultOperators(Type::Content)
-        , m_properties { .content = move(content), .alt_text = move(alt_text) }
+    friend class StyleValue;
+
+    explicit ContentStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Content, data)
+        , m_content(StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(data->content.content.pointer)))->as_value_list())
     {
+        auto const* alt_text_data = static_cast<StyleValueFFI::StyleValueData const*>(data->content.alt_text.pointer);
+        if (alt_text_data)
+            m_alt_text = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(alt_text_data))->as_value_list();
     }
 
-    struct Properties {
-        ValueComparingNonnullRefPtr<StyleValueList const> content;
-        ValueComparingRefPtr<StyleValueList const> alt_text;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    ValueComparingNonnullRefPtr<StyleValueList const> m_content;
+    ValueComparingRefPtr<StyleValueList const> m_alt_text;
 };
 
 }

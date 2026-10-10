@@ -17,20 +17,23 @@ public:
     static ValueComparingNonnullRefPtr<DisplayStyleValue const> create(Display const&);
     virtual ~DisplayStyleValue() override = default;
 
-    virtual String to_string(SerializationMode) const override { return m_display.to_string(); }
+    Display display() const { return bit_cast<Display>(m_value->display.raw); }
 
-    Display display() const { return m_display; }
-
-    bool properties_equal(DisplayStyleValue const& other) const { return m_display == other.m_display; }
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
-    explicit DisplayStyleValue(Display const& display)
-        : StyleValueWithDefaultOperators(Type::Display)
-        , m_display(display)
+    friend class StyleValue;
+
+    explicit DisplayStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Display, data)
     {
     }
 
-    Display m_display;
+    explicit DisplayStyleValue(Display const& display)
+        : StyleValueWithDefaultOperators(Type::Display, StyleValueFFI::rust_style_value_create_display(bit_cast<u32>(display)))
+    {
+        static_assert(sizeof(Display) == sizeof(u32));
+    }
 };
 
 }

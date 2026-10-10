@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    #declares-font-size { font-size: 12px; }
+    #em-margin { margin-left: 2em; }
+    #plain {
+        background-color: currentcolor;
+        border: 2px solid;
+        outline: 1px solid currentcolor;
+        text-decoration-color: currentcolor;
+    }
+    #mixed { background-color: color-mix(in srgb, currentcolor 50%, white); }
+    #shadow { box-shadow: 0 0 color-mix(in srgb, currentcolor 50%, white); }
+    #stop { stop-color: color-mix(in srgb, currentcolor 50%, white); }
+</style>
+<div id="root">
+    <div><div><div id="plain">plain</div></div></div>
+    <div><div><div id="mixed">mixed</div></div></div>
+    <div><div><div id="shadow">shadow</div></div></div>
+    <div><div><div id="stop">stop</div></div></div>
+    <div id="declares-font-size">declares font size</div>
+    <div id="em-margin">em margin</div>
+</div>
+<script>
+    test(() => {
+        const root = document.getElementById("root");
+        const plain = document.getElementById("plain");
+        const mixed = document.getElementById("mixed");
+        const shadow = document.getElementById("shadow");
+        const stop = document.getElementById("stop");
+        const declaresFontSize = document.getElementById("declares-font-size");
+        const emMargin = document.getElementById("em-margin");
+
+        getComputedStyle(plain).fontSize;
+        internals.updateStyle();
+        internals.resetStyleInvalidationCounters();
+
+        root.style.fontSize = "20px";
+        internals.updateStyle();
+
+        println(`plain font size: ${getComputedStyle(plain).fontSize}`);
+        println(`declared font size: ${getComputedStyle(declaresFontSize).fontSize}`);
+        println(`em margin: ${getComputedStyle(emMargin).marginLeft}`);
+
+        const counters = internals.getStyleInvalidationCounters();
+        println(`C++ recomputations: ${counters.elementStyleRecomputations}`);
+        println(`engine records: ${counters.engineComputedStyleRecords}`);
+
+        internals.resetStyleInvalidationCounters();
+        root.style.color = "rgb(0, 128, 0)";
+        internals.updateStyle();
+
+        println(`plain color: ${getComputedStyle(plain).color}`);
+        println(`plain background color: ${getComputedStyle(plain).backgroundColor}`);
+        println(`plain border color: ${getComputedStyle(plain).borderTopColor}`);
+        println(`plain outline color: ${getComputedStyle(plain).outlineColor}`);
+        println(`plain text decoration color: ${getComputedStyle(plain).textDecorationColor}`);
+        println(`mixed background color: ${getComputedStyle(mixed).backgroundColor}`);
+        println(`shadow color: ${getComputedStyle(shadow).boxShadow}`);
+        println(`stop color: ${getComputedStyle(stop).stopColor}`);
+        const colorCounters = internals.getStyleInvalidationCounters();
+        println(`color C++ recomputations: ${colorCounters.elementStyleRecomputations}`);
+        println(`color engine records: ${colorCounters.engineComputedStyleRecords}`);
+    });
+</script>

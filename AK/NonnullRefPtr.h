@@ -6,12 +6,11 @@
 
 #pragma once
 
-#define NONNULLREFPTR_SCRUB_BYTE 0xe1
-
 #include <AK/Assertions.h>
 #include <AK/Format.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -93,11 +92,7 @@ public:
 
     ALWAYS_INLINE ~NonnullRefPtr()
     {
-        auto* ptr = exchange(m_ptr, nullptr);
-        unref_if_not_null(ptr);
-#ifdef SANITIZE_PTRS
-        m_ptr = reinterpret_cast<T*>(explode_byte(NONNULLREFPTR_SCRUB_BYTE));
-#endif
+        unref_if_not_null(m_ptr);
     }
 
     template<typename U>
@@ -222,6 +217,7 @@ private:
 template<typename T>
 inline NonnullRefPtr<T> adopt_ref(T& object)
 {
+    static_assert(AllocatedWithKmalloc<T>, "T must allocate with AK_ALLOC_WITH_KMALLOC");
     return NonnullRefPtr<T>(NonnullRefPtr<T>::Adopt, object);
 }
 
@@ -229,6 +225,7 @@ inline NonnullRefPtr<T> adopt_ref(T& object)
 template<typename T>
 inline ErrorOr<NonnullRefPtr<T>> adopt_nonnull_ref_or_enomem(T* object)
 {
+    static_assert(AllocatedWithKmalloc<T>, "T must allocate with AK_ALLOC_WITH_KMALLOC");
     if (!object)
         return Error::from_errno(ENOMEM);
     return NonnullRefPtr<T>(NonnullRefPtr<T>::Adopt, *object);
@@ -267,6 +264,7 @@ inline void swap(NonnullRefPtr<T>& a, NonnullRefPtr<U>& b)
 template<typename T, class... Args>
 requires(IsConstructible<T, Args...>) inline NonnullRefPtr<T> make_ref_counted(Args&&... args)
 {
+    static_assert(AllocatedWithKmalloc<T>, "T must allocate with AK_ALLOC_WITH_KMALLOC");
     return NonnullRefPtr<T>(NonnullRefPtr<T>::Adopt, *new T(forward<Args>(args)...));
 }
 

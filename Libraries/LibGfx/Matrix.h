@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Assertions.h>
+#include <AK/Optional.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <initializer_list>
@@ -38,26 +39,8 @@ public:
     {
     }
 
-    constexpr Matrix(Matrix const& other)
-    {
-        *this = other;
-    }
-
-    constexpr Matrix& operator=(Matrix const& other)
-    {
-#ifndef __clang__
-        if (is_constant_evaluated()) {
-            for (size_t i = 0; i < N; i++) {
-                for (size_t j = 0; j < N; j++) {
-                    (*this)[i, j] = other[i, j];
-                }
-            }
-            return *this;
-        }
-#endif
-        __builtin_memcpy(m_elements, other.elements(), sizeof(T) * N * N);
-        return *this;
-    }
+    constexpr Matrix(Matrix const&) = default;
+    constexpr Matrix& operator=(Matrix const&) = default;
 
     constexpr auto elements() const { return m_elements; }
     constexpr auto elements() { return m_elements; }
@@ -201,9 +184,12 @@ public:
         return result;
     }
 
-    [[nodiscard]] constexpr Matrix inverse() const
+    [[nodiscard]] constexpr Optional<Matrix> inverse() const
     {
-        return adjugate() / determinant();
+        auto const determinant = this->determinant();
+        if (determinant == static_cast<T>(0))
+            return {};
+        return adjugate() / determinant;
     }
 
     [[nodiscard]] constexpr Matrix transpose() const

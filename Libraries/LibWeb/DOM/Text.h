@@ -7,26 +7,32 @@
 
 #pragma once
 
+#include <LibJS/Forward.h>
+#include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
 
 namespace Web::DOM {
 
 class WEB_API Text
     : public CharacterData
     , public SlottableMixin {
-    WEB_PLATFORM_OBJECT(Text, CharacterData);
+    WEB_WRAPPABLE(Text, CharacterData);
     GC_DECLARE_ALLOCATOR(Text);
 
 public:
     virtual ~Text() override = default;
 
-    static WebIDL::ExceptionOr<GC::Ref<Text>> construct_impl(JS::Realm& realm, Utf16String data);
+    [[nodiscard]] static GC::Ref<Text> create(Document&, Utf16String data);
+    [[nodiscard]] static GC::Ref<Text> create_for_constructor(JS::Object&, Utf16String data);
 
     // ^Node
-    virtual FlyString node_name() const override { return "#text"_fly_string; }
+    virtual Utf16FlyString node_name() const override { return "#text"_utf16_fly_string; }
+
+    virtual Node& slottable_as_node() override { return *this; }
 
     Optional<size_t> max_length() const { return m_max_length; }
     void set_max_length(Optional<size_t> max_length) { m_max_length = move(max_length); }
@@ -39,16 +45,26 @@ public:
 
     Optional<Element::Directionality> directionality() const;
 
+    // The text node's StyleEngine identity, or 0 while it is disconnected.
+    [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
+    void set_style_node_id(CSS::StyleNodeID);
+
 protected:
     Text(Document&, Utf16String);
     Text(Document&, NodeType, Utf16String);
 
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:
+    struct RareData;
+    virtual OwnPtr<Node::RareData> create_rare_data() const override;
+    virtual SlottableMixin::RareData* slottable_rare_data() override;
+    virtual SlottableMixin::RareData const* slottable_rare_data() const override;
+    virtual SlottableMixin::RareData& ensure_slottable_rare_data() override;
+
     Optional<size_t> m_max_length {};
     bool m_is_password_input { false };
+    CSS::StyleNodeID m_style_node_id;
 };
 
 template<>

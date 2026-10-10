@@ -30,7 +30,7 @@ static String serialize_ipv4_address(IPv4Address address)
     Array<u8, 4> output;
 
     // 2. Let n be the value of address.
-    u32 n = address;
+    u32 n = address.to_u32();
 
     // 3. For each i in the range 1 to 4, inclusive:
     for (size_t i = 0; i <= 3; ++i) {
@@ -64,7 +64,7 @@ static Optional<size_t> find_the_ipv6_address_compressed_piece_index(IPv6Address
     size_t found_size = 0;
 
     // 5. For each pieceIndex of address’s pieces’s indices:
-    for (size_t piece_index = 0; piece_index < address.size(); ++piece_index) {
+    for (size_t piece_index = 0; piece_index < 8; ++piece_index) {
         // 1. If address’s pieces[pieceIndex] is not 0:
         if (address[piece_index] != 0) {
             // 1. If foundSize is greater than longestSize, then set longestIndex to foundIndex and longestSize to foundSize.
@@ -110,7 +110,7 @@ static void serialize_ipv6_address(IPv6Address const& address, StringBuilder& ou
     auto ignore0 = false;
 
     // 4. For each pieceIndex of address’s pieces’s indices:
-    for (size_t piece_index = 0; piece_index < address.size(); ++piece_index) {
+    for (size_t piece_index = 0; piece_index < 8; ++piece_index) {
         // 1. If ignore0 is true and address[pieceIndex] is 0, then continue.
         if (ignore0 && address[piece_index] == 0)
             continue;
@@ -154,7 +154,36 @@ bool Host::is_domain() const
 bool Host::is_empty_host() const
 {
     // An empty host is the empty string.
-    return m_value.has<String>() && m_value.get<String>().is_empty();
+    return m_value.visit(
+        [](String const& domain) { return domain.is_empty(); },
+        [](OpaqueHost const& opaque_host) { return opaque_host.value.is_empty(); },
+        [](auto const&) { return false; });
+}
+
+// AD-HOC: This isn't a standalone spec concept; instead, it's the host-focused portion of steps 4 and 5 of
+//         https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy — shared here so LibWeb's Secure
+//         Contexts implementation and other components can identify hosts guaranteed to name the loopback interface.
+bool Host::is_loopback_or_localhost() const
+{
+    // If origin's host matches one of the CIDR notations 127.0.0.0/8 or ::1/128 [RFC4632], return "Potentially Trustworthy".
+    // NOTE: For hosts produced by the URL parser, to_u32() is the URL spec's IPv4 number — with the first octet in the
+    //       most-significant byte.
+    if (auto const* ipv4_address = m_value.get_pointer<IPv4Address>())
+        return (ipv4_address->to_u32() & 0xff000000) == 0x7f000000;
+
+    if (auto const* ipv6_address = m_value.get_pointer<IPv6Address>())
+        return *ipv6_address == IPv6Address::loopback();
+
+    // If the user agent conforms to the name resolution rules in [let-localhost-be-localhost] and one of the following is true:
+    // - origin's host is "localhost" or "localhost."
+    // - origin's host ends with ".localhost" or ".localhost."
+    // then return "Potentially Trustworthy".
+    auto const* domain = m_value.get_pointer<String>();
+    if (!domain)
+        return false;
+    return domain->is_one_of("localhost"sv, "localhost."sv)
+        || domain->ends_with_bytes(".localhost"sv)
+        || domain->ends_with_bytes(".localhost."sv);
 }
 
 // https://url.spec.whatwg.org/#concept-host-serializer
@@ -176,6 +205,9 @@ String Host::serialize() const
         // 3. Otherwise, host is a domain, opaque host, or empty host, return host.
         [](String const& string) {
             return string;
+        },
+        [](OpaqueHost const& opaque_host) {
+            return opaque_host.value;
         });
 }
 
@@ -184,56 +216,39 @@ Optional<String> Host::public_suffix() const
 {
     // 1. If host is not a domain, then return null.
     if (!is_domain())
-        return OptionalNone {};
-
-    auto const& host_string = m_value.get<String>();
+        return {};
 
     // 2. Let trailingDot be "." if host ends with "."; otherwise the empty string.
-    auto trailing_dot = host_string.ends_with('.') ? "."sv : ""sv;
-
     // 3. Let publicSuffix be the public suffix determined by running the Public Suffix List algorithm with host as domain. [PSL]
-    // FIXME: Unify this logic with registrable domain.
-    auto public_suffix = PublicSuffixData::the()->get_public_suffix(host_string);
-    if (!public_suffix.has_value()) {
-        auto last_dot = host_string.bytes_as_string_view().find_last('.');
-        if (last_dot.has_value())
-            public_suffix = MUST(host_string.substring_from_byte_offset(last_dot.value() + 1));
-        else
-            public_suffix = host_string;
-    }
+    auto public_suffix = PublicSuffixData::find_matching_public_suffix(*this, PublicSuffixData::IncludeStarRule::Yes);
+    if (!public_suffix.has_value())
+        return {};
 
     // 4. Assert: publicSuffix is an ASCII string that does not end with ".".
-    VERIFY(public_suffix->is_ascii());
-    VERIFY(!public_suffix->ends_with('.'));
-
     // 5. Return publicSuffix and trailingDot concatenated.
-    return MUST(String::formatted("{}{}", public_suffix, trailing_dot));
+    // NB: PublicSuffixData preserves the host's trailing dot, if any.
+    VERIFY(public_suffix->is_ascii());
+    return public_suffix;
 }
 
 // https://url.spec.whatwg.org/#host-registrable-domain
 Optional<String> Host::registrable_domain() const
 {
     // 1. If host’s public suffix is null or host’s public suffix equals host, then return null.
-    auto public_suffix = this->public_suffix();
-    if (!public_suffix.has_value() || public_suffix == m_value.get<String>())
-        return OptionalNone {};
-
-    // NOTE: If we got here, we know this Host is a String.
-    auto const& host_string = m_value.get<String>();
+    if (!is_domain())
+        return {};
 
     // 2. Let trailingDot be "." if host ends with "."; otherwise the empty string.
-    auto trailing_dot = host_string.ends_with('.') ? "."sv : ""sv;
-
     // 3. Let registrableDomain be the registrable domain determined by running the Public Suffix List algorithm with host as domain. [PSL]
-    // FIXME: This is not correct, we should be doing the same as public_suffix() above.
-    auto registrable_domain = get_registrable_domain(host_string).value_or("*"_string);
+    auto registrable_domain = PublicSuffixData::find_matching_registrable_domain(*this, PublicSuffixData::IncludeStarRule::Yes);
+    if (!registrable_domain.has_value())
+        return {};
 
-    // 4. Assert: registrableDomain is an ASCII string that does not end with ".".
-    VERIFY(registrable_domain.is_ascii());
-    VERIFY(!registrable_domain.ends_with('.'));
-
-    // 5. Return registrableDomain and trailingDot concatenated.
-    return MUST(String::formatted("{}{}", registrable_domain, trailing_dot));
+    // 4. Assert: publicSuffix is an ASCII string that does not end with ".".
+    // 5. Return publicSuffix and trailingDot concatenated.
+    // NB: PublicSuffixData preserves the host's trailing dot, if any.
+    VERIFY(registrable_domain->is_ascii());
+    return registrable_domain;
 }
 
 }

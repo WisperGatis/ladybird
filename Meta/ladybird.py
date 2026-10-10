@@ -15,15 +15,16 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(str(Path(__file__).resolve().parent))
 
-from Meta.find_compiler import pick_host_compiler
-from Meta.find_compiler import pick_swift_compilers
-from Meta.host_platform import HostArchitecture
-from Meta.host_platform import HostSystem
-from Meta.host_platform import Platform
-from Meta.utils import run_command
-from Toolchain.BuildVcpkg import build_vcpkg
+from Utils.build_vcpkg import build_vcpkg
+from Utils.find_compiler import pick_host_compiler
+from Utils.host_platform import HostArchitecture
+from Utils.host_platform import HostSystem
+from Utils.host_platform import Platform
+from Utils.utils import run_command
+
+LADYBIRD_SOURCE_DIR = Path(__file__).resolve().parent.parent
 
 
 def main():
@@ -37,9 +38,7 @@ def main():
     preset_parser.add_argument(
         "--preset",
         required=False,
-        default=os.environ.get(
-            "BUILD_PRESET", "Windows_Experimental" if platform.host_system == HostSystem.Windows else "Release"
-        ),
+        default=os.environ.get("BUILD_PRESET", "Release"),
     )
 
     compiler_parser = argparse.ArgumentParser(add_help=False)
@@ -66,6 +65,9 @@ def main():
 
     run_parser = subparsers.add_parser(
         "run", help="Runs the application on the build host", parents=[preset_parser, compiler_parser, target_parser]
+    )
+    run_parser.add_argument(
+        "--no-build", action="store_true", help="Run an existing binary without configuring or building"
     )
     run_parser.add_argument(
         "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the application"
@@ -101,7 +103,10 @@ def main():
         "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the build system"
     )
 
-    subparsers.add_parser("vcpkg", help="Ensure that dependencies are available", parents=[preset_parser])
+    vcpkg_parser = subparsers.add_parser(
+        "vcpkg", help="Ensure that dependencies are available", parents=[preset_parser]
+    )
+    vcpkg_parser.add_argument("--jobs", "-j", required=False)
 
     subparsers.add_parser("clean", help="Cleans the build environment", parents=[preset_parser])
 
@@ -128,24 +133,35 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # FIXME: The devcontainer installation script (.devcontainer/features/vcpkg-cache/install.sh) currently runs as the
+    #        root user. We should set up the vcpkg cache as a non-root user.
+    if args.command == "vcpkg":
+        _, vcpkg_preset_dir = configure_build_env(platform, args.preset, args.jobs)
+        build_vcpkg(vcpkg_preset_dir)
+        return
+
     if platform.host_system != HostSystem.Windows and os.geteuid() == 0:
         print("Do not run ladybird.py as root, your Build directory will become root-owned", file=sys.stderr)
         sys.exit(1)
-    elif platform.host_system == HostSystem.Windows and "VCINSTALLDIR" not in os.environ:
+    elif (
+        platform.host_system == HostSystem.Windows
+        and "VCINSTALLDIR" not in os.environ
+        and not (args.command == "run" and args.no_build)
+    ):
         print("ladybird.py must be run from a Visual Studio enabled environment", file=sys.stderr)
         sys.exit(1)
 
     if "target" in args:
-        if args.target == "ladybird":
+        if platform.host_system != HostSystem.Windows and args.target == "ladybird":
             args.target = "Ladybird"
         if not args.target and args.command not in ("build", "rebuild"):
-            args.target = "Ladybird"
+            args.target = "ladybird" if platform.host_system == HostSystem.Windows else "Ladybird"
 
     if args.command == "build":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target, args.args)
     elif args.command == "test":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs)
         test_main(build_dir, args.preset, args.pattern)
     elif args.command == "run":
@@ -159,66 +175,58 @@ def main():
             os.environ["UBSAN_OPTIONS"] = os.environ.get(
                 "UBSAN_OPTIONS", "print_stacktrace=1:print_summary=1:halt_on_error=1"
             )
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
-        build_main(build_dir, args.jobs, args.target)
+        if args.no_build:
+            build_dir, _ = configure_build_env(platform, args.preset, args.jobs)
+        else:
+            build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
+            build_main(build_dir, args.jobs, args.target)
         run_main(platform.host_system, build_dir, args.target, args.args)
     elif args.command == "debug":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target, args.args)
         debug_main(platform.host_system, build_dir, args.target, args.debugger, args.cmd)
     elif args.command == "profile":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target)
         profile_main(platform.host_system, build_dir, args.target, args.args)
     elif args.command == "install":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target, args.args)
         build_main(build_dir, args.jobs, "install", args.args)
-    elif args.command == "vcpkg":
-        configure_build_env(platform, args.preset)
-        build_vcpkg()
     elif args.command == "clean":
         clean_main(platform, args.preset)
     elif args.command == "rebuild":
         clean_main(platform, args.preset)
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target, args.args)
     elif args.command == "addr2line":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx)
+        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target)
         addr2line_main(build_dir, args.target, args.program, args.addresses)
 
 
-def configure_main(platform: Platform, preset: str, cc: str, cxx: str) -> Path:
-    ladybird_source_dir, build_preset_dir = configure_build_env(platform, preset)
-    build_vcpkg()
+def configure_main(platform: Platform, preset: str, cc: str, cxx: str, jobs: Optional[str]) -> Path:
+    build_preset_dir, vcpkg_preset_dir = configure_build_env(platform, preset, jobs)
+    build_vcpkg(vcpkg_preset_dir)
 
     if build_preset_dir.joinpath("build.ninja").exists() or build_preset_dir.joinpath("ladybird.sln").exists():
         return build_preset_dir
 
-    swiftc: Optional[str] = None
     validate_cmake_version()
 
-    if "Swift" in preset:
-        compilers = pick_swift_compilers(platform, ladybird_source_dir)
-        (cc, cxx, swiftc) = tuple(map(str, compilers))
-    else:
-        (cc, cxx) = pick_host_compiler(platform, cc, cxx)
+    (cc, cxx) = pick_host_compiler(platform, cc, cxx)
 
     config_args = [
         "cmake",
         "--preset",
         preset,
         "-S",
-        ladybird_source_dir,
+        LADYBIRD_SOURCE_DIR,
         "-B",
         build_preset_dir,
         f"-DCMAKE_C_COMPILER={cc}",
         f"-DCMAKE_CXX_COMPILER={cxx}",
     ]
-
-    if swiftc:
-        config_args.append(f"-DCMAKE_Swift_COMPILER={swiftc}")
 
     if platform.host_system == HostSystem.Linux and platform.host_architecture == HostArchitecture.AArch64:
         config_args.extend(configure_skia_jemalloc())
@@ -265,42 +273,62 @@ def configure_skia_jemalloc() -> list[str]:
     return cmake_args
 
 
-def configure_build_env(platform: Platform, preset: str) -> tuple[Path, Path]:
-    ladybird_source_dir = ensure_ladybird_source_dir()
-    build_root_dir = ladybird_source_dir / "Build"
+def configure_build_env(platform: Platform, preset: str, jobs: Optional[str] = None) -> tuple[Path, Path]:
+    ladybird_main_source_dir = find_main_ladybird_source_dir()
 
-    known_presets = {
+    os.environ["LADYBIRD_SOURCE_DIR"] = str(LADYBIRD_SOURCE_DIR)
+    os.environ["LADYBIRD_MAIN_SOURCE_DIR"] = str(ladybird_main_source_dir)
+
+    build_root_dir = LADYBIRD_SOURCE_DIR / "Build"
+    main_build_root_dir = ladybird_main_source_dir / "Build"
+
+    BUILD_PRESETS = {
+        "All_Debug": build_root_dir / "alldebug",
         "Debug": build_root_dir / "debug",
         "Distribution": build_root_dir / "distribution",
+        "Fuzzers": build_root_dir / "fuzzers",
         "Release": build_root_dir / "release",
-        "Sanitizer": build_root_dir / "sanitizers",
-        "Swift_Release": build_root_dir / "swift",
-        "Windows_CI": build_root_dir / "release",
-        "Windows_Experimental": build_root_dir / "debug",
-        "Windows_Sanitizer_CI": build_root_dir / "sanitizers",
+        "Sanitizer": build_root_dir / "sanitizer",
+        "ThreadSanitizer": build_root_dir / "tsan",
     }
 
-    build_preset_dir = known_presets.get(preset, None)
-    if not build_preset_dir:
+    VCPKG_PRESETS = {
+        "All_Debug": main_build_root_dir / "vcpkg-debug",
+        "Debug": main_build_root_dir / "vcpkg-debug",
+        "Distribution": main_build_root_dir / "vcpkg-distribution",
+        "Fuzzers": main_build_root_dir / "vcpkg-distribution",
+        "Release": main_build_root_dir / "vcpkg-release",
+        "Sanitizer": main_build_root_dir / "vcpkg-sanitizer",
+        "ThreadSanitizer": main_build_root_dir / "vcpkg-release",
+    }
+
+    build_preset_dir = BUILD_PRESETS.get(preset, None)
+    vcpkg_preset_dir = VCPKG_PRESETS.get(preset, None)
+
+    if not build_preset_dir or not vcpkg_preset_dir:
         print(f'Unknown build preset "{preset}"', file=sys.stderr)
         sys.exit(1)
 
-    vcpkg_root = str(build_root_dir / "vcpkg")
-    os.environ["PATH"] += os.pathsep + str(ladybird_source_dir.joinpath("Toolchain", "Local", "cmake", "bin"))
-    os.environ["PATH"] += os.pathsep + vcpkg_root
-    os.environ["VCPKG_ROOT"] = vcpkg_root
-    if platform.host_architecture == HostArchitecture.riscv64:
-        # vcpkg refuses to build ports on riscv64 and other less common architectures without this flag.
-        # With it set vcpkg will use the system provided CMake and Ninja binaries but will still download,
-        # build and use its own pinned versions of gn, meson and pkg-config.
+    os.environ["PATH"] += os.pathsep + str(vcpkg_preset_dir)
+    os.environ["VCPKG_ROOT"] = str(vcpkg_preset_dir)
+
+    if jobs:
+        os.environ["VCPKG_MAX_CONCURRENCY"] = jobs
+
+    needs_system_binaries = platform.host_architecture == HostArchitecture.riscv64 or (
+        platform.host_system == HostSystem.Linux and platform.host_architecture == HostArchitecture.AArch64
+    )
+    if needs_system_binaries:
+        # vcpkg does not ship prebuilt tool binaries for riscv64 or arm64 Linux and refuses to build
+        # ports on these hosts without this flag. With it set vcpkg uses the system provided CMake and
+        # Ninja binaries but still downloads, builds and uses its own pinned gn, meson and pkg-config.
         os.environ["VCPKG_FORCE_SYSTEM_BINARIES"] = "1"
 
-    return ladybird_source_dir, build_preset_dir
+    return build_preset_dir, vcpkg_preset_dir
 
 
 def validate_cmake_version():
-    # FIXME: This 3.25+ CMake version check may not be needed anymore due to vcpkg downloading a newer version
-    cmake_install_message = "Please install CMake version 3.25 or newer."
+    cmake_install_message = "Please install CMake version 3.30 or newer."
 
     cmake_version_output = run_command(["cmake", "--version"], return_output=True, exit_on_failure=True)
     assert cmake_version_output
@@ -314,27 +342,44 @@ def validate_cmake_version():
     minor = int(version_match.group(2))
     patch = int(version_match.group(3))
 
-    if major < 3 or (major == 3 and minor < 25):
+    if major < 3 or (major == 3 and minor < 30):
         print(f"CMake version {major}.{minor}.{patch} is too old. {cmake_install_message}", file=sys.stderr)
         sys.exit(1)
 
 
-def ensure_ladybird_source_dir() -> Path:
-    ladybird_source_dir = os.environ.get("LADYBIRD_SOURCE_DIR", None)
-    ladybird_source_dir = Path(ladybird_source_dir) if ladybird_source_dir else None
+def find_main_ladybird_source_dir() -> Path:
+    """
+    Detects if this checkout is a git worktree and, if so, finds the main worktree to be used for a shared vcpkg build.
+    """
+    git_path = LADYBIRD_SOURCE_DIR / ".git"
+    if not git_path.is_file():
+        return LADYBIRD_SOURCE_DIR
 
-    if not ladybird_source_dir or not ladybird_source_dir.is_dir():
-        root_dir = run_command(["git", "rev-parse", "--show-toplevel"], return_output=True, exit_on_failure=True)
-        assert root_dir
+    with open(git_path, "r") as git_file:
+        git_root = git_file.read()
 
-        os.environ["LADYBIRD_SOURCE_DIR"] = root_dir
-        ladybird_source_dir = Path(root_dir)
+    segments = git_root.split(":", 1)
+    if len(segments) != 2:
+        return LADYBIRD_SOURCE_DIR
 
-    return ladybird_source_dir
+    main_worktree = Path(segments[1].strip())
+    main_worktree = main_worktree.parent.parent
+
+    # Detect whether the main worktree is a full clone or a bare clone. In full clones, the current main worktree path
+    # should be the ".git" directory. If anyone has a very unusual git layout, we could instead parse the git config
+    # file (main_worktree / "config") to detect if the main worktree is bare.
+    return main_worktree.parent if main_worktree.name == ".git" else main_worktree
+
+
+def is_running_under_coding_agent() -> bool:
+    return "CLAUDECODE" in os.environ or "CODEX_SANDBOX" in os.environ
 
 
 def build_main(build_dir: Path, jobs: Optional[str], target: Optional[str] = None, args: Optional[list[str]] = None):
     build_args = ["ninja", "-C", str(build_dir)]
+
+    if is_running_under_coding_agent():
+        build_args.append("--quiet")
 
     if not jobs:
         jobs = os.environ.get("MAKEJOBS", None)
@@ -384,7 +429,11 @@ def run_main(host_system: HostSystem, build_dir: Path, target: str, args: list[s
 
     run_args.extend(args)
 
-    run_command(run_args, exit_on_failure=True)
+    try:
+        run_command(run_args, exit_on_failure=True)
+    except FileNotFoundError:
+        print(f"Executable not found: {run_args[0]}. Build the target before running it.", file=sys.stderr)
+        sys.exit(1)
 
 
 def debug_main(host_system: HostSystem, build_dir: Path, target: str, debugger: str, debugger_commands: list[str]):
@@ -399,6 +448,8 @@ def debug_main(host_system: HostSystem, build_dir: Path, target: str, debugger: 
 
     if target == "Ladybird" and host_system == HostSystem.macOS:
         gdb_args.append(str(build_dir.joinpath("bin", "Ladybird.app")))
+    elif host_system == HostSystem.Windows:
+        gdb_args.append(str(build_dir.joinpath("bin", target + ".exe")))
     else:
         gdb_args.append(str(build_dir.joinpath("bin", target)))
 
@@ -423,10 +474,10 @@ def profile_main(host_system: HostSystem, build_dir: Path, target: str, args: li
 
 
 def clean_main(platform: Platform, preset: str):
-    ladybird_source_dir, build_preset_dir = configure_build_env(platform, preset)
+    build_preset_dir, _ = configure_build_env(platform, preset)
     shutil.rmtree(str(build_preset_dir), ignore_errors=True)
 
-    user_vars_cmake_module = ladybird_source_dir.joinpath("Meta", "CMake", "vcpkg", "user-variables.cmake")
+    user_vars_cmake_module = LADYBIRD_SOURCE_DIR.joinpath("Meta", "CMake", "vcpkg", "user-variables.cmake")
     user_vars_cmake_module.unlink(missing_ok=True)
 
 

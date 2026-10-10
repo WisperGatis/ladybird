@@ -10,7 +10,6 @@
 
 #include <AK/Assertions.h>
 #include <AK/BitCast.h>
-#include <AK/ByteString.h>
 #include <AK/Format.h>
 #include <AK/Forward.h>
 #include <AK/Function.h>
@@ -18,6 +17,8 @@
 #include <AK/SourceLocation.h>
 #include <AK/String.h>
 #include <AK/Types.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibGC/NanBoxedValue.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Root.h>
@@ -80,20 +81,12 @@ static constexpr u64 SHIFTED_INT32_TAG = INT32_TAG << GC::TAG_SHIFT;
 // 0b1111111111111xxx yyy... xxx = pointer type, yyy = pointer value
 // 0b0111111111111xxx yyy... xxx = non-pointer type, yyy = value or 0 if just type
 
-// Future expansion: We are not fully utilizing all the possible bit patterns
-// yet, these choices were made to make it easy to implement and understand.
-// We can for example drop the always 1 top bit of the mantissa expanding our
-// options from 8 tags to 15 but since we currently only use 5 for both sign bits
-// this is not needed.
-
+// The Rust runtime encodes its values with exactly these bits, so a Value crosses the embedding ABI unchanged.
 class JS_API Value : public GC::NanBoxedValue {
-public:
-    enum class PreferredType {
-        Default,
-        String,
-        Number,
-    };
+    template<typename T>
+    static constexpr bool HasForbiddenDirectJSValueConversion = requires { typename RemoveCV<T>::JSValueConversionIsForbidden; };
 
+public:
     [[nodiscard]] u16 tag() const { return m_value.tag; }
 
     bool is_special_empty_value() const { return m_value.encoded == (EMPTY_TAG << GC::TAG_SHIFT); }
@@ -110,7 +103,6 @@ public:
     ThrowCompletionOr<bool> is_array(VM&) const;
     bool is_function() const;
     bool is_constructor() const;
-    ThrowCompletionOr<bool> is_regexp(VM&) const;
 
     bool is_infinity() const
     {
@@ -126,11 +118,6 @@ public:
     bool is_negative_infinity() const
     {
         return m_value.encoded == GC::NEGATIVE_INFINITY_BITS;
-    }
-
-    bool is_positive_zero() const
-    {
-        return m_value.encoded == 0 || (is_int32() && as_i32() == 0);
     }
 
     bool is_negative_zero() const
@@ -154,6 +141,52 @@ public:
         return !is_nan() && !is_infinity();
     }
 
+    template<DerivedFrom<Object> T>
+    [[nodiscard]] ALWAYS_INLINE bool is() const
+    {
+        return !!as_if<T>();
+    }
+
+    template<DerivedFrom<Object> T>
+    [[nodiscard]] ALWAYS_INLINE GC::Ptr<T> as_if()
+    {
+        if (!is_object())
+            return nullptr;
+        if constexpr (IsSame<T, Object>) {
+            return as_object();
+        } else {
+            return ::as_if<T>(as_object());
+        }
+    }
+
+    template<DerivedFrom<Object> T>
+    [[nodiscard]] ALWAYS_INLINE GC::Ptr<T const> as_if() const
+    {
+        if (!is_object())
+            return nullptr;
+        if constexpr (IsSame<T, Object>) {
+            return as_object();
+        } else {
+            return ::as_if<T>(as_object());
+        }
+    }
+
+    template<DerivedFrom<Object> T>
+    [[nodiscard]] ALWAYS_INLINE T& as()
+    {
+        auto ptr = as_if<T>();
+        VERIFY(ptr);
+        return *ptr;
+    }
+
+    template<DerivedFrom<Object> T>
+    [[nodiscard]] ALWAYS_INLINE T const& as() const
+    {
+        auto ptr = as_if<T>();
+        VERIFY(ptr);
+        return *ptr;
+    }
+
     constexpr Value()
         : Value(UNDEFINED_TAG << GC::TAG_SHIFT, (u64)0)
     {
@@ -163,13 +196,6 @@ public:
     requires(IsSameIgnoringCV<T, bool>) explicit Value(T value)
         : Value(BOOLEAN_TAG << GC::TAG_SHIFT, (u64)value)
     {
-    }
-
-    enum class CannotFitInInt32 { Indeed };
-    Value(i64 value, CannotFitInInt32)
-    {
-        ASSERT(value < static_cast<i64>(NumericLimits<i32>::min()) || value > static_cast<i64>(NumericLimits<i32>::max()));
-        m_value.as_double = static_cast<double>(value);
     }
 
     explicit Value(double value)
@@ -184,11 +210,6 @@ public:
             else
                 m_value.as_double = value;
         }
-    }
-
-    explicit Value(f16 value)
-        : Value(static_cast<double>(value))
-    {
     }
 
     // NOTE: A couple of integral types are excluded here:
@@ -221,6 +242,9 @@ public:
     {
     }
 
+    template<typename T>
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(T*) = delete;
+
     Value(Cell const* cell)
         : Value(GC::IS_CELL_BIT << GC::TAG_SHIFT, reinterpret_cast<void const*>(cell))
     {
@@ -241,32 +265,45 @@ public:
     {
     }
 
-    Value(Accessor const* accessor)
-        : Value(ACCESSOR_TAG << GC::TAG_SHIFT, reinterpret_cast<void const*>(accessor))
-    {
-    }
-
     Value(BigInt const* bigint)
         : Value(BIGINT_TAG << GC::TAG_SHIFT, reinterpret_cast<void const*>(bigint))
     {
     }
 
     template<typename T>
-    Value(GC::Ptr<T> ptr)
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Ptr<T> ptr)
         : Value(ptr.ptr())
     {
     }
 
     template<typename T>
-    Value(GC::Ref<T> ptr)
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Ptr<T>) = delete;
+
+    template<typename T>
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Ref<T> ptr)
         : Value(ptr.ptr())
     {
     }
 
     template<typename T>
-    Value(GC::Root<T> const& ptr)
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Ref<T>) = delete;
+
+    template<typename T>
+    requires(!HasForbiddenDirectJSValueConversion<T>) Value(GC::Root<T> const& ptr)
         : Value(ptr.ptr())
     {
+    }
+
+    template<typename T>
+    requires(HasForbiddenDirectJSValueConversion<T>) Value(GC::Root<T> const&) = delete;
+
+    // Confirms the class of the cell this Value points at. The tag alone cannot do that: every
+    // cell-backed tag names a different class, but a forged Value can carry an honest tag and
+    // a pointer to a cell of some other class. The Rust runtime's cells keep their kind where
+    // C++ cells do.
+    ALWAYS_INLINE void verify_cell_kind(GC::CellKind kind) const
+    {
+        VERIFY(extract_pointer<GC::ForeignCell>()->cell_kind() == kind);
     }
 
     Cell& as_cell()
@@ -283,7 +320,7 @@ public:
 
     double as_double() const
     {
-        VERIFY(is_number());
+        ASSERT(is_number());
         if (is_int32())
             return as_i32();
         return m_value.as_double;
@@ -298,104 +335,85 @@ public:
     Object& as_object()
     {
         VERIFY(is_object());
+        verify_cell_kind(GC::CellKind::Object);
         return *extract_pointer<Object>();
     }
 
     Object const& as_object() const
     {
         VERIFY(is_object());
+        verify_cell_kind(GC::CellKind::Object);
         return *extract_pointer<Object>();
     }
 
     PrimitiveString& as_string()
     {
         VERIFY(is_string());
+        verify_cell_kind(GC::CellKind::PrimitiveString);
         return *extract_pointer<PrimitiveString>();
     }
 
     PrimitiveString const& as_string() const
     {
         VERIFY(is_string());
+        verify_cell_kind(GC::CellKind::PrimitiveString);
         return *extract_pointer<PrimitiveString>();
     }
 
     Symbol& as_symbol()
     {
         VERIFY(is_symbol());
+        verify_cell_kind(GC::CellKind::Symbol);
         return *extract_pointer<Symbol>();
     }
 
     Symbol const& as_symbol() const
     {
         VERIFY(is_symbol());
+        verify_cell_kind(GC::CellKind::Symbol);
         return *extract_pointer<Symbol>();
-    }
-
-    Accessor& as_accessor()
-    {
-        VERIFY(is_accessor());
-        return *extract_pointer<Accessor>();
     }
 
     BigInt const& as_bigint() const
     {
         VERIFY(is_bigint());
+        verify_cell_kind(GC::CellKind::BigInt);
         return *extract_pointer<BigInt>();
     }
 
     BigInt& as_bigint()
     {
         VERIFY(is_bigint());
+        verify_cell_kind(GC::CellKind::BigInt);
         return *extract_pointer<BigInt>();
     }
 
-    Array& as_array();
     FunctionObject& as_function();
     FunctionObject const& as_function() const;
 
     u64 encoded() const { return m_value.encoded; }
 
-    ThrowCompletionOr<String> to_string(VM&) const;
-    ThrowCompletionOr<ByteString> to_byte_string(VM&) const;
     ThrowCompletionOr<Utf16String> to_utf16_string(VM&) const;
-    ThrowCompletionOr<GC::Ref<PrimitiveString>> to_primitive_string(VM&);
-    ThrowCompletionOr<Value> to_primitive(VM&, PreferredType preferred_type = PreferredType::Default) const;
     ThrowCompletionOr<GC::Ref<Object>> to_object(VM&) const;
     ThrowCompletionOr<GC::Ref<Object>> to_object_slow(VM&) const;
-    ThrowCompletionOr<Value> to_numeric(VM&) const;
     ThrowCompletionOr<Value> to_number(VM&) const;
     ThrowCompletionOr<GC::Ref<BigInt>> to_bigint(VM&) const;
-    ThrowCompletionOr<i64> to_bigint_int64(VM&) const;
     ThrowCompletionOr<u64> to_bigint_uint64(VM&) const;
     ThrowCompletionOr<double> to_double(VM&) const;
-    ThrowCompletionOr<PropertyKey> to_property_key(VM&) const;
     ThrowCompletionOr<i32> to_i32(VM&) const;
     ThrowCompletionOr<u32> to_u32(VM&) const;
-    ThrowCompletionOr<i16> to_i16(VM&) const;
     ThrowCompletionOr<u16> to_u16(VM&) const;
-    ThrowCompletionOr<i8> to_i8(VM&) const;
     ThrowCompletionOr<u8> to_u8(VM&) const;
-    ThrowCompletionOr<u8> to_u8_clamp(VM&) const;
     ThrowCompletionOr<size_t> to_length(VM&) const;
-    ThrowCompletionOr<size_t> to_index(VM&) const;
-    ThrowCompletionOr<double> to_integer_or_infinity(VM&) const;
     bool to_boolean() const;
 
     ThrowCompletionOr<Value> get(VM&, PropertyKey const&) const;
-    ThrowCompletionOr<Value> get(VM&, PropertyKey const&, Bytecode::PropertyLookupCache&) const;
 
     ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&) const;
-    ThrowCompletionOr<GC::Ptr<FunctionObject>> get_method(VM&, PropertyKey const&, Bytecode::PropertyLookupCache&) const;
 
-    [[nodiscard]] String to_string_without_side_effects() const;
     [[nodiscard]] Utf16String to_utf16_string_without_side_effects() const;
 
-    [[nodiscard]] GC::Ref<PrimitiveString> typeof_(VM&) const;
-
     bool operator==(Value const&) const;
-
-    template<typename... Args>
-    [[nodiscard]] ALWAYS_INLINE ThrowCompletionOr<Value> invoke(VM&, PropertyKey const& property_key, Args... args);
 
     // A double is any Value which does not have the full exponent and top mantissa bit set or has
     // exactly only those bits set.
@@ -404,29 +422,14 @@ public:
 
     i32 as_i32() const
     {
-        VERIFY(is_int32());
+        ASSERT(is_int32());
         return static_cast<i32>(m_value.encoded & 0xFFFFFFFF);
-    }
-
-    i32 as_i32_clamped_integral_number() const
-    {
-        VERIFY(is_int32() || is_finite_number());
-        if (is_int32())
-            return as_i32();
-        double value = trunc(as_double());
-        if (value > INT32_MAX)
-            return INT32_MAX;
-        if (value < INT32_MIN)
-            return INT32_MIN;
-        return static_cast<i32>(value);
     }
 
     bool to_boolean_slow_case() const;
 
 private:
     ThrowCompletionOr<Value> to_number_slow_case(VM&) const;
-    ThrowCompletionOr<Value> to_numeric_slow_case(VM&) const;
-    ThrowCompletionOr<Value> to_primitive_slow_case(VM&, PreferredType) const;
 
     enum class EmptyTag { Empty };
 
@@ -445,39 +448,17 @@ private:
     Value(u64 tag, PointerType const* ptr)
     {
         if (!ptr) {
-            // Make sure all nullptrs are null
             m_value.tag = NULL_TAG;
             return;
         }
 
         ASSERT((tag & 0x8000000000000000ul) == 0x8000000000000000ul);
-
-        if constexpr (sizeof(PointerType*) < sizeof(u64)) {
-            m_value.encoded = tag | reinterpret_cast<u32>(ptr);
-        } else {
-            // NOTE: Pointers in x86-64 use just 48 bits however are supposed to be
-            //       sign extended up from the 47th bit.
-            //       This means that all bits above the 47th should be the same as
-            //       the 47th. When storing a pointer we thus drop the top 16 bits as
-            //       we can recover it when extracting the pointer again.
-            //       See also: NanBoxedValue::extract_pointer.
-            m_value.encoded = tag | (reinterpret_cast<u64>(ptr) & 0x0000ffffffffffffULL);
-        }
+        m_value.encoded = tag | GC::NanBoxedValue::encode_pointer_bits(ptr);
     }
-
-    [[nodiscard]] ThrowCompletionOr<Value> invoke_internal(VM&, PropertyKey const&, Optional<GC::RootVector<Value>> arguments);
-
-    ThrowCompletionOr<i32> to_i32_slow_case(VM&) const;
 
     friend constexpr Value js_undefined();
     friend constexpr Value js_null();
     friend constexpr Value js_special_empty_value();
-    friend ThrowCompletionOr<bool> greater_than(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<bool> greater_than_equals(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<bool> less_than(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<bool> less_than_equals(VM&, Value lhs, Value rhs);
-    friend ThrowCompletionOr<Value> add(VM&, Value lhs, Value rhs);
-    friend bool same_value_non_number(Value lhs, Value rhs);
 };
 
 inline constexpr Value js_undefined()
@@ -495,61 +476,15 @@ inline constexpr Value js_special_empty_value()
     return Value(Value::EmptyTag::Empty);
 }
 
-inline Value js_nan()
-{
-    return Value(NAN);
-}
-
-inline Value js_infinity()
-{
-    return Value(INFINITY);
-}
-
-inline Value js_negative_infinity()
-{
-    return Value(-INFINITY);
-}
-
-ThrowCompletionOr<bool> greater_than(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<bool> greater_than_equals(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<bool> less_than(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<bool> less_than_equals(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> bitwise_and(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> bitwise_or(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> bitwise_xor(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> bitwise_not(VM&, Value);
-ThrowCompletionOr<Value> unary_plus(VM&, Value);
-ThrowCompletionOr<Value> unary_minus(VM&, Value);
-ThrowCompletionOr<Value> left_shift(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> right_shift(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> unsigned_right_shift(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> add(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> sub(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> mul(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> div(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> mod(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> exp(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> in(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> instance_of(VM&, Value lhs, Value rhs);
-ThrowCompletionOr<Value> ordinary_has_instance(VM&, Value lhs, Value rhs);
-
-ThrowCompletionOr<bool> is_loosely_equal(VM&, Value lhs, Value rhs);
-bool is_strictly_equal(Value lhs, Value rhs);
 JS_API bool same_value(Value lhs, Value rhs);
 JS_API bool same_value_zero(Value lhs, Value rhs);
-bool same_value_non_number(Value lhs, Value rhs);
-ThrowCompletionOr<TriState> is_less_than(VM&, Value lhs, Value rhs, bool left_first);
-
-double to_integer_or_infinity(double);
 
 enum class NumberToStringMode {
     WithExponent,
     WithoutExponent,
 };
-[[nodiscard]] JS_API String number_to_string(double, NumberToStringMode = NumberToStringMode::WithExponent);
+JS_API void number_to_string(StringBuilder&, double, NumberToStringMode = NumberToStringMode::WithExponent);
 [[nodiscard]] JS_API Utf16String number_to_utf16_string(double, NumberToStringMode = NumberToStringMode::WithExponent);
-[[nodiscard]] ByteString number_to_byte_string(double, NumberToStringMode = NumberToStringMode::WithExponent);
-double string_to_number(StringView);
 
 inline bool Value::operator==(Value const& value) const { return same_value(*this, value); }
 
@@ -560,99 +495,15 @@ namespace AK {
 static_assert(sizeof(JS::Value) == sizeof(double));
 
 template<>
-class Optional<JS::Value> : public OptionalBase<JS::Value> {
-    template<typename U>
-    friend class Optional;
+struct SentinelOptionalTraits<JS::Value> {
+    static constexpr JS::Value sentinel_value() { return JS::js_special_empty_value(); }
+    static constexpr bool is_sentinel(JS::Value const& value) { return value.is_special_empty_value(); }
+};
 
+template<>
+class Optional<JS::Value> : public SentinelOptional<JS::Value> {
 public:
-    using ValueType = JS::Value;
-
-    constexpr Optional() = default;
-
-    template<SameAs<OptionalNone> V>
-    constexpr Optional(V) { }
-
-    constexpr Optional(Optional<JS::Value> const& other)
-    {
-        if (other.has_value())
-            m_value = other.m_value;
-    }
-
-    constexpr Optional(Optional&& other)
-        : m_value(other.m_value)
-    {
-    }
-
-    template<typename U = JS::Value>
-    requires(!IsSame<OptionalNone, RemoveCVReference<U>>)
-    explicit(!IsConvertible<U&&, JS::Value>) constexpr Optional(U&& value)
-    requires(!IsSame<RemoveCVReference<U>, Optional<JS::Value>> && IsConstructible<JS::Value, U &&>)
-        : m_value(forward<U>(value))
-    {
-    }
-
-    template<SameAs<OptionalNone> V>
-    constexpr Optional& operator=(V)
-    {
-        clear();
-        return *this;
-    }
-
-    constexpr Optional& operator=(Optional const& other)
-    {
-        if (this != &other) {
-            clear();
-            m_value = other.m_value;
-        }
-        return *this;
-    }
-
-    constexpr Optional& operator=(Optional&& other)
-    {
-        if (this != &other) {
-            clear();
-            m_value = other.m_value;
-        }
-        return *this;
-    }
-
-    constexpr void clear()
-    {
-        m_value = JS::js_special_empty_value();
-    }
-
-    [[nodiscard]] constexpr bool has_value() const
-    {
-        return !m_value.is_special_empty_value();
-    }
-
-    [[nodiscard]] constexpr JS::Value& value() &
-    {
-        VERIFY(has_value());
-        return m_value;
-    }
-
-    [[nodiscard]] constexpr JS::Value const& value() const&
-    {
-        VERIFY(has_value());
-        return m_value;
-    }
-
-    [[nodiscard]] constexpr JS::Value value() &&
-    {
-        return release_value();
-    }
-
-    [[nodiscard]] constexpr JS::Value release_value()
-    {
-        VERIFY(has_value());
-        JS::Value released_value = m_value;
-        clear();
-        return released_value;
-    }
-
-private:
-    JS::Value m_value { JS::js_special_empty_value() };
+    using SentinelOptional::SentinelOptional;
 };
 
 }
@@ -705,12 +556,12 @@ inline Root<JS::Value> make_root(JS::Value value, SourceLocation location = Sour
 namespace AK {
 
 template<>
-struct Formatter<JS::Value> : Formatter<StringView> {
+struct Formatter<JS::Value> : Formatter<FormatString> {
     ErrorOr<void> format(FormatBuilder& builder, JS::Value value)
     {
         if (value.is_special_empty_value())
             return Formatter<StringView>::format(builder, "<empty>"sv);
-        return Formatter<StringView>::format(builder, value.to_string_without_side_effects());
+        return Formatter<Utf16String> {}.format(builder, value.to_utf16_string_without_side_effects());
     }
 };
 

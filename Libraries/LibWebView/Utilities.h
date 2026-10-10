@@ -10,19 +10,22 @@
 #include <AK/ByteString.h>
 #include <AK/Error.h>
 #include <AK/String.h>
+#include <AK/Types.h>
 #include <AK/Vector.h>
+#include <LibIPC/File.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <LibWebView/Forward.h>
 
 namespace WebView {
 
-WEBVIEW_API void platform_init(Optional<ByteString> ladybird_binary_path = {});
-WEBVIEW_API void copy_default_config_files(StringView config_path);
-WEBVIEW_API ErrorOr<Vector<ByteString>> get_paths_for_helper_process(StringView process_name);
+WEBVIEW_API ErrorOr<Web::HTML::SelectedFile> create_selected_file(ByteString const&);
 
-WEBVIEW_API extern ByteString s_ladybird_resource_root;
-WEBVIEW_API Optional<ByteString const&> mach_server_name();
-WEBVIEW_API void set_mach_server_name(ByteString name);
+// Opens a local file a renderer asked for, read-only. Only regular files and directories are opened, and the open
+// never blocks, so a path naming a FIFO or a device cannot stall the UI process.
+WEBVIEW_API ErrorOr<IPC::File> open_local_file_for_renderer(ByteString const& path);
 
-WEBVIEW_API ErrorOr<void> handle_attached_debugger();
+ErrorOr<JsonObject> read_json_file(ByteString const& path);
+ErrorOr<void> write_json_file(ByteString const& path, JsonValue const& value);
 
 }

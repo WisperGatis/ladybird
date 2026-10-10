@@ -1,0 +1,42 @@
+With mask-image:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+      [e1 in s1] mask=[8,8 100x100] kind=alpha origin=css-mask-layers (BlockContainer<DIV>#box.box)
+
+DisplayList:
+DeclareMaskContent@s1/e1 rect=[8,8 100x100] effect=e1
+  PaintLinearGradient@s1/e1 rect=[8,8 100x100] inline_clips=[clip=[8,8 100x100]]
+FillRect@s1/e1 rect=[8,8 100x100] color=rgb(173, 216, 230)
+DrawGlyphRun@s1/e1 rect=[8,8 30x16] translation=[8,20.796875] color=rgb(0, 0, 0)
+
+After mask-image removal:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+
+DisplayList:
+FillRect@s1/e0 rect=[8,8 100x100] color=rgb(173, 216, 230)
+DrawGlyphRun@s1/e0 rect=[8,8 30x16] translation=[8,20.796875] color=rgb(0, 0, 0)
+
+After mask-image reinstatement:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+      [e1 in s1] mask=[8,8 100x100] kind=alpha origin=css-mask-layers (BlockContainer<DIV>#box.box)
+
+DisplayList:
+DeclareMaskContent@s1/e1 rect=[8,8 100x100] effect=e1
+  PaintLinearGradient@s1/e1 rect=[8,8 100x100] inline_clips=[clip=[8,8 100x100]]
+FillRect@s1/e1 rect=[8,8 100x100] color=rgb(173, 216, 230)
+DrawGlyphRun@s1/e1 rect=[8,8 30x16] translation=[8,20.796875] color=rgb(0, 0, 0)
+

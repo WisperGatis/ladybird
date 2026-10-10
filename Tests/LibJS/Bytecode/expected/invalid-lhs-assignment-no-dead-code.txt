@@ -1,0 +1,51 @@
+$2c4e495c invalid-lhs-assignment-no-dead-code.js:8:1
+  Registers: 10
+  Blocks:    3
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] GetLexicalEnvironment dst:reg4
+  [  10] Jump target:block2
+
+block1:
+  [  18] Catch dst:reg5
+  [  20] SetLexicalEnvironment environment:reg4
+  [  28] Mov2 c0_dst:reg6, c0_src:Undefined, c1_dst:reg7, c1_src:reg6
+  [  40] End value:reg6
+
+block2:
+  [  48] MovSrcUndefined dst:reg5
+  [  50] GetGlobal value_feedback:0, dst:reg8, `f`
+  [  60] NewFunction dst:reg9, shared_function_data_index:0
+  [  78] Call value_feedback:1, call_feedback:0, dst:reg6, callee:reg8, this_value:Undefined, f, arguments:[reg9]
+  [  a0] Mov2 c0_dst:reg5, c0_src:reg6, c1_dst:reg6, c1_src:reg5
+  [  b8] End value:reg6
+
+Exception handlers:
+  [  48 ..   c0] => handler block1
+
+
+f$cb5318f8 invalid-lhs-assignment-no-dead-code.js:5:6
+  Registers: 6
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] Call value_feedback:0, call_feedback:0, dst:reg5, callee:arg0, this_value:Undefined, x
+  [  28] NewReferenceError dst:reg5, Invalid left-hand side in assignment
+  [  38] Throw src:reg5
+
+
+$4e59e625
+  Registers: 5
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] End value:Undefined

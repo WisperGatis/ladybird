@@ -1,0 +1,22 @@
+// https://fullscreen.spec.whatwg.org/#ref-for-document
+partial interface Document {
+    [LegacyLenientSetter] readonly attribute boolean fullscreenEnabled;
+    [LegacyLenientSetter, Unscopable] readonly attribute boolean fullscreen; // historical
+
+    [CreatesPromise] Promise<undefined> exitFullscreen();
+
+    attribute EventHandler onfullscreenchange;
+    attribute EventHandler onfullscreenerror;
+
+    // Legacy WebKit Fullscreen API aliases.
+    [ImplementedAs=fullscreen] readonly attribute boolean webkitIsFullScreen;
+    [ImplementedAs=retargeted_fullscreen_element] readonly attribute Element? webkitCurrentFullScreenElement;
+    [ImplementedAs=webkit_exit_fullscreen] undefined webkitCancelFullScreen();
+
+    [ImplementedAs=fullscreen_enabled] readonly attribute boolean webkitFullscreenEnabled;
+    [ImplementedAs=retargeted_fullscreen_element] readonly attribute Element? webkitFullscreenElement;
+    [ImplementedAs=webkit_exit_fullscreen] undefined webkitExitFullscreen();
+
+    attribute EventHandler onwebkitfullscreenchange;
+    attribute EventHandler onwebkitfullscreenerror;
+};

@@ -9,20 +9,28 @@
 
 #pragma once
 
-#include <LibRegex/Regex.h>
+#include <AK/Utf16View.h>
+#include <LibRegex/ECMAScriptRegex.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/FileAPI/FileList.h>
 #include <LibWeb/HTML/AutocompleteElement.h>
-#include <LibWeb/HTML/ColorPickerUpdateState.h>
-#include <LibWeb/HTML/FileFilter.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/HTML/PopoverInvokerElement.h>
+#include <LibWeb/HTML/PopoverTargetAttributes.h>
 #include <LibWeb/Layout/ImageProvider.h>
 #include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/WebIDL/Types.h>
+
+namespace JS {
+
+class Object;
+class Realm;
+
+}
 
 namespace Web::HTML {
 
@@ -55,18 +63,17 @@ class WEB_API HTMLInputElement final
     : public HTMLElement
     , public FormAssociatedTextControlElement
     , public Layout::ImageProvider
-    , public PopoverInvokerElement
+    , public PopoverTargetAttributes
     , public AutocompleteElement {
-    WEB_PLATFORM_OBJECT(HTMLInputElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLInputElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLInputElement);
-    FORM_ASSOCIATED_ELEMENT(HTMLElement, HTMLInputElement);
     AUTOCOMPLETE_ELEMENT(HTMLElement, HTMLInputElement);
 
 public:
     virtual ~HTMLInputElement() override;
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
+    virtual void set_being_activated(bool) override;
 
     enum class TypeAttributeState {
 #define __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE(_, state) state,
@@ -74,38 +81,40 @@ public:
 #undef __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE
     };
 
-    StringView type() const;
+    Utf16FlyString type() const;
     TypeAttributeState type_state() const { return m_type; }
-    WebIDL::ExceptionOr<void> set_type(String const&);
+    void set_type(Utf16View);
 
-    String default_value() const { return get_attribute_value(HTML::AttributeNames::value); }
+    Utf16String default_value() const { return get_attribute_value(HTML::AttributeNames::value); }
+    void set_default_value(Utf16View value) { set_attribute_value(HTML::AttributeNames::value, value); }
 
-    virtual Utf16String value() const override;
-    virtual Optional<String> optional_value() const override;
-    WebIDL::ExceptionOr<void> set_value(Utf16String const&);
+    Utf16String value() const;
+    virtual Utf16String form_value() const override { return value(); }
+    virtual Optional<Utf16String> optional_value() const override;
+    WebIDL::ExceptionOr<void> set_value(Utf16View);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
-    virtual Utf16String relevant_value() override { return value(); }
-    WebIDL::ExceptionOr<void> set_relevant_value(Utf16String const& value) override { return set_value(value); }
+    virtual Utf16String relevant_value() const override;
+    WebIDL::ExceptionOr<void> set_relevant_value(Utf16View value) override;
+    virtual Optional<Utf16String> selected_text_for_stringifier() const override;
 
     virtual void set_dirty_value_flag(bool flag) override { m_dirty_value = flag; }
 
     bool user_validity() const { return m_user_validity; }
-    void set_user_validity(bool flag) { m_user_validity = flag; }
+    void set_user_validity(bool);
 
     void commit_pending_changes();
     bool has_uncommitted_changes() { return m_has_uncommitted_changes; }
 
-    String placeholder() const;
-    Optional<String> placeholder_value() const;
+    void ensure_user_agent_shadow_tree(Badge<Internals::Internals>) { create_shadow_tree_if_needed(); }
+
+    Utf16String placeholder() const;
+    Optional<Utf16String> placeholder_value() const;
 
     bool checked() const { return m_checked; }
     void set_checked(bool);
 
-    bool checked_binding() const { return checked(); }
-    void set_checked_binding(bool);
-
-    bool indeterminate() const { return m_indeterminate; }
+    bool indeterminate() const;
     void set_indeterminate(bool);
 
     bool can_have_text_editing_cursor() const;
@@ -139,10 +148,10 @@ public:
     WebIDL::ExceptionOr<void> set_size(WebIDL::UnsignedLong value);
 
     WebIDL::UnsignedLong height() const;
-    WebIDL::ExceptionOr<void> set_height(WebIDL::UnsignedLong value);
+    void set_height(WebIDL::UnsignedLong value);
 
     WebIDL::UnsignedLong width() const;
-    WebIDL::ExceptionOr<void> set_width(WebIDL::UnsignedLong value);
+    void set_width(WebIDL::UnsignedLong value);
 
     struct SelectedCoordinate {
         int x { 0 };
@@ -150,8 +159,10 @@ public:
     };
     SelectedCoordinate selected_coordinate() const { return m_selected_coordinate; }
 
-    JS::Object* value_as_date() const;
-    WebIDL::ExceptionOr<void> set_value_as_date(Optional<GC::Root<JS::Object>> const&);
+    Optional<double> value_as_date() const;
+    WebIDL::ExceptionOr<void> set_value_as_date(Optional<double>);
+    GC::Ptr<JS::Object> value_as_date_object(JS::Object& relevant_global_object) const;
+    WebIDL::ExceptionOr<void> set_value_as_date_object(GC::Ptr<JS::Object>);
 
     double value_as_number() const;
     WebIDL::ExceptionOr<void> set_value_as_number(double value);
@@ -168,6 +179,8 @@ public:
     virtual bool is_focusable() const override;
 
     // ^FormAssociatedElement
+    virtual bool is_form_associated_element() const override { return true; }
+
     // https://html.spec.whatwg.org/multipage/forms.html#category-listed
     virtual bool is_listed() const override { return true; }
 
@@ -185,6 +198,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/forms.html#concept-submit-button
     virtual bool is_submit_button() const override;
+    static bool is_submit_button(TypeAttributeState);
 
     bool is_single_line() const;
 
@@ -192,7 +206,10 @@ public:
     virtual void clear_algorithm() override;
 
     virtual void form_associated_element_was_inserted() override;
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_was_removed(DOM::Node*) override;
+    virtual void form_associated_element_was_moved(GC::Ptr<DOM::Node>) override;
+    virtual void form_associated_element_form_owner_changed() override;
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const override;
 
@@ -221,6 +238,7 @@ public:
     bool multiple_applies() const;
     bool required_applies() const;
     bool checked_applies() const;
+    static bool checked_applies(TypeAttributeState);
     bool has_selectable_text() const;
 
     bool supports_a_picker() const;
@@ -229,11 +247,22 @@ public:
 
     static bool selection_or_range_applies_for_type_state(TypeAttributeState);
 
-    Optional<String> selection_direction_binding() { return selection_direction(); }
+    WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement);
+    WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, SelectionMode = SelectionMode::Preserve);
+
+    Optional<String> selection_direction_binding()
+    {
+        auto direction = selection_direction();
+        if (!direction.has_value())
+            return {};
+        return direction->to_utf16_string().to_utf8();
+    }
 
     // ^FormAssociatedTextControlElement
-    virtual void did_edit_text_node() override;
+    virtual HTMLElement& text_control_to_html_element() override { return *this; }
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) override;
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() override { return m_text_node; }
+    virtual GC::Ptr<DOM::Element> text_control_scroll_container() override { return m_inner_text_element; }
 
     // https://html.spec.whatwg.org/multipage/input.html#has-a-periodic-domain/
     bool has_periodic_domain() const { return type_state() == HTMLInputElement::TypeAttributeState::Time; }
@@ -257,9 +286,14 @@ private:
     HTMLInputElement(DOM::Document&, DOM::QualifiedName);
 
     void type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state);
+    RadioButtonGroupRegistry* radio_button_group_registry();
+    void update_radio_button_group_registration();
+    virtual void computed_properties_changed() override;
+    virtual void prepare_for_style_computation() override { create_shadow_tree_if_needed(); }
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(GC::Ref<CSS::CascadedProperties>) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
+    virtual EventResult handle_return_key(Utf16FlyString const& ui_input_type) override;
 
     // ^DOM::Node
     virtual bool is_html_input_element() const final { return true; }
@@ -278,25 +312,18 @@ private:
     virtual bool supports_dimension_attributes() const override { return type_state() == TypeAttributeState::ImageButton; }
 
     // ^Layout::ImageProvider
-    virtual bool is_image_available() const override;
-    virtual Optional<CSSPixels> intrinsic_width() const override;
-    virtual Optional<CSSPixels> intrinsic_height() const override;
-    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
-    virtual RefPtr<Gfx::ImmutableBitmap> current_image_bitmap_sized(Gfx::IntSize) const override;
-    virtual void set_visible_in_viewport(bool) override;
-    virtual GC::Ptr<DOM::Element const> to_html_element() const override { return *this; }
-
-    virtual void initialize(JS::Realm&) override;
+    virtual bool is_image_pending() const override;
+    virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override { return image_data(); }
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void adopted_from(DOM::Document&) override;
 
-    Optional<double> convert_time_string_to_number(StringView input) const;
-    Optional<double> convert_string_to_number(StringView input) const;
-    Optional<double> convert_string_to_number(Utf16String const& input) const;
+    Optional<double> convert_time_string_to_number(Utf16View input) const;
+    Optional<double> convert_string_to_number(Utf16View input) const;
     Utf16String convert_number_to_string(double input) const;
 
-    WebIDL::ExceptionOr<GC::Ptr<JS::Date>> convert_string_to_date(StringView input) const;
-    WebIDL::ExceptionOr<GC::Ptr<JS::Date>> convert_string_to_date(Utf16String const& input) const;
-    Utf16String convert_date_to_string(GC::Ref<JS::Date> input) const;
+    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(StringView input) const;
+    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(Utf16String const& input) const;
+    Utf16String convert_date_to_string(double input) const;
 
     Optional<double> min() const;
     Optional<double> max() const;
@@ -306,27 +333,29 @@ private:
     double step_base() const;
     WebIDL::ExceptionOr<void> step_up_or_down(bool is_down, WebIDL::Long n);
 
-    static TypeAttributeState parse_type_attribute(StringView);
+    static TypeAttributeState parse_type_attribute(Utf16View);
 
     Utf16String button_label() const;
 
     void create_shadow_tree_if_needed();
     void update_shadow_tree();
     void create_button_input_shadow_tree();
+    void create_image_button_alt_text_shadow_tree();
+    void remove_image_button_alt_text_shadow_tree();
+    void update_image_button_alt_text_shadow_tree();
     void create_text_input_shadow_tree();
     void create_color_input_shadow_tree();
     void create_file_input_shadow_tree();
     void create_range_input_shadow_tree();
     WebIDL::ExceptionOr<void> run_input_activation_behavior(DOM::Event const&);
-    void set_checked_within_group();
 
     void handle_maxlength_attribute();
-    WebIDL::ExceptionOr<void> handle_src_attribute(String const& value);
+    WebIDL::ExceptionOr<void> handle_src_attribute(Utf16View value);
 
-    void user_interaction_did_change_input_value();
+    void user_interaction_did_change_input_value(Utf16FlyString const& input_type = {}, Optional<Utf16String> const& data = {});
 
     // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
-    Utf16String value_sanitization_algorithm(Utf16String const&) const;
+    Utf16String value_sanitization_algorithm(Utf16View) const;
 
     enum class ValueAttributeMode {
         Value,
@@ -346,7 +375,10 @@ private:
     void update_text_input_shadow_tree();
     GC::Ptr<DOM::Element> m_inner_text_element;
     GC::Ptr<DOM::Text> m_text_node;
+    GC::Ptr<DOM::Text> m_image_button_alt_text_node;
     bool m_checked { false };
+    GC::Ptr<DOM::Element> m_up_button_element;
+    GC::Ptr<DOM::Element> m_down_button_element;
 
     void update_color_well_element();
     GC::Ptr<DOM::Element> m_color_well_element;
@@ -364,14 +396,14 @@ private:
     GC::Ptr<SharedResourceRequest> m_resource_request;
     SelectedCoordinate m_selected_coordinate;
 
-    Optional<Regex<ECMA262>> compiled_pattern_regular_expression() const;
+    Optional<regex::ECMAScriptRegex> compiled_pattern_regular_expression() const;
 
     Optional<GC::Ref<HTMLDataListElement const>> suggestions_source_element() const;
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
-    bool m_indeterminate { false };
+    // https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate
+    bool m_indeterminateness { false };
 
     // https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag
     bool m_dirty_checkedness { false };
@@ -381,6 +413,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };
+
+    GC::Ptr<RadioButtonGroupRegistry> m_radio_button_group_registry;
+    Utf16FlyString m_radio_button_group_name;
 
     // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
     bool m_before_legacy_pre_activation_behavior_checked { false };
@@ -393,7 +428,7 @@ private:
     TypeAttributeState m_type { TypeAttributeState::Text };
     Utf16String m_value;
 
-    String m_last_src_value;
+    Utf16String m_last_src_value;
 
     bool m_has_uncommitted_changes { false };
 
@@ -404,6 +439,7 @@ private:
     bool is_number_underflowing(double number) const;
     bool is_number_overflowing(double number) const;
     bool is_number_mismatching_step(double number) const;
+    bool is_in_same_radio_button_group_as(HTML::HTMLInputElement const&) const;
 };
 
 }

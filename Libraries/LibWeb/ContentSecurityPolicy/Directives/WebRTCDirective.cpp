@@ -5,13 +5,13 @@
  */
 
 #include <LibWeb/ContentSecurityPolicy/Directives/WebRTCDirective.h>
-#include <LibWeb/Infra/Strings.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::ContentSecurityPolicy::Directives {
 
 GC_DEFINE_ALLOCATOR(WebRTCDirective);
 
-WebRTCDirective::WebRTCDirective(String name, Vector<String> value)
+WebRTCDirective::WebRTCDirective(Utf16FlyString name, Vector<Utf16String> value)
     : Directive(move(name), move(value))
 {
 }

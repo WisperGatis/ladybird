@@ -9,11 +9,14 @@
 #include <AK/Noncopyable.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/Origin.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/NavigableContainer.h>
-#include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
+#include <LibWebCommon/HTML/BrowsingContext.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/SandboxingFlagSet.h>
 
 namespace Web::HTML {
 
@@ -27,24 +30,24 @@ public:
         GC::Ref<DOM::Document> document;
     };
 
-    static WebIDL::ExceptionOr<BrowsingContextAndDocument> create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ref<BrowsingContextGroup> group);
-    static WebIDL::ExceptionOr<BrowsingContextAndDocument> create_a_new_auxiliary_browsing_context_and_document(GC::Ref<Page> page, GC::Ref<HTML::BrowsingContext> opener);
+    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(GC::Ref<Page> page, GC::Ptr<DOM::Document> creator, GC::Ptr<DOM::Element> embedder, GC::Ptr<WindowProxy> existing_window_proxy = {}, Optional<URL::Origin> determined_origin = {});
+    static BrowsingContextAndDocument create_a_new_auxiliary_browsing_context_and_document(GC::Ref<Page> page, GC::Ref<HTML::BrowsingContext> opener);
 
     virtual ~BrowsingContext() override;
 
-    GC::Ref<TraversableNavigable> top_level_traversable() const;
-
     bool is_ancestor_of(BrowsingContext const&) const;
-    bool is_familiar_with(BrowsingContext const&) const;
 
     bool is_top_level() const;
     bool is_auxiliary() const { return m_is_auxiliary; }
 
     DOM::Document const* active_document() const;
     DOM::Document* active_document();
+    void set_active_document(GC::Ptr<DOM::Document>);
 
     HTML::WindowProxy* window_proxy();
     HTML::WindowProxy const* window_proxy() const;
+    HTML::WindowProxy* window_proxy_for(Bindings::WrapperWorld&, JS::Realm&);
+    void set_active_window(GC::Ref<HTML::Window>);
 
     void set_window_proxy(GC::Ptr<WindowProxy>);
 
@@ -54,16 +57,10 @@ public:
     Page& page() { return m_page; }
     Page const& page() const { return m_page; }
 
-    u64 virtual_browsing_context_group_id() const { return m_virtual_browsing_context_group_id; }
-
     GC::Ptr<BrowsingContext> top_level_browsing_context() const;
 
-    BrowsingContextGroup* group();
-    BrowsingContextGroup const* group() const;
-    void set_group(BrowsingContextGroup*);
-
-    // https://html.spec.whatwg.org/multipage/browsers.html#bcg-remove
-    void remove();
+    Optional<u64> browsing_context_group_id() const { return m_browsing_context_group_id; }
+    void set_browsing_context_group_id(Optional<u64> id) { m_browsing_context_group_id = id; }
 
     // https://html.spec.whatwg.org/multipage/origin.html#one-permitted-sandboxed-navigator
     BrowsingContext const* the_one_permitted_sandboxed_navigator() const;
@@ -74,8 +71,12 @@ public:
 
     bool has_navigable_been_destroyed() const;
 
-    GC::Ptr<BrowsingContext> opener_browsing_context() const { return m_opener_browsing_context; }
-    void set_opener_browsing_context(GC::Ptr<BrowsingContext> browsing_context) { m_opener_browsing_context = browsing_context; }
+    GC::Ptr<WindowProxy> opener_browsing_context_window_proxy() const;
+    Optional<CrossProcessId> opener_navigable_id() const;
+    GC::Ptr<Navigable> opener_navigable() const;
+    void set_opener_browsing_context(GC::Ptr<BrowsingContext>);
+    void set_opener_browsing_context(Navigable&);
+    void set_is_auxiliary(bool is_auxiliary) { m_is_auxiliary = is_auxiliary; }
 
     void set_is_popup(TokenizedFeature::Popup is_popup) { m_is_popup = is_popup; }
     [[nodiscard]] TokenizedFeature::Popup is_popup() const { return m_is_popup; }
@@ -92,12 +93,17 @@ private:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context
     GC::Ptr<WindowProxy> m_window_proxy;
+    // Non-main WindowProxy identity is weakly cached per WrapperWorld. A live
+    // world realm roots its global-this WindowProxy; otherwise the proxy may be
+    // collected and rematerialized because it carries no observable state.
+    Bindings::WrapperWorldWeakValueCacheMap<Bindings::WrapperWorld, WindowProxy> m_window_proxies;
+
+    // https://html.spec.whatwg.org/multipage/browsers.html#active-document
+    GC::Ptr<DOM::Document> m_active_document;
 
     // https://html.spec.whatwg.org/multipage/browsers.html#opener-browsing-context
-    GC::Ptr<BrowsingContext> m_opener_browsing_context;
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#opener-origin-at-creation
-    Optional<URL::Origin> m_opener_origin_at_creation;
+    // NB: Held as its WindowProxy, which also stands for a browsing context another process holds.
+    GC::Ptr<WindowProxy> m_opener_browsing_context_window_proxy;
 
     // https://html.spec.whatwg.org/multipage/browsers.html#is-popup
     TokenizedFeature::Popup m_is_popup { TokenizedFeature::Popup::No };
@@ -108,22 +114,11 @@ private:
     // https://html.spec.whatwg.org/multipage/document-sequences.html#is-auxiliary
     bool m_is_auxiliary { false };
 
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#browsing-context-initial-url
-    Optional<URL::URL> m_initial_url;
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#virtual-browsing-context-group-id
-    u64 m_virtual_browsing_context_group_id = { 0 };
-
     // https://html.spec.whatwg.org/multipage/browsers.html#tlbc-group
-    GC::Ptr<BrowsingContextGroup> m_group;
+    Optional<u64> m_browsing_context_group_id;
 };
 
-URL::Origin determine_the_origin(Optional<URL::URL const&>, SandboxingFlagSet, Optional<URL::Origin> source_origin);
-
 SandboxingFlagSet determine_the_creation_sandboxing_flags(BrowsingContext const&, GC::Ptr<DOM::Element> embedder);
-
-// FIXME: Find a better home for these
-WEB_API bool url_matches_about_blank(URL::URL const& url);
-bool url_matches_about_srcdoc(URL::URL const& url);
+SandboxingFlagSet determine_the_creation_sandboxing_flags(BrowsingContext const&, Navigable const&);
 
 }

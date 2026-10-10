@@ -1,13 +1,9 @@
-#import <DOM/EventTarget.idl>
-#import <HighResolutionTime/DOMHighResTimeStamp.idl>
-#import <NavigationTiming/PerformanceExtensions.idl>
-#import <NavigationTiming/PerformanceNavigation.idl>
-#import <NavigationTiming/PerformanceTiming.idl>
-#import <PerformanceTimeline/PerformanceEntry.idl>
-#import <UserTiming/PerformanceMark.idl>
-#import <UserTiming/PerformanceMeasure.idl>
+// https://w3c.github.io/hr-time/#the-performance-attribute
+partial interface mixin WindowOrWorkerGlobalScope {
+    [Replaceable] readonly attribute Performance performance;
+};
 
-// https://www.w3.org/TR/performance-timeline/#dom-performanceentrylist
+// https://w3c.github.io/performance-timeline/#typedefdef-performanceentrylist
 typedef sequence<PerformanceEntry> PerformanceEntryList;
 
 // https://w3c.github.io/hr-time/#sec-performance
@@ -30,9 +26,9 @@ interface Performance : EventTarget {
     undefined setResourceTimingBufferSize(unsigned long maxSize);
     attribute EventHandler onresourcetimingbufferfull;
 
-    // https://www.w3.org/TR/performance-timeline/#extensions-to-the-performance-interface
+    // https://w3c.github.io/performance-timeline/#extensions-to-the-performance-interface
     // "Performance Timeline" extensions to the Performance interface
     PerformanceEntryList getEntries();
-    PerformanceEntryList getEntriesByType(DOMString type);
-    PerformanceEntryList getEntriesByName(DOMString name, optional DOMString type);
+    PerformanceEntryList getEntriesByType([FlyString] DOMString type);
+    PerformanceEntryList getEntriesByName(DOMString name, optional [FlyString] DOMString type);
 };

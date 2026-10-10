@@ -1,0 +1,46 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/String.h>
+#include <LibWeb/Bindings/NavigationType.h>
+#include <LibWeb/Bindings/Wrappable.h>
+
+namespace Web::HTML {
+
+class NavigationHistoryEntry;
+
+class NavigationActivation final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(NavigationActivation, Bindings::GCAllocatedWrappable);
+    GC_DECLARE_ALLOCATOR(NavigationActivation);
+
+public:
+    static constexpr size_t entry_offset() { return offsetof(NavigationActivation, m_entry); }
+    [[nodiscard]] static GC::Ref<NavigationActivation> create(GC::Ptr<NavigationHistoryEntry> from, GC::Ref<NavigationHistoryEntry> entry, NavigationType);
+
+    virtual ~NavigationActivation() override;
+
+    GC::Ptr<NavigationHistoryEntry> from() const { return m_from; }
+    static constexpr size_t from_offset() { return offsetof(NavigationActivation, m_from); }
+    GC::Ref<NavigationHistoryEntry> entry() const { return m_entry; }
+    NavigationType navigation_type() const { return m_navigation_type; }
+
+    void set_from(GC::Ptr<NavigationHistoryEntry> from) { m_from = from; }
+    void set_entry(GC::Ref<NavigationHistoryEntry> entry) { m_entry = entry; }
+    void set_navigation_type(NavigationType navigation_type) { m_navigation_type = navigation_type; }
+
+private:
+    NavigationActivation(GC::Ptr<NavigationHistoryEntry> from, GC::Ref<NavigationHistoryEntry> entry, NavigationType);
+
+    virtual void visit_edges(GC::Cell::Visitor&) override;
+
+    GC::Ptr<NavigationHistoryEntry> m_from;
+    GC::Ref<NavigationHistoryEntry> m_entry;
+    NavigationType m_navigation_type;
+};
+
+}

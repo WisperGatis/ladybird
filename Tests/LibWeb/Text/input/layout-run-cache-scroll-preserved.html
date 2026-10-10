@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #spacer { height: 40px; }
+    #cached {
+        width: 200px;
+        height: 100px;
+        overflow: auto;
+    }
+    #tall { width: 100px; height: 400px; }
+</style>
+<div id="spacer"></div>
+<div id="cached">
+    <div id="tall"></div>
+</div>
+<script>
+    layoutTest({
+        setup: () => {
+            cached.scrollTop = 120;
+        },
+        steps: [
+            {
+                name: "moving a reused scroller preserves scrolling",
+                mutate: () => {
+                    spacer.style.height = "90px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(cached.scrollTop, 120, "scrollTop");
+                    equal(cached.scrollHeight, 400, "scrollHeight");
+                    equal(cached.getBoundingClientRect().top, 90, "cached top");
+                    cached.scrollTop = 300;
+                    equal(cached.scrollTop, 300, "scrollTop after set");
+                },
+            },
+        ],
+    });
+</script>

@@ -1,0 +1,2 @@
+selection after release: Last line of editable text
+selection after unpressed move: Last line of editable text

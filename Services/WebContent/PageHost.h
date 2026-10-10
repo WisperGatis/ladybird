@@ -11,8 +11,22 @@
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/OwnPtr.h>
 #include <LibGC/Root.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/Page/PageId.h>
 #include <WebContent/Forward.h>
+
+namespace Web {
+
+namespace Compositor {
+
+class CompositorHost;
+
+}
+
+}
 
 namespace WebContent {
 
@@ -21,21 +35,34 @@ class PageHost {
     AK_MAKE_NONMOVABLE(PageHost);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static NonnullOwnPtr<PageHost> create(ConnectionFromClient& client) { return adopt_own(*new PageHost(client)); }
     virtual ~PageHost();
 
-    Optional<PageClient&> page(u64 index);
-    PageClient& create_page();
-    void remove_page(Badge<PageClient>, u64 index);
+    void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
+    Optional<PageClient&> page(Web::PageId page_id);
+    PageClient& create_page(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id = {});
+    void remove_page(Badge<PageClient>, Web::PageId page_id);
+    Web::HTML::CrossProcessId allocate_cross_process_id();
+    Web::HTML::CrossProcessId allocate_navigable_id();
+    void for_each_page(Function<void(PageClient&)>);
 
     ConnectionFromClient& client() const { return m_client; }
+    void ensure_compositor_host();
+    void compositor_process_reconnected();
+    void compositor_process_lost();
+    void invalidate_user_style();
+    Web::Compositor::CompositorHost* compositor_host() { return m_compositor_host.ptr(); }
+    Web::Compositor::CompositorHost const* compositor_host() const { return m_compositor_host.ptr(); }
 
 private:
     explicit PageHost(ConnectionFromClient&);
 
     ConnectionFromClient& m_client;
-    HashMap<u64, GC::Root<PageClient>> m_pages;
-    u64 m_next_id { 0 };
+    OwnPtr<Web::Compositor::CompositorHost> m_compositor_host;
+    HashMap<Web::PageId, GC::Root<PageClient>> m_pages;
+    Optional<Web::HTML::CrossProcessIdAllocator> m_cross_process_id_allocator;
 };
 
 }

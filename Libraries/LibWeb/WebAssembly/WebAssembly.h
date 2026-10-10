@@ -7,32 +7,38 @@
 
 #pragma once
 
+#include <AK/HashMap.h>
+#include <AK/HashTable.h>
+#include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
+#include <AK/RefCounted.h>
 #include <LibGC/Root.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/Completion.h>
+#include <LibJS/Runtime/HostFunction.h>
 #include <LibJS/Runtime/NativeFunction.h>
-#include <LibJS/Runtime/PrototypeObject.h>
 #include <LibJS/Runtime/Value.h>
+#include <LibURL/URL.h>
 #include <LibWasm/AbstractMachine/AbstractMachine.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/WebIDL/Buffers.h>
 
 namespace Web::WebAssembly {
 
-WEB_API void visit_edges(JS::Object&, JS::Cell::Visitor&);
-WEB_API void finalize(JS::Object&);
 WEB_API void initialize(JS::Object&, JS::Realm&);
 
-WEB_API bool validate(JS::VM&, GC::Root<WebIDL::BufferSource>& bytes);
-WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> compile(JS::VM&, GC::Root<WebIDL::BufferSource>& bytes);
-WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> compile_streaming(JS::VM&, GC::Root<WebIDL::Promise> source);
+WEB_API bool validate(JS::Realm&, WebIDL::BufferSource bytes);
+WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> compile(JS::Realm&, WebIDL::BufferSource bytes);
+WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> compile_streaming(JS::Realm&, GC::Ref<WebIDL::Promise> source);
 
-WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> instantiate(JS::VM&, GC::Root<WebIDL::BufferSource>& bytes, Optional<GC::Root<JS::Object>>& import_object);
-WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> instantiate(JS::VM&, Module const& module_object, Optional<GC::Root<JS::Object>>& import_object);
-WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> instantiate_streaming(JS::VM&, GC::Root<WebIDL::Promise> source, Optional<GC::Root<JS::Object>>& import_object);
+WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> instantiate(JS::Realm&, WebIDL::BufferSource bytes, GC::Ptr<JS::Object> import_object);
+WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> instantiate(JS::Realm&, GC::Ref<Module> module_object, GC::Ptr<JS::Object> import_object);
+WEB_API WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> instantiate_streaming(JS::Realm&, GC::Ref<WebIDL::Promise> source, GC::Ptr<JS::Object> import_object);
 
 namespace Detail {
+
+Wasm::HostFunction create_host_function(JS::Realm&, JS::FunctionObject& function, Wasm::FunctionType const& type, size_t function_index);
 
 struct CompiledWebAssemblyModule : public RefCounted<CompiledWebAssemblyModule> {
     explicit CompiledWebAssemblyModule(NonnullRefPtr<Wasm::Module> module)
@@ -43,8 +49,13 @@ struct CompiledWebAssemblyModule : public RefCounted<CompiledWebAssemblyModule> 
     NonnullRefPtr<Wasm::Module> module;
 };
 
-class WebAssemblyCache {
+class WebAssemblyCache : public RefCounted<WebAssemblyCache> {
 public:
+    WebAssemblyCache();
+    ~WebAssemblyCache();
+
+    void visit_edges(JS::Cell::Visitor&);
+
     void add_compiled_module(NonnullRefPtr<CompiledWebAssemblyModule> module) { m_compiled_modules.append(module); }
     void add_function_instance(Wasm::FunctionAddress address, GC::Ptr<JS::NativeFunction> function) { m_function_instances.set(address, function); }
     void add_imported_object(GC::Ptr<JS::Object> object) { m_imported_objects.set(object); }
@@ -57,17 +68,20 @@ public:
     }
     void add_global_instance(Wasm::GlobalAddress address, GC::Ptr<WebAssembly::Global> global) { m_global_instances.set(address, global); }
     void add_memory_instance(Wasm::MemoryAddress address, GC::Ptr<WebAssembly::Memory> memory) { m_memory_instances.set(address, memory); }
+    void add_table_instance(Wasm::TableAddress address, GC::Ptr<WebAssembly::Table> table) { m_table_instances.set(address, table); }
 
     Optional<GC::Ptr<JS::NativeFunction>> get_function_instance(Wasm::FunctionAddress address) { return m_function_instances.get(address); }
     Optional<JS::Value> get_extern_value(Wasm::ExternAddress address) { return m_extern_values.get(address); }
     Optional<GC::Ptr<WebAssembly::Global>> get_global_instance(Wasm::GlobalAddress address) { return m_global_instances.get(address); }
     Optional<GC::Ptr<WebAssembly::Memory>> get_memory_instance(Wasm::MemoryAddress address) { return m_memory_instances.get(address); }
+    Optional<GC::Ptr<WebAssembly::Table>> get_table_instance(Wasm::TableAddress address) { return m_table_instances.get(address); }
 
     HashMap<Wasm::FunctionAddress, GC::Ptr<JS::NativeFunction>> const& function_instances() const { return m_function_instances; }
     HashMap<Wasm::ExternAddress, JS::Value> const& extern_values() const { return m_extern_values; }
     HashMap<JS::Value, Wasm::ExternAddress> const& inverse_extern_values() const { return m_inverse_extern_values; }
     HashMap<Wasm::GlobalAddress, GC::Ptr<WebAssembly::Global>> const& global_instances() const { return m_global_instances; }
     HashMap<Wasm::MemoryAddress, GC::Ptr<WebAssembly::Memory>> const& memory_instances() const { return m_memory_instances; }
+    HashMap<Wasm::TableAddress, GC::Ptr<WebAssembly::Table>> const& table_instances() const { return m_table_instances; }
     HashTable<GC::Ptr<JS::Object>> const& imported_objects() const { return m_imported_objects; }
     Wasm::AbstractMachine& abstract_machine() { return m_abstract_machine; }
 
@@ -77,115 +91,48 @@ private:
     HashMap<JS::Value, Wasm::ExternAddress> m_inverse_extern_values;
     HashMap<Wasm::GlobalAddress, GC::Ptr<WebAssembly::Global>> m_global_instances;
     HashMap<Wasm::MemoryAddress, GC::Ptr<WebAssembly::Memory>> m_memory_instances;
+    HashMap<Wasm::TableAddress, GC::Ptr<WebAssembly::Table>> m_table_instances;
     Vector<NonnullRefPtr<CompiledWebAssemblyModule>> m_compiled_modules;
     HashTable<GC::Ptr<JS::Object>> m_imported_objects;
     Wasm::AbstractMachine m_abstract_machine;
 };
 
-class ExportedWasmFunction final : public JS::NativeFunction {
-    JS_OBJECT(ExportedWasmFunction, JS::NativeFunction);
-    GC_DECLARE_ALLOCATOR(ExportedWasmFunction);
+// https://webassembly.github.io/spec/js-api/#exported-function
+GC::Ref<JS::HostFunction> create_exported_function(JS::Realm&, Utf16FlyString name, size_t length, ESCAPING Function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)> behavior, Wasm::FunctionAddress);
 
-public:
-    static GC::Ref<ExportedWasmFunction> create(JS::Realm&, Utf16FlyString name, ESCAPING Function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>, Wasm::FunctionAddress);
-    virtual ~ExportedWasmFunction() override = default;
+// The value of the function's [[FunctionAddress]] internal slot, if it has one and is therefore an Exported Function.
+Optional<Wasm::FunctionAddress> exported_function_address(JS::FunctionObject const&);
 
-    Wasm::FunctionAddress exported_address() const { return m_exported_address; }
+NonnullRefPtr<WebAssemblyCache> get_cache(JS::Realm&);
 
-protected:
-    ExportedWasmFunction(Utf16FlyString name, AK::Function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>, Wasm::FunctionAddress, Object& prototype);
-
-private:
-    Wasm::FunctionAddress m_exported_address;
-};
-
-WebAssemblyCache& get_cache(JS::Realm&);
-
-JS::ThrowCompletionOr<NonnullOwnPtr<Wasm::ModuleInstance>> instantiate_module(JS::VM&, Wasm::Module const&, GC::Ptr<JS::Object> import_object);
-JS::ThrowCompletionOr<NonnullRefPtr<CompiledWebAssemblyModule>> compile_a_webassembly_module(JS::VM&, ByteBuffer);
-JS::NativeFunction* create_native_function(JS::VM&, Wasm::FunctionAddress address, Utf16FlyString name, Instance* instance = nullptr);
-JS::ThrowCompletionOr<Wasm::Value> to_webassembly_value(JS::VM&, JS::Value value, Wasm::ValueType const& type);
-Wasm::Value default_webassembly_value(JS::VM&, Wasm::ValueType type);
-JS::Value to_js_value(JS::VM&, Wasm::Value& wasm_value, Wasm::ValueType type);
-JS::ThrowCompletionOr<void> host_ensure_can_compile_wasm_bytes(JS::VM&);
+JS::ThrowCompletionOr<NonnullRefPtr<Wasm::ModuleInstance>> instantiate_module(JS::Realm&, Wasm::Module const&, GC::Ptr<JS::Object> import_object);
+JS::ThrowCompletionOr<NonnullRefPtr<CompiledWebAssemblyModule>> compile_a_webassembly_module(JS::Realm&, ReadonlyBytes);
+Utf16FlyString name_of_webassembly_function(Wasm::Store&, Wasm::FunctionAddress);
+GC::Ptr<JS::NativeFunction> create_native_function(JS::Realm&, Wasm::FunctionAddress address, Utf16FlyString name, GC::Ptr<Instance> instance = nullptr);
+JS::ThrowCompletionOr<Wasm::Value> to_webassembly_value(JS::Realm&, JS::Value value, Wasm::ValueType const& type);
+Wasm::Value default_webassembly_value(JS::Realm&, Wasm::ValueType type);
+JS::Value to_js_value(JS::Realm&, Wasm::Value& wasm_value, Wasm::ValueType type);
+JS::ThrowCompletionOr<void> host_ensure_can_compile_wasm_bytes(JS::Realm&);
 JS::ThrowCompletionOr<JS::HandledByHost> host_resize_array_buffer(JS::VM&, JS::ArrayBuffer&, size_t);
-
-extern HashMap<GC::Ptr<JS::Object>, WebAssemblyCache> s_caches;
+JS::ThrowCompletionOr<JS::HandledByHost> host_grow_shared_array_buffer(JS::VM&, JS::ArrayBuffer&, size_t);
 
 }
 
-#define WASM_ENUMERATE_NATIVE_ERRORS                                                                                          \
-    __WASM_ENUMERATE(CompileError, "WebAssembly.CompileError", compile_error, CompileErrorPrototype, CompileErrorConstructor) \
-    __WASM_ENUMERATE(LinkError, "WebAssembly.LinkError", link_error, LinkErrorPrototype, LinkErrorConstructor)                \
-    __WASM_ENUMERATE(RuntimeError, "WebAssembly.RuntimeError", runtime_error, RuntimeErrorPrototype, RuntimeErrorConstructor)
+#define WASM_ENUMERATE_NATIVE_ERRORS                           \
+    __WASM_ENUMERATE(CompileError, "WebAssembly.CompileError") \
+    __WASM_ENUMERATE(LinkError, "WebAssembly.LinkError")       \
+    __WASM_ENUMERATE(RuntimeError, "WebAssembly.RuntimeError")
 
-// NOTE: This is technically not allowed by ECMA262, as the set of native errors is closed
-//       our implementation uses this fact in places, but for the purposes of wasm returning
-//       *some* kind of error, named e.g. 'WebAssembly.RuntimeError', this is sufficient.
-#define DECLARE_WASM_NATIVE_ERROR(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName) \
-    class WEB_API ClassName final : public JS::Error {                                                  \
-        JS_OBJECT(ClassName, Error);                                                                    \
-        GC_DECLARE_ALLOCATOR(ClassName);                                                                \
-                                                                                                        \
-    public:                                                                                             \
-        static GC::Ref<ClassName> create(JS::Realm&);                                                   \
-        static GC::Ref<ClassName> create(JS::Realm&, Utf16String message);                              \
-        static GC::Ref<ClassName> create(JS::Realm&, StringView message);                               \
-                                                                                                        \
-        explicit ClassName(Object& prototype);                                                          \
-        virtual ~ClassName() override = default;                                                        \
+// https://webassembly.github.io/spec/js-api/#error-objects
+// Errors of these types are Error objects whose prototype is the error type's prototype object in their realm. The
+// types only create such errors, for VM::throw_completion<CompileError>(...) and the like.
+#define __WASM_ENUMERATE(ClassName, FullClassName)                         \
+    struct WEB_API ClassName {                                             \
+        static GC::Ref<JS::Error> create(JS::Realm&);                      \
+        static GC::Ref<JS::Error> create(JS::Realm&, Utf16String message); \
+        static GC::Ref<JS::Error> create(JS::Realm&, StringView message);  \
     };
-
-#define DECLARE_WASM_NATIVE_ERROR_CONSTRUCTOR(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName) \
-    class ConstructorName final : public JS::NativeFunction {                                                       \
-        JS_OBJECT(ConstructorName, NativeFunction);                                                                 \
-        GC_DECLARE_ALLOCATOR(ConstructorName);                                                                      \
-                                                                                                                    \
-    public:                                                                                                         \
-        virtual void initialize(JS::Realm&) override;                                                               \
-        virtual ~ConstructorName() override;                                                                        \
-        virtual JS::ThrowCompletionOr<JS::Value> call() override;                                                   \
-        virtual JS::ThrowCompletionOr<GC::Ref<JS::Object>> construct(JS::FunctionObject& new_target) override;      \
-                                                                                                                    \
-    private:                                                                                                        \
-        explicit ConstructorName(JS::Realm&);                                                                       \
-                                                                                                                    \
-        virtual bool has_constructor() const override                                                               \
-        {                                                                                                           \
-            return true;                                                                                            \
-        }                                                                                                           \
-    };
-
-#define DECLARE_WASM_NATIVE_ERROR_PROTOTYPE(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName) \
-    class PrototypeName final : public JS::PrototypeObject<PrototypeName, ClassName> {                            \
-        JS_PROTOTYPE_OBJECT(PrototypeName, ClassName, ClassName);                                                 \
-        GC_DECLARE_ALLOCATOR(PrototypeName);                                                                      \
-                                                                                                                  \
-    public:                                                                                                       \
-        virtual void initialize(JS::Realm&) override;                                                             \
-        virtual ~PrototypeName() override = default;                                                              \
-                                                                                                                  \
-    private:                                                                                                      \
-        explicit PrototypeName(JS::Realm&);                                                                       \
-    };
-
-#define __WASM_ENUMERATE(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName) \
-    DECLARE_WASM_NATIVE_ERROR(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName)
 WASM_ENUMERATE_NATIVE_ERRORS
 #undef __WASM_ENUMERATE
-
-#define __WASM_ENUMERATE(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName) \
-    DECLARE_WASM_NATIVE_ERROR_CONSTRUCTOR(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName)
-WASM_ENUMERATE_NATIVE_ERRORS
-#undef __WASM_ENUMERATE
-
-#define __WASM_ENUMERATE(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName) \
-    DECLARE_WASM_NATIVE_ERROR_PROTOTYPE(ClassName, FullClassName, snake_name, PrototypeName, ConstructorName)
-WASM_ENUMERATE_NATIVE_ERRORS
-#undef __WASM_ENUMERATE
-
-#undef DECLARE_WASM_NATIVE_ERROR
-#undef DECLARE_WASM_NATIVE_ERROR_PROTOTYPE
-#undef DECLARE_WASM_NATIVE_ERROR_CONSTRUCTOR
 
 }

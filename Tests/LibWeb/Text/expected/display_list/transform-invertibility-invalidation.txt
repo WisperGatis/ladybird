@@ -1,0 +1,19 @@
+Before transform change:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+
+DisplayList:
+
+After transform change:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+        [s2] transform=[1,0,0,1,0,0] origin=(58,58) (BlockContainer<DIV>#box)
+  effects:
+    [e0 in s0] effects=[]
+
+DisplayList:
+FillRect@s2/e0 rect=[8,8 100x100] color=rgb(0, 128, 0)
+

@@ -5,6 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Random.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/Scripting/WorkerEnvironmentSettingsObject.h>
@@ -16,39 +19,67 @@ namespace Web::HTML {
 GC_DEFINE_ALLOCATOR(WorkerEnvironmentSettingsObject);
 
 // https://html.spec.whatwg.org/multipage/workers.html#set-up-a-worker-environment-settings-object
-GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(GC::Ref<Page> page, NonnullOwnPtr<JS::ExecutionContext> execution_context, SerializedEnvironmentSettingsObject const& outside_settings, HighResolutionTime::DOMHighResTimeStamp unsafe_worker_creation_time)
+GC::Ref<WorkerEnvironmentSettingsObject> WorkerEnvironmentSettingsObject::setup(GC::Ref<Page> page, NonnullOwnPtr<JS::ExecutionContext> execution_context, SerializedEnvironmentSettingsObject const& outside_settings, HighResolutionTime::DOMHighResTimeStamp unsafe_worker_creation_time, URL::Origin origin, EnvironmentId id)
 {
-    // 1. Let inherited origin be outside settings's origin.
-    auto inherited_origin = outside_settings.origin;
-
-    // 2. Let realm be the value of execution context's Realm component.
+    // 1. Let realm be the value of execution context's Realm component.
     auto realm = execution_context->realm;
     VERIFY(realm);
 
-    // 3. Let worker global scope be realm's global object.
-    auto& worker = as<HTML::WorkerGlobalScope>(realm->global_object());
+    // 2. Let worker global scope be realm's global object.
+    auto* worker = Bindings::worker_global_scope_from_global_object(realm->global_object());
+    VERIFY(worker);
+
+    // AD-HOC: The worker global scope's cross-origin isolated capability is inherited from the outside/creating
+    //         settings object. In our multi-process model, it arrives via the serialized outside settings; the spec
+    //         sets it while running the worker (before this algorithm), from the worker agent's agent cluster's
+    //         cross-origin isolation mode.
+    worker->set_cross_origin_isolated_capability(outside_settings.cross_origin_isolated_capability == CanUseCrossOriginIsolatedAPIs::Yes);
+
+    // 3. Let origin be a unique opaque origin if worker global scope's url's scheme is "data"; otherwise outside settings's origin.
+    // NB: The browser process determines it, as it holds the worker's environment too.
+
+    // AD-HOC: A dedicated worker agent belongs to its owner's agent cluster, and a shared or service worker agent to a
+    //         new one — which the spec settles while obtaining the agent, from outside settings' relevant agent. Here,
+    //         the owner's cluster arrives with the serialized outside settings.
+    auto agent_cluster_id = is<DedicatedWorkerGlobalScope>(*worker) ? outside_settings.agent_cluster_id : Optional<u64> { get_random<u64>() };
 
     // 4. Let settings object be a new environment settings object whose algorithms are defined as follows:
     // NOTE: See the functions defined for this class.
     // FIXME: Is it enough to cache the has_cross_site_ancestor of outside_settings, or do we need to check the live object somehow?
-    auto settings_object = realm->create<WorkerEnvironmentSettingsObject>(move(execution_context), worker, move(inherited_origin), outside_settings.has_cross_site_ancestor, unsafe_worker_creation_time);
+    auto settings_object = realm->create<WorkerEnvironmentSettingsObject>(move(execution_context), *worker, move(origin), outside_settings.has_cross_site_ancestor, unsafe_worker_creation_time, agent_cluster_id);
     settings_object->target_browsing_context = nullptr;
 
-    // FIXME: 5. Set settings object's id to a new unique opaque string, creation URL to worker global scope's url, top-level creation URL to null, target browsing context to null, and active service worker to null.
-    // 6. If worker global scope is a DedicatedWorkerGlobalScope object, then set settings object's top-level origin to outside settings's top-level origin.
-    if (is<DedicatedWorkerGlobalScope>(worker)) {
+    // 5. Set settings object's id to a new unique opaque string, creation URL to worker global scope's url, top-level
+    //    creation URL to null, target browsing context to null, and active service worker to null.
+    // NB: The browser process generates the id, as it holds the worker's environment too. WorkerHost sets (ad-hoc) the
+    //     global scope's url to be the worker URL before redirects, as the spec does not do so at that point. See
+    //     https://github.com/whatwg/html/issues/11340.
+    settings_object->id = move(id);
+    settings_object->creation_url = worker->url();
+
+    // 6. If worker global scope is a DedicatedWorkerGlobalScope object, then set settings object's top-level origin to
+    //    outside settings's top-level origin.
+    if (is<DedicatedWorkerGlobalScope>(*worker)) {
         settings_object->top_level_origin = outside_settings.top_level_origin;
     }
-    // FIXME: 7. Otherwise, set settings object's top-level origin to an implementation-defined value.
+    // 7. Otherwise, set settings object's top-level origin to an implementation-defined value.
+    else {
+        // FIXME: We set this to the same top-level origin as DedicatedWorkerGlobalScope objects for now, as this needs
+        //        to be non-null for determining network partition keys. The spec notes:
+        //
+        //        See Client-Side Storage Partitioning for the latest on properly defining this.
+        //        https://privacycg.github.io/storage-partitioning/
+        settings_object->top_level_origin = outside_settings.top_level_origin;
+    }
 
     // 8. Set realm's [[HostDefined]] field to settings object.
     auto intrinsics = realm->create<Bindings::Intrinsics>(*realm);
-    auto host_defined = make<Bindings::PrincipalHostDefined>(settings_object, intrinsics, page);
-    realm->set_host_defined(move(host_defined));
+    realm->set_host_defined(Bindings::create_principal_host_defined(settings_object, intrinsics, page));
+    Bindings::cache_global_object_wrapper(*realm);
 
     // Non-Standard: We cannot fully initialize worker object until *after* the we set up
     //    the realm's [[HostDefined]] internal slot as the internal slot contains the web platform intrinsics
-    worker.initialize_web_interfaces({});
+    Bindings::initialize_worker_web_interfaces(*worker);
 
     // 9. Return settings object.
     return settings_object;
@@ -64,9 +95,7 @@ URL::URL WorkerEnvironmentSettingsObject::api_base_url() const
 // https://html.spec.whatwg.org/multipage/workers.html#script-settings-for-workers:concept-settings-object-origin-2
 URL::Origin WorkerEnvironmentSettingsObject::origin() const
 {
-    // Return a unique opaque origin if worker global scope's url's scheme is "data", and inherited origin otherwise.
-    if (m_global_scope->url().scheme() == "data")
-        return URL::Origin::create_opaque();
+    // Return origin.
     return m_origin;
 }
 
@@ -95,15 +124,15 @@ GC::Ref<PolicyContainer> WorkerEnvironmentSettingsObject::policy_container() con
 // https://html.spec.whatwg.org/multipage/workers.html#script-settings-for-workers:concept-settings-object-cross-origin-isolated-capability
 CanUseCrossOriginIsolatedAPIs WorkerEnvironmentSettingsObject::cross_origin_isolated_capability() const
 {
-    // FIXME: Return worker global scope's cross-origin isolated capability.
-    return CanUseCrossOriginIsolatedAPIs::No;
+    // Return worker global scope's cross-origin isolated capability.
+    return m_global_scope->cross_origin_isolated_capability() ? CanUseCrossOriginIsolatedAPIs::Yes : CanUseCrossOriginIsolatedAPIs::No;
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#script-settings-for-workers:concept-settings-object-time-origin
 double WorkerEnvironmentSettingsObject::time_origin() const
 {
     // Return the result of coarsening unsafeWorkerCreationTime with worker global scope's cross-origin isolated capability.
-    return HighResolutionTime::coarsen_time(m_unsafe_worker_creation_time, cross_origin_isolated_capability() == CanUseCrossOriginIsolatedAPIs::Yes);
+    return HighResolutionTime::coarsen_time(m_unsafe_worker_creation_time, cross_origin_isolated_capability());
 }
 
 void WorkerEnvironmentSettingsObject::visit_edges(JS::Cell::Visitor& visitor)

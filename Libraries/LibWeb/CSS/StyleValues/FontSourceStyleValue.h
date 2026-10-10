@@ -6,8 +6,7 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
-#include <LibWeb/CSS/Enums.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/CSS/URL.h>
 
@@ -20,26 +19,20 @@ public:
     };
     using Source = Variant<Local, URL>;
 
-    static ValueComparingNonnullRefPtr<FontSourceStyleValue const> create(Source source, Optional<FlyString> format, Vector<FontTech> tech)
-    {
-        return adopt_ref(*new (nothrow) FontSourceStyleValue(move(source), move(format), move(tech)));
-    }
     virtual ~FontSourceStyleValue() override;
 
-    Source const& source() const { return m_source; }
-    Optional<FlyString> const& format() const { return m_format; }
-    Vector<FontTech> const& tech() const { return m_tech; }
-
-    virtual String to_string(SerializationMode) const override;
-
-    bool properties_equal(FontSourceStyleValue const&) const;
+    Source source() const;
+    Optional<Utf16FlyString> format() const
+    {
+        if (!m_value->font_source.has_format)
+            return {};
+        return css_string_from_rust(&m_value->font_source.format);
+    }
 
 private:
-    FontSourceStyleValue(Source source, Optional<FlyString> format, Vector<FontTech> tech);
+    friend class StyleValue;
 
-    Source m_source;
-    Optional<FlyString> m_format;
-    Vector<FontTech> m_tech;
+    explicit FontSourceStyleValue(StyleValueFFI::StyleValueData const*);
 };
 
 }

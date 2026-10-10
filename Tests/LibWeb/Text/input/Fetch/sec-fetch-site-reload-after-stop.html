@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    // Reloading after the user stops a navigation before its document is activated makes that navigation again — and
+    // from the same source. So a navigation this page started is fetched again as this page's: with the Sec-Fetch-Site
+    // and the referrer it first went out with, rather than as a URL the user agent supplied.
+    asyncTest(async done => {
+        const server = httpTestServer();
+        const path = "/sec-fetch-site-reload-after-stop";
+        const responseToken = crypto.randomUUID();
+        const response = {
+            status: 204,
+            wait_for_unblock: responseToken,
+            headers: { "Cache-Control": "no-store" },
+        };
+        const slowURL = await server.createEcho("GET", path, response);
+
+        // Observe requests through a worker's connection while this document's navigation is in flight.
+        const workerURL = URL.createObjectURL(new Blob([`
+            self.onmessage = async event => {
+                const url = event.data;
+                try {
+                    const response = await fetch(url, { cache: "no-store" });
+                    self.postMessage({ status: response.status, body: await response.text() });
+                } catch (error) {
+                    self.postMessage({ error: String(error) });
+                }
+            };
+        `], { type: "text/javascript" }));
+        const observer = new Worker(workerURL);
+        async function observeFetch(url) {
+            const reply = await new Promise(resolve => {
+                observer.addEventListener("message", event => resolve(event.data), { once: true });
+                observer.postMessage(url);
+            });
+            if (reply.error)
+                throw new Error(reply.error);
+            return new Response(reply.body || null, { status: reply.status });
+        }
+        async function recorded(mode, request = fetch) {
+            const url = server.recordedRequestHeadersURL(slowURL);
+            let lastResponse = "no response";
+            for (let attempt = 0; attempt < 600; ++attempt) {
+                try {
+                    const response = await request(url, { cache: "no-store" });
+                    if (response.ok) {
+                        const headers = await response.json();
+                        lastResponse = JSON.stringify(headers);
+                        if (headers["Sec-Fetch-Mode"]?.[0] === mode)
+                            return headers;
+                    } else {
+                        lastResponse = `HTTP ${response.status}`;
+                    }
+                } catch (error) {
+                    lastResponse = String(error);
+                }
+                await timeout(25);
+            }
+            throw new Error(`Expected Sec-Fetch-Mode ${mode}; last recorded response: ${lastResponse}`);
+        }
+        function describe(headers) {
+            const referer = headers?.["Referer"]?.[0];
+            return `Sec-Fetch-Site ${headers?.["Sec-Fetch-Site"]?.[0]}, Referer ${referer === location.href ? "this page" : referer}`;
+        }
+
+        // Start the worker before navigation can suspend this document's requests.
+        await observeFetch(server.recordedRequestHeadersURL(slowURL));
+        const stopped = new Promise(resolve => {
+            navigation.addEventListener("navigate", event => {
+                event.signal.addEventListener("abort", resolve, { once: true });
+            }, { once: true });
+        });
+        location.href = slowURL;
+        await recorded("navigate", observeFetch);
+        internals.stopLoadingThroughUIProcess();
+        await stopped;
+        // The abort signal fires before Stop finishes cancelling this document's fetches.
+        await timeout(0);
+        println(`navigation, stopped: ${describe(await recorded("navigate"))}`);
+        await observeFetch(`${server.baseURL}/unblock/${responseToken}`);
+
+        // A completed fetch distinguishes the stopped request from the request made again by Reload.
+        await fetch(slowURL);
+        await recorded("cors");
+        // Re-registering the same response resets its gate before Reload.
+        await server.createEcho("GET", path, response);
+
+        internals.reloadThroughUIProcess();
+        await recorded("navigate", observeFetch);
+        await observeFetch(`${server.baseURL}/unblock/${responseToken}`);
+        println(`navigation, made again by Reload: ${describe(await recorded("navigate"))}`);
+        observer.terminate();
+        URL.revokeObjectURL(workerURL);
+        done();
+    });
+</script>

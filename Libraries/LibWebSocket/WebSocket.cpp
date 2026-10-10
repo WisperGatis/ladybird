@@ -6,23 +6,31 @@
  */
 
 #include <AK/Base64.h>
+#include <AK/Endian.h>
 #include <AK/Random.h>
+#include <AK/Utf8View.h>
+#include <LibCore/Timer.h>
 #include <LibCrypto/Hash/HashManager.h>
-#include <LibCrypto/SecureRandom.h>
-#include <LibWebSocket/Impl/WebSocketImplSerenity.h>
 #include <LibWebSocket/WebSocket.h>
 
 namespace WebSocket {
 
+static constexpr int s_closing_handshake_timeout_ms = 30'000;
+
+// The longest message we accept — in a single frame, or in fragments. Gecko/Blink cap a frame's length at the same
+// INT32_MAX, and fail a longer frame with 1009: Gecko mMaxMessageSize (checked in WebSocketChannel::ProcessInput()),
+// Blink WebSocketFrameParser::DecodeFrameHeader().
+static constexpr u64 s_maximum_message_size = NumericLimits<i32>::max();
+
 // Note : The websocket protocol is defined by RFC 6455, found at https://tools.ietf.org/html/rfc6455
 // In this file, section numbers will refer to the RFC 6455
 
-NonnullRefPtr<WebSocket> WebSocket::create(ConnectionInfo connection, RefPtr<WebSocketImpl> impl)
+NonnullRefPtr<WebSocket> WebSocket::create(ConnectionInfo connection, NonnullRefPtr<WebSocketImpl> impl)
 {
     return adopt_ref(*new WebSocket(move(connection), move(impl)));
 }
 
-WebSocket::WebSocket(ConnectionInfo connection, RefPtr<WebSocketImpl> impl)
+WebSocket::WebSocket(ConnectionInfo connection, NonnullRefPtr<WebSocketImpl> impl)
     : m_connection(move(connection))
     , m_impl(move(impl))
 {
@@ -31,13 +39,21 @@ WebSocket::WebSocket(ConnectionInfo connection, RefPtr<WebSocketImpl> impl)
 void WebSocket::start()
 {
     VERIFY(m_state == WebSocket::InternalState::NotStarted);
-
-    if (!m_impl)
-        m_impl = adopt_ref(*new WebSocketImplSerenity);
+    VERIFY(m_impl);
 
     m_impl->on_connection_error = [this] {
-        dbgln("WebSocket: Connection error (underlying socket)");
-        fatal_error(WebSocket::Error::CouldNotEstablishConnection);
+        if (m_state == InternalState::Closing) {
+            // If the connection drops while we are waiting for the server's close frame, check if we actually received
+            // one in the last read. If we did, we can consider this a clean close.
+            bool was_clean = m_last_close_code != to_underlying(CloseStatusCode::NoStatusReceived);
+            set_state(was_clean ? InternalState::Closed : InternalState::Errored);
+            if (!was_clean)
+                notify_error(Error::ServerClosedSocket);
+            notify_close(m_last_close_code, m_last_close_message, was_clean);
+            discard_connection();
+            return;
+        }
+        fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), WebSocket::Error::CouldNotEstablishConnection, "Connection error (underlying socket)");
     };
     m_impl->on_connected = [this] {
         if (m_state != WebSocket::InternalState::EstablishingProtocolConnection)
@@ -112,15 +128,19 @@ void WebSocket::close(u16 code, ByteString const& message)
     case InternalState::WaitingForServerHandshake:
         // "If the WebSocket connection is not yet established [WSP]
         // Fail the WebSocket connection and set this’s ready state to CLOSING (2)."
-        // FIXME: Fail the connection.
         set_state(InternalState::Closing);
+        fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), WebSocket::Error::CouldNotEstablishConnection, "Closing connection that's not yet established");
         break;
     case InternalState::Open: {
         // "If the WebSocket closing handshake has not yet been started [WSP]
         // Start the WebSocket closing handshake and set this’s ready state to CLOSING (2)."
         auto message_bytes = message.bytes();
         auto close_payload = ByteBuffer::create_uninitialized(message_bytes.size() + 2).release_value_but_fixme_should_propagate_errors(); // FIXME: Handle possible OOM situation.
-        close_payload.overwrite(0, (u8*)&code, 2);
+        // Section 5.5.1:
+        // > If there is a body, the first two bytes of the body MUST be a 2-byte unsigned integer (in network byte order)
+        // > representing a status code with value /code/ defined in Section 7.4.
+        NetworkOrdered<u16> network_ordered_code { code };
+        close_payload.overwrite(0, &network_ordered_code, sizeof(network_ordered_code));
         close_payload.overwrite(2, message_bytes.data(), message_bytes.size());
         send_frame(WebSocket::OpCode::ConnectionClose, close_payload, true);
         set_state(InternalState::Closing);
@@ -157,17 +177,24 @@ void WebSocket::drain_read()
     } break;
     case InternalState::Open:
     case InternalState::Closing: {
-        auto result = m_impl->read(65536);
-        if (result.is_error()) {
-            fatal_error(WebSocket::Error::ServerClosedSocket);
-            return;
-        }
-        auto bytes = result.release_value();
-        m_buffered_data.append(bytes.data(), bytes.size());
-        do {
-            if (auto maybe_error = read_frame(); maybe_error.is_error())
+        // NB: The socket tells us just once that it has data to read, however much it has — so keep reading until
+        // there's none left. Gecko/Blink read a chunk, parse it, and repeat until the socket would block, the same way:
+        // Gecko WebSocketChannel::OnInputStreamReady(), Blink WebSocketChannel::ReadFrames().
+        while (m_state == InternalState::Open || m_state == InternalState::Closing) {
+            auto result = m_impl->read(65536);
+            if (result.is_error()) {
+                fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), WebSocket::Error::ServerClosedSocket, {});
+                return;
+            }
+            auto bytes = result.release_value();
+            if (bytes.is_empty())
                 break;
-        } while (!m_buffered_data.is_empty());
+            m_buffered_data.append(bytes.data(), bytes.size());
+            do {
+                if (auto maybe_error = read_frame(); maybe_error.is_error())
+                    break;
+            } while (!m_buffered_data.is_empty());
+        }
     } break;
     case InternalState::Closed:
     case InternalState::Errored: {
@@ -205,7 +232,7 @@ void WebSocket::send_client_handshake()
 
     // 7. 16-byte nonce encoded as Base64
     u8 nonce_data[16];
-    Crypto::fill_with_secure_random(nonce_data);
+    fill_with_random(nonce_data);
     // FIXME: change to TRY() and make method fallible
     m_websocket_key = MUST(encode_base64({ nonce_data, 16 })).to_byte_string();
     builder.appendff("Sec-WebSocket-Key: {}\r\n", m_websocket_key);
@@ -233,7 +260,7 @@ void WebSocket::send_client_handshake()
     }
 
     // 12. Additional headers
-    for (auto& header : m_connection.headers().headers()) {
+    for (auto const& header : m_connection.headers()) {
         builder.appendff("{}: {}\r\n", header.name, header.value);
     }
 
@@ -246,10 +273,12 @@ void WebSocket::send_client_handshake()
 
 void WebSocket::fail_connection(u16 close_status_code, WebSocket::Error error_code, ByteString const& reason)
 {
-    dbgln("WebSocket: {}", reason);
-    set_state(WebSocket::InternalState::Closed);
-    fatal_error(error_code);
+    if (!reason.is_empty())
+        dbgln("WebSocket: {}", reason);
+    set_state(WebSocket::InternalState::Errored);
+    notify_error(error_code);
     notify_close(close_status_code, reason, false);
+    discard_connection();
 }
 
 // The server handshake message is defined in the third list of section 4.1
@@ -279,7 +308,7 @@ void WebSocket::read_server_handshake()
         }
         if (parts[1] != "101") {
             // 1. If the status code is not 101, handle as per HTTP procedures.
-            // FIXME : This could be a redirect or a 401 authentication request, which we do not handle.
+            // FIXME: This could be a redirect or a 401 authentication request, which we do not handle.
             fail_opening_handshake(ByteString::formatted("Server HTTP Handshake return status {} which isn't supported", parts[1]));
             return;
         }
@@ -411,25 +440,40 @@ ErrorOr<void> WebSocket::read_frame()
 
     size_t cursor = 0;
     auto get_buffered_bytes = [&](size_t count) -> ReadonlyBytes {
-        if (cursor + count > m_buffered_data.size())
+        // NB: The cursor never passes the end of the buffered data, so this subtraction can't wrap — whereas
+        // cursor + count does, for a count near the top of size_t's range.
+        if (count > m_buffered_data.size() - cursor)
             return {};
         auto bytes = m_buffered_data.span().slice(cursor, count);
         cursor += count;
         return bytes;
     };
 
+    // NB: Fewer than 2 bytes buffered only means the rest of the header hasn't arrived yet — it's drain_read() that
+    // notices the server closing the connection. Gecko/WebKit/Blink wait for the rest of a header the same way: Gecko
+    // ProcessInput(), WebKit parseFrame(), Blink DecodeFrameHeader().
     auto head_bytes = get_buffered_bytes(2);
-    if (head_bytes.is_null() || head_bytes.is_empty()) {
-        // The connection got closed.
-        set_state(WebSocket::InternalState::Closed);
-        notify_close(m_last_close_code, m_last_close_message, true);
-        discard_connection();
-        return AK::Error::from_errno(ECONNABORTED);
+    if (head_bytes.is_null())
+        return AK::Error::from_errno(EAGAIN);
+
+    auto op_code_value = head_bytes[0] & 0x0f;
+    if ((op_code_value >= 0x3 && op_code_value <= 0x7) || op_code_value >= 0xb) {
+        fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server sent a reserved opcode");
+        return AK::Error::from_errno(EPROTO);
     }
 
-    auto op_code = (WebSocket::OpCode)(head_bytes[0] & 0x0f);
+    if (head_bytes[0] & 0x70) {
+        fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server set a reserved frame bit");
+        return AK::Error::from_errno(EPROTO);
+    }
+
+    auto op_code = static_cast<WebSocket::OpCode>(op_code_value);
     bool is_final_frame = head_bytes[0] & 0x80;
-    bool is_masked = head_bytes[1] & 0x80;
+    bool is_control_frame = head_bytes[0] & 0x08;
+    if (head_bytes[1] & 0x80) {
+        fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server sent a masked frame");
+        return AK::Error::from_errno(EPROTO);
+    }
 
     // Parse the payload length.
     size_t payload_length;
@@ -447,7 +491,20 @@ ErrorOr<void> WebSocket::read_frame()
             | (u64)((u64)(actual_bytes[5] & 0xff) << 16)
             | (u64)((u64)(actual_bytes[6] & 0xff) << 8)
             | (u64)((u64)(actual_bytes[7] & 0xff) << 0);
-        VERIFY(full_payload_length <= NumericLimits<size_t>::max());
+
+        // https://datatracker.ietf.org/doc/html/rfc6455#section-5.2
+        // "If 127, the following 8 bytes interpreted as a 64-bit unsigned integer (the most significant bit MUST be 0)
+        // are the payload length."
+        if (full_payload_length > static_cast<u64>(NumericLimits<i64>::max())) {
+            fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server sent a frame length with its most significant bit set");
+            return AK::Error::from_errno(EPROTO);
+        }
+
+        if (full_payload_length > s_maximum_message_size) {
+            fail_connection(to_underlying(CloseStatusCode::MessageTooBig), WebSocket::Error::ServerClosedSocket, "Server sent a frame that's too long");
+            return AK::Error::from_errno(EMSGSIZE);
+        }
+
         payload_length = (size_t)full_payload_length;
     } else if (payload_length_bits == 126) {
         // A code of 126 means that the next 2 bytes contains the payload length
@@ -460,33 +517,33 @@ ErrorOr<void> WebSocket::read_frame()
         payload_length = (size_t)payload_length_bits;
     }
 
-    // Parse the mask, if it exists.
-    // Note : this is technically non-conformant with Section 5.1 :
-    // > A server MUST NOT mask any frames that it sends to the client.
-    // > A client MUST close a connection if it detects a masked frame.
-    // > (These rules might be relaxed in a future specification.)
-    // But because it doesn't cost much, we can support receiving masked frames anyways.
-    u8 masking_key[4];
-    if (is_masked) {
-        auto masking_key_data = get_buffered_bytes(4);
-        if (masking_key_data.is_null())
-            return AK::Error::from_errno(EAGAIN);
-        masking_key[0] = masking_key_data[0];
-        masking_key[1] = masking_key_data[1];
-        masking_key[2] = masking_key_data[2];
-        masking_key[3] = masking_key_data[3];
+    if ((payload_length_bits == 126 && payload_length < 126) || (payload_length_bits == 127 && payload_length < 65536)) {
+        fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server used a non-minimal frame length");
+        return AK::Error::from_errno(EPROTO);
     }
 
-    auto payload = ByteBuffer::create_uninitialized(payload_length).release_value_but_fixme_should_propagate_errors(); // FIXME: Handle possible OOM situation.
-    u64 read_length = 0;
-    while (read_length < payload_length) {
-        auto payload_part = get_buffered_bytes(payload_length - read_length);
-        if (payload_part.is_null())
-            return AK::Error::from_errno(EAGAIN);
-        // We read at most "actual_length - read" bytes, so this is safe to do.
-        payload.overwrite(read_length, payload_part.data(), payload_part.size());
-        read_length += payload_part.size();
+    if (is_control_frame && (!is_final_frame || payload_length > 125)) {
+        fail_connection(to_underlying(CloseStatusCode::ProtocolError), WebSocket::Error::ServerClosedSocket, "Server sent an invalid control frame");
+        return AK::Error::from_errno(EPROTO);
     }
+
+    // A message that arrives in fragments gets the same limit as one that arrives in a single frame — so a server can't
+    // make the fragment buffer grow without bound. Gecko/Blink limit the whole message too: Gecko ProcessInput() adds
+    // mFragmentAccumulator to a frame's length before checking mMaxMessageSize, and Blink fails a message that's longer
+    // than max_message_size_ (WebSocketChannelImpl::ConsumeDataFrame()). In contrast, WebKit sets no limit of its own.
+    if (!is_control_frame && m_fragmented_data_buffer.size() + payload_length > s_maximum_message_size) {
+        fail_connection(to_underlying(CloseStatusCode::MessageTooBig), WebSocket::Error::ServerClosedSocket, "Server sent a message that's too long");
+        return AK::Error::from_errno(EMSGSIZE);
+    }
+
+    // Wait until the whole payload has arrived before allocating anything for it — so a frame header on its own can't
+    // make us allocate. Gecko/WebKit/Blink don't allocate from a header either: Gecko WebSocketChannel::ProcessInput()
+    // and WebKit WebSocketFrame::parseFrame() wait for the whole payload too, and Blink hands out only the bytes that
+    // have arrived (WebSocketFrameParser::DecodeFramePayload()).
+    auto payload_bytes = get_buffered_bytes(payload_length);
+    if (payload_bytes.is_null())
+        return AK::Error::from_errno(EAGAIN);
+    auto payload = ByteBuffer::copy(payload_bytes).release_value_but_fixme_should_propagate_errors(); // FIXME: Handle possible OOM situation.
 
     if (cursor == m_buffered_data.size()) {
         m_buffered_data.clear();
@@ -496,17 +553,19 @@ ErrorOr<void> WebSocket::read_frame()
         m_buffered_data = move(new_buffered_data);
     }
 
-    if (is_masked) {
-        // Unmask the payload
-        for (size_t i = 0; i < payload.size(); ++i) {
-            payload[i] = payload[i] ^ (masking_key[i % 4]);
-        }
-    }
-
     if (op_code == WebSocket::OpCode::ConnectionClose) {
         if (payload.size() > 1) {
             m_last_close_code = (((u16)(payload[0] & 0xff) << 8) | ((u16)(payload[1] & 0xff)));
-            m_last_close_message = ByteString(ReadonlyBytes(payload.offset_pointer(2), payload.size() - 2));
+            auto close_message = ByteString(ReadonlyBytes(payload.offset_pointer(2), payload.size() - 2));
+            // NB: UTF-8 has no encoding for a surrogate — so, a reason that holds one isn't valid either. Gecko/Blink
+            // fail the connection for one too: Gecko IsUtf8() in WebSocketChannel::ProcessInput(), and Blink
+            // base::IsStringUTF8AllowingNoncharacters() in ParseCloseFrame(). In contrast, WebKit takes the Close frame
+            // but drops its reason: String::fromUTF8() in WebSocketTask::didReceiveData() gives a null string for it.
+            if (!Utf8View(close_message).validate(AllowLonelySurrogates::No)) {
+                fail_connection(to_underlying(CloseStatusCode::InvalidPayload), WebSocket::Error::ServerClosedSocket, {});
+                return AK::Error::from_errno(EPROTO);
+            }
+            m_last_close_message = move(close_message);
         } else {
             m_last_close_code = 1000;
             m_last_close_message = {};
@@ -515,8 +574,14 @@ ErrorOr<void> WebSocket::read_frame()
         return {};
     }
     if (op_code == WebSocket::OpCode::Ping) {
-        // Immediately send a pong frame as a reply, with the given payload.
-        send_frame(WebSocket::OpCode::Pong, payload, true);
+        // https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.2
+        // "Upon receipt of a Ping frame, an endpoint MUST send a Pong frame in response, unless it already received a
+        // Close frame."
+        // AD-HOC: We also don't reply once we've sent a Close frame of our own — and neither do WebKit/Blink: WebKit
+        // WebSocketTask::sendFrame() (m_didSendClosingHandshake), Blink WebSocketChannel::HandleFrameByState(). In
+        // contrast, Gecko WebSocketChannel::ProcessInput() keeps replying til the server's Close frame has arrived.
+        if (m_state == WebSocket::InternalState::Open)
+            send_frame(WebSocket::OpCode::Pong, payload, true);
         return {};
     }
     if (op_code == WebSocket::OpCode::Pong) {
@@ -621,12 +686,9 @@ void WebSocket::send_frame(WebSocket::OpCode op_code, ReadonlyBytes payload, boo
         // > Clients MUST choose a new masking key for each frame, using an algorithm
         // > that cannot be predicted by end applications that provide data
         u8 masking_key[4];
-        Crypto::fill_with_secure_random(masking_key);
+        fill_with_random(masking_key);
         buf.overwrite(offset, masking_key, 4);
         offset += 4;
-        // don't try to send empty payload
-        if (payload.size() == 0)
-            return;
         // Mask the payload
         auto masked_payload = buf.span().slice(offset, payload.size());
         for (size_t i = 0; i < payload.size(); ++i) {
@@ -638,13 +700,6 @@ void WebSocket::send_frame(WebSocket::OpCode op_code, ReadonlyBytes payload, boo
         offset += payload.size();
     }
     m_impl->send(buf.span().slice(0, offset));
-}
-
-void WebSocket::fatal_error(WebSocket::Error error)
-{
-    set_state(WebSocket::InternalState::Errored);
-    notify_error(error);
-    discard_connection();
 }
 
 void WebSocket::discard_connection()
@@ -697,6 +752,21 @@ void WebSocket::set_state(InternalState state)
         return;
     auto old_ready_state = ready_state();
     m_state = state;
+
+    if (state == InternalState::Closing) {
+        if (!m_closing_handshake_timer) {
+            m_closing_handshake_timer = Core::Timer::create_single_shot(s_closing_handshake_timeout_ms, [this] {
+                if (m_state != InternalState::Closing)
+                    return;
+                fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), WebSocket::Error::ServerClosedSocket, "Timed out waiting for the peer's close frame");
+            });
+        } else {
+            m_closing_handshake_timer->restart(s_closing_handshake_timeout_ms);
+        }
+    } else if (m_closing_handshake_timer) {
+        m_closing_handshake_timer->stop();
+    }
+
     auto new_ready_state = ready_state();
     if (old_ready_state != new_ready_state) {
         if (on_ready_state_change)

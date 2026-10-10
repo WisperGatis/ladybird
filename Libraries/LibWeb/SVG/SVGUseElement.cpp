@@ -1,23 +1,24 @@
 /*
  * Copyright (c) 2023, Preston Taylor <95388976+PrestonLTaylor@users.noreply.github.com>
- * Copyright (c) 2024, Shannon Booth <shannon@serenityos.org>
+ * Copyright (c) 2024-2026, Shannon Booth <shannon@serenityos.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGUseElementPrototype.h>
+#include <LibGC/Heap.h>
+#include <LibGC/HeapHashTable.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/Box.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/AttributeNames.h>
+#include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGSymbolElement.h>
@@ -28,25 +29,30 @@ namespace Web::SVG {
 GC_DEFINE_ALLOCATOR(SVGUseElement);
 
 SVGUseElement::SVGUseElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : SVGGraphicsElement(document, qualified_name)
+    : SVGGraphicsElement(document, move(qualified_name))
 {
 }
 
-void SVGUseElement::initialize(JS::Realm& realm)
+void SVGUseElement::initialize_element()
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGUseElement);
-    Base::initialize(realm);
-
     // NOTE: The spec says "The shadow tree is open (inspectable by script), but read-only."
     //       This doesn't actually match other browsers, and there's a spec issue to change it.
     //       Spec bug: https://github.com/w3c/svgwg/issues/875
-    auto shadow_root = realm.create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
+    auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
+    shadow_root->set_user_agent_internal(true);
 
     // The user agent must create a use-element shadow tree whose host is the ‘use’ element itself
     set_shadow_root(shadow_root);
 
-    m_document_observer = realm.create<DOM::DocumentObserver>(realm, document());
-    m_document_observer->set_document_completely_loaded([this]() {
+    m_document_observer = DOM::DocumentObserver::create(document());
+    m_document_observer->set_document_readiness_observer([this](HTML::DocumentReadyState readiness) {
+        if (readiness != HTML::DocumentReadyState::Interactive)
+            return;
+        // The href processing path already populated the shadow tree for resolved references,
+        // unless the referenced subtree changed while the document was still being parsed.
+        if (instance_root() && !m_needs_parsing_complete_reclone)
+            return;
+        m_needs_parsing_complete_reclone = false;
         clone_element_tree_as_our_shadow_tree(referenced_element());
     });
 }
@@ -59,30 +65,134 @@ void SVGUseElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_resource_request);
 }
 
-void SVGUseElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGUseElement::adopted_from(DOM::Document& old_document)
+{
+    Base::adopted_from(old_document);
+
+    if (m_load_event_delayer.has_value())
+        m_load_event_delayer.emplace(document());
+
+    m_document_observer->retarget_for_adoption(document());
+
+    auto href = href_value();
+    if (!href.has_value())
+        return;
+
+    m_href = document().encoding_parse_url(*href);
+    if (!m_href.has_value())
+        return;
+
+    if (!is_referenced_element_same_document()) {
+        fetch_the_document(*m_href);
+        return;
+    }
+
+    if (auto to_clone = referenced_element())
+        clone_element_tree_as_our_shadow_tree(to_clone);
+}
+
+void SVGUseElement::inserted()
+{
+    Base::inserted();
+
+    // Only use elements in the document's node tree react to changes of the elements they reference, mirroring the
+    // document-wide traversal this registry replaced. A use element inside a shadow tree is itself part of a clone.
+    if (!root().is_document())
+        return;
+
+    register_for_referenced_element_changes();
+
+    // The insertion that connected us may have inserted our referenced element along with us, with its insertion
+    // steps running before ours, i.e. before we were registered to be notified about changes to it. If our shadow
+    // tree has not been populated yet, try resolving the reference again.
+    if (!instance_root()
+        && m_href.has_value() && m_href->fragment().has_value() && is_referenced_element_same_document()) {
+        clone_element_tree_as_our_shadow_tree(referenced_element());
+    }
+}
+
+void SVGUseElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
+{
+    Base::removed_from(is_subtree_root, old_ancestor, old_root);
+
+    if (old_root.is_document())
+        unregister_for_referenced_element_changes();
+}
+
+void SVGUseElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_ancestor)
+{
+    Base::moved_from(is_subtree_root, old_ancestor);
+
+    if (!old_ancestor)
+        return;
+
+    auto was_in_document_tree = old_ancestor->root().is_document();
+    auto is_in_document_tree = root().is_document();
+    if (was_in_document_tree == is_in_document_tree)
+        return;
+
+    if (was_in_document_tree) {
+        unregister_for_referenced_element_changes();
+        return;
+    }
+
+    register_for_referenced_element_changes();
+
+    if (!instance_root()
+        && m_href.has_value() && m_href->fragment().has_value() && is_referenced_element_same_document()) {
+        clone_element_tree_as_our_shadow_tree(referenced_element());
+    }
+}
+
+void SVGUseElement::finalize()
+{
+    Base::finalize();
+
+    // A GC'ed "use" element may never run its removal steps. So, unlink it from the document's list of use elements
+    // here — to avoid destroying a still-linked list node.
+    unregister_for_referenced_element_changes();
+}
+
+void SVGUseElement::register_for_referenced_element_changes()
+{
+    if (m_list_node.is_in_list())
+        return;
+    document().register_svg_use_element({}, *this);
+}
+
+void SVGUseElement::unregister_for_referenced_element_changes()
+{
+    if (!m_list_node.is_in_list())
+        return;
+    document().unregister_svg_use_element({}, *this);
+}
+
+void SVGUseElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    // https://svgwg.org/svg2-draft/struct.html#UseLayout
-    if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_coordinate(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_coordinate(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::href || name == "xlink:href"_fly_string) {
+    if (name == SVG::AttributeNames::href || name == SVG::AttributeNames::xlink_href) {
         // When the ‘href’ attribute is set (or, in the absence of an ‘href’ attribute, an ‘xlink:href’ attribute), the user agent must process the URL.
         process_the_url(value);
     }
 }
 
+Optional<Utf16String> SVGUseElement::href_value() const
+{
+    if (auto href = get_attribute_ns(Optional<Utf16FlyString> {}, AttributeNames::href); href.has_value())
+        return href;
+    return get_attribute_ns(Namespace::XLink, AttributeNames::href);
+}
+
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
-void SVGUseElement::process_the_url(Optional<String> const& href)
+void SVGUseElement::process_the_url(Optional<Utf16String> const& href)
 {
     // In all other cases, the URL is for a resource to be used in this SVG document. The user agent
     // must parse the URL to separate out the target fragment from the rest of the URL, and compare
     // it with the document base URL. If all parts other than the target fragment are equal, this is
     // a same-document URL reference, and processing the URL must continue as indicated in Identifying
     // the target element with the current document as the referenced document.
-    m_href = document().url().complete_url(href.value_or(String {}));
+    m_href = document().encoding_parse_url(href.value_or({}));
     if (!m_href.has_value())
         return;
 
@@ -95,19 +205,7 @@ void SVGUseElement::process_the_url(Optional<String> const& href)
 
 bool SVGUseElement::is_referenced_element_same_document() const
 {
-    return m_href->equals(document().url(), URL::ExcludeFragment::Yes);
-}
-
-Gfx::AffineTransform SVGUseElement::element_transform() const
-{
-    // The x and y properties define an additional transformation (translate(x,y), where x and y represent the computed value of the corresponding property)
-    // to be applied to the ‘use’ element, after any transformations specified with other properties
-    return Base::element_transform().translate(m_x.value_or(0), m_y.value_or(0));
-}
-
-void SVGUseElement::inserted()
-{
-    Base::inserted();
+    return m_href->equals(document().base_url(), URL::ExcludeFragment::Yes);
 }
 
 void SVGUseElement::svg_element_changed(SVGElement& svg_element)
@@ -118,9 +216,20 @@ void SVGUseElement::svg_element_changed(SVGElement& svg_element)
     }
 
     // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
-    if (to_clone == &svg_element || to_clone->is_ancestor_of(svg_element)) {
+    if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element)) {
         clone_element_tree_as_our_shadow_tree(to_clone);
     }
+}
+
+void SVGUseElement::svg_element_changed_before_parsing_complete(SVGElement& svg_element)
+{
+    auto to_clone = referenced_element();
+    if (!to_clone)
+        return;
+
+    // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
+    if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element))
+        m_needs_parsing_complete_reclone = true;
 }
 
 void SVGUseElement::svg_element_removed(SVGElement& svg_element)
@@ -129,13 +238,14 @@ void SVGUseElement::svg_element_removed(SVGElement& svg_element)
         return;
     }
 
-    if (AK::StringUtils::matches(svg_element.get_attribute_value("id"_fly_string), m_href->fragment().value())) {
+    auto id = decode_fragment_identifier(*m_href->fragment());
+    if (svg_element.get_attribute_value("id"_utf16_fly_string) == id) {
         shadow_root()->remove_all_children();
     }
 }
 
 // https://svgwg.org/svg2-draft/linking.html#processingURL-target
-GC::Ptr<DOM::Element> SVGUseElement::referenced_element()
+GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
 {
     if (!m_href.has_value())
         return nullptr;
@@ -143,8 +253,10 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element()
     if (!m_href->fragment().has_value())
         return nullptr;
 
-    if (is_referenced_element_same_document())
-        return document().get_element_by_id(*m_href->fragment());
+    if (is_referenced_element_same_document()) {
+        auto id = decode_fragment_identifier(*m_href->fragment());
+        return document().get_element_by_id(id);
+    }
 
     if (!m_resource_request)
         return nullptr;
@@ -153,14 +265,14 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element()
     if (!data || !is<SVG::SVGDecodedImageData>(*data))
         return nullptr;
 
-    return as<SVG::SVGDecodedImageData>(*data).svg_document().get_element_by_id(*m_href->fragment());
+    return as<SVG::SVGDecodedImageData>(*data).svg_document().get_element_by_id(decode_fragment_identifier(*m_href->fragment()));
 }
 
 // https://svgwg.org/svg2-draft/linking.html#processingURL-fetch
 void SVGUseElement::fetch_the_document(URL::URL const& url)
 {
     m_load_event_delayer.emplace(document());
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(realm(), document().page(), url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
     m_resource_request->add_callbacks(
         [this] {
             clone_element_tree_as_our_shadow_tree(referenced_element());
@@ -168,19 +280,27 @@ void SVGUseElement::fetch_the_document(URL::URL const& url)
         },
         [this] {
             m_load_event_delayer.clear();
+        },
+        [this] {
+            m_load_event_delayer.clear();
         });
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(vm(), url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(&document().relevant_settings_object());
-        m_resource_request->fetch_resource(realm(), request);
+        m_resource_request->fetch_resource(request);
     }
 }
 
 // https://svgwg.org/svg2-draft/struct.html#UseShadowTree
-void SVGUseElement::clone_element_tree_as_our_shadow_tree(Element* to_clone)
+void SVGUseElement::clone_element_tree_as_our_shadow_tree(GC::Ptr<Element> to_clone)
 {
     shadow_root()->remove_all_children();
+
+    // https://svgwg.org/svg2-draft/struct.html#UseStyleInheritance
+    // When the referenced element is from the same document as the ‘use’ element, the same document stylesheets will
+    // apply in both the original document and the shadow tree document fragment.
+    shadow_root()->set_uses_document_style_sheets(to_clone && is_referenced_element_same_document());
 
     if (to_clone && is_valid_reference_element(*to_clone)) {
         // The ‘use’ element references another element, a copy of which is rendered in place of the ‘use’ in the document.
@@ -193,10 +313,10 @@ void SVGUseElement::clone_element_tree_as_our_shadow_tree(Element* to_clone)
             // on the instance root element. However, if the computed value for the property on the ‘use’ element is
             // auto, then the property is computed as normal for the element instance.
             if (has_attribute(AttributeNames::width)) {
-                MUST(cloned_element.set_attribute(AttributeNames::width, get_attribute_value(AttributeNames::width)));
+                cloned_element.set_attribute_value(AttributeNames::width, get_attribute_value(AttributeNames::width));
             }
             if (has_attribute(AttributeNames::height)) {
-                MUST(cloned_element.set_attribute(AttributeNames::height, get_attribute_value(AttributeNames::height)));
+                cloned_element.set_attribute_value(AttributeNames::height, get_attribute_value(AttributeNames::height));
             }
         }
         shadow_root()->append_child(cloned_reference_node).release_value_but_fixme_should_propagate_errors();
@@ -206,38 +326,51 @@ void SVGUseElement::clone_element_tree_as_our_shadow_tree(Element* to_clone)
 bool SVGUseElement::is_valid_reference_element(Element const& reference_element) const
 {
     // If the referenced element that results from resolving the URL is not an SVG element, then the reference is invalid and the ‘use’ element is in error.
-    // If the referenced element is a (shadow-including) ancestor of the ‘use’ element, then this is an invalid circular reference and the ‘use’ element is in error.
-    return reference_element.is_svg_element() && !reference_element.is_ancestor_of(*this);
+    if (!reference_element.is_svg_element())
+        return false;
+
+    // https://svgwg.org/svg2-draft/struct.html#UseShadowTree
+    // When a ‘use’ references another element which is another ‘use’ or whose content contains a ‘use’ element, then
+    // the shadow DOM cloning approach described above is recursive. However, a set of references that directly or
+    // indirectly reference a element to create a circular dependency is an invalid circular reference. The ‘use’
+    // element or element instance whose shadow tree would create the circular reference is in error and must not be
+    // rendered by the user agent.
+    return !would_create_circular_reference(reference_element);
 }
 
-// https://www.w3.org/TR/SVG11/shapes.html#RectElementXAttribute
-GC::Ref<SVGAnimatedLength> SVGUseElement::x() const
+bool SVGUseElement::would_create_circular_reference(Element const& target) const
 {
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto base_length = SVGLength::create(realm(), 0, m_x.value_or(0), SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, m_x.value_or(0), SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
+    auto visited = GC::Heap::the().allocate<GC::HeapHashTable<GC::Ref<Element const>>>();
+    return would_create_circular_reference_impl(target, visited);
 }
 
-// https://www.w3.org/TR/SVG11/shapes.html#RectElementYAttribute
-GC::Ref<SVGAnimatedLength> SVGUseElement::y() const
+bool SVGUseElement::would_create_circular_reference_impl(
+    Element const& target,
+    GC::HeapHashTable<GC::Ref<Element const>>& visited) const
 {
-    // FIXME: Populate the unit type when it is parsed (0 here is "unknown").
-    // FIXME: Create a proper animated value when animations are supported.
-    auto base_length = SVGLength::create(realm(), 0, m_y.value_or(0), SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, m_y.value_or(0), SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
+    // FIXME: I am certain there is a much more efficient way of keeping track of cycles here!
+    if (visited.table().contains(target))
+        return true;
 
-GC::Ref<SVGAnimatedLength> SVGUseElement::width() const
-{
-    return fake_animated_length_fixme();
-}
+    visited.table().set(target);
 
-GC::Ref<SVGAnimatedLength> SVGUseElement::height() const
-{
-    return fake_animated_length_fixme();
+    bool found_circular_reference = false;
+    target.for_each_in_inclusive_subtree_of_type<SVGUseElement>([&](auto& element) {
+        auto referenced = element.referenced_element();
+        if (!referenced)
+            return TraversalDecision::Continue;
+
+        if (would_create_circular_reference_impl(*referenced, visited)) {
+            found_circular_reference = true;
+            return TraversalDecision::Break;
+        }
+
+        return TraversalDecision::Continue;
+    });
+
+    visited.table().remove(target);
+
+    return found_circular_reference;
 }
 
 // https://svgwg.org/svg2-draft/struct.html#TermInstanceRoot
@@ -246,14 +379,9 @@ GC::Ptr<SVGElement> SVGUseElement::instance_root() const
     return const_cast<DOM::ShadowRoot&>(*shadow_root()).first_child_of_type<SVGElement>();
 }
 
-GC::Ptr<SVGElement> SVGUseElement::animated_instance_root() const
+CSS::ElementBoxKind SVGUseElement::box_kind() const
 {
-    return instance_root();
-}
-
-GC::Ptr<Layout::Node> SVGUseElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
-{
-    return heap().allocate<Layout::SVGGraphicsBox>(document(), *this, move(style));
+    return CSS::ElementBoxKind::SvgGraphics;
 }
 
 }

@@ -6,13 +6,14 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
 struct CounterDefinition {
-    FlyString name;
+    Utf16FlyString name;
     bool is_reversed;
     ValueComparingRefPtr<StyleValue const> value;
 };
@@ -21,7 +22,7 @@ struct CounterDefinition {
  * Holds a list of CounterDefinitions.
  * Shared between counter-increment, counter-reset, and counter-set properties that have (almost) identical grammar.
  */
-class CounterDefinitionsStyleValue : public StyleValueWithDefaultOperators<CounterDefinitionsStyleValue> {
+class WEB_API CounterDefinitionsStyleValue : public StyleValueWithDefaultOperators<CounterDefinitionsStyleValue> {
 public:
     static ValueComparingNonnullRefPtr<CounterDefinitionsStyleValue const> create(Vector<CounterDefinition> counter_definitions)
     {
@@ -29,20 +30,28 @@ public:
     }
     virtual ~CounterDefinitionsStyleValue() override = default;
 
-    auto const& counter_definitions() const { return m_counter_definitions; }
-    virtual String to_string(SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool properties_equal(CounterDefinitionsStyleValue const& other) const;
+    Vector<CounterDefinition> counter_definitions() const;
 
 private:
+    friend class StyleValue;
+
     explicit CounterDefinitionsStyleValue(Vector<CounterDefinition> counter_definitions)
-        : StyleValueWithDefaultOperators(Type::CounterDefinitions)
-        , m_counter_definitions(move(counter_definitions))
+        : StyleValueWithDefaultOperators(Type::CounterDefinitions, make_counter_definitions_data(counter_definitions))
     {
     }
 
-    Vector<CounterDefinition> m_counter_definitions;
+    explicit CounterDefinitionsStyleValue(StyleValueFFI::StyleValueData const*);
+
+    static StyleValueFFI::StyleValueData const* make_counter_definitions_data(Vector<CounterDefinition> const& counter_definitions)
+    {
+        Vector<StyleValueFFI::FfiCounterDefinition> ffi_definitions;
+        ffi_definitions.ensure_capacity(counter_definitions.size());
+        for (auto const& definition : counter_definitions) {
+            auto const* value_data = definition.value ? StyleValueFFI::rust_style_value_retain(definition.value->rust_style_value_data()) : nullptr;
+            ffi_definitions.unchecked_append({ definition.name.to_raw_leaked(), definition.is_reversed, { value_data } });
+        }
+        return StyleValueFFI::rust_style_value_create_counter_definitions(ffi_definitions.data(), ffi_definitions.size());
+    }
 };
 
 }

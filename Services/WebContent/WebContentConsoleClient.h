@@ -16,8 +16,7 @@
 
 namespace WebContent {
 
-class WebContentConsoleClient : public JS::ConsoleClient
-    , public Weakable<WebContentConsoleClient> {
+class WebContentConsoleClient : public JS::ConsoleClient {
     GC_CELL(WebContentConsoleClient, JS::ConsoleClient);
     GC_DECLARE_ALLOCATOR(WebContentConsoleClient);
 
@@ -27,14 +26,12 @@ public:
     void handle_input(StringView js_source);
 
     virtual void handle_result(JS::Value) = 0;
-    virtual void send_messages(i32 start_index) = 0;
 
 protected:
-    WebContentConsoleClient(JS::Realm&, JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
+    WebContentConsoleClient(JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
-    GC::Ref<JS::Realm> m_realm;
     GC::Ref<PageClient> m_client;
     GC::Ref<ConsoleGlobalEnvironmentExtensions> m_console_global_environment_extensions;
 };

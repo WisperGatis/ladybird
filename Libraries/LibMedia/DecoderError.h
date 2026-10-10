@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Gregory Bertilson <zaggy1024@gmail.com>
+ * Copyright (c) 2022-2026, Gregory Bertilson <gregory@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -10,6 +10,8 @@
 #include <AK/Error.h>
 #include <AK/Format.h>
 #include <AK/SourceLocation.h>
+#include <LibIPC/Forward.h>
+#include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <errno.h>
 
@@ -18,10 +20,12 @@ namespace Media {
 template<typename T>
 using DecoderErrorOr = ErrorOr<T, DecoderError>;
 
-enum class DecoderErrorCategory : u32 {
+enum class DecoderErrorCategory : u8 {
+    Aborted,
     Unknown,
     IO,
     NeedsMoreInput,
+    TryAgain,
     EndOfStream,
     Memory,
     // The input is corrupted.
@@ -30,6 +34,8 @@ enum class DecoderErrorCategory : u32 {
     Invalid,
     // The input uses features that are not yet implemented.
     NotImplemented,
+    // A reader doesn't recognize the provided data.
+    UnrecognizedFormat,
 };
 
 class DecoderError {
@@ -82,6 +88,35 @@ private:
     Variant<StringView, ByteString> m_description;
 };
 
+constexpr StringView decoder_error_category_to_string(DecoderErrorCategory category)
+{
+    switch (category) {
+    case DecoderErrorCategory::Aborted:
+        return "Aborted"sv;
+    case DecoderErrorCategory::Unknown:
+        return "Unknown"sv;
+    case DecoderErrorCategory::IO:
+        return "IO"sv;
+    case DecoderErrorCategory::NeedsMoreInput:
+        return "NeedsMoreInput"sv;
+    case DecoderErrorCategory::TryAgain:
+        return "TryAgain"sv;
+    case DecoderErrorCategory::EndOfStream:
+        return "EndOfStream"sv;
+    case DecoderErrorCategory::Memory:
+        return "Memory"sv;
+    case DecoderErrorCategory::Corrupted:
+        return "Corrupted"sv;
+    case DecoderErrorCategory::Invalid:
+        return "Invalid"sv;
+    case DecoderErrorCategory::NotImplemented:
+        return "NotImplemented"sv;
+    case DecoderErrorCategory::UnrecognizedFormat:
+        return "UnrecognizedFormat"sv;
+    }
+    return "Invalid"sv;
+}
+
 #define DECODER_TRY(category, expression)                                                  \
     ({                                                                                     \
         auto&& _result = ((expression));                                                   \
@@ -102,11 +137,29 @@ private:
 namespace AK {
 
 template<>
+struct Formatter<Media::DecoderErrorCategory> : StandardFormatter {
+    ErrorOr<void> format(FormatBuilder& builder, Media::DecoderErrorCategory const& decoder_error_category)
+    {
+        return builder.put_literal(Media::decoder_error_category_to_string(decoder_error_category));
+    }
+};
+
+template<>
 struct Formatter<Media::DecoderError> : Formatter<FormatString> {
     ErrorOr<void> format(FormatBuilder& builder, Media::DecoderError const& decoder_error)
     {
-        return Formatter<FormatString>::format(builder, "[DecoderError]: {}"sv, decoder_error.description());
+        return Formatter<FormatString>::format(builder, "[DecoderError] ({}): {}"sv, decoder_error.category(), decoder_error.description());
     }
 };
+
+}
+
+namespace IPC {
+
+template<>
+MEDIA_API ErrorOr<void> encode(Encoder&, Media::DecoderError const&);
+
+template<>
+MEDIA_API ErrorOr<Media::DecoderError> decode(Decoder&);
 
 }

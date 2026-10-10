@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<iframe id="testFrame"></iframe>
+<script>
+    const server = httpTestServer();
+
+    // The echo path keys both the server-side recording of the most-recent request headers and the disk cache entry.
+    // Give each run its own path, so parallel runner clones of this test don't overwrite each other's recording.
+
+    // A page served with an explicit freshness lifetime and Last-Modified validator. Reloading this must revalidate it
+    // with the server even though the cached response is still fresh; the reload must not be served straight from cache.
+    const DOCUMENT_PATH = "/reload-revalidates-document";
+    const DOCUMENT_BODY =
+        "<!DOCTYPE html><script>window.onmessage = () => { location.reload(); };<\/script>reload test document";
+
+    async function registerDocumentEcho() {
+        return server.createEcho("GET", DOCUMENT_PATH, {
+            status: 200,
+            headers: {
+                "Cache-Control": "max-age=999",
+                "Content-Type": "text/html",
+                "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            },
+            body: DOCUMENT_BODY,
+        });
+    }
+
+    function waitForFrameLoad(frame) {
+        return new Promise(resolve => {
+            frame.addEventListener("load", resolve, { once: true });
+        });
+    }
+
+    async function recordedRequestHeaderNames(url) {
+        const recordedRequestHeadersURL = server.recordedRequestHeadersURL(url);
+        const response = await fetch(recordedRequestHeadersURL);
+        const headers = await response.json();
+        return Object.keys(headers).map(name => name.toLowerCase());
+    }
+
+    promiseTest(async () => {
+        const url = await registerDocumentEcho();
+
+        // In test mode, the disk cache only stores responses to requests carrying the cache-enablement header. A page
+        // cannot attach a header to a navigation request, so have every navigation request carry it. The document of
+        // the iframe is cached in a partition of its own, which no fetch from this page can reach.
+        const diskCacheWasEnabledForNavigations = internals.setDiskCacheEnabledForNavigations(true);
+
+        // Navigate the iframe to the document, which caches it.
+        const frame = document.getElementById("testFrame");
+        const initialLoad = waitForFrameLoad(frame);
+        frame.src = url;
+        await initialLoad;
+
+        // Reload the iframe from within itself — so this works regardless of whether the test page and the echo server
+        // are same-origin.
+        const reloadLoad = waitForFrameLoad(frame);
+        frame.contentWindow.postMessage("reload", "*");
+        await reloadLoad;
+        internals.setDiskCacheEnabledForNavigations(diskCacheWasEnabledForNavigations);
+
+        // The server records the request headers of the most-recent request at the echo path. If the reload never
+        // contacted the server, the request headers are still those of the initial navigation.
+        const headerNames = await recordedRequestHeaderNames(url);
+
+        if (headerNames.includes("if-modified-since"))
+            println("PASS: the reloaded document was revalidated with the server");
+        else
+            println("FAIL: the reload was not revalidated with the server");
+    });
+</script>

@@ -71,7 +71,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         return 1;
     }
 
-    Core::EventLoop loop;
+    auto& loop = Core::EventLoop::initialize_for_current_thread();
 
     DNS::Resolver resolver {
         [&] -> ErrorOr<DNS::Resolver::SocketResult> {
@@ -88,6 +88,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
                 return DNS::Resolver::SocketResult {
                     TRY(Core::BufferedSocket<Core::UDPSocket>::create(TRY(Core::UDPSocket::connect(address)))),
                     DNS::Resolver::ConnectionMode::UDP,
+                    [address] -> ErrorOr<NonnullOwnPtr<Core::Socket>> {
+                        return TRY(Core::TCPSocket::connect(address));
+                    },
                 };
             };
 

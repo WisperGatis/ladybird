@@ -1,0 +1,184 @@
+test("basic functionality", () => {
+    expect(RegExp.prototype.test).toHaveLength(1);
+});
+
+test("simple test", () => {
+    let re = /test/;
+    expect(re.test("test")).toBe(true);
+    expect(re.test("test")).toBe(true);
+});
+
+test("non-global fast path coerces lastIndex", () => {
+    const accepted = regexp => {
+        regexp.lastIndex = Symbol("revoked");
+        try {
+            return regexp.test("allow");
+        } catch {
+            return false;
+        }
+    };
+
+    expect(accepted(/^allow$/)).toBeFalse();
+    expect(accepted(/^allow$/g)).toBeFalse();
+});
+
+test("simple global test", () => {
+    let re = /test/g;
+    expect(re.test("testtest")).toBe(true);
+    expect(re.test("testtest")).toBe(true);
+    expect(re.test("testtest")).toBe(false);
+    expect(re.test("testtest")).toBe(true);
+    expect(re.test("testtest")).toBe(true);
+});
+
+test("global test with offset lastIndex", () => {
+    let re = /test/g;
+    re.lastIndex = 2;
+    expect(re.test("testtest")).toBe(true);
+    expect(re.test("testtest")).toBe(false);
+    expect(re.test("testtest")).toBe(true);
+    expect(re.test("testtest")).toBe(true);
+    expect(re.test("testtest")).toBe(false);
+});
+
+test("sticky test with offset lastIndex", () => {
+    let re = /test/y;
+    re.lastIndex = 2;
+    expect(re.test("aatest")).toBe(true);
+    expect(re.test("aatest")).toBe(false);
+    expect(re.test("aatest")).toBe(false);
+});
+
+test("flag and options", () => {
+    expect(/foo/gi.flags).toBe("gi");
+    expect(/foo/mu.flags).toBe("mu");
+    expect(/foo/gimsuy.flags).toBe("gimsuy");
+
+    let re = /foo/gim;
+    expect(re.dotAll).toBe(false);
+    expect(re.global).toBe(true);
+    expect(re.ignoreCase).toBe(true);
+    expect(re.multiline).toBe(true);
+    expect(re.sticky).toBe(false);
+    expect(re.unicode).toBe(false);
+
+    expect(() => {
+        Function("/foo/gg");
+    }).toThrowWithMessage(SyntaxError, "Repeated RegExp flag 'g'");
+
+    expect(() => {
+        Function("/foo/x");
+    }).toThrowWithMessage(SyntaxError, "Invalid RegExp flag 'x'");
+});
+
+test("override exec with function", () => {
+    let calls = 0;
+
+    let re = /test/;
+    let oldExec = re.exec.bind(re);
+    re.exec = function (...args) {
+        ++calls;
+        return oldExec(...args);
+    };
+
+    expect(re.test("test")).toBe(true);
+    expect(calls).toBe(1);
+});
+
+test("override exec on prototype", () => {
+    let calls = 0;
+    let original = RegExp.prototype.exec;
+    try {
+        RegExp.prototype.exec = function (s) {
+            ++calls;
+            return original.call(this, s);
+        };
+
+        let re = /abc.+de/;
+        expect(re.test("abcXdef")).toBe(true);
+        expect(calls).toBe(1);
+
+        expect(re.test("no match")).toBe(false);
+        expect(calls).toBe(2);
+    } finally {
+        RegExp.prototype.exec = original;
+    }
+});
+
+test("override exec with bad function", () => {
+    let calls = 0;
+
+    let re = /test/;
+    re.exec = function (...args) {
+        ++calls;
+        return 4;
+    };
+
+    expect(() => {
+        re.test("test");
+    }).toThrow(TypeError);
+    expect(calls).toBe(1);
+});
+
+test("override exec with non-function", () => {
+    let re = /test/;
+    re.exec = 3;
+    expect(re.test("test")).toBe(true);
+});
+
+test("successful fast test invalidates nonlegacy state", () => {
+    function NewTarget() {}
+    NewTarget.prototype = RegExp.prototype;
+    const regexp = Reflect.construct(RegExp, ["(.)"], NewTarget);
+
+    /(PROTECTED)/.test("PROTECTED");
+    expect(regexp.test("P")).toBeTrue();
+    expect(RegExp.input).toBe("");
+    expect(RegExp.$1).toBe("");
+});
+
+test("property escapes", () => {
+    expect(/\p{ASCII}/.test("a")).toBeFalse();
+    expect(/\p{ASCII}/.test("p{ASCII}")).toBeTrue();
+    expect(/\p{ASCII}/u.test("a")).toBeTrue();
+    expect(/\p{ASCII}/u.test("😀")).toBeFalse();
+    expect(/\p{ASCII_Hex_Digit}/u.test("1")).toBeTrue();
+    expect(/\p{ASCII_Hex_Digit}/u.test("a")).toBeTrue();
+    expect(/\p{ASCII_Hex_Digit}/u.test("x")).toBeFalse();
+    expect(/\p{Any}/u.test("\u0378")).toBeTrue();
+    expect(/\p{Assigned}/u.test("\u0378")).toBeFalse();
+});
+
+test("case-insensitive character class with mixed builtins and literals", () => {
+    expect(/[\dA]/i.test("a")).toBeTrue();
+    expect(/[\dA]/i.test("A")).toBeTrue();
+    expect(/[\dA]/i.test("5")).toBeTrue();
+    expect(/[\dA]/i.test("b")).toBeFalse();
+});
+
+test("a non-writable lastIndex is fine on a pattern that is neither global nor sticky", () => {
+    // RegExpBuiltinExec writes lastIndex back only for a global or sticky pattern, so nothing here throws.
+    const pattern = /a/;
+    Object.defineProperty(pattern, "lastIndex", { writable: false });
+
+    expect(pattern.test("aaa")).toBeTrue();
+    expect(pattern.lastIndex).toBe(0);
+});
+
+test("character class with many overlapping ranges", () => {
+    // More than eight ranges, where one range contains all the others.
+    expect(/[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/.test("P")).toBeTrue();
+    expect(/^[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]+$/.test("PQR")).toBeTrue();
+    expect(/[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/.test("{")).toBeFalse();
+    expect(/[^\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/.test("P")).toBeFalse();
+    expect(/[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]/v.test("P")).toBeTrue();
+    expect(/^[\x00-\x7a\x10\x20\x30\x40\x60\x61\x62\x63]+$/v.test("PQR")).toBeTrue();
+});
+
+test("a failed test leaves the legacy static properties alone", () => {
+    expect(/(a)/.exec("xa")).not.toBeNull();
+    expect(/b/.test("c")).toBeFalse();
+    expect(RegExp.$1).toBe("a");
+    expect(RegExp.lastMatch).toBe("a");
+    expect(RegExp.leftContext).toBe("x");
+});

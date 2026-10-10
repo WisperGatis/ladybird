@@ -1,0 +1,21 @@
+Before background-attachment change:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+
+DisplayList:
+PaintLinearGradient@s1/e0 rect=[0,0 200x600] inline_clips=[clip=[0,0 200x200]]
+
+After background-attachment change:
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+
+DisplayList:
+PaintLinearGradient@s0/e0 rect=[0,0 800x600] inline_clips=[clip=[0,0 200x200]]
+

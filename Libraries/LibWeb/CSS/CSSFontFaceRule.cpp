@@ -5,34 +5,47 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontStyleMapping.h>
-#include <LibWeb/Bindings/CSSFontFaceRulePrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
+#include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/FontFaceState.h>
 #include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/Dump.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSFontFaceRule);
 
-GC::Ref<CSSFontFaceRule> CSSFontFaceRule::create(JS::Realm& realm, GC::Ref<CSSFontFaceDescriptors> style)
+GC::Ref<CSSFontFaceRule> CSSFontFaceRule::create(RustRule rule)
 {
-    return realm.create<CSSFontFaceRule>(realm, style);
+    return GC::Heap::the().allocate<CSSFontFaceRule>(move(rule));
 }
 
-CSSFontFaceRule::CSSFontFaceRule(JS::Realm& realm, GC::Ref<CSSFontFaceDescriptors> style)
-    : CSSRule(realm, Type::FontFace)
-    , m_style(style)
+CSSFontFaceRule::CSSFontFaceRule(RustRule rule)
+    : CSSRule(move(rule))
+    , m_descriptors(Parser::ValueParserFFI::rust_descriptor_block_retain(native_rule().payload().descriptors))
 {
-    m_style->set_parent_rule(*this);
 }
 
-void CSSFontFaceRule::initialize(JS::Realm& realm)
+size_t CSSFontFaceRule::external_memory_size() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSFontFaceRule);
-    Base::initialize(realm);
+    return JS::saturating_add_external_memory_size(Base::external_memory_size(), m_descriptors.external_memory_size());
+}
+
+GC::Ref<CSSFontFaceDescriptors> CSSFontFaceRule::descriptors() const
+{
+    if (!m_style) {
+        m_style = CSSFontFaceDescriptors::create(m_descriptors.retain());
+        m_style->set_parent_rule(const_cast<CSSFontFaceRule&>(*this));
+    }
+    return *m_style;
 }
 
 bool CSSFontFaceRule::is_valid() const
@@ -40,110 +53,208 @@ bool CSSFontFaceRule::is_valid() const
     // @font-face rules require a font-family and src descriptor; if either of these are missing, the @font-face rule
     // must not be considered when performing the font matching algorithm.
     // https://drafts.csswg.org/css-fonts-4/#font-face-rule
-    return !m_style->descriptor(DescriptorID::FontFamily).is_null()
-        && !m_style->descriptor(DescriptorID::Src).is_null();
+    return !m_descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFamily)).is_null()
+        && !m_descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::Src)).is_null();
 }
 
-ParsedFontFace CSSFontFaceRule::font_face() const
+// https://drafts.csswg.org/cssom/#ref-for-cssfontfacerule
+Utf16String CSSFontFaceRule::serialized() const
 {
-    return ParsedFontFace::from_descriptors(m_style);
-}
+    auto const& descriptors = m_descriptors;
 
-// https://www.w3.org/TR/cssom/#ref-for-cssfontfacerule
-String CSSFontFaceRule::serialized() const
-{
-    auto& descriptors = *m_style;
-
-    StringBuilder builder;
+    Utf16StringBuilder builder;
     // The result of concatenating the following:
 
-    // 1. The string "@font-face {", followed by a single SPACE (U+0020).
-    builder.append("@font-face { "sv);
+    // 1. The string "@font-face {".
+    builder.append_ascii("@font-face {"sv);
 
-    // 2. The string "font-family:", followed by a single SPACE (U+0020).
-    builder.append("font-family: "sv);
+    // 2. If the font-family descriptor is present:
+    if (auto font_family = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFamily)); !font_family.is_null()) {
+        // 1. A single SPACE (U+0020), followed by the string "font-family:", followed by a single SPACE (U+0020).
+        builder.append_ascii(" font-family: "sv);
 
-    // 3. The result of performing serialize a string on the rule’s font family name.
-    builder.append(descriptors.descriptor(DescriptorID::FontFamily)->to_string(SerializationMode::Normal));
-
-    // 4. The string ";", i.e., SEMICOLON (U+003B).
-    builder.append(';');
-
-    // 5. If the rule’s associated source list is not empty, follow these substeps:
-    if (auto sources = descriptors.descriptor(DescriptorID::Src)) {
-        // 1. A single SPACE (U+0020), followed by the string "src:", followed by a single SPACE (U+0020).
-        builder.append(" src: "sv);
-
-        // 2. The result of invoking serialize a comma-separated list on performing serialize a URL or serialize a LOCAL for each source on the source list.
-        builder.append(sources->to_string(SerializationMode::Normal));
+        // 2. The result of performing serialize a string on the rule’s font family name.
+        descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFamily))->serialize(builder, SerializationMode::Normal);
 
         // 3. The string ";", i.e., SEMICOLON (U+003B).
-        builder.append(';');
+        builder.append_ascii(';');
     }
 
-    // 6. If rule’s associated unicode-range descriptor is present, a single SPACE (U+0020), followed by the string "unicode-range:", followed by a single SPACE (U+0020), followed by the result of performing serialize a <'unicode-range'>, followed by the string ";", i.e., SEMICOLON (U+003B).
-    if (auto unicode_range = descriptors.descriptor(DescriptorID::UnicodeRange)) {
-        builder.append(" unicode-range: "sv);
-        builder.append(unicode_range->to_string(SerializationMode::Normal));
-        builder.append(';');
+    // 3. If the rule’s associated source list is not empty, follow these substeps:
+    if (auto sources = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::Src))) {
+        // 1. A single SPACE (U+0020), followed by the string "src:", followed by a single SPACE (U+0020).
+        builder.append_ascii(" src: "sv);
+
+        // 2. The result of invoking serialize a comma-separated list on performing serialize a URL or serialize a LOCAL for each source on the source list.
+        sources->serialize(builder, SerializationMode::Normal);
+
+        // 3. The string ";", i.e., SEMICOLON (U+003B).
+        builder.append_ascii(';');
     }
 
-    // FIXME: 7. If rule’s associated font-variant descriptor is present, a single SPACE (U+0020),
+    // 4. If rule’s associated unicode-range descriptor is present, a single SPACE (U+0020), followed by the string "unicode-range:", followed by a single SPACE (U+0020), followed by the result of performing serialize a <'unicode-range'>, followed by the string ";", i.e., SEMICOLON (U+003B).
+    if (auto unicode_range = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::UnicodeRange))) {
+        builder.append_ascii(" unicode-range: "sv);
+        unicode_range->serialize(builder, SerializationMode::Normal);
+        builder.append_ascii(';');
+    }
+
+    // FIXME: 5. If rule’s associated font-variant descriptor is present, a single SPACE (U+0020),
     // followed by the string "font-variant:", followed by a single SPACE (U+0020),
     // followed by the result of performing serialize a <'font-variant'>,
     // followed by the string ";", i.e., SEMICOLON (U+003B).
 
-    // 8. If rule’s associated font-feature-settings descriptor is present, a single SPACE (U+0020),
+    // 6. If rule’s associated font-feature-settings descriptor is present, a single SPACE (U+0020),
     //    followed by the string "font-feature-settings:", followed by a single SPACE (U+0020),
     //    followed by the result of performing serialize a <'font-feature-settings'>,
     //    followed by the string ";", i.e., SEMICOLON (U+003B).
-    if (auto font_feature_settings = descriptors.descriptor(DescriptorID::FontFeatureSettings)) {
-        builder.append(" font-feature-settings: "sv);
-        builder.append(font_feature_settings->to_string(SerializationMode::Normal));
-        builder.append(";"sv);
+    if (auto font_feature_settings = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontFeatureSettings))) {
+        builder.append_ascii(" font-feature-settings: "sv);
+        font_feature_settings->serialize(builder, SerializationMode::Normal);
+        builder.append_ascii(";"sv);
     }
 
-    // 9. If rule’s associated font-stretch descriptor is present, a single SPACE (U+0020),
+    // 7. If rule’s associated font-stretch descriptor is present, a single SPACE (U+0020),
     //    followed by the string "font-stretch:", followed by a single SPACE (U+0020),
     //    followed by the result of performing serialize a <'font-stretch'>,
     //    followed by the string ";", i.e., SEMICOLON (U+003B).
     // NOTE: font-stretch is now an alias for font-width, so we use that instead.
-    if (auto font_width = descriptors.descriptor(DescriptorID::FontWidth)) {
-        builder.append(" font-stretch: "sv);
-        builder.append(font_width->to_string(SerializationMode::Normal));
-        builder.append(";"sv);
+    if (auto font_width = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontWidth))) {
+        builder.append_ascii(" font-stretch: "sv);
+        font_width->serialize(builder, SerializationMode::Normal);
+        builder.append_ascii(";"sv);
     }
 
-    // 10. If rule’s associated font-weight descriptor is present, a single SPACE (U+0020),
+    // 8. If rule’s associated font-weight descriptor is present, a single SPACE (U+0020),
     //     followed by the string "font-weight:", followed by a single SPACE (U+0020),
     //     followed by the result of performing serialize a <'font-weight'>,
     //     followed by the string ";", i.e., SEMICOLON (U+003B).
-    if (auto font_weight = descriptors.descriptor(DescriptorID::FontWeight)) {
-        builder.append(" font-weight: "sv);
-        builder.append(font_weight->to_string(SerializationMode::Normal));
-        builder.append(";"sv);
+    if (auto font_weight = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontWeight))) {
+        builder.append_ascii(" font-weight: "sv);
+        font_weight->serialize(builder, SerializationMode::Normal);
+        builder.append_ascii(";"sv);
     }
 
-    // 11. If rule’s associated font-style descriptor is present, a single SPACE (U+0020),
+    // 9. If rule’s associated font-style descriptor is present, a single SPACE (U+0020),
     //     followed by the string "font-style:", followed by a single SPACE (U+0020),
     //     followed by the result of performing serialize a <'font-style'>,
     //     followed by the string ";", i.e., SEMICOLON (U+003B).
-    if (auto font_style = descriptors.descriptor(DescriptorID::FontStyle)) {
-        builder.append(" font-style: "sv);
-        builder.append(font_style->to_string(SerializationMode::Normal));
-        builder.append(";"sv);
+    if (auto font_style = descriptors.descriptor(DescriptorNameAndID::from_id(DescriptorID::FontStyle))) {
+        builder.append_ascii(" font-style: "sv);
+        font_style->serialize(builder, SerializationMode::Normal);
+        builder.append_ascii(";"sv);
     }
 
-    // 12. A single SPACE (U+0020), followed by the string "}", i.e., RIGHT CURLY BRACKET (U+007D).
-    builder.append(" }"sv);
+    // 10. A single SPACE (U+0020), followed by the string "}", i.e., RIGHT CURLY BRACKET (U+007D).
+    builder.append_ascii(" }"sv);
 
-    return MUST(builder.to_string());
+    return builder.to_string();
 }
 
-void CSSFontFaceRule::visit_edges(Visitor& visitor)
+void CSSFontFaceRule::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_style);
+}
+
+RefPtr<FontFaceState> CSSFontFaceRule::css_connected_font_face() const
+{
+    auto* sheet = parent_style_sheet();
+    return sheet ? sheet->css_connected_font_face(native_rule().identity()) : nullptr;
+}
+
+void CSSFontFaceRule::handle_descriptor_change(Utf16FlyString const& property)
+{
+    auto font_face = css_connected_font_face();
+    if (!font_face)
+        return;
+
+    if (!is_valid()) {
+        disconnect_font_face();
+        return;
+    }
+
+    if (property.equals_ignoring_ascii_case("src"_utf16_fly_string)) {
+        handle_src_descriptor_change();
+        return;
+    }
+
+    auto descriptor_affects_font_matching = property.equals_ignoring_ascii_case("font-family"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-weight"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-style"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-width"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-stretch"_utf16_fly_string);
+
+    FontComputer* font_computer = nullptr;
+    if (descriptor_affects_font_matching) {
+        if (auto document = parent_style_sheet() ? parent_style_sheet()->owning_document() : nullptr) {
+            font_computer = &document->font_computer();
+            font_computer->unregister_font_face(*font_face);
+        }
+    }
+
+    // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+    // any change made to a @font-face descriptor is immediately reflected in the corresponding FontFace attribute
+    font_face->reparse_connected_css_font_face_rule_descriptors();
+
+    if (font_computer) {
+        font_computer->register_font_face(*font_face);
+        return;
+    }
+
+    // A descriptor that leaves the face's matching key alone, such as unicode-range or font-display, still changes
+    // what selecting the face answers with, in ways a cascade's fonts alone do not show. Such an edit is rare, so every
+    // cascade of the family goes.
+    if (!font_face->should_be_registered_with_font_computer())
+        return;
+    if (auto document = parent_style_sheet() ? parent_style_sheet()->owning_document() : nullptr)
+        document->font_computer().did_load_font(font_face->family_name());
+}
+
+// https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+void CSSFontFaceRule::handle_src_descriptor_change()
+{
+    // If a @font-face rule has its src descriptor changed to a new value, the original connected FontFace object must
+    // stop being CSS-connected. A new FontFace reflecting its new src must be created and CSS-connected to the
+    // @font-face.
+
+    if (!css_connected_font_face())
+        return;
+
+    disconnect_font_face();
+
+    auto* style_sheet = parent_style_sheet();
+    if (!style_sheet)
+        return;
+
+    auto document = style_sheet->owning_document();
+    if (!document)
+        return;
+
+    auto new_font_face = FontFaceState::create_css_connected(HTML::relevant_realm(*document), native_rule().identity(), *style_sheet);
+    document->fonts()->add_css_connected_font(new_font_face);
+}
+
+// https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+// If a @font-face rule is removed from the document, its corresponding FontFace object is no longer CSS-connected.
+// The connection is not restorable by any means (but adding the @font-face back to the stylesheet will create a
+// brand new FontFace object which is CSS-connected).
+void CSSFontFaceRule::disconnect_font_face()
+{
+    auto font_face = css_connected_font_face();
+    if (!font_face)
+        return;
+
+    font_face->disconnect_from_css_rule();
+}
+
+void CSSFontFaceRule::dump(StringBuilder& builder, int indent_levels) const
+{
+    Base::dump(builder, indent_levels);
+
+    dump_indent(builder, indent_levels + 1);
+    builder.appendff("Valid: {}\n", is_valid());
+    dump_descriptors(builder, descriptors(), indent_levels + 1);
 }
 
 }

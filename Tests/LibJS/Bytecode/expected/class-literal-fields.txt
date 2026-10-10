@@ -1,0 +1,80 @@
+$015bd143 class-literal-fields.js:12:1
+  Registers: 15
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] GetGlobal value_feedback:0, dst:reg6, `test`
+  [  18] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, test
+  [  38] DynamicInitializeLexicalBinding `a`, src:reg5
+  [  48] GetGlobal value_feedback:2, dst:reg6, `console`
+  [  58] GetById value_feedback:3, dst:reg7, base:reg6, `log` (console.log)
+  [  70] GetGlobal value_feedback:4, dst:reg8, `a`
+  [  80] GetById value_feedback:5, dst:reg9, base:reg8, `x` (a.x)
+  [  98] GetGlobal value_feedback:6, dst:reg8, `a`
+  [  a8] GetById value_feedback:7, dst:reg10, base:reg8, `y` (a.y)
+  [  c0] GetGlobal value_feedback:8, dst:reg8, `a`
+  [  d0] GetById value_feedback:9, dst:reg11, base:reg8, `z` (a.z)
+  [  e8] GetGlobal value_feedback:10, dst:reg8, `a`
+  [  f8] GetById value_feedback:11, dst:reg12, base:reg8, `w` (a.w)
+  [ 110] GetGlobal value_feedback:12, dst:reg8, `a`
+  [ 120] GetById value_feedback:13, dst:reg13, base:reg8, `s` (a.s)
+  [ 138] GetGlobal value_feedback:14, dst:reg8, `a`
+  [ 148] GetById value_feedback:15, dst:reg14, base:reg8, `computed` (a.computed)
+  [ 160] Call value_feedback:16, call_feedback:1, dst:reg5, callee:reg7, this_value:reg6, console.log, arguments:[reg9, reg10, reg11, reg12, reg13, reg14]
+  [ 198] End value:reg5
+
+
+test$f7b067c4 class-literal-fields.js:2:5
+  Registers: 7
+  Blocks:    1
+  Locals:    A~0
+  Constants:
+    [0] = String("x")
+    [1] = String("y")
+    [2] = String("z")
+    [3] = String("w")
+    [4] = String("s")
+    [5] = String("computed")
+    [6] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] GetLexicalEnvironment dst:reg4
+  [  10] CreateLexicalEnvironment dst:reg5, parent:reg4, capacity:1, is_catch_environment:false
+  [  28] CreateVariable `A`, is_immutable:true, is_global:false, is_strict:true
+  [  38] SetLexicalEnvironment environment:reg4
+  [  40] NewClass dst:reg6, class_environment:reg5, class_blueprint_index:0, element_keys:[element_keys:String("x"), element_keys:String("y"), element_keys:String("z"), element_keys:String("w"), element_keys:String("s"), element_keys:String("computed")]
+  [  78] Mov dst:A~0, src:reg6
+  [  88] ThrowIfTDZ src:A~0
+  [  90] CallConstruct value_feedback:0, call_feedback:0, dst:reg6, callee:A~0, A
+  [  b0] Return value:reg6
+
+
+A$70678274
+  Registers: 5
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] End value:Undefined
+
+
+field$4eb4aa79 class-literal-fields.js:8:22
+  Registers: 5
+  Blocks:    1
+  Constants:
+    [0] = Int32(1)
+    [1] = Int32(2)
+    [2] = Int32(3)
+
+block0:
+  [   0] Enter
+  [   8] Return value:Int32(3)
+
+
+42 -1 true null "hi" 3

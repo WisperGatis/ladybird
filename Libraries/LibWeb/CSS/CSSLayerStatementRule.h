@@ -12,25 +12,26 @@ namespace Web::CSS {
 
 // https://drafts.csswg.org/css-cascade-5/#the-csslayerstatementrule-interface
 class CSSLayerStatementRule final : public CSSRule {
-    WEB_PLATFORM_OBJECT(CSSLayerStatementRule, CSSRule);
+    WEB_WRAPPABLE(CSSLayerStatementRule, CSSRule);
     GC_DECLARE_ALLOCATOR(CSSLayerStatementRule);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSLayerStatementRule> create(JS::Realm&, Vector<FlyString> name_list);
+    [[nodiscard]] static GC::Ref<CSSLayerStatementRule> create(RustRule);
 
     virtual ~CSSLayerStatementRule() = default;
 
     // FIXME: Should be FrozenArray
-    ReadonlySpan<FlyString> name_list() const { return m_name_list; }
-    Vector<FlyString> internal_qualified_name_list(Badge<StyleComputer>) const;
+    Vector<Utf16String> name_list() const;
 
 private:
-    CSSLayerStatementRule(JS::Realm&, Vector<FlyString> name_list);
+    CSSLayerStatementRule(RustRule);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual String serialized() const override;
+    virtual Utf16String serialized() const override;
+    virtual void dump(StringBuilder&, int indent_levels) const override;
+    virtual size_t external_memory_size() const override;
 
-    Vector<FlyString> m_name_list;
+    Utf16View name_at(size_t) const;
+    Parser::ValueParserFFI::LayerNames const& m_names;
 };
 
 }

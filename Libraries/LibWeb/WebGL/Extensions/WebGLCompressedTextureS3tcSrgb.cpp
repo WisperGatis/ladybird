@@ -4,38 +4,39 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/WebGLCompressedTextureS3tcSrgbPrototype.h>
+#include <LibWeb/Bindings/WebGLCompressedTextureS3tcSrgb.h>
 #include <LibWeb/WebGL/Extensions/WebGLCompressedTextureS3tcSrgb.h>
-#include <LibWeb/WebGL/OpenGLContext.h>
+#include <LibWeb/WebGL/WebGLContextProxy.h>
+#include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
 GC_DEFINE_ALLOCATOR(WebGLCompressedTextureS3tcSrgb);
 
-JS::ThrowCompletionOr<GC::Ptr<WebGLCompressedTextureS3tcSrgb>> WebGLCompressedTextureS3tcSrgb::create(JS::Realm& realm, WebGLRenderingContextBase* context)
+GC::Ref<Bindings::Wrappable> WebGLCompressedTextureS3tcSrgb::create(GC::Ref<WebGLRenderingContextBase> context)
 {
+    auto& realm = context->realm();
     return realm.create<WebGLCompressedTextureS3tcSrgb>(realm, context);
 }
 
-WebGLCompressedTextureS3tcSrgb::WebGLCompressedTextureS3tcSrgb(JS::Realm& realm, WebGLRenderingContextBase* context)
-    : PlatformObject(realm)
-    , m_context(context)
+WebGLCompressedTextureS3tcSrgb::WebGLCompressedTextureS3tcSrgb(JS::Realm&, GC::Ref<WebGLRenderingContextBase> context)
+    : m_context(context)
 {
-    m_context->context().request_extension("GL_EXT_texture_compression_s3tc_srgb");
-}
-
-void WebGLCompressedTextureS3tcSrgb::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(WebGLCompressedTextureS3tcSrgb);
-    Base::initialize(realm);
+    m_context->enable_compressed_texture_format(GL_COMPRESSED_SRGB_S3TC_DXT1_EXT);
+    m_context->enable_compressed_texture_format(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT);
+    m_context->enable_compressed_texture_format(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT);
+    m_context->enable_compressed_texture_format(GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT);
 }
 
 void WebGLCompressedTextureS3tcSrgb::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(m_context->gc_cell());
+    visitor.visit(m_context);
 }
 
 }

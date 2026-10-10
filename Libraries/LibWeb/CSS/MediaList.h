@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022, Sam Atkins <atkinssj@serenityos.org>
+ * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
  *
@@ -9,43 +9,52 @@
 #pragma once
 
 #include <AK/Optional.h>
-#include <LibJS/Runtime/Object.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/CSS/MediaQuery.h>
+#include <AK/String.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/CSS/RustMediaList.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
 // https://www.w3.org/TR/cssom-1/#the-medialist-interface
-class MediaList final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(MediaList, Bindings::PlatformObject);
+class MediaList final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(MediaList, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(MediaList);
 
 public:
-    [[nodiscard]] static GC::Ref<MediaList> create(JS::Realm&, Vector<NonnullRefPtr<MediaQuery>>&&);
-    virtual ~MediaList() override = default;
+    [[nodiscard]] static GC::Ref<MediaList> create(RustMediaList);
+    virtual ~MediaList() override;
 
-    String media_text() const;
-    void set_media_text(StringView);
-    size_t length() const { return m_media.size(); }
-    Optional<String> item(u32 index) const;
-    void append_medium(StringView);
-    void delete_medium(StringView);
+    Utf16String media_text() const;
+    void set_media_text(Utf16View);
+    size_t length() const { return m_media.length(); }
+    Optional<Utf16String> item(u32 index) const;
+    void append_medium(Utf16View);
+    WebIDL::ExceptionOr<void> delete_medium(Utf16View);
 
-    virtual Optional<JS::Value> item_value(size_t index) const override;
+    RustMediaList const& native_list() const { return m_media; }
 
-    bool evaluate(DOM::Document const&);
-    bool matches() const;
+    void set_associated_style_sheet(NonnullRefPtr<StyleSheetState>);
 
-    void set_associated_style_sheet(GC::Ref<StyleSheet> style_sheet) { m_associated_style_sheet = style_sheet; }
+    // A media list belongs either to a sheet or to an `@media` rule inside one. Both are gates on
+    // whether rules apply, so both have to say when the gate moves - a rule's list said nothing at
+    // all, and changing a group's media therefore changed no style.
+    void set_associated_rule(GC::Ref<CSSRule> rule) { m_associated_rule = rule; }
 
 private:
-    MediaList(JS::Realm&, Vector<NonnullRefPtr<MediaQuery>>&&);
+    MediaList(RustMediaList);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
-    GC::Ptr<StyleSheet> m_associated_style_sheet;
-    Vector<NonnullRefPtr<MediaQuery>> m_media;
+    RefPtr<StyleSheetState> owning_style_sheet();
+    void invalidate_owners_for_media_change();
+
+    RefPtr<StyleSheetState> m_associated_style_sheet;
+    GC::Ptr<CSSStyleSheet> m_associated_cssom_sheet;
+    GC::Ptr<CSSRule> m_associated_rule;
+    RustMediaList m_media;
 };
+
+void invalidate_style_sheet_for_media_change(StyleSheetState&);
 
 }

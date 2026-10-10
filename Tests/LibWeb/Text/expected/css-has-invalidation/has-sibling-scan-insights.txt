@@ -1,0 +1,2 @@
+[descendant-only :has() sheet]
+[sheet with sibling-sensitive :has()]

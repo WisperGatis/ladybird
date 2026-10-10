@@ -28,11 +28,13 @@ public:
     struct PreloadedResponseCandidatePendingTag { };
     using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, GC::Ref<Response>>;
 
-    [[nodiscard]] static GC::Ref<FetchParams> create(JS::VM&, GC::Ref<Request>, GC::Ref<FetchTimingInfo>);
+    [[nodiscard]] static GC::Ref<FetchParams> create(GC::Ref<Request>, NonnullRefPtr<FetchTimingInfo>);
+    [[nodiscard]] static GC::Ref<FetchParams> copy(FetchParams const&);
 
     [[nodiscard]] GC::Ref<Request> request() const { return m_request; }
+    void set_request(GC::Ref<Request> request) { m_request = request; }
     [[nodiscard]] GC::Ref<FetchController> controller() const { return m_controller; }
-    [[nodiscard]] GC::Ref<FetchTimingInfo> timing_info() const { return m_timing_info; }
+    [[nodiscard]] NonnullRefPtr<FetchTimingInfo> timing_info() const { return m_timing_info; }
 
     [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const { return m_algorithms; }
     void set_algorithms(GC::Ref<FetchAlgorithms const> algorithms) { m_algorithms = algorithms; }
@@ -51,8 +53,12 @@ public:
     [[nodiscard]] bool is_aborted() const;
     [[nodiscard]] bool is_canceled() const;
 
+    [[nodiscard]] bool has_response_body_transfer_lease() const { return m_has_response_body_transfer_lease; }
+    void set_has_response_body_transfer_lease(bool value) { m_has_response_body_transfer_lease = value; }
+
 private:
-    FetchParams(GC::Ref<Request>, GC::Ref<FetchAlgorithms>, GC::Ref<FetchController>, GC::Ref<FetchTimingInfo>);
+    FetchParams(GC::Ref<Request>, GC::Ref<FetchAlgorithms>, GC::Ref<FetchController>, NonnullRefPtr<FetchTimingInfo>);
+    FetchParams(FetchParams const&);
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
@@ -94,12 +100,15 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-params-timing-info
     // timing info
     //     A fetch timing info.
-    GC::Ref<FetchTimingInfo> m_timing_info;
+    NonnullRefPtr<FetchTimingInfo> m_timing_info;
 
     // https://fetch.spec.whatwg.org/#fetch-params-preloaded-response-candidate
     // preloaded response candidate (default null)
     //     Null, "pending", or a response.
     PreloadedResponseCandidate m_preloaded_response_candidate;
+
+    // Non-spec process integration: a navigation response is retained while the UI process selects its document host.
+    bool m_has_response_body_transfer_lease { false };
 };
 
 }

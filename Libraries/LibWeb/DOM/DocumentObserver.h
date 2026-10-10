@@ -6,21 +6,24 @@
 
 #pragma once
 
+#include <LibGC/Cell.h>
 #include <LibGC/Function.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Forward.h>
-#include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/DocumentReadyState.h>
-#include <LibWeb/HTML/VisibilityState.h>
+#include <LibWebCommon/HTML/VisibilityState.h>
 
 namespace Web::DOM {
 
-class WEB_API DocumentObserver final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(DocumentObserver, Bindings::PlatformObject);
+class WEB_API DocumentObserver final : public GC::Cell {
+    GC_CELL(DocumentObserver, GC::Cell);
     GC_DECLARE_ALLOCATOR(DocumentObserver);
 
 public:
+    static GC::Ref<DocumentObserver> create(Document&);
+
     [[nodiscard]] GC::Ptr<GC::Function<void()>> document_became_active() const { return m_document_became_active; }
     void set_document_became_active(Function<void()>);
 
@@ -42,10 +45,14 @@ public:
     GC::Ref<Document> document() { return m_document; }
     void set_document(GC::Ref<Document>);
 
-private:
-    explicit DocumentObserver(JS::Realm&, Document&);
+    // Retargets this observer to the observed element's new document and synthesizes a became-active or
+    // became-inactive callback if the old and new documents differ in fully-active state.
+    void retarget_for_adoption(GC::Ref<Document>);
 
-    virtual void visit_edges(Cell::Visitor&) override;
+private:
+    explicit DocumentObserver(Document&);
+
+    virtual void visit_edges(GC::Cell::Visitor&) override;
     virtual void finalize() override;
 
     GC::Ref<Document> m_document;

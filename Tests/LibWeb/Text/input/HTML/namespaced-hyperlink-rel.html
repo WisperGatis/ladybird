@@ -1,0 +1,54 @@
+<!doctype html>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const server = httpTestServer();
+        const hostname = uniqueLocalhostHostname("namespaced-hyperlink-rel");
+        const openerURL = new URL(
+            await server.createEcho("GET", "/namespaced-rel-opener", {
+                status: 200,
+                body: "ok",
+            })
+        );
+        const noOpenerURL = new URL(
+            await server.createEcho("GET", "/namespaced-rel-no-opener", {
+                status: 200,
+                body: "ok",
+            })
+        );
+        openerURL.hostname = hostname;
+        noOpenerURL.hostname = hostname;
+        const popupURL = new URL(
+            await server.createEcho("GET", "/namespaced-rel-popup", {
+                status: 200,
+                headers: { "Content-Type": "text/html" },
+                body: `<script>fetch(opener ? "${openerURL.href}" : "${noOpenerURL.href}");<\/script>`,
+            })
+        );
+        popupURL.hostname = hostname;
+
+        const anchor = document.createElement("a");
+        anchor.target = "_blank";
+        anchor.href = popupURL;
+        anchor.setAttributeNS("urn:test", "rel", "opener");
+        anchor.setAttributeNS(null, "rel", "noreferrer");
+        document.body.appendChild(anchor);
+        anchor.click();
+
+        for (;;) {
+            try {
+                if ((await fetch(server.recordedRequestHeadersURL(openerURL))).ok) {
+                    println("LEAK");
+                    break;
+                }
+            } catch {}
+            try {
+                if ((await fetch(server.recordedRequestHeadersURL(noOpenerURL))).ok) {
+                    println("PASS");
+                    break;
+                }
+            } catch {}
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+    });
+</script>

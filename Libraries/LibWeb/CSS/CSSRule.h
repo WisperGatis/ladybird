@@ -8,78 +8,77 @@
 #pragma once
 
 #include <AK/String.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibGC/Ptr.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
-#include <LibWeb/CSS/Selector.h>
+#include <LibWeb/CSS/Parser/SourcePosition.h>
+#include <LibWeb/CSS/RustRule.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::CSS {
 
-class WEB_API CSSRule : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(CSSRule, Bindings::PlatformObject);
+class WEB_API CSSRule : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(CSSRule, Bindings::GCAllocatedWrappable);
 
 public:
-    virtual ~CSSRule() = default;
+    static GC::Ref<CSSRule> create(RustRule, GC::Ptr<DOM::Document>);
+    virtual ~CSSRule() override;
 
-    // https://drafts.csswg.org/cssom/#dom-cssrule-type
-    enum class Type : WebIDL::UnsignedShort {
-        Style = 1,
-        Import = 3,
-        Media = 4,
-        FontFace = 5,
-        Page = 6,
-        Keyframes = 7,
-        Keyframe = 8,
-        Margin = 9,
-        Namespace = 10,
-        Supports = 12,
-        // AD-HOC: These are not included in the spec, but we need them internally. So, their numbers are arbitrary.
-        LayerBlock = 100,
-        LayerStatement = 101,
-        NestedDeclarations = 102,
-        Property = 103,
-    };
+    using Type = RustRule::Type;
 
     Type type() const { return m_type; }
+    RustRule const& native_rule() const { return m_native_rule; }
     WebIDL::UnsignedShort type_for_bindings() const;
 
-    String css_text() const;
-    void set_css_text(StringView);
+    Utf16String css_text() const;
+    void set_css_text(Utf16View);
 
     CSSRule* parent_rule() { return m_parent_rule.ptr(); }
     CSSRule const* parent_rule() const { return m_parent_rule.ptr(); }
     void set_parent_rule(CSSRule*);
+    static constexpr size_t parent_rule_offset() { return offsetof(CSSRule, m_parent_rule); }
 
-    CSSStyleSheet* parent_style_sheet() { return m_parent_style_sheet.ptr(); }
-    virtual void set_parent_style_sheet(CSSStyleSheet*);
+    StyleSheetState* parent_style_sheet() { return m_parent_style_sheet.ptr(); }
+    StyleSheetState const* parent_style_sheet() const { return m_parent_style_sheet.ptr(); }
+    MUST_UPCALL virtual void set_parent_style_sheet(StyleSheetState*);
+    CSSStyleSheet* parent_style_sheet_for_bindings() const;
+
+    Optional<SourcePosition> const& source_location() const { return m_source_position; }
 
     template<typename T>
     bool fast_is() const = delete;
 
     // https://drafts.csswg.org/cssom-1/#serialize-a-css-rule
-    virtual String serialized() const = 0;
+    virtual Utf16String serialized() const = 0;
 
-    virtual void clear_caches();
+    MUST_UPCALL virtual void dump(StringBuilder&, int indent_levels = 0) const;
+
+    MUST_UPCALL virtual void clear_caches();
 
 protected:
-    CSSRule(JS::Realm&, Type);
+    explicit CSSRule(RustRule);
 
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
-    [[nodiscard]] FlyString const& parent_layer_internal_qualified_name() const
+    [[nodiscard]] Utf16FlyString const& parent_layer_internal_qualified_name() const
     {
         return m_cached_layer_name.ensure([&] { return parent_layer_internal_qualified_name_slow_case(); });
     }
 
-    [[nodiscard]] FlyString parent_layer_internal_qualified_name_slow_case() const;
+    [[nodiscard]] Utf16FlyString parent_layer_internal_qualified_name_slow_case() const;
 
     Type m_type;
+    RustRule m_native_rule;
     GC::Ptr<CSSRule> m_parent_rule;
-    GC::Ptr<CSSStyleSheet> m_parent_style_sheet;
+    RefPtr<StyleSheetState> m_parent_style_sheet;
+    GC::Ptr<CSSStyleSheet> m_parent_cssom_sheet;
 
-    mutable Optional<FlyString> m_cached_layer_name;
+    Optional<SourcePosition> m_source_position;
+    mutable Optional<Utf16FlyString> m_cached_layer_name;
 };
 
 }

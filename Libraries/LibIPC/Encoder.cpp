@@ -9,16 +9,16 @@
 #include <AK/BitCast.h>
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
-#include <AK/JsonObject.h>
+#include <AK/Checked.h>
 #include <AK/JsonValue.h>
 #include <AK/NumericLimits.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibCore/AnonymousBuffer.h>
-#include <LibCore/Proxy.h>
-#include <LibCore/System.h>
+#include <LibIPC/Attachment.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/File.h>
 #include <LibURL/Origin.h>
@@ -28,8 +28,7 @@ namespace IPC {
 
 ErrorOr<void> Encoder::encode_size(size_t size)
 {
-    if (static_cast<u64>(size) > static_cast<u64>(NumericLimits<u32>::max()))
-        return Error::from_string_literal("Container exceeds the maximum allowed size");
+    VERIFY(size <= NumericLimits<u32>::max());
     return encode(static_cast<u32>(size));
 }
 
@@ -66,15 +65,23 @@ ErrorOr<void> encode(Encoder& encoder, Utf16String const& value)
 }
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, Utf16FlyString const& value)
+{
+    return encoder.encode(value.view());
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, Utf16View const& value)
 {
     TRY(encoder.encode(value.has_ascii_storage()));
     TRY(encoder.encode_size(value.length_in_code_units()));
 
-    if (value.has_ascii_storage())
+    if (value.has_ascii_storage()) {
         TRY(encoder.append(value.bytes().data(), value.length_in_code_units()));
-    else
+    } else {
+        VERIFY(!Checked<size_t>::multiplication_would_overflow(value.length_in_code_units(), sizeof(char16_t)));
         TRY(encoder.append(reinterpret_cast<u8 const*>(value.utf16_span().data()), value.length_in_code_units() * sizeof(char16_t)));
+    }
 
     return {};
 }
@@ -112,20 +119,36 @@ ErrorOr<void> encode(Encoder& encoder, UnixDateTime const& value)
 }
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, IPv4Address const& ipv4)
+{
+    return encoder.encode(ipv4.to_u32());
+}
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, IPv6Address const& ipv6)
+{
+    auto const& data = ipv6.to_in6_addr_t();
+    return encoder.encode(ReadonlySpan<u8>(data));
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, URL::URL const& value)
 {
     TRY(encoder.encode(value.serialize()));
+    TRY(encoder.encode(value.blob_url_entry()));
+    return {};
+}
 
-    if (!value.blob_url_entry().has_value())
-        return encoder.encode(false);
-
-    TRY(encoder.encode(true));
-
-    auto const& entry = value.blob_url_entry().value();
-
-    TRY(encoder.encode(entry.object));
+template<>
+ErrorOr<void> encode(Encoder& encoder, URL::BlobURLEntry const& entry)
+{
+    // NB: The entry's object stays in this process. Only the origin and the token are sent, and the receiver asks the
+    //     user agent's blob URL store for the object by token.
+    auto const* blob = entry.object.get_pointer<URL::BlobURLEntry::Blob>();
+    TRY(encoder.encode(blob != nullptr));
+    if (blob)
+        TRY(encoder.encode(blob->token));
     TRY(encoder.encode(entry.environment.origin));
-
     return {};
 }
 
@@ -134,12 +157,14 @@ ErrorOr<void> encode(Encoder& encoder, URL::Origin const& origin)
 {
     if (origin.is_opaque()) {
         TRY(encoder.encode(true));
-        TRY(encoder.encode(origin.nonce()));
+        TRY(encoder.encode(origin.opaque_data().nonce));
+        TRY(encoder.encode(origin.opaque_data().type));
     } else {
         TRY(encoder.encode(false));
         TRY(encoder.encode(origin.scheme()));
         TRY(encoder.encode(origin.host()));
         TRY(encoder.encode(origin.port()));
+        TRY(encoder.encode(origin.domain()));
     }
 
     return {};
@@ -153,11 +178,18 @@ ErrorOr<void> encode(Encoder& encoder, URL::Host const& host)
 }
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, URL::OpaqueHost const& opaque_host)
+{
+    return encoder.encode(opaque_host.value);
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, File const& file)
 {
     int fd = file.take_fd();
+    VERIFY(fd >= 0);
 
-    TRY(encoder.append_file_descriptor(fd));
+    TRY(encoder.append_attachment(Attachment::from_fd(fd)));
     return {};
 }
 
@@ -173,33 +205,10 @@ ErrorOr<void> encode(Encoder& encoder, Core::AnonymousBuffer const& buffer)
     TRY(encoder.encode(buffer.is_valid()));
 
     if (buffer.is_valid()) {
-        TRY(encoder.encode_size(buffer.size()));
+        TRY(encoder.encode(static_cast<u64>(buffer.size())));
         TRY(encoder.encode(TRY(IPC::File::clone_fd(buffer.fd()))));
     }
 
-    return {};
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Core::ProxyData const& proxy)
-{
-    TRY(encoder.encode(proxy.type));
-    TRY(encoder.encode(proxy.host_ipv4));
-    TRY(encoder.encode(proxy.port));
-    return {};
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, URL::BlobURLEntry::Blob const& blob)
-{
-    TRY(encoder.encode(blob.type));
-    TRY(encoder.encode(blob.data));
-    return {};
-}
-
-template<>
-ErrorOr<void> encode(Encoder&, URL::BlobURLEntry::MediaSource const&)
-{
     return {};
 }
 

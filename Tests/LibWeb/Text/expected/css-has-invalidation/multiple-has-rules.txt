@@ -1,0 +1,2 @@
+[add .red (only :has(.red) flips)]
+[add .blue (only :has(.blue) flips, .red stable)]

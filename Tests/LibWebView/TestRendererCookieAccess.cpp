@@ -1,0 +1,168 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/LexicalPath.h>
+#include <AK/Random.h>
+#include <AK/ScopeGuard.h>
+#include <LibCore/Directory.h>
+#include <LibCore/Environment.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/StandardPaths.h>
+#include <LibFileSystem/FileSystem.h>
+#include <LibGfx/SystemTheme.h>
+#include <LibHTTP/Cookie/Cookie.h>
+#include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibMain/Main.h>
+#include <LibURL/Parser.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
+#include <LibWebView/Application.h>
+#include <LibWebView/BlobURLStore.h>
+#include <LibWebView/BrowsingSession.h>
+#include <LibWebView/CanonicalDocument.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
+#include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/CanonicalWindow.h>
+#include <LibWebView/CookieJar.h>
+#include <LibWebView/HeadlessWebView.h>
+#include <LibWebView/Utilities.h>
+#include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebContentPage.h>
+
+namespace {
+
+// Neither WebDriver nor the test harness drives this application, so its renderers get no HTTP-like cookie access.
+class TestApplication : public WebView::Application {
+    WEB_VIEW_APPLICATION(TestApplication)
+
+public:
+    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
+        : WebView::Application(move(ladybird_binary_path))
+    {
+    }
+
+    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
+    {
+        browser_options.headless_mode = WebView::HeadlessMode::Test;
+        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
+        web_content_options.is_test_mode = WebView::IsTestMode::No;
+    }
+
+    virtual bool should_coordinate_browser_process() const override { return false; }
+};
+
+}
+
+// A renderer must not read or write cookies the way an HTTP response or WebDriver does: that would expose and let it
+// replace the HttpOnly cookies of every site. RequestServer handles the cookies of HTTP traffic itself, so the UI process
+// treats such a request from a renderer as misbehavior and terminates it, and the cookie jar stays untouched.
+
+ErrorOr<int> ladybird_main(Main::Arguments arguments)
+{
+    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestRendererCookieAccess-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
+    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
+    auto cleanup_test_config_directory = ScopeGuard([&] {
+        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
+    });
+    MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, test_config_directory, Core::Environment::Overwrite::Yes));
+
+#if defined(LADYBIRD_BINARY_PATH)
+    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
+#else
+    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
+#endif
+
+    auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
+    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+
+    auto victim_url = URL::Parser::basic_parse("https://victim.example/"sv).release_value();
+
+    // The messages below go straight to the UI process's handlers, which only need the view's page to be assigned. A
+    // view may be given a spare process that finished its initial load before the view existed, so there is no load
+    // to wait for.
+    auto create_view = [&] {
+        return WebView::HeadlessWebView::create(theme, { 800, 600 });
+    };
+
+    auto victim_cookie_value = [&](WebView::CookieJar& cookie_jar, StringView name = "session"sv) -> Optional<String> {
+        for (auto const& cookie : cookie_jar.get_all_cookies_webdriver(victim_url)) {
+            if (cookie.name == name)
+                return cookie.value;
+        }
+        return {};
+    };
+
+    auto view = create_view();
+    auto& cookie_jar = *view->page().client().session().cookie_jar;
+    cookie_jar.set_cookie(victim_url, HTTP::Cookie::ParsedCookie { .name = "session"_string, .value = "secret"_string, .http_only_attribute_present = true }, HTTP::Cookie::Source::Http, {});
+    VERIFY(victim_cookie_value(cookie_jar) == "secret"sv);
+
+    // Script reaches cookies through a document the process hosts, and only those of such a document's origin. Any
+    // other access sees and changes nothing, but is not misbehavior: a document can outlive the UI process's record
+    // of it.
+    cookie_jar.set_cookie(victim_url, HTTP::Cookie::ParsedCookie { .name = "visible"_string, .value = "secret"_string }, HTTP::Cookie::Source::Http, {});
+    auto& stub = static_cast<WebContentClientStub&>(view->page().client());
+    auto page_id = view->page().id();
+    auto page_environment_id = view->traversable().active_document().relevant_global_object().relevant_settings_object().id();
+    for (auto const& environment_id : { Web::HTML::EnvironmentId::generate(), page_environment_id }) {
+        VERIFY(stub.did_request_cookie(page_id, environment_id, victim_url, HTTP::Cookie::Source::NonHttp).cookie().cookie.is_empty());
+        VERIFY(stub.did_request_all_cookies_cookiestore(page_id, environment_id, victim_url).cookies().is_empty());
+        stub.did_set_cookie(page_id, environment_id, victim_url, HTTP::Cookie::ParsedCookie { .name = "visible"_string, .value = "attacker"_string }, HTTP::Cookie::Source::NonHttp);
+        VERIFY(victim_cookie_value(cookie_jar, "visible"sv) == "secret"sv);
+    }
+
+    // A blob URL entry has the origin of the environment that added it, and only that origin revokes it.
+    auto& blob_url_store = *view->page().client().session().blob_url_store;
+    auto victim_blob_url = "blob:https://victim.example/entry"_utf16;
+    auto forged_blob_url = "blob:https://victim.example/forged"_utf16;
+    Web::FileAPI::SerializedBlobURLEntry victim_entry { .object = Web::FileAPI::SerializedBlobURLEntry::MediaSource {}, .origin = victim_url.origin() };
+    blob_url_store.add_entry(victim_blob_url, victim_entry, WeakPtr<WebView::WebContentClient> {});
+    for (auto const& environment_id : { Web::HTML::EnvironmentId::generate(), page_environment_id }) {
+        stub.did_add_blob_url_entry(page_id, environment_id, forged_blob_url, victim_entry);
+        auto forged_entry = blob_url_store.resolve(forged_blob_url, {});
+        VERIFY(!forged_entry.has_value() || !forged_entry->origin.is_same_origin(victim_url.origin()));
+        stub.did_remove_blob_url_entries(page_id, environment_id, { victim_blob_url });
+        VERIFY(blob_url_store.resolve(victim_blob_url, {}).has_value());
+    }
+
+    auto expect_rejected = [&](StringView what, Function<void(WebContentClientStub&, Web::PageId)> send) {
+        auto view = create_view();
+        Optional<WebView::ViewImplementation::WebContentCrashReason> crash_reason;
+        view->on_web_content_crashed = [&](auto reason) { crash_reason = reason; };
+
+        send(static_cast<WebContentClientStub&>(view->page().client()), view->page().id());
+        Core::EventLoop::current().spin_until([&]() { return crash_reason.has_value(); });
+
+        if (crash_reason != WebView::ViewImplementation::WebContentCrashReason::RejectedIPC) {
+            warnln("FAIL: {} was not rejected", what);
+            VERIFY_NOT_REACHED();
+        }
+        VERIFY(victim_cookie_value(cookie_jar) == "secret"sv);
+    };
+
+    expect_rejected("reading cookies with the HTTP source"sv, [&](auto& stub, auto page_id) {
+        VERIFY(stub.did_request_cookie(page_id, {}, victim_url, HTTP::Cookie::Source::Http).cookie().cookie.is_empty());
+    });
+    expect_rejected("reading all cookies for WebDriver"sv, [&](auto& stub, auto) {
+        VERIFY(stub.did_request_all_cookies_webdriver(victim_url, {}).cookies().is_empty());
+    });
+    expect_rejected("storing a cookie with the HTTP source"sv, [&](auto& stub, auto page_id) {
+        stub.did_set_cookie(page_id, {}, victim_url, HTTP::Cookie::ParsedCookie { .name = "session"_string, .value = "attacker"_string, .http_only_attribute_present = true }, HTTP::Cookie::Source::Http);
+    });
+    expect_rejected("reading a named cookie for WebDriver"sv, [&](auto& stub, auto) {
+        VERIFY(!stub.did_request_named_cookie(victim_url, "session"_string).cookie().has_value());
+    });
+    expect_rejected("deleting all cookies of a URL"sv, [&](auto& stub, auto page_id) {
+        stub.did_request_delete_all_cookies(page_id, 0, victim_url);
+    });
+    expect_rejected("updating a cookie by its identity"sv, [&](auto& stub, auto) {
+        auto cookie = cookie_jar.get_all_cookies_webdriver(victim_url).first();
+        cookie.value = "attacker"_string;
+        stub.did_update_cookie(move(cookie));
+    });
+
+    outln("PASS: renderers cannot read, store or update cookies the way HTTP responses and WebDriver do, nor reach another origin's cookies or blob URL entries");
+    return 0;
+}

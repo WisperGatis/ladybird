@@ -1,0 +1,997 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Format.h>
+#include <AK/Math.h>
+#include <AK/NonnullOwnPtr.h>
+#include <LibIPC/Decoder.h>
+#include <LibIPC/Encoder.h>
+#include <LibMedia/DecoderError.h>
+#include <LibMedia/DecoderRegistry.h>
+#include <LibMedia/MediaSourceExtensions/ByteStreamParser.h>
+#include <LibMedia/MediaSourceExtensions/SourceBufferDemuxer.h>
+#include <LibMedia/MediaSourceExtensions/SourceBufferProcessor.h>
+#include <LibMedia/MediaSourceExtensions/TrackBuffer.h>
+#include <LibMedia/ReadonlyBytesCursor.h>
+
+namespace Media::MediaSourceExtensions {
+
+SourceBufferProcessor::SourceBufferProcessor()
+    : m_cursor(adopt_ref(*new Media::ReadonlyBytesCursor({})))
+{
+}
+SourceBufferProcessor::~SourceBufferProcessor() = default;
+
+void SourceBufferProcessor::run(Command command)
+{
+    enqueue(move(command));
+    run_pending_commands();
+}
+
+void SourceBufferProcessor::enqueue(Command command)
+{
+    m_pending_commands.append(move(command));
+}
+
+// Subtitle tracks have no decoder to ask, so only the media tracks are checked.
+static bool codecs_are_supported(Vector<Media::Track> const& tracks)
+{
+    for (auto const& track : tracks) {
+        if (track.type() == Media::TrackType::Subtitles)
+            continue;
+        if (!Media::decoder_capabilities(track.parsed_codec()).has_value())
+            return false;
+    }
+    return true;
+}
+
+void SourceBufferProcessor::run_pending_commands()
+{
+    // NB: Executing a command can enqueue further ones — the append-error path resets the parser
+    //     state — so the queue is drained rather than iterated.
+    if (m_running_commands)
+        return;
+    m_running_commands = true;
+    while (!m_pending_commands.is_empty()) {
+        auto command = m_pending_commands.take_first();
+        execute(command);
+        publish();
+    }
+    m_running_commands = false;
+}
+
+void SourceBufferProcessor::abandon_buffer_append()
+{
+    m_pending_commands.remove_all_matching([](Command const& command) {
+        return command.has<Commands::BufferAppend>();
+    });
+}
+
+void SourceBufferProcessor::execute(Command& command)
+{
+    command.visit(
+        [&](Commands::SetParser& set_parser) {
+            m_parser = move(set_parser.parser);
+        },
+        [&](Commands::BufferAppend& buffer_append) {
+            // https://w3c.github.io/media-source/#dom-sourcebuffer-appendbuffer
+            // 2. Add data to the end of the [[input buffer]].
+            // NB: The spec adds the data in appendBuffer() before the buffer append algorithm is
+            //     run. It is added here so that a reset queued ahead of this append still empties
+            //     the input buffer the append then writes into.
+            m_input_buffer.append(buffer_append.data);
+            m_cursor->set_data(m_input_buffer.bytes());
+            run_segment_parser_loop();
+        },
+        [&](Commands::ResetParserState&) {
+            reset_parser_state();
+        },
+        [&](Commands::CodedFrameRemoval& removal) {
+            run_coded_frame_removal(removal.start, removal.end);
+        },
+        [&](Commands::CodedFrameEviction& eviction) {
+            run_coded_frame_eviction(eviction.new_data_size, eviction.current_time);
+        },
+        [&](Commands::SetMode& set_mode) {
+            // https://w3c.github.io/media-source/#dom-sourcebuffer-mode
+            // 6. If the new value equals "sequence", then set the [[group start timestamp]] to the
+            //    [[group end timestamp]].
+            if (set_mode.mode == AppendMode::Sequence)
+                m_group_start_timestamp = m_group_end_timestamp;
+            // 7. Update the attribute to the new value.
+            m_mode = set_mode.mode;
+        },
+        [&](Commands::SetTimestampOffset& set_timestamp_offset) {
+            // https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset
+            // 6. If the mode attribute equals "sequence", then set the [[group start timestamp]] to
+            //    new timestamp offset.
+            if (m_mode == AppendMode::Sequence)
+                m_group_start_timestamp = set_timestamp_offset.timestamp_offset;
+            // 7. Update the attribute to new timestamp offset.
+            m_timestamp_offset = set_timestamp_offset.timestamp_offset;
+        },
+        [&](Commands::SetAppendWindow& set_append_window) {
+            m_append_window_start = set_append_window.start;
+            m_append_window_end = set_append_window.end;
+        },
+        [&](Commands::SetGenerateTimestampsFlag& set_flag) {
+            m_generate_timestamps_flag = set_flag.flag;
+        },
+        [&](Commands::SetPendingInitializationSegmentForChangeTypeFlag& set_flag) {
+            m_pending_initialization_segment_for_change_type_flag = set_flag.flag;
+        },
+        [&](Commands::SetReachedEndOfStream& reached_end_of_stream) {
+            set_reached_end_of_stream(reached_end_of_stream.reached);
+        });
+}
+
+void SourceBufferProcessor::publish()
+{
+    m_published_state = {
+        .track_buffered_ranges = track_buffered_ranges(),
+        .timestamp_offset = m_timestamp_offset,
+        .append_state = m_append_state,
+        .mode = m_mode,
+        .generate_timestamps_flag = m_generate_timestamps_flag,
+        .buffer_full = m_buffer_full_flag,
+        .highest_presentation_timestamp = highest_presentation_timestamp(),
+        .highest_end_time = highest_end_time(),
+        .buffered_bytes = total_buffered_bytes(),
+        .capacity_bytes = capacity_in_bytes(),
+    };
+}
+
+static constexpr size_t AUDIO_TRACK_BYTE_CAPACITY = 12 * MiB;
+static constexpr size_t VIDEO_TRACK_BYTE_CAPACITY = 150 * MiB;
+static constexpr size_t TEXT_TRACK_BYTE_CAPACITY = 1 * MiB;
+
+size_t SourceBufferProcessor::total_buffered_bytes() const
+{
+    size_t total = 0;
+    for (auto const& [track_id, track_buffer] : m_track_buffers)
+        total += track_buffer->demuxer().total_bytes(track_buffer->track());
+    return total;
+}
+
+size_t SourceBufferProcessor::capacity_in_bytes() const
+{
+    size_t total = 0;
+    for (auto const& [track_id, track_buffer] : m_track_buffers) {
+        switch (track_buffer->track().type()) {
+        case Media::TrackType::Audio:
+            total += AUDIO_TRACK_BYTE_CAPACITY;
+            break;
+        case Media::TrackType::Video:
+            total += VIDEO_TRACK_BYTE_CAPACITY;
+            break;
+        case Media::TrackType::Subtitles:
+            total += TEXT_TRACK_BYTE_CAPACITY;
+            break;
+        case Media::TrackType::Unknown:
+            break;
+        }
+    }
+    return total;
+}
+
+size_t SourceBufferProcessor::evictable_bytes(AK::Duration current_time) const
+{
+    size_t total = 0;
+    for (auto const& [track_id, track_buffer] : m_track_buffers)
+        total += track_buffer->demuxer().evictable_bytes_when_taking_all_earliest_frames(track_buffer->track(), current_time);
+    return total;
+}
+
+void SourceBufferProcessor::set_duration_change_callback(DurationChangeCallback callback)
+{
+    m_duration_change_callback = move(callback);
+}
+
+void SourceBufferProcessor::set_first_initialization_segment_callback(InitializationSegmentCallback callback)
+{
+    m_first_initialization_segment_callback = move(callback);
+}
+
+void SourceBufferProcessor::set_append_error_callback(AppendErrorCallback callback)
+{
+    m_append_error_callback = move(callback);
+}
+
+void SourceBufferProcessor::set_coded_frame_processing_done_callback(CodedFrameProcessingDoneCallback callback)
+{
+    m_coded_frame_processing_done_callback = move(callback);
+}
+
+void SourceBufferProcessor::set_append_done_callback(AppendDoneCallback callback)
+{
+    m_append_done_callback = move(callback);
+}
+
+// https://w3c.github.io/media-source/#sourcebuffer-segment-parser-loop
+void SourceBufferProcessor::run_segment_parser_loop()
+{
+    VERIFY(m_parser);
+
+    while (true) {
+        // 1. Loop Top: If the [[input buffer]] is empty, then jump to the need more data step below.
+        if (m_cursor->position() >= m_cursor->blocking_size())
+            goto need_more_data;
+
+        // 2. If the [[input buffer]] contains bytes that violate the SourceBuffer byte stream format specification,
+        //    then run the append error algorithm and abort this algorithm.
+        // AD-HOC: We'll react to this below when actually parsing the segments.
+
+        // 3. Remove any bytes that the byte stream format specifications say MUST be ignored from the start of
+        //    the [[input buffer]].
+        {
+            auto skip_result = m_parser->skip_ignored_bytes(*m_cursor);
+            if (skip_result.is_error()) {
+                if (skip_result.error().category() == Media::DecoderErrorCategory::EndOfStream)
+                    goto need_more_data;
+                m_append_error_callback();
+                return;
+            }
+            drop_consumed_bytes_from_input_buffer();
+        }
+
+        // 4. If the [[append state]] equals WAITING_FOR_SEGMENT, then run the following steps:
+        if (m_append_state == AppendState::WaitingForSegment) {
+            auto sniff_result = m_parser->sniff_segment_type(*m_cursor);
+            if (sniff_result.is_error()) {
+                m_append_error_callback();
+                return;
+            }
+            auto segment_type = sniff_result.value();
+
+            // 1. If the beginning of the [[input buffer]] indicates the start of an initialization segment, set the
+            //    [[append state]] to PARSING_INIT_SEGMENT.
+            if (segment_type == SegmentType::InitializationSegment) {
+                m_append_state = AppendState::ParsingInitSegment;
+                // 2. If the beginning of the [[input buffer]] indicates the start of a media segment, set [[append
+                //    state]] to PARSING_MEDIA_SEGMENT.
+            } else if (segment_type == SegmentType::MediaSegment) {
+                m_append_state = AppendState::ParsingMediaSegment;
+            } else if (segment_type == SegmentType::Incomplete) {
+                // NB: If we cannot determine the type due to an incomplete segment, this is equivalent to if we were
+                //     parsing an initialization segment and didn't have enough data, which would result in jumping to
+                //     the need more data step.
+                goto need_more_data;
+            } else {
+                VERIFY(segment_type == SegmentType::Unknown);
+                m_append_error_callback();
+                return;
+            }
+
+            // 3. Jump to the loop top step above.
+            continue;
+        }
+
+        // 5. If the [[append state]] equals PARSING_INIT_SEGMENT, then run the following steps:
+        if (m_append_state == AppendState::ParsingInitSegment) {
+            // 1. If the [[input buffer]] does not contain a complete initialization segment yet, then jump to the need
+            //    more data step below.
+            auto parse_result = m_parser->parse_initialization_segment(*m_cursor);
+            if (parse_result.is_error()) {
+                if (parse_result.error().category() == Media::DecoderErrorCategory::EndOfStream)
+                    goto need_more_data;
+
+                // AD-HOC: Handle bytes that violate the byte stream format specification as specified above.
+                m_append_error_callback();
+                return;
+            }
+
+            // 2. Run the initialization segment received algorithm.
+            // AD-HOC: If the initialization-segment-received algorithm ran the append-error algorithm, abort this.
+            //         Otherwise, this loop would complete normally and invoke the append done callback — and the
+            //         buffer-append algorithm would complete the failed append, firing update and updateend events
+            //         after the error and updateend events queued by the append-error algorithm.
+            if (!initialization_segment_received())
+                return;
+
+            // 3. Remove the initialization segment bytes from the beginning of the [[input buffer]].
+            drop_consumed_bytes_from_input_buffer();
+
+            // 4. Set [[append state]] to WAITING_FOR_SEGMENT.
+            m_append_state = AppendState::WaitingForSegment;
+
+            // 5. Jump to the loop top step above.
+            continue;
+        }
+
+        // 6. If the [[append state]] equals PARSING_MEDIA_SEGMENT, then run the following steps:
+        if (m_append_state == AppendState::ParsingMediaSegment) {
+            // 1. If the [[first initialization segment received flag]] is false or the [[pending initialization
+            //    segment for changeType flag]] is true, then run the append error algorithm and abort this algorithm.
+            if (!m_first_initialization_segment_received_flag || m_pending_initialization_segment_for_change_type_flag) {
+                m_append_error_callback();
+                return;
+            }
+
+            {
+                // 2. If the [[input buffer]] contains one or more complete coded frames, then run the coded frame
+                //    processing algorithm.
+                auto parse_result = m_parser->parse_media_segment(*m_cursor);
+                if (parse_result.is_error()) {
+                    // AD-HOC: Handle bytes that violate the byte stream format specification as specified above.
+                    m_append_error_callback();
+                    return;
+                }
+
+                run_coded_frame_processing(parse_result.value().coded_frames);
+
+                // FIXME: 3. If this SourceBuffer is full and cannot accept more media data, then set the [[buffer full flag]]
+                //           to true.
+
+                // 4. If the [[input buffer]] does not contain a complete media segment, then jump to the need more
+                //    data step below.
+                if (!parse_result.value().completed_segment)
+                    goto need_more_data;
+            }
+
+            // 5. Remove the media segment bytes from the beginning of the [[input buffer]].
+            drop_consumed_bytes_from_input_buffer();
+
+            // 6. Set [[append state]] to WAITING_FOR_SEGMENT.
+            m_append_state = AppendState::WaitingForSegment;
+
+            // 7. Jump to the loop top step above.
+            continue;
+        }
+
+        // 7. Need more data: Return control to the calling algorithm.
+    need_more_data:
+        drop_consumed_bytes_from_input_buffer();
+        m_append_done_callback();
+        return;
+    }
+}
+
+// https://w3c.github.io/media-source/#sourcebuffer-reset-parser-state
+void SourceBufferProcessor::reset_parser_state()
+{
+    // 1. If the [[append state]] equals PARSING_MEDIA_SEGMENT and the [[input buffer]] contains some
+    //    complete coded frames, then run the coded frame processing algorithm until all of these
+    //    complete coded frames have been processed.
+    if (m_append_state == AppendState::ParsingMediaSegment) {
+        // FIXME: Process any complete coded frames
+    }
+
+    if (m_parser)
+        m_parser->reset_parser_state();
+
+    // 2. Unset the last decode timestamp on all track buffers.
+    // 3. Unset the last frame duration on all track buffers.
+    // 4. Unset the highest end timestamp on all track buffers.
+    unset_all_track_buffer_timestamps();
+
+    // 5. Set the need random access point flag on all track buffers to true.
+    set_need_random_access_point_flag_on_all_track_buffers(true);
+
+    // 6. If the mode attribute equals "sequence", then
+    if (m_mode == AppendMode::Sequence) {
+        // set the [[group start timestamp]] to the [[group end timestamp]]
+        m_group_start_timestamp = m_group_end_timestamp;
+    }
+
+    // 7. Remove all bytes from the [[input buffer]].
+    m_input_buffer.clear();
+    m_cursor->set_data({});
+    MUST(m_cursor->seek(0, AK::SeekMode::SetPosition));
+
+    // 8. Set [[append state]] to WAITING_FOR_SEGMENT.
+    m_append_state = AppendState::WaitingForSegment;
+}
+
+// https://w3c.github.io/media-source/#sourcebuffer-init-segment-received
+// AD-HOC: Returns false if the append-error algorithm was run — so that the segment parser loop can abort.
+bool SourceBufferProcessor::initialization_segment_received()
+{
+    // 1. Update the duration attribute if it currently equals NaN:
+    // AD-HOC: Pass off the duration to the callback, and allow it to check for NaN.
+    {
+        // If the initialization segment contains a duration:
+        if (m_parser->duration().has_value()) {
+            // Run the duration change algorithm with new duration set to the duration in the initialization segment.
+            m_duration_change_callback(m_parser->duration().value().to_seconds_f64());
+        }
+        // Otherwise:
+        else {
+            // Run the duration change algorithm with new duration set to positive Infinity.
+            m_duration_change_callback(AK::Infinity<double>);
+        }
+    }
+
+    // 2. If the initialization segment has no audio, video, or text tracks, then run the append error algorithm
+    //    and abort these steps.
+    if (m_parser->video_tracks().is_empty() && m_parser->audio_tracks().is_empty() && m_parser->text_tracks().is_empty()) {
+        m_append_error_callback();
+        return false;
+    }
+
+    // 3. If the [[first initialization segment received flag]] is true, then run the following steps:
+    if (m_first_initialization_segment_received_flag) {
+        // 1. Verify the following properties. If any of the checks fail then run the append error algorithm
+        //    and abort these steps.
+        //        - The number of audio, video, and text tracks match what was in the first initialization segment.
+        //        - If more than one track for a single type are present (e.g., 2 audio tracks), then the Track IDs
+        //          match the ones in the first initialization segment.
+        //        - The codecs for each track are supported by the user agent.
+        // NB: Track buffers are keyed by Track ID, so finding one of a matching type for every track in this segment
+        //     and counting the same number of them covers both of the first two checks.
+        size_t track_count = 0;
+        for (auto const* tracks : { &m_parser->audio_tracks(), &m_parser->video_tracks(), &m_parser->text_tracks() }) {
+            for (auto const& track : *tracks) {
+                track_count++;
+                auto track_buffer = m_track_buffers.get(track.identifier());
+                if (!track_buffer.has_value() || track_buffer.value()->track().type() != track.type()) {
+                    m_append_error_callback();
+                    return false;
+                }
+            }
+            if (!codecs_are_supported(*tracks)) {
+                m_append_error_callback();
+                return false;
+            }
+        }
+        if (track_count != m_track_buffers.size()) {
+            m_append_error_callback();
+            return false;
+        }
+
+        // 2. Add the appropriate track descriptions from this initialization segment to each of the track buffers.
+        // NB: A track's description travels with its coded frames, since the parser gives the first frame that
+        //     follows an initialization segment the codec and configuration that it selects.
+
+        // 3. Set the need random access point flag on all track buffers to true.
+        set_need_random_access_point_flag_on_all_track_buffers(true);
+    }
+
+    // 4. Let active track flag equal false.
+    // NB: active track flag is never true unless [[first initialization segment received flag]] is true, and it is
+    //     used only by the synchronous code, so we handle this in the callback invoked below.
+
+    // 5. If the [[first initialization segment received flag]] is false, then run the following steps:
+    if (!m_first_initialization_segment_received_flag) {
+        // 1. If the initialization segment contains tracks with codecs the user agent does not support, then run
+        //    the append error algorithm and abort these steps.
+        for (auto const* tracks : { &m_parser->audio_tracks(), &m_parser->video_tracks(), &m_parser->text_tracks() }) {
+            if (!codecs_are_supported(*tracks)) {
+                m_append_error_callback();
+                return false;
+            }
+        }
+
+        // AD-HOC: The coded frames of all of this SourceBuffer's track buffers are stored by one demuxer, since the
+        //         buffered ranges that limit playback of each track are shared by all of them.
+        Vector<Media::Track> all_tracks;
+        all_tracks.extend(m_parser->audio_tracks());
+        all_tracks.extend(m_parser->video_tracks());
+        all_tracks.extend(m_parser->text_tracks());
+        auto demuxer = make_ref_counted<SourceBufferDemuxer>(all_tracks);
+        m_demuxer = demuxer;
+
+        auto build_tracks = [&](Vector<Media::Track> const& tracks) {
+            // 2. For each audio track in the initialization segment, run following steps:
+            // 3. For each video track in the initialization segment, run following steps:
+            // 4. For each text track in the initialization segment, run following steps:
+            for (auto const& track : tracks) {
+                // AD-HOC: Steps 1-6 are handled in the callback invoked below.
+
+                // 7. Create a new track buffer to store coded frames for this track.
+                // 8. Add the track description for this track to the track buffer.
+                m_track_buffers.set(track.identifier(), make<TrackBuffer>(demuxer, track));
+            }
+            // AD-HOC: Pass off the track information to the callback so that it can initialize the DOM objects.
+            return tracks;
+        };
+
+        m_first_initialization_segment_callback({
+            .demuxer = demuxer,
+            .audio_tracks = build_tracks(m_parser->audio_tracks()),
+            .video_tracks = build_tracks(m_parser->video_tracks()),
+            .text_tracks = build_tracks(m_parser->text_tracks()),
+        });
+
+        // 6. Set [[first initialization segment received flag]] to true.
+        m_first_initialization_segment_received_flag = true;
+    }
+
+    // 6. Set [[pending initialization segment for changeType flag]] to false.
+    m_pending_initialization_segment_for_change_type_flag = false;
+
+    // 7. If the active track flag equals true, then run the following steps:
+    // NB: Steps 8-9 (updating the element's readyState) are handled by the initialization segment callback invoked
+    //     above. Since active track flag is only true if the first initialization segment was being received, this
+    //     will only need to happen when that callback is invoked, so we don't need separate one.
+
+    return true;
+}
+
+// https://w3c.github.io/media-source/#sourcebuffer-coded-frame-processing
+void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>& coded_frames)
+{
+    // 1. For each coded frame in the media segment run the following steps:
+    for (auto& demuxed_frame : coded_frames) {
+        auto& frame = demuxed_frame.coded_frame;
+
+        // 1. Loop Top:
+    loop_top:
+
+        // FIXME: If generate timestamps flag equals true:
+        //            1. Let presentation timestamp equal 0.
+        //            2. Let decode timestamp equal 0.
+        //        Otherwise:
+        //            1. Let presentation timestamp be a double precision floating point representation
+        //               of the coded frame's presentation timestamp in seconds.
+        //            2. Let decode timestamp be a double precision floating point representation
+        //               of the coded frame's decode timestamp in seconds.
+        auto presentation_timestamp = frame.presentation_timestamp();
+        auto decode_timestamp = frame.decode_timestamp();
+
+        // 2. Let frame duration be a double precision floating point representation of the coded
+        //    frame's duration in seconds.
+        auto frame_duration = frame.duration();
+
+        // FIXME: 3. If mode equals "sequence" and group start timestamp is set, then run the following steps:
+
+        // 4. If timestampOffset is not 0, then run the following steps:
+        if (!m_timestamp_offset.is_zero()) {
+            // 1. Add timestampOffset to the presentation timestamp.
+            presentation_timestamp += m_timestamp_offset;
+            // 2. Add timestampOffset to the decode timestamp.
+            decode_timestamp += m_timestamp_offset;
+        }
+
+        // 5. Let track buffer equal the track buffer that the coded frame will be added to.
+        auto maybe_track_buffer = m_track_buffers.get(demuxed_frame.track_number);
+
+        // AD-HOC: If we're passed a media segment containing coded frames from a track we don't know about, don't
+        //         crash on it.
+        if (!maybe_track_buffer.has_value())
+            continue;
+        auto& track_buffer = *maybe_track_buffer.release_value();
+        auto& demuxer = track_buffer.demuxer();
+        auto const& track = track_buffer.track();
+
+        auto last_decode_timestamp = track_buffer.last_decode_timestamp();
+        auto last_frame_duration = track_buffer.last_frame_duration();
+        VERIFY(last_decode_timestamp.has_value() == last_frame_duration.has_value());
+
+        // 6.
+        if (
+            // -> If last decode timestamp for track buffer is set
+            (last_decode_timestamp.has_value()
+                //  and decode timestamp is less than last decode timestamp:
+                && decode_timestamp < last_decode_timestamp.value())
+            // OR
+            ||
+            // -> If last decode timestamp for track buffer is set
+            (last_decode_timestamp.has_value()
+                // and the difference between decode timestamp and last decode timestamp is greater than 2 times last frame duration:
+                && decode_timestamp - last_decode_timestamp.value() > (last_frame_duration.value() + last_frame_duration.value()))) {
+            // 1. -> If mode equals "segments":
+            if (m_mode == AppendMode::Segments) {
+                //       Set [[group end timestamp]] to presentation timestamp.
+                m_group_end_timestamp = presentation_timestamp;
+            }
+            //    -> If mode equals "sequence":
+            else if (m_mode == AppendMode::Sequence) {
+                //       Set [[group start timestamp]] equal to the [[group end timestamp]].
+                m_group_start_timestamp = m_group_end_timestamp;
+            }
+
+            for (auto& [id, track_buffer] : m_track_buffers) {
+                // 2. Unset the last decode timestamp on all track buffers.
+                track_buffer->unset_last_decode_timestamp();
+
+                // 3. Unset the last frame duration on all track buffers.
+                track_buffer->unset_last_frame_duration();
+
+                // 4. Unset the highest end timestamp on all track buffers.
+                track_buffer->unset_highest_end_timestamp();
+
+                // 5. Set the need random access point flag on all track buffers to true.
+                track_buffer->set_need_random_access_point_flag(true);
+            }
+            // 6. Jump to the Loop Top step above to restart processing of the current coded frame.
+            goto loop_top;
+        }
+
+        // 7. Let frame end timestamp equal the sum of presentation timestamp and frame duration.
+        auto frame_end_timestamp = presentation_timestamp + frame_duration;
+
+        // AD-HOC: If we're appending audio, splice audio as the spec notes that we can, such that we don't lose any
+        //         samples at the leading and trailing edges of the append window.
+        auto is_audio = track.type() == Media::TrackType::Audio;
+
+        // 8. If presentation timestamp is less than appendWindowStart, then set the need random access point flag to
+        //    true, drop the coded frame, and jump to the top of the loop.
+        if (presentation_timestamp < m_append_window_start) {
+            if (!is_audio || frame_end_timestamp <= m_append_window_start) {
+                track_buffer.set_need_random_access_point_flag(true);
+                demuxer.carry_codec_configuration_of_dropped_frame(track, frame);
+                continue;
+            }
+            auto discarded_duration = m_append_window_start - presentation_timestamp;
+            frame.set_leading_discard(frame.leading_discard() + discarded_duration);
+            presentation_timestamp += discarded_duration;
+            decode_timestamp += discarded_duration;
+            frame_duration -= discarded_duration;
+        }
+
+        // 9. If frame end timestamp is greater than appendWindowEnd, then set the need random access point flag to
+        //    true, drop the coded frame, and jump to the top of the loop.
+        if (frame_end_timestamp > m_append_window_end) {
+            if (!is_audio || presentation_timestamp >= m_append_window_end) {
+                track_buffer.set_need_random_access_point_flag(true);
+                demuxer.carry_codec_configuration_of_dropped_frame(track, frame);
+                continue;
+            }
+            auto discarded_duration = frame_end_timestamp - m_append_window_end;
+            frame.set_trailing_discard(frame.trailing_discard() + discarded_duration);
+            frame_duration -= discarded_duration;
+            frame_end_timestamp = m_append_window_end;
+        }
+
+        // 10. If the need random access point flag on track buffer equals true, then run the following steps:
+        if (track_buffer.need_random_access_point_flag()) {
+            // 1. If the coded frame is not a random access point, then drop the coded frame and jump to
+            //    the top of the loop.
+            if (!frame.is_keyframe()) {
+                demuxer.carry_codec_configuration_of_dropped_frame(track, frame);
+                continue;
+            }
+            // 2. Set the need random access point flag on track buffer to false.
+            track_buffer.set_need_random_access_point_flag(false);
+        }
+
+        // FIXME: 11. Let spliced audio frame be an unset variable for holding audio splice information
+
+        // FIXME: 12. Let spliced timed text frame be an unset variable for holding timed text splice information
+
+        // FIXME: 13. If last decode timestamp for track buffer is unset and presentation timestamp falls within
+        //            the presentation interval of a coded frame in track buffer, then run the following steps:
+
+        // 14. Remove existing coded frames in track buffer:
+        auto highest_end_timestamp = track_buffer.highest_end_timestamp();
+        // -> If highest end timestamp for track buffer is not set:
+        if (!highest_end_timestamp.has_value()) {
+            //    Remove all coded frames from track buffer that have a presentation timestamp greater than
+            //    or equal to presentation timestamp and less than frame end timestamp.
+            demuxer.remove_coded_frames_and_dependants_in_range(track, presentation_timestamp, frame_end_timestamp);
+        }
+        // -> If highest end timestamp for track buffer is set and less than or equal to presentation timestamp:
+        else if (highest_end_timestamp.value() <= presentation_timestamp) {
+            //    Remove all coded frames from track buffer that have a presentation timestamp greater than
+            //    or equal to highest end timestamp and less than frame end timestamp.
+            demuxer.remove_coded_frames_and_dependants_in_range(track, highest_end_timestamp.value(), frame_end_timestamp);
+        }
+
+        // 15. Remove all possible decoding dependencies on the coded frames removed in the previous two
+        //     steps by removing all coded frames from track buffer between those frames removed in the
+        //     previous two steps and the next random access point after those removed frames.
+        // NB: This step is done as part of the removal above.
+
+        // 16. If spliced audio frame is set:
+        //         Add spliced audio frame to the track buffer.
+        //     If spliced timed text frame is set:
+        //         Add spliced timed text frame to the track buffer.
+        //     Otherwise:
+        //         Add the coded frame with the presentation timestamp, decode timestamp, and frame
+        //         duration to the track buffer.
+        frame.set_presentation_timestamp(presentation_timestamp);
+        frame.set_decode_timestamp(decode_timestamp);
+        frame.set_duration(frame_duration);
+        demuxer.add_coded_frame(track, move(frame));
+
+        // 17. Set last decode timestamp for track buffer to decode timestamp.
+        track_buffer.set_last_decode_timestamp(decode_timestamp);
+
+        // 18. Set last frame duration for track buffer to frame duration.
+        track_buffer.set_last_frame_duration(frame_duration);
+
+        // 19. If highest end timestamp for track buffer is unset or frame end timestamp is greater
+        //     than highest end timestamp, then
+        if (!track_buffer.highest_end_timestamp().has_value()
+            || frame_end_timestamp > track_buffer.highest_end_timestamp().value()) {
+            // set highest end timestamp for track buffer to frame end timestamp.
+            track_buffer.set_highest_end_timestamp(frame_end_timestamp);
+        }
+
+        // 20. If frame end timestamp is greater than group end timestamp, then set group end timestamp
+        //     equal to frame end timestamp.
+        if (frame_end_timestamp > m_group_end_timestamp)
+            m_group_end_timestamp = frame_end_timestamp;
+
+        // FIXME: 21. If generate timestamps flag equals true, then set timestampOffset equal to
+        //            frame end timestamp.
+    }
+
+    // AD-HOC: Steps 2-5 are handled by the callback, as they mutate the DOM.
+    m_coded_frame_processing_done_callback(m_group_end_timestamp);
+}
+
+// https://w3c.github.io/media-source/#dfn-coded-frame-removal
+void SourceBufferProcessor::run_coded_frame_removal(AK::Duration start, AK::Duration end)
+{
+    // 1. Let start be the starting presentation timestamp for the removal range.
+    // 2. Let end be the end presentation timestamp for the removal range.
+
+    // 3. For each track buffer in this SourceBuffer, run the following steps:
+    for (auto& [track_id, track_buffer] : m_track_buffers) {
+        // 1. Let remove end timestamp be the current value of duration
+        // 2. If this track buffer has a random access point timestamp that is greater than or equal to end, then
+        //    update remove end timestamp to that random access point timestamp.
+        // NB: The removal below runs on to the next random access point, which is where remove end timestamp
+        //     would land.
+
+        // 3. Remove all media data, from this track buffer, that contain starting timestamps greater than or
+        //    equal to start and less than the remove end timestamp.
+        auto removed_frame_presentation_timestamp = track_buffer->demuxer().remove_coded_frames_and_dependants_in_range_returning_presentation_timestamp_at(track_buffer->track(), start, end, track_buffer->last_decode_timestamp());
+
+        //     1. For each removed frame, if the frame has a decode timestamp equal to the last decode timestamp
+        //        for the frame's track, run the following steps:
+        if (removed_frame_presentation_timestamp.has_value()) {
+            // -> If mode equals "segments":
+            if (m_mode == AppendMode::Segments) {
+                //    Set [[group end timestamp]] to presentation timestamp.
+                m_group_end_timestamp = removed_frame_presentation_timestamp.value();
+            }
+            // -> If mode equals "sequence":
+            else if (m_mode == AppendMode::Sequence) {
+                //    Set [[group start timestamp]] equal to the [[group end timestamp]].
+                m_group_start_timestamp = m_group_end_timestamp;
+            }
+
+            // AD-HOC: The spec doesn't nest the steps below under step 1's if statement, but clearing the last
+            //         decode timestamp upon every removal here would potentially force a RAP unexpectedly.
+            //         https://github.com/w3c/media-source/issues/290
+
+            // 2. Unset the last decode timestamp on all track buffers.
+            // 3. Unset the last frame duration on all track buffers.
+            // 4. Unset the highest end timestamp on all track buffers.
+            unset_all_track_buffer_timestamps();
+            // 5. Set the need random access point flag on all track buffers to true.
+            set_need_random_access_point_flag_on_all_track_buffers(true);
+        }
+
+        // 4. Remove all possible decoding dependencies on the coded frames removed in the previous step by
+        //    removing all coded frames from this track buffer between those frames removed in the previous step
+        //    and the next random access point after those removed frames.
+        // NB: This is taken care of by the SourceBufferDemuxer above.
+
+        // 5. If this object is in activeSourceBuffers, the current playback position is greater than or equal to
+        //    start and less than the remove end timestamp, and HTMLMediaElement's readyState is greater than
+        //    HAVE_METADATA, then set the HTMLMediaElement's readyState attribute to HAVE_METADATA and stall
+        //    playback.
+        // NB: SourceBuffer invokes the unified readyState update method on HTMLMediaElement once this algorithm
+        //     has removed frames from every track buffer.
+    }
+
+    // 4. If the [[buffer full flag]] equals true and this object is ready to accept more bytes, then set the
+    //    [[buffer full flag]] to false.
+    if (total_buffered_bytes() < capacity_in_bytes())
+        m_buffer_full_flag = false;
+}
+
+// https://w3c.github.io/media-source/#sourcebuffer-coded-frame-eviction
+void SourceBufferProcessor::run_coded_frame_eviction(size_t new_data_size, AK::Duration current_time)
+{
+    // https://w3c.github.io/media-source/#dfn-coded-frame-removal
+    // AD-HOC: We'll run some of the final steps from the coded frame removal algorithm below.
+    //         We explicitly do not remove dependencies here (step 4), since that may evict data ahead of what the
+    //         demuxer needs still for its clients.
+    //         We also skip the ready state change here (step 5), since we explicitly avoid evicting current data.
+
+    // NB: Before the first initialization segment has been parsed, no track buffers exist and there is nothing to
+    //     evict.
+    // AD-HOC: Set the buffer full flag based on the projected size of the buffer after appending the new data.
+    //         If we don't do so here, we will not trigger removal until after an append throws a QuotaExceededError.
+    //         https://github.com/w3c/media-source/issues/289
+    if (m_track_buffers.is_empty())
+        return;
+    auto current_bytes = total_buffered_bytes();
+    auto current_capacity_in_bytes = capacity_in_bytes();
+    auto consumed_bytes_after_append = current_bytes + new_data_size;
+    m_buffer_full_flag = consumed_bytes_after_append > current_capacity_in_bytes;
+
+    // 1. Let new data equal the data that is about to be appended to this SourceBuffer.
+    // 2. If the [[buffer full flag]] equals false, then abort these steps.
+    if (!m_buffer_full_flag)
+        return;
+
+    // 3. Let removal ranges equal a list of presentation time ranges that can be evicted from the presentation to make
+    //    room for the new data.
+    // 4. For each range in removal ranges, run the coded frame removal algorithm with start and end equal to the
+    //    removal range start and end timestamp respectively.
+    // AD-HOC: Steps 3 and 4 are completed together by removing frames relative to the current playback position. We
+    //         first evict frames strictly before current_time across all tracks (oldest first), and if more room is
+    //         needed, evict frames beyond the buffered segment containing current_time (latest first). The per-track
+    //         demuxer enforces the "don't break the currently-playing segment" boundary so seeks naturally preserve
+    //         data around the new position.
+    VERIFY(consumed_bytes_after_append > current_capacity_in_bytes);
+    auto bytes_to_evict = consumed_bytes_after_append - current_capacity_in_bytes;
+    size_t bytes_evicted = 0;
+
+    while (bytes_evicted < bytes_to_evict) {
+        TrackBuffer* oldest_track_buffer = nullptr;
+        AK::Duration oldest_timestamp;
+        for (auto& [track_id, track_buffer] : m_track_buffers) {
+            auto candidate = track_buffer->demuxer().earliest_evictable_frame_timestamp(track_buffer->track(), current_time);
+            if (!candidate.has_value())
+                continue;
+            if (!oldest_track_buffer || candidate.value() < oldest_timestamp) {
+                oldest_track_buffer = track_buffer.ptr();
+                oldest_timestamp = candidate.value();
+            }
+        }
+        if (!oldest_track_buffer)
+            break;
+        bytes_evicted += oldest_track_buffer->demuxer().take_earliest_frame_and_dependants(oldest_track_buffer->track());
+    }
+
+    while (bytes_evicted < bytes_to_evict) {
+        TrackBuffer* latest_track_buffer = nullptr;
+        AK::Duration latest_timestamp;
+        for (auto& [track_id, track_buffer] : m_track_buffers) {
+            auto candidate = track_buffer->demuxer().latest_evictable_frame_timestamp(track_buffer->track(), current_time);
+            if (!candidate.has_value())
+                continue;
+            if (!latest_track_buffer || candidate.value() > latest_timestamp) {
+                latest_track_buffer = track_buffer.ptr();
+                latest_timestamp = candidate.value();
+            }
+        }
+        if (!latest_track_buffer)
+            break;
+        auto last_decode_timestamp = latest_track_buffer->last_decode_timestamp();
+        auto removed_frame = latest_track_buffer->demuxer().take_latest_frame(latest_track_buffer->track());
+        bytes_evicted += removed_frame.byte_size;
+
+        // https://w3c.github.io/media-source/#dfn-coded-frame-removal
+        // AD-HOC: Steps starting from 3.3.1 are implemented here.
+
+        // 1. For each removed frame, if the frame has a decode timestamp equal to the last decode timestamp for the
+        //    frame's track, run the following steps:
+        // AD-HOC: The spec doesn't nest steps 2-5 below under step 1's if statement, but clearing the last decode
+        //         timestamp upon every removal here would potentially force a RAP unexpectedly.
+        //         https://github.com/w3c/media-source/issues/290
+        if (last_decode_timestamp.has_value() && removed_frame.decode_timestamp == last_decode_timestamp.value()) {
+            // -> If mode equals "segments":
+            if (m_mode == AppendMode::Segments) {
+                // Set [[group end timestamp]] to presentation timestamp.
+                m_group_end_timestamp = latest_timestamp;
+            }
+            // -> If mode equals "sequence":
+            else if (m_mode == AppendMode::Sequence) {
+                // Set [[group start timestamp]] equal to the [[group end timestamp]].
+                m_group_start_timestamp = m_group_end_timestamp;
+            }
+            // 2. Unset the last decode timestamp on all track buffers.
+            // 3. Unset the last frame duration on all track buffers.
+            // 4. Unset the highest end timestamp on all track buffers.
+            unset_all_track_buffer_timestamps();
+            // 5. Set the need random access point flag on all track buffers to true.
+            set_need_random_access_point_flag_on_all_track_buffers(true);
+        }
+    }
+
+    // https://w3c.github.io/media-source/#dfn-coded-frame-removal
+    // 4. If the [[buffer full flag]] equals true and this object is ready to accept more bytes, then set the
+    //    [[buffer full flag]] to false.
+    if (total_buffered_bytes() + new_data_size <= current_capacity_in_bytes)
+        m_buffer_full_flag = false;
+}
+
+void SourceBufferProcessor::drop_consumed_bytes_from_input_buffer()
+{
+    auto consumed = m_cursor->position();
+    if (consumed == 0)
+        return;
+    VERIFY(consumed <= m_input_buffer.size());
+    auto remaining_bytes = m_input_buffer.bytes().slice(consumed);
+    AK::TypedTransfer<u8>::move(m_input_buffer.data(), remaining_bytes.data(), remaining_bytes.size());
+    m_input_buffer.trim(remaining_bytes.size(), false);
+    m_cursor->set_data(m_input_buffer.bytes());
+    MUST(m_cursor->seek(0, AK::SeekMode::SetPosition));
+}
+
+void SourceBufferProcessor::unset_all_track_buffer_timestamps()
+{
+    for (auto& [track_id, track_buffer] : m_track_buffers) {
+        track_buffer->unset_last_decode_timestamp();
+        track_buffer->unset_last_frame_duration();
+        track_buffer->unset_highest_end_timestamp();
+    }
+}
+
+void SourceBufferProcessor::set_need_random_access_point_flag_on_all_track_buffers(bool flag)
+{
+    for (auto& [track_id, track_buffer] : m_track_buffers) {
+        track_buffer->set_need_random_access_point_flag(flag);
+    }
+}
+
+void SourceBufferProcessor::set_reached_end_of_stream(bool reached)
+{
+    if (!m_demuxer)
+        return;
+    if (reached)
+        m_demuxer->set_reached_end_of_stream();
+    else
+        m_demuxer->clear_reached_end_of_stream();
+}
+
+AK::Duration SourceBufferProcessor::highest_presentation_timestamp() const
+{
+    AK::Duration highest_presentation_timestamp;
+    for (auto const& [track_id, track_buffer] : m_track_buffers)
+        highest_presentation_timestamp = max(highest_presentation_timestamp, track_buffer->demuxer().highest_presentation_timestamp(track_buffer->track()));
+    return highest_presentation_timestamp;
+}
+
+AK::Duration SourceBufferProcessor::highest_end_time() const
+{
+    AK::Duration highest_end_time;
+    for (auto const& [track_id, track_buffer] : m_track_buffers) {
+        auto end_time = track_buffer->demuxer().track_buffer_ranges(track_buffer->track()).highest_end_time();
+        highest_end_time = max(highest_end_time, end_time);
+    }
+    return highest_end_time;
+}
+
+Vector<Media::TimeRanges> SourceBufferProcessor::track_buffered_ranges() const
+{
+    if (!m_demuxer)
+        return {};
+    return m_demuxer->track_buffered_ranges();
+}
+
+}
+
+namespace IPC {
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Media::MediaSourceExtensions::PublishedState const& state)
+{
+    TRY(encoder.encode(state.track_buffered_ranges));
+    TRY(encoder.encode(state.timestamp_offset));
+    TRY(encoder.encode(state.append_state));
+    TRY(encoder.encode(state.mode));
+    TRY(encoder.encode(state.generate_timestamps_flag));
+    TRY(encoder.encode(state.buffer_full));
+    TRY(encoder.encode(state.highest_presentation_timestamp));
+    TRY(encoder.encode(state.highest_end_time));
+    TRY(encoder.encode(state.buffered_bytes));
+    TRY(encoder.encode(state.capacity_bytes));
+    TRY(encoder.encode(state.evictable_bytes));
+    return {};
+}
+
+template<>
+ErrorOr<Media::MediaSourceExtensions::PublishedState> decode(Decoder& decoder)
+{
+    using namespace Media::MediaSourceExtensions;
+    PublishedState state;
+    state.track_buffered_ranges = TRY(decoder.decode<Vector<Media::TimeRanges>>());
+    state.timestamp_offset = TRY(decoder.decode<AK::Duration>());
+    state.append_state = TRY(decoder.decode<AppendState>());
+    if (state.append_state > AppendState::ParsingMediaSegment)
+        return Error::from_string_literal("IPC: Invalid append state");
+    state.mode = TRY(decoder.decode<AppendMode>());
+    if (state.mode > AppendMode::Sequence)
+        return Error::from_string_literal("IPC: Invalid append mode");
+    state.generate_timestamps_flag = TRY(decoder.decode<bool>());
+    state.buffer_full = TRY(decoder.decode<bool>());
+    state.highest_presentation_timestamp = TRY(decoder.decode<AK::Duration>());
+    state.highest_end_time = TRY(decoder.decode<AK::Duration>());
+    state.buffered_bytes = TRY(decoder.decode<u64>());
+    state.capacity_bytes = TRY(decoder.decode<u64>());
+    state.evictable_bytes = TRY(decoder.decode<u64>());
+    return state;
+}
+
+}

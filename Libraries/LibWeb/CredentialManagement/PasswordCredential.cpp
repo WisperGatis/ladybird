@@ -5,41 +5,59 @@
  */
 
 #include <LibWeb/CredentialManagement/PasswordCredential.h>
+#include <LibWeb/CredentialManagement/PasswordCredentialOperations.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CredentialManagement {
 
 GC_DEFINE_ALLOCATOR(PasswordCredential);
 
-GC::Ref<PasswordCredential> PasswordCredential::create(JS::Realm& realm)
-{
-    return realm.create<PasswordCredential>(realm);
-}
-
 // https://www.w3.org/TR/credential-management-1/#dom-passwordcredential-passwordcredential
-WebIDL::ExceptionOr<GC::Ref<PasswordCredential>> PasswordCredential::construct_impl(JS::Realm& realm, HTML::HTMLFormElement const&)
+WebIDL::ExceptionOr<GC::Ref<PasswordCredential>> PasswordCredential::create(URL::Origin origin, GC::Ref<HTML::HTMLFormElement> form)
 {
-    return realm.vm().throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "construct"sv);
+    // 2. Let r be the result of executing Create a PasswordCredential from an HTMLFormElement given form and origin.
+    // 3. If r is an exception, throw r. Otherwise, return r.
+    return create_password_credential(form, move(origin));
 }
 
 // https://www.w3.org/TR/credential-management-1/#dom-passwordcredential-passwordcredential-data
-WebIDL::ExceptionOr<GC::Ref<PasswordCredential>> PasswordCredential::construct_impl(JS::Realm& realm, PasswordCredentialData const&)
+WebIDL::ExceptionOr<GC::Ref<PasswordCredential>> PasswordCredential::create(URL::Origin origin, PasswordCredentialData const& data)
 {
-    return realm.vm().throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "construct"sv);
+    // 1. Let r be the result of executing Create a PasswordCredential from PasswordCredentialData on data.
+    // 2. If r is an exception, throw r.
+    return create_password_credential(data, move(origin));
+}
+
+WebIDL::ExceptionOr<GC::Ref<PasswordCredential>> PasswordCredential::create_for_constructor(JS::Object& relevant_global_object, GC::Ref<HTML::HTMLFormElement> form)
+{
+    auto& window = HTML::relevant_window(relevant_global_object);
+    return create(HTML::relevant_settings_object(window).origin(), form);
+}
+
+WebIDL::ExceptionOr<GC::Ref<PasswordCredential>> PasswordCredential::create_for_constructor(JS::Object& relevant_global_object, PasswordCredentialData const& data)
+{
+    auto& window = HTML::relevant_window(relevant_global_object);
+    return create(HTML::relevant_settings_object(window).origin(), data);
 }
 
 PasswordCredential::~PasswordCredential()
 {
 }
 
-PasswordCredential::PasswordCredential(JS::Realm& realm)
-    : Credential(realm)
+Utf16FlyString const& PasswordCredential::type() const
 {
+    static Utf16FlyString const& type = *new Utf16FlyString("password"_utf16_fly_string);
+    return type;
 }
 
-void PasswordCredential::initialize(JS::Realm& realm)
+PasswordCredential::PasswordCredential(PasswordCredentialData data, URL::Origin origin)
+    : Credential(move(data.id))
+    , CredentialUserData(data.name.value_or(Utf16String {}), data.icon_url.value_or(Utf16String {}))
+    , m_password(move(data.password))
+    , m_origin(move(origin))
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(PasswordCredential);
-    Base::initialize(realm);
 }
 
 }

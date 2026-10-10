@@ -1,17 +1,18 @@
-#import <DOM/Node.idl>
-
 // https://html.spec.whatwg.org/multipage/custom-elements.html#customelementregistry
 [Exposed=Window]
 interface CustomElementRegistry {
-    [CEReactions] undefined define(DOMString name, CustomElementConstructor constructor, optional ElementDefinitionOptions options = {});
+    [ImplementedInBindings, RealmFreeConstructor] constructor();
+
+    [CEReactions, ImplementedInBindings, NeedsCallerRealm] undefined define(DOMString name, CustomElementConstructor constructor, optional ElementDefinitionOptions options = {});
     (CustomElementConstructor or undefined) get(DOMString name);
     DOMString? getName(CustomElementConstructor constructor);
-    Promise<CustomElementConstructor> whenDefined(DOMString name);
+    [ImplementedInBindings, NeedsCallerRealm] Promise<CustomElementConstructor> whenDefined(DOMString name);
     [CEReactions] undefined upgrade(Node root);
+    [CEReactions, ImplementedAs=initialize_for_bindings] undefined initialize(Node root);
 };
 
 callback CustomElementConstructor = HTMLElement ();
 
 dictionary ElementDefinitionOptions {
-    DOMString extends;
+    [FlyString] DOMString extends;
 };

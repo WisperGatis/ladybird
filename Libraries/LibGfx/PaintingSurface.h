@@ -14,6 +14,24 @@
 #include <LibGfx/Size.h>
 #include <LibGfx/SkiaBackendContext.h>
 
+#ifdef USE_VULKAN_DMABUF_IMAGES
+namespace Gfx {
+
+struct VulkanImage;
+
+}
+#endif
+
+#ifdef USE_DIRECTX
+#    include <AK/Error.h>
+
+namespace Gfx {
+
+class D3DSharedTexture;
+
+}
+#endif
+
 #ifdef AK_OS_MACOS
 #    include <LibGfx/MetalContext.h>
 #endif
@@ -22,6 +40,8 @@ class SkCanvas;
 class SkSurface;
 
 namespace Gfx {
+
+class SharedImage;
 
 class PaintingSurface : public AtomicRefCounted<PaintingSurface> {
 public:
@@ -32,19 +52,27 @@ public:
 
     Function<void(PaintingSurface&)> on_flush;
 
-    static NonnullRefPtr<PaintingSurface> create_with_size(RefPtr<SkiaBackendContext> context, IntSize size, BitmapFormat color_type, AlphaType alpha_type);
+    static NonnullRefPtr<PaintingSurface> create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = {});
     static NonnullRefPtr<PaintingSurface> wrap_bitmap(Bitmap&);
 
 #ifdef AK_OS_MACOS
-    static NonnullRefPtr<PaintingSurface> create_from_iosurface(Core::IOSurfaceHandle&&, NonnullRefPtr<SkiaBackendContext>, Origin = Origin::TopLeft);
+    static NonnullRefPtr<PaintingSurface> create_from_shared_image_buffer(SharedImageBuffer&, NonnullRefPtr<SkiaBackendContext>, Origin = Origin::TopLeft);
 #endif
 
-#ifdef USE_VULKAN_IMAGES
+#ifdef USE_VULKAN_DMABUF_IMAGES
     static NonnullRefPtr<PaintingSurface> create_from_vkimage(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<VulkanImage> vulkan_image, Origin origin);
 #endif
 
-    void read_into_bitmap(Bitmap&);
-    void write_from_bitmap(Bitmap const&);
+#ifdef USE_DIRECTX
+    static ErrorOr<NonnullRefPtr<PaintingSurface>> create_from_d3d_texture(NonnullRefPtr<SkiaBackendContext>, NonnullRefPtr<D3DSharedTexture>, Origin = Origin::TopLeft);
+#endif
+
+    NonnullRefPtr<Bitmap> snapshot_bitmap() const;
+    SharedImage snapshot_into_shared_image() const;
+
+    void read_into_bitmap(Bitmap&, IntPoint source_position = {}) const;
+    void write_from_bitmap(Bitmap const&, IntPoint destination_position = {});
+    void copy_from_surface(PaintingSurface&);
 
     void notify_content_will_change();
 
@@ -57,12 +85,14 @@ public:
     template<typename T>
     T sk_image_snapshot() const;
 
+    RefPtr<SkiaBackendContext> skia_backend_context() const;
+
+    // Whether the surface draws into an image shared with another process, rather than one Skia allocated.
+    bool wraps_shared_image() const;
+
     void flush();
 
     ~PaintingSurface();
-
-    void lock_context() const;
-    void unlock_context() const;
 
 private:
     struct Impl;

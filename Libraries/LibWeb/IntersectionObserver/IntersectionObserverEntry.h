@@ -6,46 +6,28 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Forward.h>
 #include <LibWeb/Geometry/DOMRect.h>
-#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
+#include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
 
 namespace Web::IntersectionObserver {
 
-struct IntersectionObserverEntryInit {
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-time
-    HighResolutionTime::DOMHighResTimeStamp time { 0.0 };
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-rootbounds
-    Optional<Geometry::DOMRectInit> root_bounds;
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-boundingclientrect
-    Geometry::DOMRectInit bounding_client_rect;
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-intersectionrect
-    Geometry::DOMRectInit intersection_rect;
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-isintersecting
-    bool is_intersecting { false };
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-intersectionratio
-    double intersection_ratio { 0.0 };
-
-    // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-target
-    GC::Root<DOM::Element> target;
-};
-
-class IntersectionObserverEntry final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(IntersectionObserverEntry, Bindings::PlatformObject);
+class IntersectionObserverEntry final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(IntersectionObserverEntry, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(IntersectionObserverEntry);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<IntersectionObserverEntry>> construct_impl(JS::Realm&, IntersectionObserverEntryInit const& options);
+    static constexpr size_t bounding_client_rect_offset() { return offsetof(IntersectionObserverEntry, m_bounding_client_rect); }
+    static constexpr size_t intersection_rect_offset() { return offsetof(IntersectionObserverEntry, m_intersection_rect); }
+    static constexpr size_t target_offset() { return offsetof(IntersectionObserverEntry, m_target); }
+    static GC::Ref<IntersectionObserverEntry> create(HighResolutionTime::DOMHighResTimeStamp time, GC::Ptr<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<DOM::Element> target);
 
     virtual ~IntersectionObserverEntry() override;
 
     HighResolutionTime::DOMHighResTimeStamp time() const { return m_time; }
     GC::Ptr<Geometry::DOMRectReadOnly> root_bounds() const { return m_root_bounds; }
+    static constexpr size_t root_bounds_offset() { return offsetof(IntersectionObserverEntry, m_root_bounds); }
     GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect() const { return m_bounding_client_rect; }
     GC::Ref<Geometry::DOMRectReadOnly> intersection_rect() const { return m_intersection_rect; }
     bool is_intersecting() const { return m_is_intersecting; }
@@ -53,10 +35,9 @@ public:
     GC::Ref<DOM::Element> target() const { return m_target; }
 
 private:
-    IntersectionObserverEntry(JS::Realm&, HighResolutionTime::DOMHighResTimeStamp time, GC::Ptr<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<DOM::Element> target);
+    IntersectionObserverEntry(HighResolutionTime::DOMHighResTimeStamp time, GC::Ptr<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<DOM::Element> target);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     // https://www.w3.org/TR/intersection-observer/#dom-intersectionobserverentry-time
     HighResolutionTime::DOMHighResTimeStamp m_time { 0.0 };

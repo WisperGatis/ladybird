@@ -7,6 +7,7 @@
 #include <LibTest/TestCase.h>
 
 #include <AK/ByteString.h>
+#include <AK/NumericLimits.h>
 #include <AK/OwnPtr.h>
 #include <AK/ReverseIterator.h>
 #include <AK/String.h>
@@ -130,6 +131,8 @@ static bool is_inline_element(auto& el, auto& vector)
     TEST_CASE(Vector##_prepend_vector_object)                                                                                            \
     {                                                                                                                                    \
         struct SubObject {                                                                                                               \
+            AK_ALLOC_WITH_KMALLOC;                                                                                                       \
+                                                                                                                                         \
             SubObject(int v)                                                                                                             \
                 : value(v)                                                                                                               \
             {                                                                                                                            \
@@ -137,6 +140,8 @@ static bool is_inline_element(auto& el, auto& vector)
             int value { 0 };                                                                                                             \
         };                                                                                                                               \
         struct Object {                                                                                                                  \
+            AK_ALLOC_WITH_KMALLOC;                                                                                                       \
+                                                                                                                                         \
             Object(NonnullOwnPtr<SubObject>&& a_subobject)                                                                               \
                 : subobject(move(a_subobject))                                                                                           \
             {                                                                                                                            \
@@ -247,6 +252,16 @@ static bool is_inline_element(auto& el, auto& vector)
         EXPECT_EQ(ints.size(), 0u);                                                                                                      \
     }                                                                                                                                    \
                                                                                                                                          \
+    BENCHMARK_CASE(Vector##_remove_all_matching_trivial)                                                                                 \
+    {                                                                                                                                    \
+        Vector<int> ints;                                                                                                                \
+        for (int i = 0; i < 10000; ++i) {                                                                                                \
+            ints.append(i);                                                                                                              \
+        }                                                                                                                                \
+        ints.remove_all_matching([](int value) { return value % 2 == 0; });                                                              \
+        EXPECT_EQ(ints.size(), 5000u);                                                                                                   \
+    }                                                                                                                                    \
+                                                                                                                                         \
     TEST_CASE(Vector##_vector_remove)                                                                                                    \
     {                                                                                                                                    \
         Vector<int> ints;                                                                                                                \
@@ -305,6 +320,8 @@ static bool is_inline_element(auto& el, auto& vector)
     TEST_CASE(Vector##_nonnullownptrvector)                                                                                              \
     {                                                                                                                                    \
         struct Object {                                                                                                                  \
+            AK_ALLOC_WITH_KMALLOC;                                                                                                       \
+                                                                                                                                         \
             ByteString string;                                                                                                           \
         };                                                                                                                               \
         Vector<NonnullOwnPtr<Object>> objects;                                                                                           \
@@ -711,4 +728,40 @@ TEST_CASE(VectorWithFastLastAccess_unsafe)
     EXPECT_EQ(v.unsafe_last(), 2);
     EXPECT_EQ(v.unsafe_take_last(), 2);
     EXPECT_EQ(v.unsafe_last(), 1);
+}
+
+TEST_CASE(try_ensure_capacity_overflow)
+{
+    Vector<u64> v;
+    auto result = v.try_ensure_capacity(NumericLimits<size_t>::max() / sizeof(u64) + 1);
+    EXPECT(result.is_error());
+    EXPECT_EQ(v.capacity(), 0u);
+    EXPECT_EQ(v.size(), 0u);
+
+    EXPECT(!v.try_append(42).is_error());
+    EXPECT_EQ(v.size(), 1u);
+    EXPECT_EQ(v[0], 42u);
+}
+
+TEST_CASE(try_resize_overflow)
+{
+    Vector<u64> v;
+    auto result = v.try_resize(NumericLimits<size_t>::max() / sizeof(u64) + 1);
+    EXPECT(result.is_error());
+    EXPECT_EQ(v.size(), 0u);
+    EXPECT_EQ(v.capacity(), 0u);
+}
+
+TEST_CASE(try_ensure_capacity_normal_growth)
+{
+    Vector<u64> v;
+    EXPECT(!v.try_ensure_capacity(1024).is_error());
+    EXPECT(v.capacity() >= 1024u);
+    EXPECT_EQ(v.size(), 0u);
+
+    v.append(1);
+    v.append(2);
+    EXPECT_EQ(v.size(), 2u);
+    EXPECT_EQ(v[0], 1u);
+    EXPECT_EQ(v[1], 2u);
 }

@@ -2,62 +2,46 @@
  * Copyright (c) 2020, Matthew Olsson <mattco@serenityos.org>
  * Copyright (c) 2022-2025, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2024, Tim Ledbetter <timledbetter@gmail.com>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #pragma once
 
-#include <AK/Span.h>
-#include <AK/Types.h>
-#include <AK/Vector.h>
+#include <AK/String.h>
+#include <AK/Utf16View.h>
 #include <LibGfx/Forward.h>
 
 namespace Web::SVG {
 
-enum class PathInstructionType : u8 {
-    Move,
-    ClosePath,
-    Line,
-    HorizontalLine,
-    VerticalLine,
-    Curve,
-    SmoothCurve,
-    QuadraticBezierCurve,
-    SmoothQuadraticBezierCurve,
-    EllipticalArc,
-    Invalid,
-};
-
-struct PathInstruction {
-    PathInstructionType type;
-    bool absolute;
-    Vector<float> data;
-
-    bool operator==(PathInstruction const&) const = default;
-
-    void serialize(StringBuilder&) const;
-
-    void dump() const;
-};
+class Path;
+Path parse_path_data(Utf16View);
 
 class Path {
 public:
-    Path() = default;
+    Path();
+    Path(Path const&);
+    Path(Path&&);
+    ~Path();
 
-    explicit Path(Vector<PathInstruction> instructions)
-        : m_instructions(move(instructions))
-    {
-    }
-    ReadonlySpan<PathInstruction> instructions() const { return m_instructions; }
+    Path& operator=(Path const&);
+    Path& operator=(Path&&);
 
     [[nodiscard]] Gfx::Path to_gfx_path() const;
     String serialize() const;
 
-    bool operator==(Path const&) const = default;
+    bool operator==(Path const&) const;
 
 private:
-    Vector<PathInstruction> m_instructions;
+    friend Path parse_path_data(Utf16View);
+
+    explicit Path(void* rust_path)
+        : m_rust_path(rust_path)
+    {
+    }
+
+    void* m_rust_path { nullptr };
 };
 
 }

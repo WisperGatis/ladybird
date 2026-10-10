@@ -6,11 +6,15 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <LibWeb/CSS/Angle.h>
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Frequency.h>
 #include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/CSS/Time.h>
+#include <LibWeb/Forward.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::CSS {
 

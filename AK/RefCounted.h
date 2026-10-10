@@ -8,8 +8,10 @@
 
 #include <AK/Assertions.h>
 #include <AK/Checked.h>
+#include <AK/Diagnostics.h>
 #include <AK/Noncopyable.h>
 #include <AK/Platform.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -18,6 +20,8 @@ class RefCountedBase {
     AK_MAKE_NONMOVABLE(RefCountedBase);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     using RefCountType = unsigned int;
     using AllowOwnPtr = FalseType;
 
@@ -58,11 +62,13 @@ public:
     {
         auto* that = const_cast<T*>(static_cast<T const*>(this));
 
-        auto new_ref_count = deref_base();
+        auto new_ref_count = that->deref_base();
         if (new_ref_count == 0) {
             if constexpr (requires { that->will_be_destroyed(); })
                 that->will_be_destroyed();
-            delete static_cast<T const*>(this);
+            // FIXME: GCC 15.1.0 seems to think this is reachable with non-heap objects
+            //        in some possibly Variant related cases.
+            AK_IGNORE_DIAGNOSTIC("-Wfree-nonheap-object", delete static_cast<T const*>(this);)
             return true;
         }
         return false;

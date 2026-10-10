@@ -1,0 +1,12 @@
+custom function: 6px
+environment fallback: 4px
+conditional: 5px
+custom function attribute default: 7px
+custom function inherited attribute: 7px
+compound conditional: 7px
+inherit function: 6
+attribute: 7px
+conditional after mutation: 6px
+compound conditional after mutation: 8px
+registered inherit initial: 8
+registered inherit mutation: 9

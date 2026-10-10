@@ -1,12 +1,13 @@
-include(audio)
-include(SDL3)
-
 set(SOURCES
     ConnectionFromClient.cpp
     ConsoleGlobalEnvironmentExtensions.cpp
     DevToolsConsoleClient.cpp
+    DevToolsDebugger.cpp
+    DevToolsIndexedDB.cpp
     PageClient.cpp
     PageHost.cpp
+    TestConnection.cpp
+    WebContentCompositorHost.cpp
     WebContentConsoleClient.cpp
     WebDriverConnection.cpp
     WebUIConnection.cpp
@@ -20,7 +21,7 @@ if (ANDROID)
         ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/JNIHelpers.cpp
         ${SOURCES}
     )
-    target_link_libraries(webcontentservice PRIVATE android)
+    target_link_libraries(webcontentservice PRIVATE android LibWebView)
 else()
     add_library(webcontentservice STATIC ${SOURCES})
     set_target_properties(webcontentservice PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
@@ -30,32 +31,28 @@ target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${CMAKE_CU
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}>)
 target_include_directories(webcontentservice PUBLIC $<BUILD_INTERFACE:${LADYBIRD_SOURCE_DIR}/Services/>)
 
-target_link_libraries(webcontentservice PUBLIC LibCore LibCrypto LibFileSystem LibGfx LibIPC LibJS LibMain LibMedia LibWeb LibWebSocket LibRequests LibWebView LibImageDecoderClient LibGC)
+target_link_libraries(webcontentservice PUBLIC LibCompositing LibCore LibCrypto LibDevTools LibFileSystem LibGfx LibHTTP LibIPC LibJS LibMain LibMedia LibWasm LibWeb LibRequests LibImageDecoderClient LibMediaClient LibGC)
+if (ENABLE_CRANELIFT_JIT)
+    target_link_libraries(webcontentservice PUBLIC LibWasmCompilerClient)
+endif()
 target_link_libraries(webcontentservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
-target_link_libraries(webcontentservice PRIVATE SDL3::SDL3)
+target_compile_options(webcontentservice PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
 
-if (ENABLE_QT AND NOT DEFINED LADYBIRD_AUDIO_BACKEND)
-    find_package(Qt6 REQUIRED COMPONENTS Multimedia)
+add_executable(WebContent main.cpp)
 
-    qt_add_executable(WebContent main.cpp)
-    target_link_libraries(WebContent PRIVATE Qt::Core)
-    target_compile_definitions(WebContent PRIVATE HAVE_QT=1)
-
-    target_sources(WebContent PRIVATE
-        ${LADYBIRD_SOURCE_DIR}/UI/Qt/AudioCodecPluginQt.cpp
-        ${LADYBIRD_SOURCE_DIR}/UI/Qt/AudioThread.cpp
-    )
-    target_link_libraries(WebContent PRIVATE LibWebViewPlatform Qt::Multimedia)
-    target_compile_definitions(WebContent PRIVATE HAVE_QT_MULTIMEDIA=1)
+if (LINUX)
+    target_sources(WebContent PRIVATE ../RendererSandboxLinux.cpp)
+elseif (APPLE)
+    target_sources(WebContent PRIVATE ../RendererSandboxMacOS.cpp)
 else()
-    add_executable(WebContent main.cpp)
+    target_sources(WebContent PRIVATE ../RendererSandboxUnimplemented.cpp)
 endif()
 
-target_link_libraries(WebContent PRIVATE webcontentservice LibURL)
+target_link_libraries(WebContent PRIVATE webcontentservice LibSandbox LibURL)
+target_compile_options(WebContent PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
 
 if(WIN32)
-    find_package(unofficial-angle REQUIRED CONFIG)
-    target_link_libraries(WebContent PRIVATE LibTextCodec unofficial::angle::libGLESv2)
+    ladybird_windows_bin(WebContent CONSOLE)
 endif()
 
 
@@ -63,8 +60,13 @@ target_sources(webcontentservice PUBLIC FILE_SET server TYPE HEADERS
     BASE_DIRS ${LADYBIRD_SOURCE_DIR}/Services
     FILES ConnectionFromClient.h
           ConsoleGlobalEnvironmentExtensions.h
+          DevToolsDebugger.h
+          DevToolsIndexedDB.h
           Forward.h
           PageHost.h
+          WebContentCompositorHost.h
           WebContentConsoleClient.h
           WebDriverConnection.h
 )
+
+ladybird_sign_helper_process(WebContent ALLOW_JIT)

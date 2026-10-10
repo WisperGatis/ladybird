@@ -4,65 +4,53 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/Iterator.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/URLSearchParamsIteratorPrototype.h>
+#include <LibWeb/Bindings/URLSearchParams.h>
 #include <LibWeb/DOMURL/URLSearchParamsIterator.h>
-
-namespace Web::Bindings {
-
-template<>
-void Intrinsics::create_web_prototype_and_constructor<URLSearchParamsIteratorPrototype>(JS::Realm& realm)
-{
-    auto prototype = realm.create<URLSearchParamsIteratorPrototype>(realm);
-    m_prototypes.set("URLSearchParamsIterator"_fly_string, prototype);
-}
-
-}
 
 namespace Web::DOMURL {
 
 GC_DEFINE_ALLOCATOR(URLSearchParamsIterator);
 
-WebIDL::ExceptionOr<GC::Ref<URLSearchParamsIterator>> URLSearchParamsIterator::create(URLSearchParams const& url_search_params, JS::Object::PropertyKind iteration_kind)
-{
-    return url_search_params.realm().create<URLSearchParamsIterator>(url_search_params, iteration_kind);
-}
+static constexpr JSHostClass url_search_params_iterator_host_class = JS::make_host_class(JS_HOST_CLASS_OBJECT, "URLSearchParamsIterator"sv, nullptr, nullptr, nullptr, 0);
 
 URLSearchParamsIterator::URLSearchParamsIterator(URLSearchParams const& url_search_params, JS::Object::PropertyKind iteration_kind)
-    : PlatformObject(url_search_params.realm())
-    , m_url_search_params(url_search_params)
+    : m_url_search_params(url_search_params)
     , m_iteration_kind(iteration_kind)
 {
 }
 
 URLSearchParamsIterator::~URLSearchParamsIterator() = default;
 
-void URLSearchParamsIterator::initialize(JS::Realm& realm)
+WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> URLSearchParamsIterator::create(JS::Realm& realm, URLSearchParams const& url_search_params, JS::Object::PropertyKind iteration_kind)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(URLSearchParamsIterator);
-    Base::initialize(realm);
+    static auto const& prototype_name = "URLSearchParamsIterator"_utf16_fly_string;
+    auto iterator = realm.create<URLSearchParamsIterator>(url_search_params, iteration_kind);
+    auto& prototype = Bindings::ensure_web_prototype<Bindings::URLSearchParamsIteratorPrototype>(realm, prototype_name);
+    return JS::HostObject::create(realm, url_search_params_iterator_host_class, prototype, {}, iterator);
 }
 
-void URLSearchParamsIterator::visit_edges(JS::Cell::Visitor& visitor)
+void URLSearchParamsIterator::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_url_search_params);
 }
 
-JS::Object* URLSearchParamsIterator::next()
+JS::Object* URLSearchParamsIterator::next(JS::Realm& realm)
 {
     if (m_index >= m_url_search_params->m_list.size())
-        return create_iterator_result_object(vm(), JS::js_undefined(), true);
+        return JS::create_iterator_result_object(realm, JS::js_undefined(), true).ptr();
 
     auto& entry = m_url_search_params->m_list[m_index++];
     if (m_iteration_kind == JS::Object::PropertyKind::Key)
-        return create_iterator_result_object(vm(), JS::PrimitiveString::create(vm(), entry.name), false);
+        return JS::create_iterator_result_object(realm, JS::PrimitiveString::create(vm(), entry.name), false).ptr();
     else if (m_iteration_kind == JS::Object::PropertyKind::Value)
-        return create_iterator_result_object(vm(), JS::PrimitiveString::create(vm(), entry.value), false);
+        return JS::create_iterator_result_object(realm, JS::PrimitiveString::create(vm(), entry.value), false).ptr();
 
-    return create_iterator_result_object(vm(), JS::Array::create_from(realm(), { JS::PrimitiveString::create(vm(), entry.name), JS::PrimitiveString::create(vm(), entry.value) }), false);
+    return JS::create_iterator_result_object(realm, JS::Array::create_from(realm, { JS::PrimitiveString::create(vm(), entry.name), JS::PrimitiveString::create(vm(), entry.value) }), false).ptr();
 }
 
 }

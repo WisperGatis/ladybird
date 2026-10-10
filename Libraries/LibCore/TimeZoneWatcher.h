@@ -10,13 +10,16 @@
 #include <AK/Function.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
+#include <LibCore/Export.h>
 
 namespace Core {
 
-class TimeZoneWatcher {
+class CORE_API TimeZoneWatcher {
     AK_MAKE_NONCOPYABLE(TimeZoneWatcher);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<NonnullOwnPtr<TimeZoneWatcher>> create();
     virtual ~TimeZoneWatcher() = default;
 

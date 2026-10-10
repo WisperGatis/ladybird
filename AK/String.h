@@ -7,12 +7,12 @@
 
 #pragma once
 
+#include <AK/AllOf.h>
 #include <AK/CharacterTypes.h>
 #include <AK/Concepts.h>
 #include <AK/Format.h>
 #include <AK/Forward.h>
 #include <AK/Optional.h>
-#include <AK/RefCounted.h>
 #include <AK/Span.h>
 #include <AK/StringBase.h>
 #include <AK/StringBuilder.h>
@@ -23,17 +23,9 @@
 #include <AK/UnicodeUtils.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
-
-// FIXME: Remove this when OpenBSD Clang fully supports consteval.
-//        And once oss-fuzz updates to clang >15.
-//        And once Android ships an NDK with clang >14
-#if defined(AK_OS_OPENBSD) || defined(OSS_FUZZ) || defined(AK_OS_ANDROID)
-#    define AK_SHORT_STRING_CONSTEVAL constexpr
-#else
-#    define AK_SHORT_STRING_CONSTEVAL consteval
-#endif
 
 // String is a strongly owned sequence of Unicode code points encoded as UTF-8.
 // The data may or may not be heap-allocated, and may or may not be reference counted.
@@ -43,6 +35,8 @@ class String : public Detail::StringBase {
     AK_MAKE_DEFAULT_MOVABLE(String);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     // NOTE: For short strings, we avoid heap allocations by storing them in the data pointer slot.
     static constexpr size_t MAX_SHORT_STRING_BYTE_COUNT = Detail::MAX_SHORT_STRING_BYTE_COUNT;
 
@@ -66,12 +60,45 @@ public:
     [[nodiscard]] static String from_utf8_without_validation(ReadonlyBytes);
     [[nodiscard]] static String from_ascii_without_validation(ReadonlyBytes);
 
+    // NB: These round-trip the one-word raw representation through FFI bridges (e.g. the LibWeb
+    //     Rust style value data), which retain the raw value and manage its reference manually.
+    //     to_raw_leaked() leaks one reference to the bridge, from_raw() reconstructs a string
+    //     without consuming the bridge's reference, and unref_raw() releases it.
+    [[nodiscard]] FlatPtr to_raw_leaked() const
+    {
+        if (!is_short_string())
+            data_without_union_member_assertion()->ref();
+        return raw({});
+    }
+
+    [[nodiscard]] static String from_raw(FlatPtr raw)
+    {
+        auto string = adopt_raw(raw);
+        if (!string.is_short_string())
+            string.data_without_union_member_assertion()->ref();
+        return string;
+    }
+
+    static void unref_raw(FlatPtr raw)
+    {
+        // Adopt the bridge's reference and let it drop.
+        auto string = adopt_raw(raw);
+    }
+
+    [[nodiscard]] static constexpr String from_ascii_short_string_without_validation(char const* data, size_t length)
+    {
+        VERIFY(length <= Detail::MAX_SHORT_STRING_BYTE_COUNT);
+        auto short_string = Detail::ShortString::create_with_byte_count(length);
+        for (size_t i = 0; i < length; ++i)
+            short_string.storage[i] = static_cast<u8>(data[i]);
+        return String { StringBase { short_string } };
+    }
+
     static ErrorOr<String> from_string_builder(Badge<StringBuilder>, StringBuilder&);
     [[nodiscard]] static String from_string_builder_without_validation(Badge<StringBuilder>, StringBuilder&);
 
     // Creates a new String from a sequence of UTF-16 encoded code points.
-    static ErrorOr<String> from_utf16_le_with_replacement_character(ReadonlyBytes);
-    static ErrorOr<String> from_utf16_be_with_replacement_character(ReadonlyBytes);
+    static ErrorOr<String> from_utf16_with_replacement_character(Utf16View const&);
 
     // Creates a new String by reading byte_count bytes from a UTF-8 encoded Stream.
     static ErrorOr<String> from_stream(Stream&, size_t byte_count);
@@ -102,7 +129,7 @@ public:
         Upper,
         Lower,
     };
-    [[nodiscard]] static String bijective_base_from(size_t value, Case, unsigned base = 26, StringView map = {});
+    [[nodiscard]] static String bijective_base_from(size_t value, Case, unsigned base = 26, Optional<StringView> map = {});
     [[nodiscard]] static String greek_letter_from(size_t value);
     [[nodiscard]] static String roman_number_from(size_t value, Case);
 
@@ -227,9 +254,19 @@ public:
 
 private:
     friend class ::AK::FlyString;
-    friend class Optional<String>;
+    friend struct SentinelOptionalTraits<String>;
 
     using ShortString = Detail::ShortString;
+
+    // Adopts a raw value previously produced by to_raw_leaked(), together with ownership of one
+    // reference to its data if it is not a short string.
+    [[nodiscard]] static String adopt_raw(FlatPtr raw)
+    {
+        String string;
+        auto const** data = __builtin_launder(&string.m_impl.data);
+        *data = bit_cast<Detail::StringData const*>(raw);
+        return string;
+    }
 
     constexpr bool is_invalid() const
     {
@@ -248,97 +285,15 @@ private:
 };
 
 template<>
-class Optional<String> : public OptionalBase<String> {
-    template<typename U>
-    friend class Optional;
+struct SentinelOptionalTraits<String> {
+    static constexpr String sentinel_value() { return String(nullptr); }
+    static constexpr bool is_sentinel(String const& value) { return value.is_invalid(); }
+};
 
+template<>
+class Optional<String> : public SentinelOptional<String> {
 public:
-    using ValueType = String;
-
-    constexpr Optional() = default;
-
-    template<SameAs<OptionalNone> V>
-    constexpr Optional(V) { }
-
-    constexpr Optional(Optional<String> const& other)
-    {
-        if (other.has_value())
-            m_value = other.m_value;
-    }
-
-    constexpr Optional(Optional&& other)
-        : m_value(move(other.m_value))
-    {
-    }
-
-    template<typename U = String>
-    requires(!IsSame<OptionalNone, RemoveCVReference<U>>)
-    explicit(!IsConvertible<U&&, String>) constexpr Optional(U&& value)
-    requires(!IsSame<RemoveCVReference<U>, Optional<String>> && IsConstructible<String, U &&>)
-        : m_value(forward<U>(value))
-    {
-    }
-
-    template<SameAs<OptionalNone> V>
-    constexpr Optional& operator=(V)
-    {
-        clear();
-        return *this;
-    }
-
-    constexpr Optional& operator=(Optional const& other)
-    {
-        if (this != &other) {
-            m_value = other.m_value;
-        }
-        return *this;
-    }
-
-    constexpr Optional& operator=(Optional&& other)
-    {
-        if (this != &other) {
-            m_value = move(other.m_value);
-        }
-        return *this;
-    }
-
-    constexpr void clear()
-    {
-        m_value = String(nullptr);
-    }
-
-    [[nodiscard]] constexpr bool has_value() const
-    {
-        return !m_value.is_invalid();
-    }
-
-    [[nodiscard]] constexpr String& value() &
-    {
-        VERIFY(has_value());
-        return m_value;
-    }
-
-    [[nodiscard]] constexpr String const& value() const&
-    {
-        VERIFY(has_value());
-        return m_value;
-    }
-
-    [[nodiscard]] constexpr String value() &&
-    {
-        return release_value();
-    }
-
-    [[nodiscard]] constexpr String release_value()
-    {
-        VERIFY(has_value());
-        String released_value = move(m_value);
-        clear();
-        return released_value;
-    }
-
-private:
-    String m_value { nullptr };
+    using SentinelOptional::SentinelOptional;
 };
 
 template<>
@@ -358,8 +313,14 @@ struct ASCIICaseInsensitiveStringTraits : public Traits<String> {
 
 }
 
-[[nodiscard]] ALWAYS_INLINE AK::String operator""_string(char const* cstring, size_t length)
+[[nodiscard]] ALWAYS_INLINE constexpr AK::String operator""_string(char const* cstring, size_t length)
 {
+    // OPTIMIZATION: Short ASCII strings become compile-time constants with no runtime validation or heap allocation.
+    if (length <= AK::Detail::MAX_SHORT_STRING_BYTE_COUNT
+        && AK::all_of(cstring, cstring + length, AK::is_ascii)) {
+        return AK::String::from_ascii_short_string_without_validation(cstring, length);
+    }
+
     ASSERT(Utf8View(AK::StringView(cstring, length)).validate());
     return AK::String::from_utf8_without_validation({ cstring, length });
 }

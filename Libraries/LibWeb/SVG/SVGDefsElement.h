@@ -6,26 +6,23 @@
 
 #pragma once
 
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 
 namespace Web::SVG {
 
 class SVGDefsElement final : public SVGGraphicsElement {
-    WEB_PLATFORM_OBJECT(SVGDefsElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGDefsElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGDefsElement);
 
 public:
     virtual ~SVGDefsElement();
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override
-    {
-        return nullptr;
-    }
+    virtual CSS::ElementBoxKind box_kind() const override { return CSS::ElementBoxKind::NoBox; }
 
 private:
     SVGDefsElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
 };
 
 }

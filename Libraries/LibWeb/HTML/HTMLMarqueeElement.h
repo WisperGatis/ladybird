@@ -8,30 +8,28 @@
 #pragma once
 
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
 // NOTE: This element is marked as obsolete, but is still listed as required by the specification.
 class HTMLMarqueeElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLMarqueeElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLMarqueeElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLMarqueeElement);
 
 public:
     virtual ~HTMLMarqueeElement() override;
 
     WebIDL::UnsignedLong scroll_amount();
-    WebIDL::ExceptionOr<void> set_scroll_amount(WebIDL::UnsignedLong);
+    void set_scroll_amount(WebIDL::UnsignedLong);
 
     WebIDL::UnsignedLong scroll_delay();
-    WebIDL::ExceptionOr<void> set_scroll_delay(WebIDL::UnsignedLong);
+    void set_scroll_delay(WebIDL::UnsignedLong);
 
 private:
     HTMLMarqueeElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(GC::Ref<CSS::CascadedProperties>) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 };
 
 }

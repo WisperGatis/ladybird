@@ -6,26 +6,25 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Forward.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
-class EXTColorBufferFloat : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(EXTColorBufferFloat, Bindings::PlatformObject);
+class EXTColorBufferFloat : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(EXTColorBufferFloat, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(EXTColorBufferFloat);
 
 public:
-    static JS::ThrowCompletionOr<GC::Ptr<EXTColorBufferFloat>> create(JS::Realm&, GC::Ref<WebGL2RenderingContext>);
+    static GC::Ref<Bindings::Wrappable> create(GC::Ref<WebGLRenderingContextBase>);
 
 protected:
-    void initialize(JS::Realm&) override;
     void visit_edges(Visitor&) override;
 
 private:
-    EXTColorBufferFloat(JS::Realm&, GC::Ref<WebGL2RenderingContext>);
+    EXTColorBufferFloat(JS::Realm&, GC::Ref<WebGLRenderingContextBase>);
 
-    GC::Ref<WebGL2RenderingContext> m_context;
+    GC::Ref<WebGLRenderingContextBase> m_context;
 };
 
 }

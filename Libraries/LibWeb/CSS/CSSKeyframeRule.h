@@ -7,9 +7,10 @@
 #pragma once
 
 #include <AK/NonnullRefPtr.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/Percentage.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -17,36 +18,45 @@ namespace Web::CSS {
 
 // https://drafts.csswg.org/css-animations/#interface-csskeyframerule
 class CSSKeyframeRule final : public CSSRule {
-    WEB_PLATFORM_OBJECT(CSSKeyframeRule, CSSRule);
+    WEB_WRAPPABLE(CSSKeyframeRule, CSSRule);
     GC_DECLARE_ALLOCATOR(CSSKeyframeRule);
 
 public:
-    static GC::Ref<CSSKeyframeRule> create(JS::Realm&, CSS::Percentage key, CSSStyleProperties&);
+    static GC::Ref<CSSKeyframeRule> create(RustRule);
 
     virtual ~CSSKeyframeRule() = default;
 
-    CSS::Percentage key() const { return m_key; }
-    GC::Ref<CSSStyleProperties> style() const { return m_declarations; }
+    GC::Ref<CSSStyleProperties> style() const;
 
-    String key_text() const
+    Utf16String key_text() const
     {
-        return m_key.to_string();
+        Utf16StringBuilder builder;
+        auto keys = Parser::ValueParserFFI::rust_keyframe_keys(&m_frame);
+        for (auto key : ReadonlySpan<double> { keys.values, keys.count }) {
+            if (!builder.is_empty())
+                builder.append(", "sv);
+            builder.appendff("{}%"sv, key);
+        }
+
+        return builder.to_string();
     }
 
-    void set_key_text(String const& key_text)
+    void set_key_text(Utf16View)
     {
-        dbgln("FIXME: CSSKeyframeRule::set_key_text is not implemented: {}", key_text);
+        dbgln("FIXME: CSSKeyframeRule::set_key_text is not implemented");
     }
 
 private:
-    CSSKeyframeRule(JS::Realm&, CSS::Percentage, CSSStyleProperties&);
+    CSSKeyframeRule(RustRule);
 
+    virtual size_t external_memory_size() const override;
     virtual void visit_edges(Visitor&) override;
-    virtual void initialize(JS::Realm&) override;
-    virtual String serialized() const override;
+    virtual Utf16String serialized() const override;
+    virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    CSS::Percentage m_key;
-    GC::Ref<CSSStyleProperties> m_declarations;
+    Parser::ValueParserFFI::FfiKeyframe const& m_frame;
+    RustDeclarationBlock m_declarations;
+    mutable GC::Ptr<CSSStyleProperties> m_style;
 };
 
 template<>

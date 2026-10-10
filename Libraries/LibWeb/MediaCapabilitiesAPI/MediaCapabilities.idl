@@ -1,5 +1,3 @@
-#import <EncryptedMediaExtensions/MediaKeySystemAccess.idl>
-
 // https://w3c.github.io/media-capabilities/#mediaconfiguration
 dictionary MediaConfiguration {
     VideoConfiguration video;
@@ -97,18 +95,19 @@ dictionary MediaCapabilitiesInfo {
     required boolean powerEfficient;
 };
 
+[GenerateToValue]
 dictionary MediaCapabilitiesDecodingInfo : MediaCapabilitiesInfo {
-    [FIXME, required] MediaKeySystemAccess keySystemAccess;
-    MediaDecodingConfiguration configuration;
+    required MediaKeySystemAccess? keySystemAccess;
+    required MediaDecodingConfiguration configuration;
 };
 
 dictionary MediaCapabilitiesEncodingInfo : MediaCapabilitiesInfo {
-    MediaEncodingConfiguration configuration;
+    required MediaEncodingConfiguration configuration;
 };
 
 // https://w3c.github.io/media-capabilities/#mediacapabilities
 [Exposed=(Window, Worker)]
 interface MediaCapabilities {
-    [NewObject] Promise<MediaCapabilitiesDecodingInfo> decodingInfo(MediaDecodingConfiguration configuration);
+    [NewObject, CreatesPromise] Promise<MediaCapabilitiesDecodingInfo> decodingInfo(MediaDecodingConfiguration configuration);
     [FIXME, NewObject] Promise<MediaCapabilitiesEncodingInfo> encodingInfo(MediaEncodingConfiguration configuration);
 };

@@ -5,14 +5,21 @@
  */
 
 #include <AK/IDAllocator.h>
+#include <AK/NeverDestroyed.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
+#include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(Task);
 
-static IDAllocator s_unique_task_source_allocator { static_cast<int>(Task::Source::UniqueTaskSourceStart) };
+static IDAllocator& unique_task_source_allocator()
+{
+    static NeverDestroyed<IDAllocator> allocator { static_cast<int>(Task::Source::UniqueTaskSourceStart) };
+    return *allocator;
+}
 
 [[nodiscard]] static TaskID allocate_task_id()
 {
@@ -20,15 +27,17 @@ static IDAllocator s_unique_task_source_allocator { static_cast<int>(Task::Sourc
     return next_task_id++;
 }
 
-GC::Ref<Task> Task::create(JS::VM& vm, Source source, GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps)
+GC::Ref<Task> Task::create(Source source, GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps, Priority priority, GC::Ptr<GC::Function<void()>> discard_steps)
 {
-    return vm.heap().allocate<Task>(source, document, move(steps));
+    return GC::Heap::the().allocate<Task>(source, document, move(steps), priority, discard_steps);
 }
 
-Task::Task(Source source, GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps)
+Task::Task(Source source, GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps, Priority priority, GC::Ptr<GC::Function<void()>> discard_steps)
     : m_id(allocate_task_id())
     , m_source(source)
+    , m_priority(priority)
     , m_steps(steps)
+    , m_discard_steps(discard_steps)
     , m_document(document)
 {
 }
@@ -39,27 +48,36 @@ void Task::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_steps);
+    visitor.visit(m_discard_steps);
     visitor.visit(m_document);
 }
 
 void Task::execute()
 {
+    auto scope_guard = SVG::ScopedSVGImageDocument::create_if_needed(m_document, SVG::ScopedSVGImageDocument::FrameRequests::RouteToCurrentImage);
+
     m_steps->function()();
+}
+
+void Task::discard()
+{
+    if (auto discard_steps = m_discard_steps) {
+        m_discard_steps = nullptr;
+        discard_steps->function()();
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable
 bool Task::is_runnable() const
 {
     // A task is runnable if its document is either null or fully active.
-    if (!m_document)
-        return true;
+    // AD-HOC: Decoded SVG documents are not generally active but are made active while executing their tasks.
+    return !m_document || m_document->is_fully_active() || (m_document->is_decoded_svg() && !m_document->has_been_destroyed());
+}
 
-    // AD-HOC: If the document has been destroyed, we'll consider the task runnable.
-    //         Otherwise it would get stuck here forever, since a destroyed document never becomes fully active again.
-    if (m_document->has_been_destroyed())
-        return true;
-
-    return m_document->is_fully_active();
+bool Task::is_permanently_unrunnable() const
+{
+    return m_document && m_document->has_been_destroyed();
 }
 
 DOM::Document const* Task::document() const
@@ -68,13 +86,13 @@ DOM::Document const* Task::document() const
 }
 
 UniqueTaskSource::UniqueTaskSource()
-    : source(static_cast<Task::Source>(s_unique_task_source_allocator.allocate()))
+    : source(static_cast<Task::Source>(unique_task_source_allocator().allocate()))
 {
 }
 
 UniqueTaskSource::~UniqueTaskSource()
 {
-    s_unique_task_source_allocator.deallocate(static_cast<int>(source));
+    unique_task_source_allocator().deallocate(static_cast<int>(source));
 }
 
 NonnullRefPtr<ParallelQueue> ParallelQueue::create()
@@ -85,7 +103,7 @@ NonnullRefPtr<ParallelQueue> ParallelQueue::create()
 TaskID ParallelQueue::enqueue(GC::Ref<GC::Function<void()>> algorithm)
 {
     auto& event_loop = HTML::main_thread_event_loop();
-    auto task = HTML::Task::create(event_loop.vm(), m_task_source.source, nullptr, algorithm);
+    auto task = HTML::Task::create(m_task_source.source, nullptr, algorithm);
     event_loop.task_queue().add(task);
     return task->id();
 }

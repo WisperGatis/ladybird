@@ -1,0 +1,14 @@
+// https://fullscreen.spec.whatwg.org/#ref-for-element
+partial interface Element {
+    [CreatesPromise] Promise<undefined> requestFullscreen();
+
+    attribute EventHandler onfullscreenchange;
+    attribute EventHandler onfullscreenerror;
+
+    // Legacy WebKit Fullscreen API aliases.
+    [ImplementedAs=webkit_request_fullscreen] undefined webkitRequestFullScreen();
+    [ImplementedAs=webkit_request_fullscreen] undefined webkitRequestFullscreen();
+
+    attribute EventHandler onwebkitfullscreenchange;
+    attribute EventHandler onwebkitfullscreenerror;
+};

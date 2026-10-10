@@ -5,112 +5,249 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#define GL_GLEXT_PROTOTYPES 1
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 extern "C" {
 #include <GLES2/gl2ext_angle.h>
 }
 
-#include <LibGfx/SkiaUtils.h>
+#include <LibCompositing/WebGL/TextureUpload.h>
+#include <LibGfx/DecodedImageFrame.h>
+#include <LibJS/Runtime/Object.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/HTML/DecodedImageData.h>
+#include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
-#include <LibWeb/WebGL/OpenGLContext.h>
+#include <LibWeb/HTML/OffscreenCanvas.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+#include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/WebGL/EventNames.h>
+#include <LibWeb/WebGL/Extensions/ANGLEInstancedArrays.h>
+#include <LibWeb/WebGL/Extensions/EXTBlendMinMax.h>
+#include <LibWeb/WebGL/Extensions/EXTColorBufferFloat.h>
+#include <LibWeb/WebGL/Extensions/EXTRenderSnorm.h>
+#include <LibWeb/WebGL/Extensions/EXTTextureFilterAnisotropic.h>
+#include <LibWeb/WebGL/Extensions/EXTTextureNorm16.h>
+#include <LibWeb/WebGL/Extensions/OESElementIndexUint.h>
+#include <LibWeb/WebGL/Extensions/OESStandardDerivatives.h>
+#include <LibWeb/WebGL/Extensions/OESVertexArrayObject.h>
+#include <LibWeb/WebGL/Extensions/WebGLCompressedTextureS3tc.h>
+#include <LibWeb/WebGL/Extensions/WebGLCompressedTextureS3tcSrgb.h>
+#include <LibWeb/WebGL/Extensions/WebGLDebugRendererInfo.h>
+#include <LibWeb/WebGL/Extensions/WebGLDrawBuffers.h>
+#include <LibWeb/WebGL/WebGLContextProxy.h>
+#include <LibWeb/WebGL/WebGLObject.h>
+#include <LibWeb/WebGL/WebGLRenderingContext.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
-
-#include <core/SkCanvas.h>
-#include <core/SkColorSpace.h>
-#include <core/SkColorType.h>
-#include <core/SkImage.h>
-#include <core/SkPixmap.h>
-#include <core/SkSurface.h>
 
 namespace Web::WebGL {
 
-static constexpr Optional<int> opengl_format_and_type_number_of_bytes(WebIDL::UnsignedLong format, WebIDL::UnsignedLong type)
+WebGLRenderingContextBase::WebGLRenderingContextBase(JS::Realm& realm)
+    : m_realm(realm)
 {
-    switch (format) {
-    case GL_LUMINANCE:
-    case GL_ALPHA:
-        if (type != GL_UNSIGNED_BYTE)
-            return OptionalNone {};
-
-        return 1;
-    case GL_LUMINANCE_ALPHA:
-        if (type != GL_UNSIGNED_BYTE)
-            return OptionalNone {};
-
-        return 2;
-    case GL_RGB:
-        if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT_5_6_5)
-            return OptionalNone {};
-
-        return type == GL_UNSIGNED_BYTE ? 3 : 2;
-    case GL_RGBA:
-        if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT_4_4_4_4 && type != GL_UNSIGNED_SHORT_5_5_5_1)
-            return OptionalNone {};
-
-        return type == GL_UNSIGNED_BYTE ? 4 : 2;
-    default:
-        return OptionalNone {};
-    }
 }
 
-static constexpr SkColorType opengl_format_and_type_to_skia_color_type(WebIDL::UnsignedLong format, WebIDL::UnsignedLong type)
+HTML::CanvasHost& canvas_host_for(CanvasOwner const& canvas)
 {
-    switch (format) {
-    case GL_RGB:
-        switch (type) {
-        case GL_UNSIGNED_BYTE:
-            return SkColorType::kRGB_888x_SkColorType;
-        case GL_UNSIGNED_SHORT_5_6_5:
-            return SkColorType::kRGB_565_SkColorType;
-        default:
-            break;
-        }
-        break;
-    case GL_RGBA:
-        switch (type) {
-        case GL_UNSIGNED_BYTE:
-            return SkColorType::kRGBA_8888_SkColorType;
-        case GL_UNSIGNED_SHORT_4_4_4_4:
-            // FIXME: This is not exactly the same as RGBA.
-            return SkColorType::kARGB_4444_SkColorType;
-        case GL_UNSIGNED_SHORT_5_5_5_1:
-            dbgln("WebGL FIXME: Support conversion to RGBA5551.");
-            break;
-        default:
-            break;
-        }
-        break;
-    case GL_ALPHA:
-        switch (type) {
-        case GL_UNSIGNED_BYTE:
-            return SkColorType::kAlpha_8_SkColorType;
-        default:
-            break;
-        }
-        break;
-    case GL_LUMINANCE:
-        switch (type) {
-        case GL_UNSIGNED_BYTE:
-            return SkColorType::kGray_8_SkColorType;
-        default:
-            break;
-        }
-        break;
-    default:
-        break;
-    }
-
-    dbgln("WebGL: Unsupported format and type combination. format: 0x{:04x}, type: 0x{:04x}", format, type);
-    return SkColorType::kUnknown_SkColorType;
+    return canvas.visit([](auto const& canvas) -> HTML::CanvasHost& { return *canvas; });
 }
 
-Optional<WebGLRenderingContextBase::ConvertedTexture> WebGLRenderingContextBase::read_and_pixel_convert_texture_image_source(TexImageSource const& source, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type, Optional<int> destination_width, Optional<int> destination_height)
+GC::Ptr<Bindings::Wrappable> WebGLRenderingContextBase::relevant_global_impl() const
+{
+    return canvas_host().canvas_relevant_global_impl();
+}
+
+struct Extension {
+    Vector<StringView> required_angle_extensions;
+    GC::Ref<Bindings::Wrappable> (*factory)(GC::Ref<WebGLRenderingContextBase>) { nullptr };
+    Optional<WebGLVersion> only_for_webgl_version { OptionalNone {} };
+    bool creates_empty_object { false };
+};
+
+static HashMap<String, Extension, AK::ASCIICaseInsensitiveStringTraits> const& available_webgl_extensions()
+{
+    static auto const& extensions = *new HashMap<String, Extension, AK::ASCIICaseInsensitiveStringTraits> {
+        // Khronos ratified WebGL Extensions
+        { "ANGLE_instanced_arrays"_string, { { "GL_ANGLE_instanced_arrays"sv }, ANGLEInstancedArrays::create, WebGLVersion::WebGL1 } },
+        { "EXT_blend_minmax"_string, { { "GL_EXT_blend_minmax"sv }, EXTBlendMinMax::create, WebGLVersion::WebGL1 } },
+        { "EXT_frag_depth"_string, { { "GL_EXT_frag_depth"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "EXT_shader_texture_lod"_string, { { "GL_EXT_shader_texture_lod"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "EXT_texture_filter_anisotropic"_string, { { "GL_EXT_texture_filter_anisotropic"sv }, EXTTextureFilterAnisotropic::create } },
+        { "OES_element_index_uint"_string, { { "GL_OES_element_index_uint"sv }, OESElementIndexUint::create, WebGLVersion::WebGL1 } },
+        { "OES_standard_derivatives"_string, { { "GL_OES_standard_derivatives"sv }, OESStandardDerivatives::create, WebGLVersion::WebGL1 } },
+        { "OES_texture_float"_string, { { "GL_OES_texture_float"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "OES_texture_float_linear"_string, { { "GL_OES_texture_float_linear"sv }, nullptr, OptionalNone {}, true } },
+        { "OES_texture_half_float"_string, { { "GL_OES_texture_half_float"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "OES_texture_half_float_linear"_string, { { "GL_OES_texture_half_float_linear"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "OES_vertex_array_object"_string, { { "GL_OES_vertex_array_object"sv }, OESVertexArrayObject::create, WebGLVersion::WebGL1 } },
+        { "WEBGL_compressed_texture_s3tc"_string, { { "GL_EXT_texture_compression_dxt1"sv, "GL_ANGLE_texture_compression_dxt3"sv, "GL_ANGLE_texture_compression_dxt5"sv }, WebGLCompressedTextureS3tc::create } },
+        { "WEBGL_debug_renderer_info"_string, { {}, WebGLDebugRendererInfo::create } },
+        { "WEBGL_debug_shaders"_string, { {}, nullptr } },
+        { "WEBGL_depth_texture"_string, { { "GL_ANGLE_depth_texture"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "WEBGL_draw_buffers"_string, { { "GL_EXT_draw_buffers"sv }, WebGLDrawBuffers::create, WebGLVersion::WebGL1 } },
+        { "WEBGL_lose_context"_string, { {}, nullptr } },
+
+        // Community approved WebGL Extensions
+        { "EXT_clip_control"_string, { { "GL_EXT_clip_control"sv }, nullptr } },
+        { "EXT_color_buffer_float"_string, { { "GL_EXT_color_buffer_float"sv }, EXTColorBufferFloat::create, WebGLVersion::WebGL2 } },
+        { "EXT_color_buffer_half_float"_string, { { "GL_EXT_color_buffer_half_float"sv }, nullptr } },
+        { "EXT_conservative_depth"_string, { { "GL_EXT_conservative_depth"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "EXT_depth_clamp"_string, { { "GL_EXT_depth_clamp"sv }, nullptr } },
+        { "EXT_disjoint_timer_query"_string, { { "GL_EXT_disjoint_timer_query"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "EXT_disjoint_timer_query_webgl2"_string, { { "GL_EXT_disjoint_timer_query"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "EXT_float_blend"_string, { { "GL_EXT_float_blend"sv }, nullptr, OptionalNone {}, true } },
+        { "EXT_polygon_offset_clamp"_string, { { "GL_EXT_polygon_offset_clamp"sv }, nullptr } },
+        { "EXT_render_snorm"_string, { { "GL_EXT_render_snorm"sv }, EXTRenderSnorm::create, WebGLVersion::WebGL2 } },
+        { "EXT_sRGB"_string, { { "GL_EXT_sRGB"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "EXT_texture_compression_bptc"_string, { { "GL_EXT_texture_compression_bptc"sv }, nullptr } },
+        { "EXT_texture_compression_rgtc"_string, { { "GL_EXT_texture_compression_rgtc"sv }, nullptr } },
+        { "EXT_texture_mirror_clamp_to_edge"_string, { { "GL_EXT_texture_mirror_clamp_to_edge"sv }, nullptr } },
+        { "EXT_texture_norm16"_string, { { "GL_EXT_texture_norm16"sv }, EXTTextureNorm16::create, WebGLVersion::WebGL2 } },
+        { "KHR_parallel_shader_compile"_string, { { "GL_KHR_parallel_shader_compile"sv }, nullptr } },
+        { "NV_shader_noperspective_interpolation"_string, { { "GL_NV_shader_noperspective_interpolation"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "OES_draw_buffers_indexed"_string, { { "GL_OES_draw_buffers_indexed"sv }, nullptr } },
+        { "OES_fbo_render_mipmap"_string, { { "GL_OES_fbo_render_mipmap"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "OES_sample_variables"_string, { { "GL_OES_sample_variables"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "OES_shader_multisample_interpolation"_string, { { "GL_OES_shader_multisample_interpolation"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "OVR_multiview2"_string, { { "GL_OVR_multiview2"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "WEBGL_blend_func_extended"_string, { { "GL_EXT_blend_func_extended"sv }, nullptr } },
+        { "WEBGL_clip_cull_distance"_string, { { "GL_EXT_clip_cull_distance"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "WEBGL_color_buffer_float"_string, { { "EXT_color_buffer_half_float"sv, "OES_texture_float"sv }, nullptr, WebGLVersion::WebGL1 } },
+        { "WEBGL_compressed_texture_astc"_string, { { "KHR_texture_compression_astc_hdr"sv, "KHR_texture_compression_astc_ldr"sv }, nullptr } },
+        { "WEBGL_compressed_texture_etc"_string, { { "GL_ANGLE_compressed_texture_etc"sv }, nullptr } },
+        { "WEBGL_compressed_texture_etc1"_string, { { "GL_OES_compressed_ETC1_RGB8_texture"sv }, nullptr } },
+        { "WEBGL_compressed_texture_pvrtc"_string, { { "GL_IMG_texture_compression_pvrtc"sv }, nullptr } },
+        { "WEBGL_compressed_texture_s3tc_srgb"_string, { { "GL_EXT_texture_compression_s3tc_srgb"sv }, WebGLCompressedTextureS3tcSrgb::create } },
+        { "WEBGL_multi_draw"_string, { { "GL_ANGLE_multi_draw"sv }, nullptr } },
+        { "WEBGL_polygon_mode"_string, { { "GL_ANGLE_polygon_mode"sv }, nullptr } },
+        { "WEBGL_provoking_vertex"_string, { { "GL_ANGLE_provoking_vertex"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "WEBGL_render_shared_exponent"_string, { { "GL_QCOM_render_shared_exponent"sv }, nullptr, WebGLVersion::WebGL2 } },
+        { "WEBGL_stencil_texturing"_string, { { "GL_ANGLE_stencil_texturing"sv }, nullptr, WebGLVersion::WebGL2 } },
+    };
+    return extensions;
+}
+
+Optional<Vector<Utf16String>> WebGLRenderingContextBase::get_supported_extensions()
+{
+    auto const& opengl_extensions = context().get_supported_opengl_extensions();
+    Vector<Utf16String> webgl_extensions;
+
+    for (auto const& [available_extension_name, available_extension_info] : available_webgl_extensions()) {
+        bool supported = !available_extension_info.only_for_webgl_version.has_value()
+            || context().webgl_version() == available_extension_info.only_for_webgl_version;
+
+        if (!available_extension_info.factory && !available_extension_info.creates_empty_object && !HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interfaces()) {
+            supported = false;
+        }
+
+        if (supported) {
+            for (auto const& required_extension : available_extension_info.required_angle_extensions) {
+                if (!opengl_extensions.contains_slow(required_extension)) {
+                    supported = false;
+                    break;
+                }
+            }
+        }
+
+        if (supported)
+            webgl_extensions.append(Utf16String::from_ascii_without_validation(available_extension_name.bytes_as_string_view().bytes()));
+    }
+
+    return webgl_extensions;
+}
+
+GC::Ptr<JS::Object> WebGLRenderingContextBase::get_extension(JS::Realm& caller_realm, Utf16String const& name)
+{
+    // Returns an object if, and only if, name is an ASCII case-insensitive match [HTML] for one of the names returned
+    // from getSupportedExtensions; otherwise, returns null. The object returned from getExtension contains any constants
+    // or functions provided by the extension. A returned object may have no constants or functions if the extension does
+    // not define any, but a unique object must still be returned. That object is used to indicate that the extension has
+    // been enabled.
+    if (!name.is_ascii())
+        return nullptr;
+
+    auto name_string = MUST(String::from_byte_string(name.to_byte_string()));
+    auto supported_extensions = get_supported_extensions();
+    auto supported_extension_iterator = supported_extensions->find_if([&name](Utf16String const& supported_extension) {
+        return supported_extension.equals_ignoring_ascii_case(name);
+    });
+    if (supported_extension_iterator == supported_extensions->end())
+        return nullptr;
+
+    auto maybe_extension = m_enabled_extensions.get(name_string);
+    if (maybe_extension.has_value())
+        return Bindings::wrap(Bindings::host_defined_wrapper_world(caller_realm), caller_realm, maybe_extension.release_value()).ptr();
+
+    auto& wrapper_world = Bindings::host_defined_wrapper_world(caller_realm);
+    if (auto maybe_empty_extension_cache = m_enabled_empty_extensions.get(name_string); maybe_empty_extension_cache.has_value()) {
+        if (auto extension = maybe_empty_extension_cache.value()->get(wrapper_world))
+            return extension;
+    }
+
+    // If we pass the check above this will always return a value
+    auto const& extension_info = available_webgl_extensions().get(name_string).release_value();
+
+    if (!extension_info.factory && !extension_info.creates_empty_object)
+        return nullptr;
+
+    for (auto const& required_extension : extension_info.required_angle_extensions) {
+        context().request_extension_angle(null_terminated_string(required_extension).data());
+    }
+
+    if (extension_info.creates_empty_object) {
+        auto extension = JS::Object::create(caller_realm, caller_realm.intrinsics().object_prototype());
+        auto& cache = m_enabled_empty_extensions.ensure(move(name_string), [] {
+            return make<Bindings::WrapperWorldWeakValueCache<JS::Object>>();
+        });
+        cache->set(wrapper_world, extension);
+        return extension;
+    }
+
+    auto extension = extension_info.factory(*this);
+    m_enabled_extensions.set(move(name_string), extension);
+    return Bindings::wrap(Bindings::host_defined_wrapper_world(caller_realm), caller_realm, extension);
+}
+
+void WebGLRenderingContextBase::enable_compressed_texture_format(WebIDL::UnsignedLong format)
+{
+    m_enabled_compressed_texture_formats.append(format);
+}
+
+void WebGLRenderingContextBase::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_realm);
+    visitor.visit(m_current_vertex_array);
+    visitor.visit(m_enabled_extensions);
+}
+
+bool WebGLRenderingContextBase::extension_enabled(StringView extension) const
+{
+    auto extension_name = MUST(String::from_utf8(extension));
+    return m_enabled_extensions.contains(extension_name) || m_enabled_empty_extensions.contains(extension_name);
+}
+
+ReadonlySpan<WebIDL::UnsignedLong> WebGLRenderingContextBase::enabled_compressed_texture_formats() const
+{
+    return m_enabled_compressed_texture_formats;
+}
+
+ErrorOr<ReadonlyBytes> WebGLRenderingContextBase::texture_data_for_2d_upload(ReadonlyBytes bytes, GLsizei width, GLsizei height, GLenum format, GLenum type) const
+{
+    if (!is_valid_2d_pixel_unpack_state(width, m_unpack_state))
+        return Error::from_errno(EINVAL);
+    if (auto size = required_2d_texture_data_size(width, height, format, type, m_unpack_state); size.has_value() && *size <= bytes.size())
+        return bytes.slice(0, *size);
+    return bytes;
+}
+
+Optional<WebGLRenderingContextBase::TexImageSourceFrame> WebGLRenderingContextBase::read_texture_image_source(TexImageSource const& source, WebIDL::UnsignedLong format, WebIDL::UnsignedLong type)
 {
     // FIXME: If this function is called with an ImageData whose data attribute has been neutered,
     //        an INVALID_VALUE error is generated.
@@ -121,75 +258,216 @@ Optional<WebGLRenderingContextBase::ConvertedTexture> WebGLRenderingContextBase:
     //        ImageBitmap or OffscreenCanvas whose bitmap's origin-clean flag is set to false,
     //        a SECURITY_ERR exception must be thrown. See Origin Restrictions.
     // FIXME: If source is null then an INVALID_VALUE error is generated.
-    auto bitmap = source.visit(
-        [](GC::Root<HTML::HTMLImageElement> const& source) -> RefPtr<Gfx::ImmutableBitmap> {
-            return source->immutable_bitmap();
+    auto frame = source.visit(
+        [](GC::Ref<HTML::HTMLImageElement> source) -> Optional<Gfx::DecodedImageFrame> {
+            return source->current_image_frame();
         },
-        [](GC::Root<HTML::HTMLCanvasElement> const& source) -> RefPtr<Gfx::ImmutableBitmap> {
-            auto surface = source->surface();
-            if (!surface)
-                return Gfx::ImmutableBitmap::create(*source->get_bitmap_from_surface());
-            return Gfx::ImmutableBitmap::create_snapshot_from_painting_surface(*surface);
+        [](OneOf<GC::Ref<HTML::HTMLCanvasElement>, GC::Ref<HTML::OffscreenCanvas>> auto source) -> Optional<Gfx::DecodedImageFrame> {
+            auto bitmap = source->get_bitmap_from_surface();
+            if (!bitmap)
+                return {};
+            return Gfx::DecodedImageFrame { *bitmap };
         },
-        [](GC::Root<HTML::OffscreenCanvas> const& source) -> RefPtr<Gfx::ImmutableBitmap> {
-            return Gfx::ImmutableBitmap::create(*source->bitmap());
+        [](GC::Ref<HTML::HTMLVideoElement> source) -> Optional<Gfx::DecodedImageFrame> {
+            return source->current_decoded_image_frame();
         },
-        [](GC::Root<HTML::HTMLVideoElement> const& source) -> RefPtr<Gfx::ImmutableBitmap> {
-            return Gfx::ImmutableBitmap::create(*source->bitmap());
+        [](GC::Ref<HTML::ImageBitmap> source) -> Optional<Gfx::DecodedImageFrame> {
+            return Gfx::DecodedImageFrame { *source->bitmap() };
         },
-        [](GC::Root<HTML::ImageBitmap> const& source) -> RefPtr<Gfx::ImmutableBitmap> {
-            return Gfx::ImmutableBitmap::create(*source->bitmap());
-        },
-        [](GC::Root<HTML::ImageData> const& source) -> RefPtr<Gfx::ImmutableBitmap> {
-            return Gfx::ImmutableBitmap::create(source->bitmap());
+        [this](GC::Ref<HTML::ImageData> source) -> Optional<Gfx::DecodedImageFrame> {
+            // ImageData keeps a cached bitmap for ordinary use, but its data
+            // attribute can be detached independently. WebGL must reject that
+            // source instead of uploading the stale cached pixels.
+            auto data = source->data();
+            if (!data)
+                return OptionalNone {};
+            auto data_record = JS::make_typed_array_with_buffer_witness_record(*data, JS::ArrayBuffer::Order::SeqCst);
+            if (JS::is_typed_array_out_of_bounds(data_record)) {
+                set_error(GL_INVALID_VALUE);
+                return OptionalNone {};
+            }
+            auto bitmap = source->bitmap();
+            if (bitmap.is_error()) {
+                set_error(GL_INVALID_VALUE);
+                return OptionalNone {};
+            }
+            NonnullRefPtr<Gfx::Bitmap const> bitmap_ref = bitmap.release_value();
+            return Gfx::DecodedImageFrame { move(bitmap_ref) };
         });
-    if (!bitmap)
+    if (!frame.has_value())
         return OptionalNone {};
 
-    int width = destination_width.value_or(bitmap->width());
-    int height = destination_height.value_or(bitmap->height());
-
-    Checked<size_t> buffer_pitch = width;
-
-    auto number_of_bytes = opengl_format_and_type_number_of_bytes(format, type);
-    if (!number_of_bytes.has_value())
+    // Validate the combination before recording; the pixels travel to the host as shared
+    // memory and the host performs the conversion next to GL.
+    if (!texture_export_format(format, type).has_value())
         return OptionalNone {};
 
-    buffer_pitch *= number_of_bytes.value();
-
-    if (buffer_pitch.has_overflow())
-        return OptionalNone {};
-
-    if (Checked<size_t>::multiplication_would_overflow(buffer_pitch.value(), height))
-        return OptionalNone {};
-
-    auto buffer = MUST(ByteBuffer::create_zeroed(buffer_pitch.value() * height));
-
-    auto skia_format = opengl_format_and_type_to_skia_color_type(format, type);
-
-    // FIXME: Respect UNPACK_PREMULTIPLY_ALPHA_WEBGL
     // FIXME: Respect unpackColorSpace
-    auto color_space = SkColorSpace::MakeSRGB();
-    auto image_info = SkImageInfo::Make(width, height, skia_format, SkAlphaType::kPremul_SkAlphaType, color_space);
-    auto surface = SkSurfaces::WrapPixels(image_info, buffer.data(), buffer_pitch.value());
-    auto surface_canvas = surface->getCanvas();
-    auto dst_rect = Gfx::to_skia_rect(Gfx::Rect { 0, 0, width, height });
+    return TexImageSourceFrame {
+        .frame = frame.release_value(),
+        // The first pixel transferred from the source to the WebGL implementation corresponds to the upper left corner of
+        // the source. This behavior is modified by the UNPACK_FLIP_Y_WEBGL pixel storage parameter, except for ImageBitmap
+        // arguments, as described in the abovementioned section.
+        .flip_y = m_unpack_flip_y && !source.has<GC::Ref<HTML::ImageBitmap>>(),
+        .premultiply_alpha = m_unpack_premultiply_alpha,
+    };
+}
 
-    // The first pixel transferred from the source to the WebGL implementation corresponds to the upper left corner of
-    // the source. This behavior is modified by the UNPACK_FLIP_Y_WEBGL pixel storage parameter, except for ImageBitmap
-    // arguments, as described in the abovementioned section.
-    if (m_unpack_flip_y && !source.has<GC::Root<HTML::ImageBitmap>>()) {
-        surface_canvas->translate(0, dst_rect.height());
-        surface_canvas->scale(1, -1);
+// https://registry.khronos.org/webgl/specs/latest/1.0/#CONTEXT_LOST_WEBGL
+static constexpr GLenum CONTEXT_LOST_WEBGL = 0x9242;
+
+// TODO: The glGetError spec allows for queueing errors which is something we should probably do, for now
+//       this just keeps track of one error which is also fine by the spec
+GLenum WebGLRenderingContextBase::get_error_value()
+{
+    if (m_context_lost) {
+        auto error = m_error;
+        m_error = GL_NO_ERROR;
+        return error;
     }
 
-    surface_canvas->drawImageRect(bitmap->sk_image(), dst_rect, Gfx::to_skia_sampling_options(Gfx::ScalingMode::NearestNeighbor));
+    if (auto local_error = context().take_pending_local_error(); local_error != GL_NO_ERROR)
+        return local_error;
 
-    return ConvertedTexture {
-        .buffer = move(buffer),
-        .width = width,
-        .height = height,
-    };
+    auto context_error = context().get_error();
+    if (context_error != GL_NO_ERROR)
+        return context_error;
+
+    auto error = m_error;
+    m_error = GL_NO_ERROR;
+    return error;
+}
+
+void WebGLRenderingContextBase::set_error(GLenum error)
+{
+    if (m_error == GL_NO_ERROR)
+        m_error = error;
+}
+
+bool WebGLRenderingContextBase::is_context_lost() const
+{
+    dbgln_if(WEBGL_CONTEXT_DEBUG, "WebGLRenderingContext::is_context_lost()");
+    return m_context_lost;
+}
+
+void WebGLRenderingContextBase::lose_context_from_compositor_loss()
+{
+    if (m_context_lost)
+        return;
+    m_context_lost = true;
+    context().set_lost();
+
+    // The next getError() must report CONTEXT_LOST_WEBGL (one-shot) per the spec.
+    m_error = CONTEXT_LOST_WEBGL;
+
+    HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(heap(), [this] {
+        // webglcontextlost is cancelable; preventDefault() means the page wants the context
+        // restored once a compositor is available again.
+        m_context_restore_requested = !fire_webgl_context_event(canvas_host(), EventNames::webglcontextlost);
+    }));
+}
+
+void WebGLRenderingContextBase::restore_context_after_compositor_reconnect()
+{
+    if (!m_context_lost || !m_context_restore_requested)
+        return;
+
+    // A fresh host context starts with no GL objects; per the spec the page re-creates them
+    // in its webglcontextrestored handler.
+    if (!reestablish_remote_context())
+        return;
+
+    reset_context_state_after_loss();
+    m_context_lost = false;
+    m_context_restore_requested = false;
+    m_error = GL_NO_ERROR;
+
+    HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(heap(), [this] {
+        fire_webgl_context_event(canvas_host(), EventNames::webglcontextrestored);
+    }));
+}
+
+void WebGLRenderingContextBase::reset_context_state_after_loss()
+{
+    ++m_context_generation;
+    m_unpack_state = {};
+    m_unpack_flip_y = false;
+    m_unpack_premultiply_alpha = false;
+    m_unpack_colorspace_conversion = BROWSER_DEFAULT_WEBGL;
+    reset_client_side_webgl_state();
+}
+
+// https://immersive-web.github.io/webxr/#dom-webglrenderingcontextbase-makexrcompatible
+GC::Ref<WebIDL::Promise> WebGLRenderingContextBase::make_xr_compatible()
+{
+    // 1. If the requesting document’s origin is not allowed to use the "xr-spatial-tracking" permissions policy,
+    //    resolve promise and return it.
+    // FIXME: Implement this.
+
+    // 2. Let promise be a new Promise created in the Realm of this WebGLRenderingContextBase.
+    auto& realm = this->realm();
+    auto promise = WebIDL::create_promise_for(canvas_host().canvas_relevant_global_object());
+
+    // 3. Let context be this.
+    auto context = this;
+
+    // 4. Run the following steps in parallel:
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), [&realm, context, promise]() {
+        // 1. Let device be the result of ensuring an immersive XR device is selected.
+        // FIXME: Implement https://immersive-web.github.io/webxr/#ensure-an-immersive-xr-device-is-selected
+
+        // 2. Set context’s XR compatible boolean as follows:
+
+        // -> If context’s WebGL context lost flag is set:
+        if (context->is_context_lost()) {
+            // Queue a task to set context’s XR compatible boolean to false and reject promise with an InvalidStateError.
+            HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise, context]() {
+                context->set_xr_compatible(false);
+                HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+                WebIDL::reject_promise(promise, WebIDL::InvalidStateError::create("The WebGL context has been lost."_utf16));
+            }));
+        }
+        // -> If device is null:
+        else if (false) {
+            // Queue a task to set context’s XR compatible boolean to false and reject promise with an InvalidStateError.
+            HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise, context]() {
+                context->set_xr_compatible(false);
+                HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+                WebIDL::reject_promise(promise, WebIDL::InvalidStateError::create("Could not select an immersive XR device."_utf16));
+            }));
+        }
+        // -> If context’s XR compatible boolean is true:
+        else if (context->xr_compatible()) {
+            // Queue a task to resolve promise.
+            HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise]() {
+                HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+                WebIDL::resolve_promise(promise);
+            }));
+        }
+        // -> If context was created on a compatible graphics adapter for device:
+        // FIXME: For now we just pretend that this happened, so that we can resolve the promise and proceed running basic WPT tests for this.
+        else if (true) {
+            // Queue a task to set context’s XR compatible boolean to true and resolve promise.
+            HTML::queue_a_task(HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(realm.heap(), [&realm, promise, context]() {
+                context->set_xr_compatible(true);
+                HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+                WebIDL::resolve_promise(promise);
+            }));
+        }
+        // -> Otherwise:
+        else {
+            // Queue a task on the WebGL task source to perform the following steps:
+            HTML::queue_a_task(HTML::Task::Source::WebGL, nullptr, nullptr, GC::create_function(realm.heap(), []() {
+                // 1. Force context to be lost.
+
+                // 2. Handle the context loss as described by the WebGL specification:
+                // FIXME: Implement https://registry.khronos.org/webgl/specs/latest/1.0/#CONTEXT_LOST
+            }));
+        }
+    }));
+
+    // 5. Return promise.
+    return promise;
 }
 
 }

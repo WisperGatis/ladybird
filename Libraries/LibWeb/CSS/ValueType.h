@@ -9,6 +9,7 @@
 #include <AK/Format.h>
 #include <AK/Optional.h>
 #include <AK/Types.h>
+#include <AK/Utf16View.h>
 
 namespace Web::CSS {
 
@@ -22,11 +23,18 @@ enum class ValueType : u8 {
     Color,
     CornerShape,
     Counter,
+    CounterStyle,
     CustomIdent,
+    DashedIdent,
     EasingFunction,
     FilterValueList,
     FitContent,
     Flex,
+    FontStyle,
+    FontVariantAlternates,
+    FontVariantEastAsian,
+    FontVariantLigatures,
+    FontVariantNumeric,
     Frequency,
     FrequencyPercentage,
     Image,
@@ -34,7 +42,7 @@ enum class ValueType : u8 {
     Length,
     LengthPercentage,
     Number,
-    Opacity,
+    OpacityValue,
     OpentypeTag,
     Paint,
     Percentage,
@@ -42,16 +50,18 @@ enum class ValueType : u8 {
     Ratio,
     Rect,
     Resolution,
+    ScrollFunction,
     String,
     Time,
     TimePercentage,
     TransformFunction,
     TransformList,
     Url,
+    ViewFunction,
+    ViewTimelineInset
 };
 
 StringView value_type_to_string(ValueType);
-Optional<ValueType> value_type_from_string(StringView);
 
 }
 

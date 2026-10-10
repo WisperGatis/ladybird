@@ -6,9 +6,6 @@
  */
 
 #include <AK/ByteBuffer.h>
-#include <AK/Debug.h>
-#include <AK/Random.h>
-#include <LibCrypto/ASN1/ASN1.h>
 #include <LibCrypto/ASN1/DER.h>
 #include <LibCrypto/ASN1/PEM.h>
 #include <LibCrypto/Certificate/Certificate.h>
@@ -366,6 +363,9 @@ ErrorOr<ByteBuffer> RSA::encrypt(ReadonlyBytes in)
 
 ErrorOr<ByteBuffer> RSA::decrypt(ReadonlyBytes in)
 {
+    if (in.size() != m_private_key.length())
+        return Error::from_string_literal("RSA ciphertext has an invalid length");
+
     auto key = TRY(private_key_to_openssl_pkey(m_private_key));
 
     auto ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_pkey(nullptr, key.ptr(), nullptr)));
@@ -400,6 +400,9 @@ ErrorOr<ByteBuffer> RSA::sign(ReadonlyBytes message)
 
 ErrorOr<bool> RSA::verify(ReadonlyBytes message, ReadonlyBytes signature)
 {
+    if (!TRY(m_public_key.is_valid()))
+        return false;
+
     auto key = TRY(public_key_to_openssl_pkey(m_public_key));
 
     auto ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_pkey(nullptr, key.ptr(), nullptr)));
@@ -502,6 +505,15 @@ ErrorOr<EVP_MD const*> hash_kind_to_hash_type(Hash::HashKind hash_kind)
 
 ErrorOr<bool> RSA_EMSA::verify(ReadonlyBytes message, ReadonlyBytes signature)
 {
+    if (!TRY(m_public_key.is_valid()))
+        return false;
+
+    if (signature.size() != m_public_key.length())
+        return false;
+
+    if (!TRY(m_public_key.is_valid()))
+        return false;
+
     auto key = TRY(public_key_to_openssl_pkey(m_public_key));
     auto const* hash_type = TRY(hash_kind_to_hash_type(m_hash_kind));
 

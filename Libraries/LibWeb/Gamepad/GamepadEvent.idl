@@ -1,13 +1,10 @@
-#import <DOM/Event.idl>
-#import <Gamepad/Gamepad.idl>
-
 // https://w3c.github.io/gamepad/#dom-gamepadevent
 [Exposed=Window]
 interface GamepadEvent : Event {
     // eventInitDict is not marked as optional in the specification, but existing implementations treat it as optional.
     // See: https://github.com/w3c/gamepad/pull/217
     constructor(DOMString type, optional GamepadEventInit eventInitDict = {});
-    [SameObject] readonly attribute Gamepad? gamepad;
+    [DirectGetter, SameObject] readonly attribute Gamepad? gamepad;
 };
 
 // https://w3c.github.io/gamepad/#dom-gamepadeventinit

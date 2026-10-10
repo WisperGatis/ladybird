@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #containing-block { position: relative; width: 300px; height: 200px; }
+    #shell { width: 100px; height: 40px; overflow: hidden; }
+    #cached { width: 80px; height: 20px; overflow: hidden; }
+</style>
+<div id="containing-block">
+    <div id="shell">
+        <div id="cached">
+            <div id="absolute" style="position: absolute; right: 0; top: 10px; width: 10px; height: 10px"></div>
+        </div>
+    </div>
+</div>
+<script>
+    let leftBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "replaying fragments relays the escaped absolute descendant",
+                mutate: () => {
+                    leftBefore = absolute.getBoundingClientRect().left;
+                    document.getElementById("containing-block").style.width = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#shell/block RUN (cache=miss)
+                            BlockContainer<DIV>#cached/block REPLAY FRAGMENTS
+                          BlockContainer<DIV>#absolute/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(leftBefore, 290, "left before");
+                    equal(absolute.getBoundingClientRect().left, 190, "left after");
+                },
+            },
+        ],
+    });
+</script>

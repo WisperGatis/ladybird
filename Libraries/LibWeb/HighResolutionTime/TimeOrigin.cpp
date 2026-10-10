@@ -38,24 +38,29 @@ DOMHighResTimeStamp get_time_origin_timestamp(JS::Object const& global)
 {
     // To get time origin timestamp, given a global object global, run the following steps, which return a duration:
     // 1. Let timeOrigin be global's relevant settings object's time origin.
-    auto time_origin = HTML::relevant_principal_settings_object(global).time_origin();
+    auto time_origin = HTML::relevant_settings_object(global).time_origin();
 
     // 2. Return the duration from the estimated monotonic time of the Unix epoch to timeOrigin.
     return time_origin - estimated_monotonic_time_of_the_unix_epoch();
 }
 
 // https://w3c.github.io/hr-time/#dfn-coarsen-time
-DOMHighResTimeStamp coarsen_time(DOMHighResTimeStamp timestamp, bool cross_origin_isolated_capability)
+DOMHighResTimeStamp coarsen_time(DOMHighResTimeStamp timestamp, HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability)
 {
     // 1. Let time resolution be 100 microseconds, or a higher implementation-defined value.
-    auto time_resolution_milliseconds = 0.1;
+    i64 coarsening_factor = 10;
 
     // 2. If crossOriginIsolatedCapability is true, set time resolution to be 5 microseconds, or a higher implementation-defined value.
-    if (cross_origin_isolated_capability)
-        time_resolution_milliseconds = 0.005;
+    if (cross_origin_isolated_capability == HTML::CanUseCrossOriginIsolatedAPIs::Yes)
+        coarsening_factor = 200;
 
     // 3. In an implementation-defined manner, coarsen and potentially jitter timestamp such that its resolution will not exceed time resolution
-    timestamp = floor(timestamp / time_resolution_milliseconds) * time_resolution_milliseconds;
+    auto bucket = static_cast<i64>(floor(timestamp * static_cast<double>(coarsening_factor)));
+    timestamp = static_cast<double>(bucket) / static_cast<double>(coarsening_factor);
+    // NB: Division can represent the exact bucket boundary slightly below its intended value. Move such a result up
+    //     by one representable value so that coarsening it again does not select the previous bucket.
+    if (floor(timestamp * static_cast<double>(coarsening_factor)) < static_cast<double>(bucket))
+        timestamp = nextafter(timestamp, AK::Infinity<double>);
 
     // FIXME: Applying jitter to the coarsened timestamp here may decrease our susceptibility to timing attacks.
 
@@ -72,14 +77,10 @@ DOMHighResTimeStamp current_high_resolution_time(JS::Object const& global)
 }
 
 // https://w3c.github.io/hr-time/#dfn-relative-high-resolution-time
-// https://pr-preview.s3.amazonaws.com/w3c/hr-time/pull/168.html#dfn-relative-high-resolution-time
 DOMHighResTimeStamp relative_high_resolution_time(DOMHighResTimeStamp time, JS::Object const& global)
 {
-    // 1. Let settings be the global's relevant principal settings object.
-    auto& settings = HTML::relevant_principal_settings_object(global);
-
-    // 2. Let coarse time be the result of calling coarsen time with time and settings's cross-origin isolated capability.
-    auto coarse_time = coarsen_time(time, settings.cross_origin_isolated_capability() == HTML::CanUseCrossOriginIsolatedAPIs::Yes);
+    // 1. Let coarse time be the result of calling coarsen time with time and global’s relevant settings object’s cross-origin isolated capability.
+    auto coarse_time = coarsen_time(time, HTML::relevant_settings_object(global).cross_origin_isolated_capability());
 
     // 2. Return the relative high resolution coarse time for coarse time and global.
     return relative_high_resolution_coarsen_time(coarse_time, global);
@@ -89,12 +90,12 @@ DOMHighResTimeStamp relative_high_resolution_time(DOMHighResTimeStamp time, JS::
 DOMHighResTimeStamp relative_high_resolution_coarsen_time(DOMHighResTimeStamp coarsen_time, JS::Object const& global)
 {
     // The relative high resolution coarse time given a moment from the monotonic clock coarseTime and a global object global, is the duration from global's relevant settings object's time origin to coarseTime.
-    auto time_origin = HTML::relevant_principal_settings_object(global).time_origin();
+    auto time_origin = HTML::relevant_settings_object(global).time_origin();
     return coarsen_time - time_origin;
 }
 
 // https://w3c.github.io/hr-time/#dfn-coarsened-shared-current-time
-DOMHighResTimeStamp coarsened_shared_current_time(bool cross_origin_isolated_capability)
+DOMHighResTimeStamp coarsened_shared_current_time(HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability)
 {
     // The coarsened shared current time given an optional boolean crossOriginIsolatedCapability (default false), must return the result of calling coarsen time with the unsafe shared current time and crossOriginIsolatedCapability.
     return coarsen_time(unsafe_shared_current_time(), cross_origin_isolated_capability);

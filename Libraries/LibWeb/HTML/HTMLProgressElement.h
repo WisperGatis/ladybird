@@ -13,24 +13,22 @@
 namespace Web::HTML {
 
 class HTMLProgressElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLProgressElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLProgressElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLProgressElement);
 
 public:
     virtual ~HTMLProgressElement() override;
 
     double value() const;
-    WebIDL::ExceptionOr<void> set_value(double);
+    void set_value(double);
 
     WebIDL::Double max() const;
-    WebIDL::ExceptionOr<void> set_max(WebIDL::Double value);
+    void set_max(WebIDL::Double value);
 
     double position() const;
 
     // ^HTMLElement
     virtual void inserted() override;
-
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
@@ -43,8 +41,6 @@ private:
 
     // ^DOM::Node
     virtual bool is_html_progress_element() const final { return true; }
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     void create_shadow_tree_if_needed();

@@ -6,9 +6,12 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
+#include <AK/OwnPtr.h>
 #include <LibGfx/Path.h>
 
 class SkPath;
+class SkPathBuilder;
 
 namespace Gfx {
 
@@ -26,34 +29,43 @@ public:
     virtual void arc_to(FloatPoint point, float radius, bool large_arc, bool sweep) override;
     virtual void quadratic_bezier_curve_to(FloatPoint through, FloatPoint point) override;
     virtual void cubic_bezier_curve_to(FloatPoint c1, FloatPoint c2, FloatPoint p2) override;
-    virtual void text(Utf8View const&, Font const&) override;
-    virtual void text(Utf16View const&, Font const&) override;
     virtual void glyph_run(GlyphRun const&) override;
-    virtual void offset(Gfx::FloatPoint const&) override;
 
     virtual void append_path(Gfx::Path const&) override;
-    virtual void intersect(Gfx::Path const&) override;
+
+    [[nodiscard]] virtual Vector<u8> serialize_to_bytes() const override;
+    virtual void deserialize_from_bytes(ReadonlyBytes) override;
 
     [[nodiscard]] virtual bool is_empty() const override;
     virtual Gfx::FloatPoint last_point() const override;
     virtual Gfx::FloatRect bounding_box() const override;
+    virtual float length() const override;
     virtual bool contains(FloatPoint point, Gfx::WindingRule) const override;
     virtual void set_fill_type(Gfx::WindingRule winding_rule) override;
 
     virtual NonnullOwnPtr<PathImpl> clone() const override;
     virtual NonnullOwnPtr<PathImpl> copy_transformed(Gfx::AffineTransform const&) const override;
-    virtual NonnullOwnPtr<PathImpl> place_text_along(Utf8View const& text, Font const&) const override;
-    virtual NonnullOwnPtr<PathImpl> place_text_along(Utf16View const& text, Font const&) const override;
+    virtual NonnullOwnPtr<PathImpl> place_glyph_runs_along(ReadonlySpan<NonnullRefPtr<GlyphRun>>, float offset = 0) const override;
 
-    SkPath const& sk_path() const { return *m_path; }
-    SkPath& sk_path() { return *m_path; }
+    virtual String to_svg_string() const override;
+
+    SkPath const& sk_path() const;
+    SkPathBuilder& sk_path_builder();
+    void update_state_from_builder();
 
 private:
     PathImplSkia();
     PathImplSkia(PathImplSkia const& other);
 
+    void set_path(SkPath const&);
+    void update_state_from_path(SkPath const&);
+
     Gfx::FloatPoint m_last_move_to;
-    NonnullOwnPtr<SkPath> m_path;
+    bool m_has_current_point { false };
+    NonnullOwnPtr<SkPathBuilder> m_path_builder;
+    // NB: Const queries may run on several threads at once, so the lazily built snapshot is
+    //     published with a compare-and-swap.
+    mutable Atomic<SkPath*> m_cached_path { nullptr };
 };
 
 }

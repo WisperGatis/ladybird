@@ -1,0 +1,15 @@
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+        [s2] svg-viewport-transform=[1,0,0,1,8,8] origin=(0,0) (SVGSVGBox<svg>)
+          [s3] transform=[1,0,0,1,20,20] origin=(0,0) (SVGGeometryBox<rect>)
+  clips:
+    [c0 in s1] clip=[8,8 200x200] (SVGSVGBox<svg>)
+  effects:
+    [e0 in s0] effects=[]
+      [e1 in s2 out=c0] effects=[opacity=0.5] (SVGGeometryBox<rect>)
+
+DisplayList:
+FillPath@s3/c0/e1 path_bounding_rect=[0,0 100x100]
+

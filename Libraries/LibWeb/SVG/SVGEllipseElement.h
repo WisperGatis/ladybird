@@ -6,36 +6,47 @@
 
 #pragma once
 
-#include <LibWeb/SVG/SVGAnimatedLength.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGGeometryElement.h>
 
 namespace Web::SVG {
 
 class SVGEllipseElement final : public SVGGeometryElement {
-    WEB_PLATFORM_OBJECT(SVGEllipseElement, SVGGeometryElement);
+    WEB_WRAPPABLE(SVGEllipseElement, SVGGeometryElement);
     GC_DECLARE_ALLOCATOR(SVGEllipseElement);
 
 public:
     virtual ~SVGEllipseElement() override = default;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual Gfx::Path get_path(CSSPixelSize viewport_size, CSS::ComputedValues const&) override;
 
-    virtual Gfx::Path get_path(CSSPixelSize viewport_size) override;
+    // AD-HOC: The spec states that the cx, cy, rx and ry IDL attributes reflect the respective computed values and their
+    //         corresponding presentation attributes but other browsers reflect the attribute values instead - see
+    //         https://github.com/w3c/svgwg/issues/1153
 
-    GC::Ref<SVGAnimatedLength> cx() const;
-    GC::Ref<SVGAnimatedLength> cy() const;
-    GC::Ref<SVGAnimatedLength> rx() const;
-    GC::Ref<SVGAnimatedLength> ry() const;
+    // https://w3c.github.io/svgwg/svg2-draft/shapes.html#__svg__SVGEllipseElement__cx
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(cx, Horizontal, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/shapes.html#__svg__SVGEllipseElement__cy
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(cy, Vertical, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/shapes.html#__svg__SVGEllipseElement__rx
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(rx, Horizontal, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/shapes.html#__svg__SVGEllipseElement__ry
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(ry, Vertical, SVGLengthValue::number(0));
 
 private:
+    virtual bool is_svg_ellipse_element() const final { return true; }
+
     SVGEllipseElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-
-    Optional<float> m_center_x;
-    Optional<float> m_center_y;
-    Optional<float> m_radius_x;
-    Optional<float> m_radius_y;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGEllipseElement>() const { return is_svg_ellipse_element(); }
 
 }

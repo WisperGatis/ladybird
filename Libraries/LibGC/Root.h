@@ -6,12 +6,12 @@
 
 #pragma once
 
-#include <AK/Badge.h>
 #include <AK/IntrusiveList.h>
 #include <AK/Noncopyable.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/SourceLocation.h>
+#include <AK/kmalloc.h>
 #include <LibGC/Forward.h>
 #include <LibGC/Ptr.h>
 
@@ -24,8 +24,8 @@ class GC_API RootImpl : public RefCounted<RootImpl> {
 public:
     ~RootImpl();
 
-    Cell* cell() { return m_cell; }
-    Cell const* cell() const { return m_cell; }
+    Cell* cell() { return m_cell.ptr(); }
+    Cell const* cell() const { return m_cell.ptr(); }
 
     SourceLocation const& source_location() const { return m_location; }
 
@@ -46,21 +46,23 @@ public:
 template<class T>
 class Root {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     Root() = default;
 
     static Root create(T* cell, SourceLocation location = SourceLocation::current())
     {
-        return Root(adopt_ref(*new RootImpl(const_cast<RemoveConst<T>*>(cell), location)));
+        return Root(adopt_ref(*new RootImpl(as_cell(const_cast<RemoveConst<T>*>(cell)), location)));
     }
 
     Root(T* cell, SourceLocation location = SourceLocation::current())
     {
         if (cell)
-            m_impl = adopt_ref(*new RootImpl(cell, location));
+            m_impl = adopt_ref(*new RootImpl(as_cell(cell), location));
     }
 
     Root(T& cell, SourceLocation location = SourceLocation::current())
-        : m_impl(adopt_ref(*new RootImpl(&cell, location)))
+        : m_impl(adopt_ref(*new RootImpl(as_cell(&cell), location)))
     {
     }
 
@@ -78,7 +80,7 @@ public:
     {
         if (!m_impl)
             return nullptr;
-        return static_cast<T*>(m_impl->cell());
+        return static_cell_cast<T>(m_impl->cell());
     }
 
     T* ptr() const

@@ -13,26 +13,16 @@ namespace Web::CSS {
 // https://drafts.csswg.org/css-values-5/#pending-substitution-value
 class PendingSubstitutionStyleValue final : public StyleValueWithDefaultOperators<PendingSubstitutionStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<PendingSubstitutionStyleValue> create()
-    {
-        static ValueComparingNonnullRefPtr<PendingSubstitutionStyleValue> instance = adopt_ref(*new (nothrow) PendingSubstitutionStyleValue());
-        return instance;
-    }
     virtual ~PendingSubstitutionStyleValue() override = default;
-    virtual String to_string(SerializationMode) const override { return {}; }
-    virtual Vector<Parser::ComponentValue> tokenize() const override
-    {
-        // Not sure what to do here, but this isn't valid so returning GIV seems the most correct.
-        return { Parser::ComponentValue { Parser::GuaranteedInvalidValue {} } };
-    }
+    ValueComparingNonnullRefPtr<StyleValue const> original_shorthand_value() const { return wrap_rust_child(m_value->pending_substitution.original_shorthand_value); }
 
-    // We shouldn't need to compare these, but in case we do: The nature of them is that their value is unknown, so
-    // consider them all to be unique.
-    bool properties_equal(PendingSubstitutionStyleValue const&) const { return false; }
-
+    // NB: Pending-substitution values never compare equal (their value is unknown);
+    //     StyleValue::equals special-cases them.
 private:
-    PendingSubstitutionStyleValue()
-        : StyleValueWithDefaultOperators(Type::PendingSubstitution)
+    friend class StyleValue;
+
+    explicit PendingSubstitutionStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::PendingSubstitution, data)
     {
     }
 };

@@ -10,6 +10,7 @@
 #include <AK/OwnPtr.h>
 #include <AK/SinglyLinkedList.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -64,16 +65,30 @@ public:
         return value;
     }
 
-    T const& head() const
+    template<typename Self>
+    auto&& head(this Self&& self)
     {
-        VERIFY(!is_empty());
-        return m_segments.first()->data[m_index_into_first];
+        VERIFY(!self.is_empty());
+        return self.m_segments.first()->data[self.m_index_into_first];
     }
 
-    T& tail()
+    template<typename Self>
+    auto&& tail(this Self&& self)
     {
-        VERIFY(!is_empty());
-        return m_segments.last()->data.last();
+        VERIFY(!self.is_empty());
+        return self.m_segments.last()->data.last();
+    }
+
+    template<typename F>
+    void for_each(F&& callback) const
+    {
+        bool first = true;
+        for (auto const& segment : m_segments) {
+            size_t start = first ? m_index_into_first : 0;
+            first = false;
+            for (size_t i = start; i < segment.data.size(); ++i)
+                callback(segment.data[i]);
+        }
     }
 
     void clear()
@@ -86,6 +101,8 @@ public:
 
 private:
     struct QueueSegment {
+        AK_ALLOC_WITH_KMALLOC;
+
         Vector<T, segment_size> data;
         IntrusiveListNode<QueueSegment> node;
     };

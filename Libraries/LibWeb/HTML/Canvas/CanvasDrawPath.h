@@ -6,7 +6,8 @@
 
 #pragma once
 
-#include <AK/ByteString.h>
+#include <AK/Utf16FlyString.h>
+#include <LibWeb/Bindings/CanvasDrawPath.h>
 #include <LibWeb/HTML/Path2D.h>
 
 namespace Web::HTML {
@@ -18,17 +19,17 @@ public:
 
     virtual void begin_path() = 0;
 
-    virtual void fill(StringView fill_rule) = 0;
-    virtual void fill(Path2D& path, StringView fill_rule) = 0;
+    virtual void fill(Bindings::CanvasFillRule) = 0;
+    virtual void fill(Path2D& path, Bindings::CanvasFillRule) = 0;
 
     virtual void stroke() = 0;
     virtual void stroke(Path2D const& path) = 0;
 
-    virtual void clip(StringView fill_rule) = 0;
-    virtual void clip(Path2D& path, StringView fill_rule) = 0;
+    virtual void clip(Bindings::CanvasFillRule) = 0;
+    virtual void clip(Path2D& path, Bindings::CanvasFillRule) = 0;
 
-    virtual bool is_point_in_path(double x, double y, StringView fill_rule) = 0;
-    virtual bool is_point_in_path(Path2D const& path, double x, double y, StringView fill_rule) = 0;
+    virtual bool is_point_in_path(double x, double y, Bindings::CanvasFillRule) = 0;
+    virtual bool is_point_in_path(Path2D const& path, double x, double y, Bindings::CanvasFillRule) = 0;
 
 protected:
     CanvasDrawPath() = default;

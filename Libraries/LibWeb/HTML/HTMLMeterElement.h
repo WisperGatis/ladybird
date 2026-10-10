@@ -14,29 +14,29 @@
 namespace Web::HTML {
 
 class HTMLMeterElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLMeterElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLMeterElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLMeterElement);
 
 public:
     virtual ~HTMLMeterElement() override;
 
+    virtual bool is_html_meter_element() const final { return true; }
+
     double value() const;
-    WebIDL::ExceptionOr<void> set_value(double);
+    void set_value(double);
     double min() const;
-    WebIDL::ExceptionOr<void> set_min(double value);
+    void set_min(double value);
     double max() const;
-    WebIDL::ExceptionOr<void> set_max(double value);
+    void set_max(double value);
     double low() const;
-    WebIDL::ExceptionOr<void> set_low(double value);
+    void set_low(double value);
     double high() const;
-    WebIDL::ExceptionOr<void> set_high(double value);
+    void set_high(double value);
     double optimum() const;
-    WebIDL::ExceptionOr<void> set_optimum(double value);
+    void set_optimum(double value);
 
     // ^HTMLElement
     virtual void inserted() override;
-
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
@@ -53,8 +53,6 @@ public:
 
 private:
     HTMLMeterElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     void create_shadow_tree_if_needed();
@@ -64,5 +62,12 @@ private:
     GC::Ptr<DOM::Element> m_meter_value_element;
     ValueState m_cached_value_state { ValueState::Optimal };
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLMeterElement>() const { return is_html_meter_element(); }
 
 }

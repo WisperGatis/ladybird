@@ -13,22 +13,17 @@ namespace Web::CSS {
 
 class UnicodeRangeStyleValue final : public StyleValueWithDefaultOperators<UnicodeRangeStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<UnicodeRangeStyleValue const> create(Gfx::UnicodeRange unicode_range)
-    {
-        return adopt_ref(*new (nothrow) UnicodeRangeStyleValue(unicode_range));
-    }
-    virtual ~UnicodeRangeStyleValue() override;
+    virtual ~UnicodeRangeStyleValue() override = default;
 
-    Gfx::UnicodeRange const& unicode_range() const { return m_unicode_range; }
-
-    virtual String to_string(SerializationMode) const override;
-
-    bool properties_equal(UnicodeRangeStyleValue const&) const;
+    Gfx::UnicodeRange unicode_range() const { return Gfx::UnicodeRange(m_value->unicode_range.min_code_point, m_value->unicode_range.max_code_point); }
 
 private:
-    UnicodeRangeStyleValue(Gfx::UnicodeRange);
+    friend class StyleValue;
 
-    Gfx::UnicodeRange m_unicode_range;
+    explicit UnicodeRangeStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::UnicodeRange, data)
+    {
+    }
 };
 
 }

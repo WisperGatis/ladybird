@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/kmalloc.h>
 #include <LibWebView/Forward.h>
 #include <UI/Qt/WebContentView.h>
 
@@ -24,6 +25,8 @@ class FindInPageWidget final : public QWidget {
     Q_OBJECT
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     FindInPageWidget(Tab* tab, WebContentView* content_view);
 
     void update_result_label(size_t current_match_index, Optional<size_t> const& total_match_count);
@@ -36,12 +39,15 @@ public:
 public slots:
 
 private:
+    virtual bool event(QEvent*) override;
     virtual void keyPressEvent(QKeyEvent*) override;
     virtual void focusInEvent(QFocusEvent*) override;
     virtual void showEvent(QShowEvent*) override;
     virtual void hideEvent(QHideEvent*) override;
 
+    void close_bar();
     void find_text_changed();
+    void update_chrome_style();
 
     Tab* m_tab { nullptr };
     WebContentView* m_content_view { nullptr };
@@ -50,8 +56,11 @@ private:
     QPushButton* m_previous_button { nullptr };
     QPushButton* m_next_button { nullptr };
     QPushButton* m_exit_button { nullptr };
+    QCheckBox* m_highlight_all { nullptr };
     QCheckBox* m_match_case { nullptr };
     QLabel* m_result_label { nullptr };
+    bool m_is_updating_chrome_style { false };
+    u64 m_selected_text_request_id { 0 };
 };
 
 }

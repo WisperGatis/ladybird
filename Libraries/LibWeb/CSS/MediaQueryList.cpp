@@ -5,35 +5,36 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MediaQueryListPrototype.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/MediaQueryList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/EventDispatcher.h>
 #include <LibWeb/DOM/IDLEventListener.h>
 #include <LibWeb/HTML/EventHandler.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(MediaQueryList);
 
-GC::Ref<MediaQueryList> MediaQueryList::create(DOM::Document& document, Vector<NonnullRefPtr<MediaQuery>>&& media)
+GC::Ref<MediaQueryList> MediaQueryList::create(DOM::Document& document, RustMediaList media)
 {
-    return document.realm().create<MediaQueryList>(document, move(media));
+    return GC::Heap::the().allocate<MediaQueryList>(document, move(media));
 }
 
-MediaQueryList::MediaQueryList(DOM::Document& document, Vector<NonnullRefPtr<MediaQuery>>&& media)
-    : DOM::EventTarget(document.realm())
+MediaQueryList::MediaQueryList(DOM::Document& document, RustMediaList media)
+    : DOM::EventTarget()
     , m_document(document)
     , m_media(move(media))
 {
     evaluate();
 }
 
-void MediaQueryList::initialize(JS::Realm& realm)
+GC::Ptr<Bindings::Wrappable> MediaQueryList::relevant_global_impl() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(MediaQueryList);
-    Base::initialize(realm);
+    return m_document->window();
 }
 
 void MediaQueryList::visit_edges(Cell::Visitor& visitor)
@@ -43,40 +44,24 @@ void MediaQueryList::visit_edges(Cell::Visitor& visitor)
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-mediaquerylist-media
-String MediaQueryList::media() const
+Utf16String MediaQueryList::media() const
 {
-    return serialize_a_media_query_list(m_media);
+    return m_media.media_text();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-mediaquerylist-matches
 bool MediaQueryList::matches() const
 {
-    if (m_media.is_empty())
-        return true;
-
-    bool did_match = false;
-    for (auto const& media : m_media) {
-        if (media->matches()) {
-            did_match = true;
-            break;
-        }
-    }
+    bool did_match = m_media.matches();
 
     // NOTE: If our document is inside a frame, we need to update layout
     //       since that may cause our frame (and thus viewport) to resize.
     if (auto container_document = m_document->container_document()) {
         container_document->update_layout(DOM::UpdateLayoutReason::MediaQueryListMatches);
-        const_cast<MediaQueryList*>(this)->evaluate();
+        m_media.evaluate(m_document);
     }
 
-    bool now_matches = false;
-    for (auto& media : m_media) {
-        if (media->matches()) {
-            now_matches = true;
-            break;
-        }
-    }
-
+    bool now_matches = m_media.matches();
     if (did_match != now_matches)
         m_has_changed_state = true;
 
@@ -85,15 +70,7 @@ bool MediaQueryList::matches() const
 
 bool MediaQueryList::evaluate()
 {
-    if (m_media.is_empty())
-        return true;
-
-    bool now_matches = false;
-    for (auto& media : m_media) {
-        now_matches = now_matches || media->evaluate(m_document);
-    }
-
-    return now_matches;
+    return m_media.evaluate(m_document);
 }
 
 // https://www.w3.org/TR/cssom-view/#dom-mediaquerylist-addlistener

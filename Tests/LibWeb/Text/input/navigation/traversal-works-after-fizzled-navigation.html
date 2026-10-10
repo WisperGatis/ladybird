@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<body>
+<a href="mailto:contact@ladybird.org">mailto link</a>
+<script>
+    // A navigation that will fizzle without producing a document (e.g. an unhandled non-fetch
+    // scheme like mailto:) is older than the traversal requested after it. The traversal must
+    // supersede it whether its asynchronous cleanup has run yet or not.
+    asyncTest(async done => {
+        history.pushState("pushed", "", "#pushed");
+        await internals.flushSessionHistoryTraversalQueue();
+
+        window.addEventListener("popstate", () => {
+            println("popstate after fizzled navigation");
+            done();
+        });
+
+        document.querySelector("a").click();
+        history.back();
+    });
+</script>

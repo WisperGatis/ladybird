@@ -1,0 +1,120 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/CSS/Resolution.h>
+#include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ResolutionStyleValue.h>
+#include <LibWeb/DOM/AbstractElement.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Element.h>
+#include <LibWeb/HTML/DecodedImageData.h>
+#include <LibWeb/HTML/SupportedImageTypes.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Page/Page.h>
+
+namespace Web::CSS {
+
+ImageSetStyleValue::ImageSetStyleValue(StyleValueFFI::StyleValueData const* data)
+    : AbstractImageStyleValue(Type::ImageSet, data)
+{
+}
+
+Optional<size_t> ImageSetStyleValue::select_option_index(double device_pixels_per_css_pixel) const
+{
+    Optional<size_t> best_below_or_equal;
+    Optional<double> best_below_or_equal_resolution;
+    Optional<size_t> best_above;
+    Optional<double> best_above_resolution;
+
+    auto const& options = this->options();
+    for (size_t option_index = 0; option_index < options.size(); ++option_index) {
+        auto const& option = options[option_index];
+        if (option.type.has_value() && !HTML::is_supported_image_type(*option.type))
+            continue;
+
+        auto resolution = Resolution::from_style_value(option.resolution).to_dots_per_pixel();
+
+        if (resolution >= device_pixels_per_css_pixel) {
+            if (!best_above_resolution.has_value() || resolution < *best_above_resolution) {
+                best_above = option_index;
+                best_above_resolution = resolution;
+            }
+            continue;
+        }
+
+        if (!best_below_or_equal_resolution.has_value() || resolution > *best_below_or_equal_resolution) {
+            best_below_or_equal = option_index;
+            best_below_or_equal_resolution = resolution;
+        }
+    }
+
+    if (best_above.has_value())
+        return best_above;
+    return best_below_or_equal;
+}
+
+AbstractImageStyleValue const* ImageSetStyleValue::selected_image() const
+{
+    if (!m_selected_option_index.has_value())
+        return nullptr;
+    return options()[*m_selected_option_index].image.ptr();
+}
+
+void ImageSetStyleValue::load_any_resources(DOM::Document& document)
+{
+    auto dpr = document.page().client().device_pixels_per_css_pixel();
+    if (auto option_index = select_option_index(dpr); option_index.has_value()) {
+        m_selected_option_index = option_index;
+        m_selected_resolution = Resolution::from_style_value(options()[*option_index].resolution).to_dots_per_pixel();
+    }
+    if (auto const* selected_image = this->selected_image())
+        const_cast<AbstractImageStyleValue&>(*selected_image).load_any_resources(document);
+}
+
+SizeWithAspectRatio ImageSetStyleValue::natural_size(HTML::DecodedImageData const& decoded_image_data) const
+{
+    auto scaled_by_selected_resolution = [&](Optional<CSSPixels> length) -> Optional<CSSPixels> {
+        if (!length.has_value())
+            return {};
+        return CSSPixels { length->to_double() / m_selected_resolution };
+    };
+    return {
+        .width = scaled_by_selected_resolution(decoded_image_data.intrinsic_width()),
+        .height = scaled_by_selected_resolution(decoded_image_data.intrinsic_height()),
+        .aspect_ratio = decoded_image_data.intrinsic_aspect_ratio(),
+    };
+}
+
+Optional<Painting::ImagePaint> ImageSetStyleValue::image_paint(Painting::ImagePaintRequest const& request) const
+{
+    if (auto const* selected_image = this->selected_image())
+        return selected_image->image_paint(request);
+    return {};
+}
+
+bool ImageSetStyleValue::is_paintable(GC::Ptr<HTML::DecodedImageData> decoded_image_data) const
+{
+    if (auto const* selected_image = this->selected_image())
+        return selected_image->is_paintable(decoded_image_data);
+    return false;
+}
+
+void ImageSetStyleValue::set_style_sheet(StyleSheetState* style_sheet)
+{
+
+    // Propagate the style sheet to candidate images whose type() filter does not exclude them. This ensures the
+    // candidate images register themselves as pending image resources on the style sheet, so their fetches start when
+    // the style sheet is associated with the document, properly delaying the document's load event.
+    for (auto const& option : options()) {
+        if (option.type.has_value() && !HTML::is_supported_image_type(*option.type))
+            continue;
+        const_cast<AbstractImageStyleValue&>(*option.image).set_style_sheet(style_sheet);
+    }
+}
+
+}

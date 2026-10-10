@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NonnullOwnPtr.h>
 #include <LibCore/Event.h>
 #include <LibCore/EventLoopImplementation.h>
 #include <LibCore/ThreadEventQueue.h>
@@ -22,6 +21,31 @@ EventLoopImplementation::EventLoopImplementation()
 }
 
 EventLoopImplementation::~EventLoopImplementation() = default;
+
+void EventLoopImplementation::request_exit(int code)
+{
+    m_exit_code.store(code, AK::MemoryOrder::memory_order_relaxed);
+    m_exit_requested.store(true, AK::MemoryOrder::memory_order_release);
+}
+
+bool EventLoopImplementation::was_exit_requested() const
+{
+    return m_exit_requested.load(AK::MemoryOrder::memory_order_acquire);
+}
+
+Optional<int> EventLoopImplementation::exit_code_if_requested() const
+{
+    if (!m_exit_requested.load(AK::MemoryOrder::memory_order_acquire))
+        return {};
+    return m_exit_code.load(AK::MemoryOrder::memory_order_relaxed);
+}
+
+void EventLoopImplementation::deferred_invoke(Function<void()>&& invokee)
+{
+    m_thread_event_queue.deferred_invoke(move(invokee));
+    if (&m_thread_event_queue != ThreadEventQueue::current_or_null())
+        wake();
+}
 
 static EventLoopManager* s_event_loop_manager = nullptr;
 EventLoopManager& EventLoopManager::the()

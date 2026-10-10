@@ -1,0 +1,1 @@
+PASS: reused inline-flex retains its baseline (work + checks)

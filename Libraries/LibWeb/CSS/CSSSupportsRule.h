@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022, Sam Atkins <atkinssj@serenityos.org>
+ * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -16,28 +16,26 @@ namespace Web::CSS {
 
 // https://www.w3.org/TR/css-conditional-3/#the-csssupportsrule-interface
 class CSSSupportsRule final : public CSSConditionRule {
-    WEB_PLATFORM_OBJECT(CSSSupportsRule, CSSConditionRule);
+    WEB_WRAPPABLE(CSSSupportsRule, CSSConditionRule);
     GC_DECLARE_ALLOCATOR(CSSSupportsRule);
 
 public:
-    static GC::Ref<CSSSupportsRule> create(JS::Realm&, NonnullRefPtr<Supports>&&, CSSRuleList&);
+    static GC::Ref<CSSSupportsRule> create(RustRule, CSSRuleList&);
 
     virtual ~CSSSupportsRule() = default;
 
-    String condition_text() const override;
-    bool matches() const { return condition_matches(); }
+    virtual Utf16String serialized_condition_text() const override;
+    bool matches() const { return supports_condition_matches(m_supports); }
 
-    virtual bool condition_matches() const override { return m_supports->matches(); }
-
-    Supports const& supports() const { return m_supports; }
+    RustQueryHandle const& supports() const { return m_supports; }
 
 private:
-    CSSSupportsRule(JS::Realm&, NonnullRefPtr<Supports>&&, CSSRuleList&);
+    CSSSupportsRule(RustRule, CSSRuleList&);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual String serialized() const override;
+    virtual Utf16String serialized() const override;
+    virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    NonnullRefPtr<Supports> m_supports;
+    RustQueryHandle m_supports;
 };
 
 template<>

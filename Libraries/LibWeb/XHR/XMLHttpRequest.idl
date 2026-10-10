@@ -1,9 +1,3 @@
-#import <DOM/Document.idl>
-#import <DOM/EventHandler.idl>
-#import <Fetch/BodyInit.idl>
-#import <XHR/XMLHttpRequestEventTarget.idl>
-#import <XHR/XMLHttpRequestUpload.idl>
-
 enum XMLHttpRequestResponseType {
     "",
     "arraybuffer",
@@ -31,7 +25,7 @@ interface XMLHttpRequest : XMLHttpRequestEventTarget {
     readonly attribute unsigned short readyState;
 
     // request
-    undefined open(DOMString method, DOMString url);
+    undefined open(ByteString method, USVString url);
     undefined open(ByteString method, USVString url, boolean async, optional USVString? username = null, optional USVString? password = null);
     undefined setRequestHeader(ByteString name, ByteString value);
     attribute unsigned long timeout;
@@ -49,7 +43,7 @@ interface XMLHttpRequest : XMLHttpRequestEventTarget {
     undefined overrideMimeType(DOMString mime);
     attribute XMLHttpRequestResponseType responseType;
     readonly attribute any response;
-    readonly attribute DOMString responseText;
+    readonly attribute USVString responseText;
     [Exposed=Window] readonly attribute Document? responseXML;
 
 };

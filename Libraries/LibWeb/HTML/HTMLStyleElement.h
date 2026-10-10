@@ -7,28 +7,25 @@
 
 #pragma once
 
-#include <LibWeb/DOM/StyleElementUtils.h>
+#include <LibWeb/DOM/StyleElementBase.h>
 #include <LibWeb/HTML/HTMLElement.h>
 
 namespace Web::HTML {
 
-class HTMLStyleElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLStyleElement, HTMLElement);
+class HTMLStyleElement final
+    : public HTMLElement
+    , public DOM::StyleElementBase {
+    WEB_WRAPPABLE(HTMLStyleElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLStyleElement);
 
 public:
     virtual ~HTMLStyleElement() override;
 
-    virtual void children_changed(ChildrenChangedMetadata const*) override;
+    virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual void inserted() override;
-    virtual void removed_from(Node* old_parent, Node& old_root) override;
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
-
-    bool disabled();
-    void set_disabled(bool disabled);
-
-    CSS::CSSStyleSheet* sheet();
-    CSS::CSSStyleSheet const* sheet() const;
+    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     virtual bool contributes_a_script_blocking_style_sheet() const final;
 
@@ -38,10 +35,19 @@ private:
     // ^DOM::Node
     virtual bool is_html_style_element() const override { return true; }
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    // ^DOM::StyleElementBase
+    virtual Element& as_element() override { return *this; }
+    virtual Element const& as_element() const override { return *this; }
 
-    DOM::StyleElementUtils m_style_element_utils;
+    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void adopted_from(DOM::Document&) override;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLStyleElement>() const { return is_html_style_element(); }
 
 }

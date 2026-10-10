@@ -1,0 +1,130 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "hidden": true,
+      "name": "base",
+      "displayName": "Default Config",
+      "generator": "Ninja",
+      "environment": {
+        "LADYBIRD_SOURCE_DIR": "${sourceDir}"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Default"
+        }
+      }
+    },
+    {
+      "hidden": true,
+      "name": "Release_base",
+      "displayName": "Release Config",
+      "description": "Release build",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LADYBIRD_VCPKG_TYPE": "release"
+      }
+    },
+    {
+      "hidden": true,
+      "name": "Debug_base",
+      "displayName": "Debug Config",
+      "description": "Debug build",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LADYBIRD_VCPKG_TYPE": "debug"
+      }
+    },
+    {
+      "hidden": true,
+      "name": "Sanitizer_base",
+      "displayName": "Sanitizer Config",
+      "description": "Sanitizer build",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/sanitizer",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LADYBIRD_VCPKG_TYPE": "sanitizer",
+        "ENABLE_UNDEFINED_SANITIZER": "ON",
+        "ENABLE_ADDRESS_SANITIZER": "ON"
+      }
+    },
+    {
+      "hidden": true,
+      "name": "ThreadSanitizer_base",
+      "displayName": "Thread Sanitizer Config",
+      "description": "Thread sanitizer build",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LADYBIRD_VCPKG_TYPE": "release",
+        "ENABLE_LTO_FOR_RELEASE": "OFF",
+        "ENABLE_THREAD_SANITIZER": "ON"
+      }
+    },
+    {
+      "hidden": true,
+      "name": "All_Debug_base",
+      "displayName": "All Debug Config",
+      "description": "All Debug build",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/alldebug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LADYBIRD_VCPKG_TYPE": "debug",
+        "ENABLE_ALL_THE_DEBUG_MACROS": "ON"
+      }
+    },
+    {
+      "hidden": true,
+      "name": "Distribution_base",
+      "displayName": "Distribution Config",
+      "description": "Distribution build with static libraries",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/distribution",
+      "cacheVariables": {
+        "BUILD_SHARED_LIBS": "OFF",
+        "CMAKE_BUILD_TYPE": "Release",
+        "LADYBIRD_VCPKG_TYPE": "distribution"
+      }
+    },
+    {
+      "hidden": true,
+      "name": "Fuzzers_base",
+      "displayName": "Fuzzers Config",
+      "description": "Fuzzers build",
+      "binaryDir": "$env{LADYBIRD_SOURCE_DIR}/Build/fuzzers",
+      "cacheVariables": {
+        "BUILD_SHARED_LIBS": "OFF",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LADYBIRD_VCPKG_TYPE": "distribution",
+        "ENABLE_FUZZERS_LIBFUZZER": "ON",
+        "ENABLE_ADDRESS_SANITIZER": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "hidden": true,
+      "name": "base",
+      "targets": [
+        "all"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "hidden": true,
+      "name": "base",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": true
+      },
+      "environment": {
+        "LADYBIRD_SOURCE_DIR": "${sourceDir}"
+      }
+    }
+  ]
+}

@@ -3,18 +3,17 @@
  * Copyright (c) 2021-2022, Kenneth Myhra <kennethmyhra@serenityos.org>
  * Copyright (c) 2021-2024, Sam Atkins <atkinssj@serenityos.org>
  * Copyright (c) 2022, Matthias Zimmerman <matthias291999@gmail.com>
+ * Copyright (c) 2026, Gregory Bertilson <gregory@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <AK/ByteString.h>
-#include <AK/FixedArray.h>
+#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
-#include <AK/ScopedValueRollback.h>
 #include <AK/StdLibExtras.h>
-#include <AK/String.h>
 #include <AK/Vector.h>
-#include <LibCore/Environment.h>
 #include <LibCore/System.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -36,8 +35,13 @@ static int memfd_create(char const* name, unsigned int flags)
 }
 #endif
 
+#if defined(AK_OS_LINUX)
+#    include <sys/sendfile.h>
+#endif
+
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #    include <mach-o/dyld.h>
+#    include <mach/vm_statistics.h>
 #    include <sys/mman.h>
 #else
 extern char** environ;
@@ -141,59 +145,153 @@ ErrorOr<void> munmap(void* address, size_t size)
     return {};
 }
 
-ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options)
+static int mmap_anonymous_fd([[maybe_unused]] MemoryTag tag)
+{
+#ifdef AK_OS_MACOS
+    if (tag == MemoryTag::GarbageCollector)
+        return VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_2);
+#endif
+    return -1;
+}
+
+ErrorOr<void*> reserve_address_space(size_t size, MemoryTag tag)
+{
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    return ptr;
+}
+
+ErrorOr<void*> allocate_anonymous_memory(size_t size, MemoryTag tag)
+{
+    auto* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    return ptr;
+}
+
+ErrorOr<void> commit_memory(void* address, size_t size, MemoryTag tag)
+{
+    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    return {};
+}
+
+ErrorOr<void> protect_memory_readonly(void* address, size_t size)
+{
+    if (size == 0)
+        return {};
+    if (::mprotect(address, size, PROT_READ) < 0)
+        return Error::from_syscall("mprotect"sv, errno);
+    return {};
+}
+
+ErrorOr<void> decommit_memory(void* address, size_t size, MemoryTag tag)
+{
+    if (size == 0)
+        return {};
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    auto* ptr = ::mmap(address, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    VERIFY(ptr == address);
+    return {};
+}
+
+ErrorOr<void> map_shared_memory_fixed(void* address, size_t size, int fd)
+{
+    auto* ptr = ::mmap(address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (ptr == MAP_FAILED)
+        return Error::from_syscall("mmap"sv, errno);
+    VERIFY(ptr == address);
+    return {};
+}
+
+ErrorOr<void> release_address_space(void* address, size_t size)
+{
+    if (::munmap(address, size) < 0)
+        return Error::from_syscall("munmap"sv, errno);
+    return {};
+}
+
+ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options, [[maybe_unused]] AllowSealing allow_sealing)
 {
     int fd = -1;
 #if defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
-    // FIXME: Support more options on Linux.
     auto linux_options = ((options & O_CLOEXEC) > 0) ? MFD_CLOEXEC : 0;
+#    ifdef MFD_ALLOW_SEALING
+    if (allow_sealing == AllowSealing::Yes)
+        linux_options |= MFD_ALLOW_SEALING;
+#    endif
     fd = memfd_create("", linux_options);
-    if (fd < 0)
-        return Error::from_errno(errno);
-    if (::ftruncate(fd, size) < 0) {
-        auto saved_errno = errno;
-        TRY(close(fd));
-        return Error::from_errno(saved_errno);
-    }
 #elif defined(SHM_ANON)
     fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | options, 0600);
-    if (fd < 0)
-        return Error::from_errno(errno);
-    if (::ftruncate(fd, size) < 0) {
-        auto saved_errno = errno;
-        TRY(close(fd));
-        return Error::from_errno(saved_errno);
-    }
-#elif defined(AK_OS_BSD_GENERIC) || defined(AK_OS_EMSCRIPTEN) || defined(AK_OS_HAIKU)
-    static size_t shared_memory_id = 0;
+#elif defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU)
+    // Create the shared memory object under an unpredictable, single-use name, and unlink it immediately — so only the
+    // returned fd keeps it alive. Use O_EXCL to ensure that if the name already exists, the open fails.
+    static Atomic<u32> shared_memory_id = 0;
+    auto name = ByteString::formatted("/shm-{:016x}-{:08x}", get_random<u64>(), shared_memory_id++);
+    // Passing O_CLOEXEC to shm_open in the oflag argument isn't POSIX-compliant and is known to be rejected
+    // in macOS 26.4+. So we filter it out here, and instead set FD_CLOEXEC via fcntl after opening.
+    fd = shm_open(name.characters(), O_RDWR | O_CREAT | O_EXCL | (options & ~O_CLOEXEC), 0600);
 
-    auto name = ByteString::formatted("/shm-{}-{}", getpid(), shared_memory_id++);
-    fd = shm_open(name.characters(), O_RDWR | O_CREAT | options, 0600);
+    if (fd >= 0) {
+        if (shm_unlink(name.characters()) == -1) {
+            auto saved_errno = errno;
+            TRY(close(fd));
+            return Error::from_errno(saved_errno);
+        }
 
-    if (shm_unlink(name.characters()) == -1) {
-        auto saved_errno = errno;
-        TRY(close(fd));
-        return Error::from_errno(saved_errno);
-    }
-
-    if (fd < 0)
-        return Error::from_errno(errno);
-
-    if (::ftruncate(fd, size) < 0) {
-        auto saved_errno = errno;
-        TRY(close(fd));
-        return Error::from_errno(saved_errno);
-    }
-
-    void* addr = ::mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, 0);
-    if (addr == MAP_FAILED) {
-        auto saved_errno = errno;
-        TRY(close(fd));
-        return Error::from_errno(saved_errno);
+        if (options & O_CLOEXEC) {
+            if (::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+                auto saved_errno = errno;
+                TRY(close(fd));
+                return Error::from_errno(saved_errno);
+            }
+        }
     }
 #endif
     if (fd < 0)
         return Error::from_errno(errno);
+
+    int truncate_result;
+    do {
+        truncate_result = ::ftruncate(fd, size);
+    } while (truncate_result < 0 && errno == EINTR);
+    if (truncate_result < 0) {
+        auto saved_errno = errno;
+        TRY(close(fd));
+        return Error::from_errno(saved_errno);
+    }
+
+    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. macOS needs no seal, because it
+    //        allows only one successful ftruncate() per POSIX shared memory object. On other platforms, the flag is
+    //        accepted, but the fd stays resizable. SAB backing relies on this seal to stop a transferred fd from being
+    //        shrunk under a peer.
+#if defined(AK_OS_LINUX)
+    // Seal a fixed-size shared fd against resizing: A peer process holding the transferred fd must not be able to
+    // ftruncate it smaller, and SIGBUS siblings that touch the now-missing pages. Writes stay allowed on purpose (no
+    // F_SEAL_WRITE); the shared memory must remain writable. F_SEAL_SEAL is deliberately NOT set: it would block any
+    // later F_ADD_SEALS, and AllowSealing::Yes promises callers that the fd stays sealable. Leaving it off costs
+    // nothing, because a seal can never be removed once applied.
+    if (allow_sealing == AllowSealing::Yes) {
+        if (::fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) < 0) {
+            auto saved_errno = errno;
+            TRY(close(fd));
+            return Error::from_errno(saved_errno);
+        }
+    }
+#endif
+
     return fd;
 }
 
@@ -255,17 +353,17 @@ ErrorOr<struct stat> lstat(StringView path)
     return st;
 }
 
-ErrorOr<ssize_t> read(int fd, Bytes buffer)
+ErrorOr<size_t> read(int fd, Bytes buffer)
 {
-    ssize_t rc = ::read(fd, buffer.data(), buffer.size());
+    auto rc = ::read(fd, buffer.data(), buffer.size());
     if (rc < 0)
         return Error::from_syscall("read"sv, errno);
     return rc;
 }
 
-ErrorOr<ssize_t> write(int fd, ReadonlyBytes buffer)
+ErrorOr<size_t> write(int fd, ReadonlyBytes buffer)
 {
-    ssize_t rc = ::write(fd, buffer.data(), buffer.size());
+    auto rc = ::write(fd, buffer.data(), buffer.size());
     if (rc < 0)
         return Error::from_syscall("write"sv, errno);
     return rc;
@@ -280,7 +378,9 @@ ErrorOr<void> kill(pid_t pid, int signal)
 
 ErrorOr<int> dup(int source_fd)
 {
-    int fd = ::dup(source_fd);
+    // A plain dup() clears close-on-exec, so a process that another thread spawns in the meantime would inherit the
+    // duplicate. Descriptors that a child should have are passed with explicit file actions instead.
+    int fd = ::fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     if (fd < 0)
         return Error::from_syscall("dup"sv, errno);
     return fd;
@@ -309,11 +409,7 @@ ErrorOr<void> ioctl(int fd, unsigned request, ...)
 {
     va_list ap;
     va_start(ap, request);
-#ifdef AK_OS_HAIKU
     void* arg = va_arg(ap, void*);
-#else
-    FlatPtr arg = va_arg(ap, FlatPtr);
-#endif
     va_end(ap);
     if (::ioctl(fd, request, arg) < 0)
         return Error::from_syscall("ioctl"sv, errno);
@@ -414,6 +510,20 @@ ErrorOr<bool> isatty(int fd)
     return rc == 1;
 }
 
+ErrorOr<TerminalSize> terminal_size(int fd)
+{
+    struct winsize ws {};
+    if (::ioctl(fd, TIOCGWINSZ, &ws) < 0)
+        return Error::from_syscall("ioctl"sv, errno);
+    return TerminalSize { ws.ws_col, ws.ws_row };
+}
+
+ErrorOr<void> enable_ansi_escape_sequence_processing(int)
+{
+    // POSIX terminals interpret escape sequences natively.
+    return {};
+}
+
 ErrorOr<void> link(StringView old_path, StringView new_path)
 {
     ByteString old_path_string = old_path;
@@ -434,8 +544,6 @@ ErrorOr<void> symlink(StringView target, StringView link_path)
 
 ErrorOr<void> mkdir(StringView path, mode_t mode)
 {
-    if (path.is_null())
-        return Error::from_errno(EFAULT);
     ByteString path_string = path;
     if (::mkdir(path_string.characters(), mode) < 0)
         return Error::from_syscall("mkdir"sv, errno);
@@ -444,9 +552,6 @@ ErrorOr<void> mkdir(StringView path, mode_t mode)
 
 ErrorOr<void> chdir(StringView path)
 {
-    if (path.is_null())
-        return Error::from_errno(EFAULT);
-
     ByteString path_string = path;
     if (::chdir(path_string.characters()) < 0)
         return Error::from_syscall("chdir"sv, errno);
@@ -455,9 +560,6 @@ ErrorOr<void> chdir(StringView path)
 
 ErrorOr<void> rmdir(StringView path)
 {
-    if (path.is_null())
-        return Error::from_errno(EFAULT);
-
     ByteString path_string = path;
     if (::rmdir(path_string.characters()) < 0)
         return Error::from_syscall("rmdir"sv, errno);
@@ -472,21 +574,8 @@ ErrorOr<int> mkstemp(Span<char> pattern)
     return fd;
 }
 
-ErrorOr<String> mkdtemp(Span<char> pattern)
-{
-    auto* path = ::mkdtemp(pattern.data());
-    if (path == nullptr) {
-        return Error::from_errno(errno);
-    }
-
-    return String::from_utf8(StringView { path, strlen(path) });
-}
-
 ErrorOr<void> rename(StringView old_path, StringView new_path)
 {
-    if (old_path.is_null() || new_path.is_null())
-        return Error::from_errno(EFAULT);
-
     ByteString old_path_string = old_path;
     ByteString new_path_string = new_path;
     if (::rename(old_path_string.characters(), new_path_string.characters()) < 0)
@@ -494,11 +583,17 @@ ErrorOr<void> rename(StringView old_path, StringView new_path)
     return {};
 }
 
+ErrorOr<void> renameat(int old_directory_fd, StringView old_path, int new_directory_fd, StringView new_path)
+{
+    ByteString old_path_string = old_path;
+    ByteString new_path_string = new_path;
+    if (::renameat(old_directory_fd, old_path_string.characters(), new_directory_fd, new_path_string.characters()) < 0)
+        return Error::from_syscall("renameat"sv, errno);
+    return {};
+}
+
 ErrorOr<void> unlink(StringView path)
 {
-    if (path.is_null())
-        return Error::from_errno(EFAULT);
-
     ByteString path_string = path;
     if (::unlink(path_string.characters()) < 0)
         return Error::from_syscall("unlink"sv, errno);
@@ -507,25 +602,10 @@ ErrorOr<void> unlink(StringView path)
 
 ErrorOr<void> utimensat(int fd, StringView path, struct timespec const times[2], int flag)
 {
-    if (path.is_null())
-        return Error::from_errno(EFAULT);
-
-    StringBuilder builder;
-    TRY(builder.try_append(path));
-    TRY(builder.try_append('\0'));
-
-    // Note the explicit null terminators above.
-    if (::utimensat(fd, builder.string_view().characters_without_null_termination(), times, flag) < 0)
+    ByteString path_string = path;
+    if (::utimensat(fd, path_string.characters(), times, flag) < 0)
         return Error::from_syscall("utimensat"sv, errno);
     return {};
-}
-
-ErrorOr<struct utsname> uname()
-{
-    struct utsname uts;
-    if (::uname(&uts) < 0)
-        return Error::from_syscall("uname"sv, errno);
-    return uts;
 }
 
 ErrorOr<int> socket(int domain, int type, int protocol)
@@ -534,6 +614,12 @@ ErrorOr<int> socket(int domain, int type, int protocol)
     if (fd < 0)
         return Error::from_syscall("socket"sv, errno);
     return fd;
+}
+
+ErrorOr<void> set_socket_blocking(int socket, bool enabled)
+{
+    int value = enabled ? 0 : 1;
+    return ioctl(socket, FIONBIO, &value);
 }
 
 ErrorOr<void> bind(int sockfd, struct sockaddr const* address, socklen_t address_length)
@@ -565,15 +651,15 @@ ErrorOr<void> connect(int sockfd, struct sockaddr const* address, socklen_t addr
     return {};
 }
 
-ErrorOr<ssize_t> send(int sockfd, void const* buffer, size_t buffer_length, int flags)
+ErrorOr<size_t> send(int sockfd, ReadonlyBytes data, int flags)
 {
-    auto sent = ::send(sockfd, buffer, buffer_length, flags);
+    auto sent = ::send(sockfd, data.data(), data.size(), flags);
     if (sent < 0)
         return Error::from_syscall("send"sv, errno);
     return sent;
 }
 
-ErrorOr<ssize_t> sendmsg(int sockfd, const struct msghdr* message, int flags)
+ErrorOr<size_t> sendmsg(int sockfd, const struct msghdr* message, int flags)
 {
     auto sent = ::sendmsg(sockfd, message, flags);
     if (sent < 0)
@@ -581,23 +667,23 @@ ErrorOr<ssize_t> sendmsg(int sockfd, const struct msghdr* message, int flags)
     return sent;
 }
 
-ErrorOr<ssize_t> sendto(int sockfd, void const* source, size_t source_length, int flags, struct sockaddr const* destination, socklen_t destination_length)
+ErrorOr<size_t> sendto(int sockfd, ReadonlyBytes data, int flags, struct sockaddr const* destination, socklen_t destination_length)
 {
-    auto sent = ::sendto(sockfd, source, source_length, flags, destination, destination_length);
+    auto sent = ::sendto(sockfd, data.data(), data.size(), flags, destination, destination_length);
     if (sent < 0)
         return Error::from_syscall("sendto"sv, errno);
     return sent;
 }
 
-ErrorOr<ssize_t> recv(int sockfd, void* buffer, size_t length, int flags)
+ErrorOr<size_t> recv(int sockfd, Bytes buffer, int flags)
 {
-    auto received = ::recv(sockfd, buffer, length, flags);
+    auto received = ::recv(sockfd, buffer.data(), buffer.size(), flags);
     if (received < 0)
         return Error::from_syscall("recv"sv, errno);
     return received;
 }
 
-ErrorOr<ssize_t> recvmsg(int sockfd, struct msghdr* message, int flags)
+ErrorOr<size_t> recvmsg(int sockfd, struct msghdr* message, int flags)
 {
     auto received = ::recvmsg(sockfd, message, flags);
     if (received < 0)
@@ -605,9 +691,9 @@ ErrorOr<ssize_t> recvmsg(int sockfd, struct msghdr* message, int flags)
     return received;
 }
 
-ErrorOr<ssize_t> recvfrom(int sockfd, void* buffer, size_t buffer_length, int flags, struct sockaddr* address, socklen_t* address_length)
+ErrorOr<size_t> recvfrom(int sockfd, Bytes buffer, int flags, struct sockaddr* address, socklen_t* address_length)
 {
-    auto received = ::recvfrom(sockfd, buffer, buffer_length, flags, address, address_length);
+    auto received = ::recvfrom(sockfd, buffer.data(), buffer.size(), flags, address, address_length);
     if (received < 0)
         return Error::from_syscall("recvfrom"sv, errno);
     return received;
@@ -704,9 +790,6 @@ ErrorOr<Array<int, 2>> pipe2(int flags)
 
 ErrorOr<void> access(StringView pathname, int mode, int flags)
 {
-    if (pathname.is_null())
-        return Error::from_syscall("access"sv, EFAULT);
-
     ByteString path_string = pathname;
     (void)flags;
 
@@ -807,8 +890,6 @@ ErrorOr<ByteString> current_executable_path()
     if (sizeof(info.name) > sizeof(path))
         return Error::from_errno(ENAMETOOLONG);
     strlcpy(path, info.name, sizeof(path) - 1);
-#elif defined(AK_OS_EMSCRIPTEN)
-    return Error::from_string_literal("current_executable_path() unknown on this platform");
 #else
 #    warning "Not sure how to get current_executable_path on this platform!"
     // GetModuleFileName on Windows, unsure about OpenBSD.
@@ -870,13 +951,23 @@ ErrorOr<void> set_close_on_exec(int fd, bool enabled)
     return {};
 }
 
-ErrorOr<size_t> transfer_file_through_pipe(int source_fd, int target_fd, size_t source_offset, size_t source_length)
+ErrorOr<size_t> transfer_file_through_socket(int source_fd, int target_fd, size_t source_offset, size_t source_length)
 {
 #if defined(AK_OS_LINUX)
-    auto sent = ::splice(source_fd, reinterpret_cast<off_t*>(&source_offset), target_fd, nullptr, source_length, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    auto sent = ::sendfile(target_fd, source_fd, reinterpret_cast<off_t*>(&source_offset), source_length);
     if (sent < 0)
-        return Error::from_syscall("send_file_to_pipe"sv, errno);
+        return Error::from_syscall("sendfile"sv, errno);
     return sent;
+#elif defined(AK_OS_MACOS)
+    auto sent_length = static_cast<off_t>(source_length);
+    if (sent_length == 0)
+        return 0;
+    auto result = ::sendfile(source_fd, target_fd, static_cast<off_t>(source_offset), &sent_length, nullptr, 0);
+    if (result != 0) {
+        if ((errno != EAGAIN && errno != EINTR) || sent_length == 0)
+            return Error::from_syscall("sendfile"sv, errno);
+    }
+    return sent_length;
 #else
     static auto page_size = PAGE_SIZE;
 
@@ -889,7 +980,7 @@ ErrorOr<size_t> transfer_file_through_pipe(int source_fd, int target_fd, size_t 
     auto* mapped = TRY(mmap(nullptr, mapped_source_length, PROT_READ, MAP_SHARED, source_fd, aligned_source_offset));
     ScopeGuard guard { [&]() { (void)munmap(mapped, mapped_source_length); } };
 
-    return TRY(write(target_fd, { static_cast<u8*>(mapped) + offset_adjustment, source_length }));
+    return write(target_fd, { static_cast<u8*>(mapped) + offset_adjustment, source_length });
 #endif
 }
 

@@ -1,13 +1,10 @@
-#import <DOM/EventHandler.idl>
-#import <Serial/SerialPort.idl>
-
 // https://wicg.github.io/serial/#serial-interface
 [Exposed=(DedicatedWorker, Window), SecureContext]
 interface Serial : EventTarget {
     attribute EventHandler onconnect;
     attribute EventHandler ondisconnect;
-    Promise<sequence<SerialPort>> getPorts();
-    [Exposed=Window] Promise<SerialPort> requestPort(optional SerialPortRequestOptions options = {});
+    [CreatesPromise] Promise<sequence<SerialPort>> getPorts();
+    [Exposed=Window, CreatesPromise] Promise<SerialPort> requestPort(optional SerialPortRequestOptions options = {});
 };
 
 // https://wicg.github.io/serial/#serialportfilter-dictionary

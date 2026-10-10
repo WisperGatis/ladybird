@@ -8,6 +8,7 @@
 
 #include <AK/Platform.h>
 #include <AK/Traits.h>
+#include <LibWebCommon/Forward.h>
 #include <LibWebView/Export.h>
 
 namespace WebView {
@@ -15,29 +16,55 @@ namespace WebView {
 class Action;
 class Application;
 class Autocomplete;
+class AutocompleteService;
+class BlobURLStore;
+class BrowsingSession;
+class BookmarkStore;
+class CanonicalBrowsingContext;
+class CanonicalBrowsingContextGroup;
+class CanonicalDocument;
+class CanonicalDocumentState;
+class CanonicalEnvironmentSettingsObject;
+class CanonicalWindowEnvironmentSettingsObject;
+class CanonicalWorkerEnvironmentSettingsObject;
+class CanonicalSessionHistoryEntry;
+class CanonicalNavigable;
+class CanonicalSimilarOriginWindowAgent;
+class CanonicalTraversable;
+class CanonicalWindow;
+class CompositorClient;
 class CookieJar;
+class DownloadStore;
+class ExternalURLHandler;
+class FaviconStore;
+class FontService;
+class FontServiceHost;
+class HistoryStore;
+class HSTSStore;
 class Menu;
 class OutOfProcessWebView;
 class ProcessManager;
+class RequestServerSiteBindings;
+class SessionStore;
 class Settings;
+class SettingsUI;
+class StorageJar;
+class TraversableSessionHistory;
 class ViewImplementation;
 class WebContentClient;
+class WebContentTestClient;
+class WebDriverBrowserConnection;
+class WebWorkerClient;
 class WebUI;
 
-#if defined(AK_OS_MACOS)
-class MachPortServer;
-#endif
-
-struct Attribute;
-struct AutocompleteEngine;
+struct DownloadRecord;
+struct BookmarkItem;
 struct BrowserOptions;
-struct ConsoleOutput;
 struct CookieStorageKey;
-struct DOMNodeProperties;
-struct Mutation;
-struct ProcessHandle;
+struct HistoryEntry;
 struct SearchEngine;
 struct WebContentOptions;
+class WebContentPage;
 
 }
 

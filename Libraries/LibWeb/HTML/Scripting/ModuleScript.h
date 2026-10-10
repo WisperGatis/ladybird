@@ -6,64 +6,64 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
+#include <LibJS/Runtime/HostModule.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibJS/SourceTextModule.h>
+#include <LibJS/SyntheticModule.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/Scripting/Script.h>
 
 namespace Web::HTML {
 
+// The only host modules are WebAssembly Module Records.
+using ModuleScriptRecord = Variant<Empty, GC::Ref<JS::SourceTextModule>, GC::Ref<JS::SyntheticModule>, GC::Ref<JS::HostModule>>;
+
 // https://html.spec.whatwg.org/multipage/webappapis.html#module-script
-class ModuleScript : public Script {
+class WEB_API ModuleScript : public Script {
     GC_CELL(ModuleScript, Script);
+    GC_DECLARE_ALLOCATOR(ModuleScript);
 
 public:
     virtual ~ModuleScript() override;
 
-protected:
-    ModuleScript(URL::URL base_url, ByteString filename, JS::Realm&);
-
-private:
-    virtual bool is_module_script() const final { return true; }
-};
-
-class WEB_API JavaScriptModuleScript final : public ModuleScript {
-    GC_CELL(JavaScriptModuleScript, ModuleScript);
-    GC_DECLARE_ALLOCATOR(JavaScriptModuleScript);
-
-public:
-    virtual ~JavaScriptModuleScript() override;
-
-    static WebIDL::ExceptionOr<GC::Ptr<JavaScriptModuleScript>> create(ByteString const& filename, StringView source, JS::Realm&, URL::URL base_url);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_from_pre_parsed(ByteString const& filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject&, URL::URL base_url, JS::ParsedProgram);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_from_pre_compiled(ByteString const& filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject&, URL::URL base_url, JS::CompiledProgram);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_from_bytecode_cache(ByteString const& filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject&, URL::URL base_url, NonnullRefPtr<JS::DecodedBytecodeCache>);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_javascript_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject&, URL::URL base_url, size_t source_line_number = 1, ScriptRegistry::IsInlineSource = ScriptRegistry::IsInlineSource::No);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_css_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject&);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_json_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject&);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_text_module_script(ByteString const& filename, Utf16View text, EnvironmentSettingsObject&);
+    static WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> create_a_webassembly_module_script(ByteString const& filename, ByteBuffer body_bytes, EnvironmentSettingsObject&, URL::URL base_url);
 
     enum class PreventErrorReporting {
         Yes,
         No
     };
 
-    JS::Promise* run(PreventErrorReporting = PreventErrorReporting::No);
+    GC::Ptr<WebIDL::Promise> run(PreventErrorReporting = PreventErrorReporting::No);
 
-    JS::SourceTextModule const* record() const { return m_record.ptr(); }
-    JS::SourceTextModule* record() { return m_record.ptr(); }
+    ModuleScriptRecord record() const { return m_record; }
 
 protected:
-    JavaScriptModuleScript(URL::URL base_url, ByteString filename, JS::Realm&);
+    ModuleScript(Optional<URL::URL> base_url, ByteString filename, EnvironmentSettingsObject&);
+    ModuleScript(Optional<URL::URL> base_url, ByteString filename, Utf16String display_filename, EnvironmentSettingsObject&);
 
 private:
-    virtual bool is_javascript_module_script() const final { return true; }
+    static GC::Ref<ModuleScript> create_internal(Optional<URL::URL> base_url, ByteString const& filename, EnvironmentSettingsObject&);
+
+    virtual bool is_module_script() const final { return true; }
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
-    GC::Ptr<JS::SourceTextModule> m_record;
+    ModuleScriptRecord m_record;
 
     size_t m_fetch_internal_request_count { 0 };
     size_t m_completed_fetch_internal_request_count { 0 };
 
-    Function<void(JavaScriptModuleScript const*)> m_completed_fetch_internal_callback;
+    Function<void(ModuleScript const*)> m_completed_fetch_internal_callback;
 };
 
 }
 
 template<>
-inline bool JS::Script::HostDefined::fast_is<Web::HTML::ModuleScript>() const { return is_module_script(); }
-
-template<>
-inline bool JS::Script::HostDefined::fast_is<Web::HTML::JavaScriptModuleScript>() const { return is_javascript_module_script(); }
+inline bool Web::HTML::Script::fast_is<Web::HTML::ModuleScript>() const { return is_module_script(); }

@@ -4,10 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Platform.h>
 #include <AK/Time.h>
 #include <LibCore/System.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
+
+#if defined(AK_OS_MACOS)
+#    include <sys/qos.h>
+#endif
 
 using namespace AK::TimeLiterals;
 
@@ -29,7 +34,7 @@ TEST_CASE(threads_can_detach)
 {
     IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<int> should_be_42 = 0;
 
-    auto thread = Threading::Thread::construct([&should_be_42]() {
+    auto thread = Threading::Thread::construct("DetachTest"sv, [&should_be_42]() {
         (void)Core::System::sleep_ms(10);
         should_be_42 = 42;
         return 0;
@@ -44,7 +49,7 @@ TEST_CASE(threads_can_detach)
 TEST_CASE(detached_threads_do_not_need_to_be_joined)
 {
     IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> should_exit { false };
-    auto thread = Threading::Thread::construct([&]() {
+    auto thread = Threading::Thread::construct("DetachTest"sv, [&]() {
         while (!should_exit.load())
             (void)Core::System::sleep_ms(10);
         return 0;
@@ -62,7 +67,7 @@ TEST_CASE(detached_threads_do_not_need_to_be_joined)
 
 TEST_CASE(join_dead_thread)
 {
-    auto thread = Threading::Thread::construct([&]() { return 0 /*nullptr*/; });
+    auto thread = Threading::Thread::construct("JoinTest"sv, [&]() { return 0 /*nullptr*/; });
     thread->start();
 
     // The thread should have exited by then.
@@ -71,3 +76,27 @@ TEST_CASE(join_dead_thread)
     auto join_result = TRY_OR_FAIL(thread->join<int*>());
     EXPECT_EQ(join_result, static_cast<int*>(0));
 }
+
+#if defined(AK_OS_MACOS)
+TEST_CASE(threads_start_with_the_requested_qos_class)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<int> default_thread_qos_class { QOS_CLASS_UNSPECIFIED };
+    auto default_thread = Threading::Thread::construct("QoSDefault"sv, [&default_thread_qos_class] {
+        default_thread_qos_class = qos_class_self();
+        return 0;
+    });
+    default_thread->start();
+    TRY_OR_FAIL(default_thread->join());
+    EXPECT_EQ(default_thread_qos_class.load(), static_cast<int>(QOS_CLASS_USER_INITIATED));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<int> utility_thread_qos_class { QOS_CLASS_UNSPECIFIED };
+    auto utility_thread = Threading::Thread::construct("QoSUtility"sv, [&utility_thread_qos_class] {
+        utility_thread_qos_class = qos_class_self();
+        return 0;
+    });
+    utility_thread->set_qos(Core::Platform::ThreadQoS::Utility);
+    utility_thread->start();
+    TRY_OR_FAIL(utility_thread->join());
+    EXPECT_EQ(utility_thread_qos_class.load(), static_cast<int>(QOS_CLASS_UTILITY));
+}
+#endif

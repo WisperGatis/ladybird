@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/String.h>
+#include <AK/StringBuilder.h>
 #include <LibWeb/CSS/SerializationMode.h>
 #include <LibWeb/CSS/Units.h>
 #include <LibWeb/Forward.h>
@@ -16,15 +17,12 @@ namespace Web::CSS {
 class Frequency {
 public:
     Frequency(double value, FrequencyUnit unit);
-    static Frequency make_hertz(double);
-    Frequency percentage_of(Percentage const&) const;
 
-    String to_string(SerializationMode = SerializationMode::Normal) const;
     double to_hertz() const;
 
     double raw_value() const { return m_value; }
     FrequencyUnit unit() const { return m_unit; }
-    FlyString unit_name() const { return CSS::to_string(m_unit); }
+    Utf16FlyString unit_name() const { return CSS::to_string(m_unit); }
 
     bool operator==(Frequency const& other) const
     {
@@ -43,19 +41,9 @@ public:
         return 0;
     }
 
-    static Frequency resolve_calculated(NonnullRefPtr<CalculatedStyleValue const> const&, Layout::Node const&, Frequency const& reference_value);
-
 private:
     FrequencyUnit m_unit;
     double m_value { 0 };
 };
 
 }
-
-template<>
-struct AK::Formatter<Web::CSS::Frequency> : Formatter<StringView> {
-    ErrorOr<void> format(FormatBuilder& builder, Web::CSS::Frequency const& frequency)
-    {
-        return Formatter<StringView>::format(builder, frequency.to_string());
-    }
-};

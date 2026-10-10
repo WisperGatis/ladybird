@@ -11,7 +11,6 @@
 #include <AK/StringView.h>
 #include <LibCrypto/ASN1/Constants.h>
 #include <LibCrypto/ASN1/DER.h>
-#include <LibCrypto/OpenSSL.h>
 
 namespace {
 
@@ -45,16 +44,21 @@ struct SECPxxxr1Point {
 
     static ErrorOr<SECPxxxr1Point> from_uncompressed(ReadonlyBytes data)
     {
-        if (data.size() < 1 || data[0] != 0x04)
+        if (data.size() < 3 || data[0] != 0x04)
             return Error::from_string_literal("Invalid length or not an uncompressed SECPxxxr1 point");
 
         auto half_size = (data.size() - 1) / 2;
+        if (1 + half_size * 2 != data.size())
+            return Error::from_string_literal("Invalid uncompressed SECPxxxr1 point length");
+
         return SECPxxxr1Point {
             UnsignedBigInteger::import_data(data.slice(1, half_size)),
             UnsignedBigInteger::import_data(data.slice(1 + half_size, half_size)),
             half_size,
         };
     }
+
+    static ErrorOr<SECPxxxr1Point> from_compressed(ReadonlyBytes data);
 
     ErrorOr<ByteBuffer> x_bytes() const
     {
@@ -84,7 +88,7 @@ struct SECPxxxr1Signature {
     UnsignedBigInteger s;
     size_t size;
 
-    static ErrorOr<SECPxxxr1Signature> from_asn(Span<int const> curve_oid, ReadonlyBytes signature, Vector<StringView> current_scope)
+    static ErrorOr<SECPxxxr1Signature> from_asn(Span<u32 const> curve_oid, ReadonlyBytes signature, Vector<StringView> current_scope)
     {
         ASN1::Decoder decoder(signature);
         ENTER_TYPED_SCOPE(Sequence, "SECPxxxr1Signature");
@@ -108,7 +112,7 @@ struct SECPxxxr1Signature {
         return SECPxxxr1Signature { r_big_int, s_big_int, scalar_size };
     }
 
-    static ErrorOr<SECPxxxr1Signature> from_raw(Span<int const> curve_oid, ReadonlyBytes signature)
+    static ErrorOr<SECPxxxr1Signature> from_raw(Span<u32 const> curve_oid, ReadonlyBytes signature)
     {
         size_t scalar_size;
         if (curve_oid == ASN1::secp256r1_oid) {

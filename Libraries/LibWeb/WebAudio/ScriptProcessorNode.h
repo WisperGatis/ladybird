@@ -12,7 +12,7 @@ namespace Web::WebAudio {
 
 // https://webaudio.github.io/web-audio-api/#ScriptProcessorNode
 class ScriptProcessorNode final : public AudioNode {
-    WEB_PLATFORM_OBJECT(ScriptProcessorNode, AudioNode);
+    WEB_WRAPPABLE(ScriptProcessorNode, AudioNode);
     GC_DECLARE_ALLOCATOR(ScriptProcessorNode);
 
 public:
@@ -20,14 +20,20 @@ public:
 
     virtual ~ScriptProcessorNode() override;
 
-    static WebIDL::ExceptionOr<GC::Ref<ScriptProcessorNode>> create(JS::Realm&, GC::Ref<BaseAudioContext>,
-        WebIDL::Long buffer_size, WebIDL::UnsignedLong number_of_input_channels,
+    static WebIDL::ExceptionOr<GC::Ref<ScriptProcessorNode>> create(
+        GC::Ref<BaseAudioContext>,
+        WebIDL::Long buffer_size,
+        WebIDL::UnsignedLong number_of_input_channels,
+        WebIDL::UnsignedLong number_of_output_channel);
+    static WebIDL::ExceptionOr<void> validate_options(
+        WebIDL::Long buffer_size,
+        WebIDL::UnsignedLong number_of_input_channels,
         WebIDL::UnsignedLong number_of_output_channel);
 
     // ^AudioNode
     virtual WebIDL::UnsignedLong channel_count() const override;
     virtual WebIDL::ExceptionOr<void> set_channel_count(WebIDL::UnsignedLong) override;
-    virtual WebIDL::ExceptionOr<void> set_channel_count_mode(Bindings::ChannelCountMode) override;
+    virtual WebIDL::ExceptionOr<void> set_channel_count_mode(ChannelCountMode) override;
     virtual WebIDL::UnsignedLong number_of_inputs() override { return 1; }
     virtual WebIDL::UnsignedLong number_of_outputs() override { return 1; }
 
@@ -38,10 +44,9 @@ public:
     WebIDL::ExceptionOr<void> set_buffer_size(WebIDL::Long buffer_size);
 
 private:
-    ScriptProcessorNode(JS::Realm&, GC::Ref<BaseAudioContext>, u8 number_of_input_channels,
-        u8 number_of_output_channels);
+    ScriptProcessorNode(GC::Ref<BaseAudioContext>, u8 number_of_input_channels, u8 number_of_output_channels);
 
-    virtual void initialize(JS::Realm&) override;
+    void set_buffer_size_without_validation(WebIDL::Long buffer_size) { m_buffer_size = buffer_size; }
 
     WebIDL::Long m_buffer_size { 0 };
     u8 m_number_of_input_channels { 0 };

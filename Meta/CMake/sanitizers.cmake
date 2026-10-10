@@ -1,3 +1,9 @@
+if ((ENABLE_ADDRESS_SANITIZER AND ENABLE_MEMORY_SANITIZER)
+    OR (ENABLE_ADDRESS_SANITIZER AND ENABLE_THREAD_SANITIZER)
+    OR (ENABLE_MEMORY_SANITIZER AND ENABLE_THREAD_SANITIZER))
+    message(FATAL_ERROR "AddressSanitizer, MemorySanitizer, and ThreadSanitizer cannot be enabled together")
+endif()
+
 function(get_clang_resource_dir result_dir)
     execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir
         OUTPUT_VARIABLE CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -16,8 +22,6 @@ if (ENABLE_ADDRESS_SANITIZER)
     else()
         add_cxx_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         add_cxx_link_options(-fsanitize=address)
-        add_swift_compile_options(-sanitize=address)
-        add_swift_link_options(-sanitize=address)
     endif()
 endif()
 
@@ -26,12 +30,17 @@ if (ENABLE_MEMORY_SANITIZER)
     add_cxx_link_options(-fsanitize=memory -fsanitize-memory-track-origins)
 endif()
 
+if (ENABLE_THREAD_SANITIZER)
+    add_cxx_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_cxx_link_options(-fsanitize=thread)
+endif()
+
 if (ENABLE_UNDEFINED_SANITIZER)
     if (WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang$")
         add_cxx_compile_options(-fsanitize=undefined)
         # FIXME: Windows on ARM
         link_libraries(clang_rt.ubsan_standalone-x86_64.lib clang_rt.ubsan_standalone_cxx-x86_64.lib)
-    elseif (APPLE OR NOT ENABLE_SWIFT)
+    else()
         add_cxx_compile_options(-fsanitize=undefined -fno-omit-frame-pointer)
         if (UNDEFINED_BEHAVIOR_IS_FATAL)
             add_cxx_compile_options(-fno-sanitize-recover=undefined)
@@ -39,8 +48,9 @@ if (ENABLE_UNDEFINED_SANITIZER)
         if (APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang$" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "17")
             add_cxx_compile_options(-fno-sanitize=function)
         endif()
+        # The LibJS runtime keeps its own class pointer where a C++ cell has its vtable pointer, so vptr checks misfire
+        # wherever one of its cells is handled as a GC::Cell.
+        add_cxx_compile_options(-fno-sanitize=vptr)
         add_cxx_link_options(-fsanitize=undefined)
-        add_swift_compile_options(-sanitize=undefined)
-        add_swift_link_options(-sanitize=undefined)
     endif()
 endif()

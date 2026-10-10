@@ -15,7 +15,6 @@ class ArgsParser;
 class BufferedSocketBase;
 class ConfigFile;
 class CustomEvent;
-class DateTime;
 class DirIterator;
 class DeferredInvocationContext;
 class ElapsedTimer;
@@ -26,9 +25,7 @@ class File;
 class LocalServer;
 class LocalSocket;
 class MappedFile;
-class MimeData;
 class NetworkJob;
-class NetworkResponse;
 class Notifier;
 class Process;
 class ProcessStatisticsReader;
@@ -47,8 +44,7 @@ class TimerEvent;
 class TimeZoneWatcher;
 class UDPServer;
 class UDPSocket;
-
-struct ProxyData;
+class WeakEventLoopReference;
 
 #ifdef AK_OS_MACH
 class MachPort;

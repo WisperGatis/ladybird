@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<style>
+body {
+    margin: 0;
+    height: 5000px;
+}
+</style>
+<script src="include.js"></script>
+<script>
+promiseTest(async () => {
+    let scrolled = new Promise(resolve => {
+        document.addEventListener("scroll", resolve, { once: true });
+    });
+
+    internals.mouseDown(100, 10);
+    internals.mouseMove(100, 610);
+
+    await scrolled;
+
+    println(`scrollTop: ${document.documentElement.scrollTop}`);
+
+    internals.mouseUp(100, 610);
+});
+</script>

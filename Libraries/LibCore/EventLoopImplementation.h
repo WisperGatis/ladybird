@@ -6,7 +6,10 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/Function.h>
+#include <AK/Optional.h>
+#include <LibCore/Export.h>
 #include <LibCore/Forward.h>
 
 namespace Core {
@@ -14,7 +17,7 @@ namespace Core {
 class EventLoopImplementation;
 class ThreadEventQueue;
 
-class EventLoopManager {
+class CORE_API EventLoopManager {
 public:
     static EventLoopManager& the();
     static void install(EventLoopManager&);
@@ -35,12 +38,17 @@ public:
     virtual int register_signal(int signal_number, Function<void(int)> handler) = 0;
     virtual void unregister_signal(int handler_id) = 0;
 
+    virtual void register_process([[maybe_unused]] pid_t pid, [[maybe_unused]] ESCAPING Function<void(pid_t)> exit_handler) { VERIFY_NOT_REACHED(); }
+    virtual void unregister_process([[maybe_unused]] pid_t pid) { VERIFY_NOT_REACHED(); }
+
 protected:
     EventLoopManager();
 };
 
-class EventLoopImplementation {
+class CORE_API EventLoopImplementation {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~EventLoopImplementation();
 
     enum class PumpMode {
@@ -52,13 +60,20 @@ public:
     virtual size_t pump(PumpMode) = 0;
     virtual void quit(int) = 0;
     virtual void wake() = 0;
-    virtual bool was_exit_requested() const = 0;
+    virtual bool was_exit_requested() const;
 
-    virtual void post_event(EventReceiver& receiver, NonnullOwnPtr<Event>&&) = 0;
+    virtual void deferred_invoke(Function<void()>&&);
 
 protected:
     EventLoopImplementation();
+    void request_exit(int);
+    Optional<int> exit_code_if_requested() const;
+
     ThreadEventQueue& m_thread_event_queue;
+
+private:
+    Atomic<int> m_exit_code { 0 };
+    Atomic<bool> m_exit_requested { false };
 };
 
 }

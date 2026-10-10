@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script>
+    asyncTest(async done => {
+        const server = httpTestServer();
+        const url = await server.createEcho("GET", "/navigation-timing-type", {
+            status: 200,
+            headers: { "Content-Type": "text/html" },
+            body: `
+                <!DOCTYPE html>
+                <script>
+                    const entry = performance.getEntriesByType("navigation")[0];
+                    parent.postMessage({ type: entry ? entry.type : "missing", legacyType: performance.navigation.type }, "*");
+                    addEventListener("message", event => {
+                        if (event.data === "reload")
+                            location.reload();
+                    });
+                <\/script>
+            `,
+        });
+
+        const types = [];
+        addEventListener("message", event => {
+            types.push(event.data);
+            if (types.length === 1) {
+                event.source.postMessage("reload", "*");
+                return;
+            }
+
+            println(`initial navigation type: ${types[0].type}`);
+            println(`initial legacy navigation type: ${types[0].legacyType}`);
+            println(`reload navigation type: ${types[1].type}`);
+            println(`reload legacy navigation type: ${types[1].legacyType}`);
+            done();
+        });
+
+        const frame = document.createElement("iframe");
+        frame.src = url;
+        document.body.appendChild(frame);
+    });
+</script>

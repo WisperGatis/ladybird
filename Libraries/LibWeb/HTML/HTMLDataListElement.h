@@ -14,7 +14,7 @@
 namespace Web::HTML {
 
 class WEB_API HTMLDataListElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLDataListElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLDataListElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLDataListElement);
 
 public:
@@ -26,11 +26,18 @@ public:
 
 private:
     HTMLDataListElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
+
+    virtual bool is_html_data_list_element() const override { return true; }
 
     GC::Ptr<DOM::HTMLCollection> m_options;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLDataListElement>() const { return is_html_data_list_element(); }
 
 }

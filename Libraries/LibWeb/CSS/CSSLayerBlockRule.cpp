@@ -1,80 +1,88 @@
 /*
- * Copyright (c) 2024, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2024-2025, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include "CSSLayerBlockRule.h"
-#include <LibWeb/Bindings/CSSLayerBlockRulePrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <AK/Utf16StringBuilder.h>
+#include <LibWeb/Bindings/CSSLayerBlockRule.h>
 #include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/Dump.h>
 
 namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSLayerBlockRule);
 
-GC::Ref<CSSLayerBlockRule> CSSLayerBlockRule::create(JS::Realm& realm, FlyString name, CSSRuleList& rules)
+GC::Ref<CSSLayerBlockRule> CSSLayerBlockRule::create(RustRule rule, CSSRuleList& rules)
 {
-    return realm.create<CSSLayerBlockRule>(realm, move(name), rules);
+    return GC::Heap::the().allocate<CSSLayerBlockRule>(move(rule), rules);
 }
 
-FlyString CSSLayerBlockRule::next_unique_anonymous_layer_name()
+CSSLayerBlockRule::CSSLayerBlockRule(RustRule rule, CSSRuleList& rules)
+    : CSSGroupingRule(rules, move(rule))
+    , m_names(*native_rule().payload().layer_names)
 {
-    static u64 s_anonymous_layer_id = 0;
-    return MUST(String::formatted("#{}", ++s_anonymous_layer_id));
+    VERIFY(Parser::ValueParserFFI::rust_layer_names_count(&m_names) == 1);
 }
 
-CSSLayerBlockRule::CSSLayerBlockRule(JS::Realm& realm, FlyString name, CSSRuleList& rules)
-    : CSSGroupingRule(realm, rules, Type::LayerBlock)
-    , m_name(move(name))
+Utf16View CSSLayerBlockRule::name() const
 {
-    if (m_name.is_empty()) {
-        m_name_internal = next_unique_anonymous_layer_name();
-    } else {
-        m_name_internal = m_name;
-    }
+    auto view = Parser::ValueParserFFI::rust_layer_names_at(&m_names, 0);
+    return { reinterpret_cast<char16_t const*>(view.utf16), view.length };
 }
 
-void CSSLayerBlockRule::initialize(JS::Realm& realm)
+Utf16FlyString const& CSSLayerBlockRule::internal_name() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSLayerBlockRule);
-    Base::initialize(realm);
+    return m_name_internal.ensure([&] {
+        auto name = native_rule().internal_layer_name().release_value();
+        return Utf16FlyString::from_utf16(name.utf16_view());
+    });
 }
 
-String CSSLayerBlockRule::serialized() const
+size_t CSSLayerBlockRule::external_memory_size() const
+{
+    return Base::external_memory_size() + Parser::ValueParserFFI::rust_layer_names_external_memory_size(&m_names);
+}
+
+Utf16String CSSLayerBlockRule::serialized() const
 {
     // AD-HOC: No spec yet, so this is based on the @media serialization algorithm.
-    StringBuilder builder;
-    builder.append("@layer"sv);
-    if (!m_name.is_empty())
-        builder.appendff(" {}", m_name);
+    Utf16StringBuilder builder;
+    builder.append_ascii("@layer"sv);
+    if (!name().is_empty())
+        builder.appendff(" {}", name());
 
-    builder.append(" {\n"sv);
+    builder.append_ascii(" {\n"sv);
     // AD-HOC: All modern browsers omit the ending newline if there are no CSS rules, so let's do the same.
     if (css_rules().length() == 0) {
-        builder.append('}');
-        return builder.to_string_without_validation();
+        builder.append_ascii('}');
+        return builder.to_string();
     }
 
     for (size_t i = 0; i < css_rules().length(); i++) {
         auto rule = css_rules().item(i);
         if (i != 0)
-            builder.append("\n"sv);
-        builder.append("  "sv);
-        builder.append(rule->css_text());
+            builder.append_ascii("\n"sv);
+        builder.append_ascii("  "sv);
+        builder.append(rule->serialized());
     }
 
-    builder.append("\n}"sv);
+    builder.append_ascii("\n}"sv);
 
-    return builder.to_string_without_validation();
+    return builder.to_string();
 }
 
-FlyString CSSLayerBlockRule::internal_qualified_name(Badge<StyleComputer>) const
+void CSSLayerBlockRule::dump(StringBuilder& builder, int indent_levels) const
 {
-    auto const& parent_name = parent_layer_internal_qualified_name();
-    if (parent_name.is_empty())
-        return m_name_internal;
-    return MUST(String::formatted("{}.{}", parent_name, m_name_internal));
+    Base::dump(builder, indent_levels);
+
+    dump_indent(builder, indent_levels + 1);
+    builder.appendff("Name: `{}` (internal `{}`)\n", name(), internal_name());
+    dump_indent(builder, indent_levels + 1);
+    builder.appendff("Rules ({}):\n", css_rules().length());
+    for (auto& rule : css_rules())
+        dump_rule(builder, rule, indent_levels + 2);
 }
 
 }

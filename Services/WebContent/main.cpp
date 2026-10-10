@@ -6,171 +6,190 @@
 
 #include <AK/LexicalPath.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/LocalServer.h>
+#include <LibCore/Platform/TaskRole.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/Resource.h>
-#include <LibCore/SystemServerTakeover.h>
+#include <LibCore/System.h>
+#include <LibCore/TimeZone.h>
+#include <LibCrypto/OpenSSL.h>
+#include <LibCrypto/OpenSSLForward.h>
 #include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/PathFontProvider.h>
 #include <LibIPC/ConnectionFromClient.h>
-#include <LibJS/Bytecode/Interpreter.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
-#include <LibMedia/Audio/Loader.h>
+#include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
+#include <LibSandbox/ConnectBroker.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Internals/Internals.h>
-#include <LibWeb/Loader/ContentFilter.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Painting/BackingStoreManager.h>
-#include <LibWeb/Painting/PaintableBox.h>
-#include <LibWeb/Platform/AudioCodecPluginAgnostic.h>
-#include <LibWeb/Platform/EventLoopPluginSerenity.h>
-#include <LibWeb/WebIDL/Tracing.h>
-#include <LibWebView/Plugins/FontPlugin.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/SiteIsolation.h>
-#include <LibWebView/Utilities.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWebCommon/WebView/Utilities.h>
+#include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
+#include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverConnection.h>
 
-#if defined(HAVE_QT_MULTIMEDIA)
-#    include <LibWebView/EventLoop/EventLoopImplementationQt.h>
-#    include <QCoreApplication>
-#    include <UI/Qt/AudioCodecPluginQt.h>
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+#    include <LibWasm/Types.h>
+#    include <LibWasmCompilerClient/State.h>
 #endif
+
+#include <openssl/thread.h>
 
 #if defined(AK_OS_MACOS)
-#    include <LibCore/Platform/ProcessStatisticsMach.h>
+#    include <LibIPC/Transport.h>
+#    include <LibIPC/TransportBootstrapMach.h>
+#else
+#    include <LibIPC/SingleServer.h>
 #endif
 
-#include <SDL3/SDL_init.h>
+#if !defined(AK_OS_WINDOWS)
+#    include <signal.h>
+static void crash_signal_handler(int signo)
+{
+    char const* name;
+    switch (signo) {
+    case SIGSEGV:
+        name = "SIGSEGV";
+        break;
+    case SIGBUS:
+        name = "SIGBUS";
+        break;
+    case SIGFPE:
+        name = "SIGFPE";
+        break;
+    case SIGABRT:
+        name = "SIGABRT";
+        break;
+    case SIGILL:
+        name = "SIGILL";
+        break;
+    default:
+        name = "unknown";
+        break;
+    }
+    warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
+    dump_backtrace(2, 100);
+    Core::Process::terminate_immediately(128 + signo);
+}
 
-static ErrorOr<void> load_content_filters(StringView config_path);
+static void install_crash_signal_handlers()
+{
+    struct sigaction sa;
+    sa.sa_handler = crash_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGILL, &sa, nullptr);
+}
+#endif
 
-static ErrorOr<void> initialize_resource_loader(GC::Heap&, int request_server_socket);
-static ErrorOr<void> reinitialize_resource_loader(IPC::File const& image_decoder_socket);
-
-static ErrorOr<void> initialize_image_decoder(int image_decoder_socket);
-static ErrorOr<void> reinitialize_image_decoder(IPC::File const& image_decoder_socket);
+static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle);
+static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
 
-    // SDL is used for the Gamepad API.
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        dbgln("Failed to initialize SDL3: {}", SDL_GetError());
-        return -1;
-    }
-
-#if defined(HAVE_QT_MULTIMEDIA)
-    QCoreApplication app(arguments.argc, arguments.argv);
-
-    Core::EventLoopManager::install(*new WebView::EventLoopManagerQt);
+#if !defined(AK_OS_WINDOWS)
+    install_crash_signal_handlers();
 #endif
-    Core::EventLoop event_loop;
+
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     WebView::platform_init();
 
-    Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPluginSerenity);
+    Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    Web::Platform::AudioCodecPlugin::install_creation_hook([](auto loader) {
-#if defined(HAVE_QT_MULTIMEDIA)
-        return Ladybird::AudioCodecPluginQt::create(move(loader));
-#else
-        return Web::Platform::AudioCodecPluginAgnostic::create(move(loader));
-#endif
-    });
-
-    StringView command_line {};
-    StringView executable_path {};
-    auto config_path = ByteString::formatted("{}/ladybird/default-config", WebView::s_ladybird_resource_root);
     StringView mach_server_name {};
     Vector<ByteString> certificates;
-    int request_server_socket { -1 };
-    int image_decoder_socket { -1 };
-    bool is_layout_test_mode = false;
+    int crash_report_fd = -1;
+    int connect_broker_fd = -1;
+    bool enable_test_mode = false;
+    bool expose_experimental_interfaces = false;
     bool expose_internals_object = false;
     bool wait_for_debugger = false;
     bool log_all_js_exceptions = false;
-    bool disable_site_isolation = false;
-    bool enable_idl_tracing = false;
-    bool enable_http_cache = false;
-    bool force_cpu_painting = false;
+    bool enable_http_memory_cache = false;
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool is_headless = false;
     bool disable_scrollbar_painting = false;
+    bool disable_sandbox = false;
     StringView echo_server_port_string_view {};
     StringView default_time_zone {};
+    bool file_origins_are_tuple_origins = false;
 
     Core::ArgsParser args_parser;
-    args_parser.add_option(command_line, "Browser process command line", "command-line", 0, "command_line");
-    args_parser.add_option(executable_path, "Browser process executable path", "executable-path", 0, "executable_path");
-    args_parser.add_option(config_path, "Ladybird configuration path", "config-path", 0, "config_path");
-    args_parser.add_option(request_server_socket, "File descriptor of the socket for the RequestServer connection", "request-server-socket", 'r', "request_server_socket");
-    args_parser.add_option(image_decoder_socket, "File descriptor of the socket for the ImageDecoder connection", "image-decoder-socket", 'i', "image_decoder_socket");
-    args_parser.add_option(is_layout_test_mode, "Is layout test mode", "layout-test-mode");
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
+    args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
+    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
+    args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
-    args_parser.add_option(disable_site_isolation, "Disable site isolation", "disable-site-isolation");
-    args_parser.add_option(enable_idl_tracing, "Enable IDL tracing", "enable-idl-tracing");
-    args_parser.add_option(enable_http_cache, "Enable HTTP cache", "enable-http-cache");
-    args_parser.add_option(force_cpu_painting, "Force CPU painting", "force-cpu-painting");
+    args_parser.add_option(enable_http_memory_cache, "Enable HTTP cache", "enable-http-memory-cache");
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical viewport scrollbars", "disable-scrollbar-painting");
+    args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.add_option(echo_server_port_string_view, "Echo server port used in test internals", "echo-server-port", 0, "echo_server_port");
     args_parser.add_option(is_headless, "Report that the browser is running in headless mode", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
+    args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
 
     args_parser.parse(arguments);
+
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
 
     if (wait_for_debugger) {
         Core::Process::wait_for_debugger_and_break();
     }
 
+    if (auto result = Core::Platform::adopt_foreground_application_task_role(); result.is_error())
+        warnln("Could not adopt the foreground application task role: {}", result.error());
+    // Match the UI process, but let its main thread win a tie, as WebKit does for its WebContent process.
+    if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInteractive, -1); result.is_error())
+        warnln("Could not set main thread QoS: {}", result.error());
+
     if (!default_time_zone.is_empty()) {
-        if (auto result = Unicode::set_current_time_zone(default_time_zone); result.is_error())
+        if (auto result = Core::TimeZone::set_current_time_zone(default_time_zone); result.is_error())
             dbgln("Failed to set default time zone: {}", result.error());
     }
 
-    auto& font_provider = static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
-    if (force_fontconfig) {
-        font_provider.set_name_but_fixme_should_create_custom_system_font_provider("FontConfig"_string);
-    }
-    font_provider.load_all_fonts_from_uri("resource://fonts"sv);
+    if (file_origins_are_tuple_origins)
+        URL::set_file_scheme_urls_have_tuple_origins();
 
-    // Layout test mode implies internals object is exposed and the Skia CPU backend is used
-    if (is_layout_test_mode) {
-        expose_internals_object = true;
-        force_cpu_painting = true;
-    }
-
-    Web::set_browser_process_command_line(command_line);
-    Web::set_browser_process_executable_path(executable_path);
-
-    // Always use the CPU backend for layout tests, as the GPU backend is not deterministic
-    WebContent::PageClient::set_use_skia_painter(force_cpu_painting ? WebContent::PageClient::UseSkiaPainter::CPUBackend : WebContent::PageClient::UseSkiaPainter::GPUBackendIfAvailable);
+    if (force_fontconfig)
+        Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
 
     WebContent::PageClient::set_is_headless(is_headless);
 
-    if (disable_site_isolation)
-        WebView::disable_site_isolation();
-
-    if (enable_http_cache) {
-
-        Web::Fetch::Fetching::set_http_cache_enabled(true);
-    }
+    if (enable_http_memory_cache)
+        Web::Fetch::Fetching::set_http_memory_cache_enabled(true);
 
     Web::Painting::set_paint_viewport_scrollbars(!disable_scrollbar_painting);
 
@@ -181,136 +200,91 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             VERIFY_NOT_REACHED();
     }
 
-#if defined(AK_OS_MACOS)
-    if (!mach_server_name.is_empty()) {
-        [[maybe_unused]] auto server_port = Core::Platform::register_with_mach_server(mach_server_name);
+    OPENSSL_TRY(OSSL_set_max_threads(nullptr, Core::System::hardware_concurrency()));
 
-        // FIXME: For some reason, our implementation of IOSurface does not work on Intel macOS. Remove this conditional
-        //        compilation when that is resolved.
-#    if ARCH(AARCH64)
-        Web::Painting::BackingStoreManager::set_browser_mach_port(move(server_port));
-#    endif
-    }
-#endif
-
-    TRY(initialize_image_decoder(image_decoder_socket));
-
+    Web::HTML::Window::set_enable_test_mode(enable_test_mode);
     Web::HTML::Window::set_internals_object_exposed(expose_internals_object);
+    Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
-    Web::Platform::FontPlugin::install(*new WebView::FontPlugin(is_layout_test_mode, &font_provider));
-
-    Web::Bindings::initialize_main_thread_vm(Web::Bindings::AgentType::SimilarOriginWindow);
+    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
 
     if (collect_garbage_on_every_allocation)
         Web::Bindings::main_thread_vm().heap().set_should_collect_on_every_allocation(true);
-
-    TRY(initialize_resource_loader(Web::Bindings::main_thread_vm().heap(), request_server_socket));
 
     if (log_all_js_exceptions) {
         JS::set_log_all_js_exceptions(true);
     }
 
-    if (enable_idl_tracing) {
-        Web::WebIDL::set_enable_idl_tracing(true);
-    }
+#if defined(AK_OS_LINUX)
+    if (connect_broker_fd != -1)
+        Sandbox::set_connect_broker_fd(connect_broker_fd);
+#endif
 
-    auto maybe_content_filter_error = load_content_filters(config_path);
-    if (maybe_content_filter_error.is_error())
-        dbgln("Failed to load content filters: {}", maybe_content_filter_error.error());
+    if (!disable_sandbox)
+        TRY(RendererSandbox::apply_sandbox(mach_server_name, RendererSandbox::AudioAccess::Yes));
 
-    // TODO: Mach IPC
+#if defined(AK_OS_MACOS)
+    auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
+    auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
+    auto webcontent_client = WebContent::ConnectionFromClient::construct(
+        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)), enable_test_mode);
+#else
+    auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name, enable_test_mode));
+#endif
 
-    auto webcontent_socket = TRY(Core::take_over_socket_from_system_server("WebContent"sv));
-    auto webcontent_client = WebContent::ConnectionFromClient::construct(make<IPC::Transport>(move(webcontent_socket)));
-
-    webcontent_client->on_request_server_connection = [&](auto const& socket_file) {
-        if (auto result = reinitialize_resource_loader(socket_file); result.is_error())
-            dbgln("Failed to reinitialize resource loader: {}", result.error());
+    auto& heap = Web::Bindings::main_thread_vm().heap();
+    webcontent_client->on_request_server_connection = [&heap](auto const& handle) {
+        if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
+            dbgln("Failed to connect to resource loader: {}", result.error());
     };
-    webcontent_client->on_image_decoder_connection = [&](auto const& socket_file) {
-        if (auto result = reinitialize_image_decoder(socket_file); result.is_error())
-            dbgln("Failed to reinitialize image decoder: {}", result.error());
+    webcontent_client->on_image_decoder_connection = [](auto const& handle) {
+        if (auto result = connect_to_image_decoder(handle); result.is_error())
+            dbgln("Failed to connect to image decoder: {}", result.error());
     };
+
+    MediaClient::Client::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_media_server_transport();
+    });
+
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
+        return WasmCompilerClient::compiler_state().compile(buffer);
+    });
+
+    webcontent_client->on_wasm_compiler_connection = [](auto handle) {
+        WasmCompilerClient::compiler_state().replace_connection(move(handle));
+    };
+#endif
 
     return event_loop.exec();
 }
 
-static ErrorOr<void> load_content_filters(StringView config_path)
+ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle)
 {
-    auto buffer = TRY(ByteBuffer::create_uninitialized(4096));
-
-    auto file = TRY(Core::File::open(ByteString::formatted("{}/BrowserContentFilters.txt", config_path), Core::File::OpenMode::Read));
-    auto ad_filter_list = TRY(Core::InputBufferedFile::create(move(file)));
-
-    Vector<String> patterns;
-
-    while (TRY(ad_filter_list->can_read_line())) {
-        auto line = TRY(ad_filter_list->read_line(buffer));
-        if (line.is_empty())
-            continue;
-
-        auto pattern = TRY(String::from_utf8(line));
-        TRY(patterns.try_append(move(pattern)));
-    }
-
-    auto& content_filter = Web::ContentFilter::the();
-    TRY(content_filter.set_patterns(patterns));
-
-    return {};
-}
-
-ErrorOr<void> initialize_resource_loader(GC::Heap& heap, int request_server_socket)
-{
-    // TODO: Mach IPC
-    auto socket = TRY(Core::LocalSocket::adopt_fd(request_server_socket));
-    TRY(socket->set_blocking(true));
-
-    auto request_client = TRY(try_make_ref_counted<Requests::RequestClient>(make<IPC::Transport>(move(socket))));
+    auto transport = TRY(handle.create_transport());
+    auto request_client = TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
 #ifdef AK_OS_WINDOWS
     auto response = request_client->send_sync<Messages::RequestServer::InitTransport>(Core::System::getpid());
     request_client->transport().set_peer_pid(response->peer_pid());
 #endif
-
-    Web::ResourceLoader::initialize(heap, move(request_client));
+    if (Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::the().set_client(move(request_client));
+    else
+        Web::ResourceLoader::initialize(heap, move(request_client));
     return {};
 }
 
-ErrorOr<void> reinitialize_resource_loader(IPC::File const& request_server_socket)
+ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
 {
-    // TODO: Mach IPC
-    auto socket = TRY(Core::LocalSocket::adopt_fd(request_server_socket.take_fd()));
-    TRY(socket->set_blocking(true));
-
-    auto request_client = TRY(try_make_ref_counted<Requests::RequestClient>(make<IPC::Transport>(move(socket))));
-    Web::ResourceLoader::the().set_client(move(request_client));
-
-    return {};
-}
-
-ErrorOr<void> initialize_image_decoder(int image_decoder_socket)
-{
-    // TODO: Mach IPC
-    auto socket = TRY(Core::LocalSocket::adopt_fd(image_decoder_socket));
-    TRY(socket->set_blocking(true));
-
-    auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(make<IPC::Transport>(move(socket))));
+    auto transport = TRY(handle.create_transport());
+    auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(move(transport)));
 #ifdef AK_OS_WINDOWS
     auto response = new_client->send_sync<Messages::ImageDecoderServer::InitTransport>(Core::System::getpid());
     new_client->transport().set_peer_pid(response->peer_pid());
 #endif
-
-    Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
-    return {};
-}
-
-ErrorOr<void> reinitialize_image_decoder(IPC::File const& image_decoder_socket)
-{
-    // TODO: Mach IPC
-    auto socket = TRY(Core::LocalSocket::adopt_fd(image_decoder_socket.take_fd()));
-    TRY(socket->set_blocking(true));
-
-    auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(make<IPC::Transport>(move(socket))));
-    static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
-
+    if (Web::Platform::ImageCodecPlugin::is_initialized())
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
+    else
+        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

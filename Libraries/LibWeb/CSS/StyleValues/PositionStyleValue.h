@@ -9,48 +9,27 @@
 
 #pragma once
 
-#include <LibWeb/CSS/Enums.h>
-#include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/CSS/StyleValues/EdgeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::CSS {
 
-class PositionStyleValue final : public StyleValueWithDefaultOperators<PositionStyleValue> {
+class WEB_API PositionStyleValue final : public StyleValueWithDefaultOperators<PositionStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<PositionStyleValue const> create(ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x, ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y)
-    {
-        return adopt_ref(*new (nothrow) PositionStyleValue(move(edge_x), move(edge_y)));
-    }
-    static ValueComparingNonnullRefPtr<PositionStyleValue const> create_center()
-    {
-        return adopt_ref(*new (nothrow) PositionStyleValue(
-            EdgeStyleValue::create(PositionEdge::Center, {}),
-            EdgeStyleValue::create(PositionEdge::Center, {})));
-    }
     virtual ~PositionStyleValue() override = default;
 
-    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x() const { return m_properties.edge_x; }
-    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y() const { return m_properties.edge_y; }
-    bool is_center() const;
-    CSSPixelPoint resolved(Layout::Node const&, CSSPixelRect const&) const;
-
-    virtual String to_string(SerializationMode) const override;
-
-    bool properties_equal(PositionStyleValue const& other) const { return m_properties == other.m_properties; }
+    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x() const { return wrap_rust_child(m_value->position.edge_x)->as_edge(); }
+    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y() const { return wrap_rust_child(m_value->position.edge_y)->as_edge(); }
 
 private:
-    PositionStyleValue(ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x, ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y)
-        : StyleValueWithDefaultOperators(Type::Position)
-        , m_properties { .edge_x = move(edge_x), .edge_y = move(edge_y) }
+    friend class StyleValue;
+
+    explicit PositionStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Position, data)
     {
     }
-
-    struct Properties {
-        ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x;
-        ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

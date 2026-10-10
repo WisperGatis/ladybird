@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const jwk = { alg: "A128GCM", kty: "oct", k: "é" };
+
+        try {
+            await crypto.subtle.importKey("jwk", jwk, "AES-GCM", false, [ "encrypt" ]);
+            println("FAIL: import succeeded");
+        } catch (error) {
+            println(error.name);
+        }
+    });
+</script>

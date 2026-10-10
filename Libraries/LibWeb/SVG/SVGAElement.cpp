@@ -5,9 +5,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGAElementPrototype.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/Invalidation/LinkInvalidator.h>
 #include <LibWeb/DOM/DOMTokenList.h>
-#include <LibWeb/Layout/SVGGraphicsBox.h>
+#include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGAElement.h>
 
 namespace Web::SVG {
@@ -21,12 +23,6 @@ SVGAElement::SVGAElement(DOM::Document& document, DOM::QualifiedName qualified_n
 
 SVGAElement::~SVGAElement() = default;
 
-void SVGAElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGAElement);
-    Base::initialize(realm);
-}
-
 void SVGAElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -35,23 +31,15 @@ void SVGAElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_target);
 }
 
-void SVGAElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGAElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == SVG::AttributeNames::href) {
-        invalidate_style(
-            DOM::StyleInvalidationReason::HTMLHyperlinkElementHrefChange,
-            {
-                { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::AnyLink },
-                { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Link },
-                { .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::LocalLink },
-            },
-            {});
-    }
+    if (name == SVG::AttributeNames::href)
+        CSS::Invalidation::invalidate_style_after_hyperlink_state_change(*this);
     if (name == HTML::AttributeNames::rel) {
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.value_or(String {}));
+            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
     }
 }
 
@@ -66,7 +54,7 @@ i32 SVGAElement::default_tab_index_value() const
 GC::Ref<SVGAnimatedString> SVGAElement::target()
 {
     if (!m_target)
-        m_target = SVGAnimatedString::create(realm(), *this, HTML::AttributeNames::target);
+        m_target = SVGAnimatedString::create(*this, DOM::QualifiedName { HTML::AttributeNames::target, OptionalNone {}, OptionalNone {} });
     return *m_target;
 }
 
@@ -79,9 +67,14 @@ GC::Ref<DOM::DOMTokenList> SVGAElement::rel_list()
     return *m_rel_list;
 }
 
-GC::Ptr<Layout::Node> SVGAElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+CSS::ElementBoxKind SVGAElement::box_kind() const
 {
-    return heap().allocate<Layout::SVGGraphicsBox>(document(), *this, move(style));
+    return CSS::ElementBoxKind::SvgGraphics;
+}
+
+void SVGAElement::activation_behavior(DOM::Event const& event)
+{
+    activate_the_hyperlink(event);
 }
 
 }

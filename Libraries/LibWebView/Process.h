@@ -6,15 +6,24 @@
 
 #pragma once
 
+#include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
 #include <AK/WeakPtr.h>
+#include <LibCore/File.h>
 #include <LibCore/Process.h>
 #include <LibIPC/Connection.h>
 #include <LibIPC/Transport.h>
+#include <LibSandbox/ConnectBroker.h>
+#include <LibWebView/CrashReport.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/ProcessType.h>
 
 namespace WebView {
+
+struct ProcessOutputCapture {
+    OwnPtr<Core::File> stdout_file;
+    OwnPtr<Core::File> stderr_file;
+};
 
 class WEBVIEW_API Process {
     AK_MAKE_NONCOPYABLE(Process);
@@ -28,28 +37,53 @@ public:
     struct ProcessAndClient;
 
     template<typename ClientType, typename... ClientArguments>
-    static ErrorOr<ProcessAndClient<ClientType>> spawn(ProcessType type, Core::ProcessSpawnOptions const& options, ClientArguments&&... client_arguments);
+    static ErrorOr<ProcessAndClient<ClientType>> spawn(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output, ClientArguments&&... client_arguments);
+
+    struct ProcessAndTransport;
+
+    // For a helper that serves another process: The caller hands the transport over instead of connecting to it.
+    static ErrorOr<ProcessAndTransport> spawn_with_transport(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output);
 
     ProcessType type() const { return m_type; }
 
     Optional<Utf16String> const& title() const { return m_title; }
     void set_title(Optional<Utf16String> title) { m_title = move(title); }
 
+    Optional<pid_t> owner_pid() const { return m_owner_pid; }
+    void set_owner_pid(pid_t pid) { m_owner_pid = pid; }
+
     template<typename ConnectionFromClient>
-    Optional<ConnectionFromClient&> client()
+    RefPtr<ConnectionFromClient> client()
     {
         if (auto strong_connection = m_connection.strong_ref())
             return as<ConnectionFromClient>(*strong_connection);
         return {};
     }
 
+    void set_crash_report(NonnullOwnPtr<CrashReport> report) { m_crash_report = move(report); }
+
+#if defined(AK_OS_LINUX)
+    // The broker serves this process alone, so it lives exactly as long as the process does.
+    void set_connect_broker(NonnullOwnPtr<Sandbox::ConnectBroker> broker) { m_connect_broker = move(broker); }
+#endif
+    void save_crash_report(Optional<int> exit_status);
+    ByteString const& saved_crash_report_name() const { return m_saved_crash_report_name; }
+
     pid_t pid() const { return m_process.pid(); }
+
+    ProcessOutputCapture& output_capture() { return m_output_capture; }
+    ProcessOutputCapture const& output_capture() const { return m_output_capture; }
 
     struct ProcessPaths {
         ByteString socket_path;
         ByteString pid_path;
     };
-    static ErrorOr<ProcessPaths> paths_for_process(StringView process_name);
+    static ErrorOr<ProcessPaths> paths_for_process(StringView process_name, StringView runtime_directory);
+
+    // The part of this process's environment that a helper process may see: debugging switches, sanitizer options,
+    // locale and a few basic variables, plus the proxy configuration for RequestServer. The rest may hold secrets of the
+    // Browser, such as tokens.
+    static Vector<ByteString> helper_process_environment(ProcessType);
     static ErrorOr<Optional<pid_t>> get_process_pid(StringView process_name, StringView pid_path);
     static ErrorOr<int> create_ipc_socket(ByteString const& socket_path);
 
@@ -57,13 +91,23 @@ private:
     struct ProcessAndIPCTransport {
         Core::Process process;
         NonnullOwnPtr<IPC::Transport> transport;
+        ProcessOutputCapture output_capture;
     };
-    static ErrorOr<ProcessAndIPCTransport> spawn_and_connect_to_process(Core::ProcessSpawnOptions const& options);
+    static ErrorOr<ProcessAndIPCTransport> spawn_and_connect_to_process(ProcessType, Core::ProcessSpawnOptions const& options, bool capture_output);
 
+    OwnPtr<CrashReport> m_crash_report;
+    ByteString m_saved_crash_report_name;
+
+#if defined(AK_OS_LINUX)
+
+    OwnPtr<Sandbox::ConnectBroker> m_connect_broker;
+#endif
     Core::Process m_process;
     ProcessType m_type;
     Optional<Utf16String> m_title;
+    Optional<pid_t> m_owner_pid;
     WeakPtr<IPC::ConnectionBase> m_connection;
+    ProcessOutputCapture m_output_capture;
 };
 
 template<typename ClientType>
@@ -72,13 +116,20 @@ struct Process::ProcessAndClient {
     NonnullRefPtr<ClientType> client;
 };
 
+struct Process::ProcessAndTransport {
+    Process process;
+    NonnullOwnPtr<IPC::Transport> transport;
+};
+
 template<typename ClientType, typename... ClientArguments>
-ErrorOr<Process::ProcessAndClient<ClientType>> Process::spawn(ProcessType type, Core::ProcessSpawnOptions const& options, ClientArguments&&... client_arguments)
+ErrorOr<Process::ProcessAndClient<ClientType>> Process::spawn(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output, ClientArguments&&... client_arguments)
 {
-    auto [core_process, transport] = TRY(spawn_and_connect_to_process(options));
+    auto [core_process, transport, output_capture] = TRY(spawn_and_connect_to_process(type, options, capture_output));
     auto client = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) ClientType { move(transport), forward<ClientArguments>(client_arguments)... }));
 
-    return ProcessAndClient<ClientType> { Process { type, client, move(core_process) }, client };
+    Process process { type, client, move(core_process) };
+    process.m_output_capture = move(output_capture);
+    return ProcessAndClient<ClientType> { move(process), client };
 }
 
 }

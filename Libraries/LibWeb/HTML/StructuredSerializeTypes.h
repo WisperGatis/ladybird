@@ -6,34 +6,29 @@
 
 #pragma once
 
+#include <AK/Array.h>
+#include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/Vector.h>
-#include <LibGC/Forward.h>
+#include <LibGC/Root.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
+#include <LibWeb/Export.h>
+#include <LibWebCommon/HTML/SerializationRecords.h>
 
 namespace Web::HTML {
 
 using DeserializationMemory = GC::RootVector<JS::Value>;
 using SerializationMemory = HashMap<GC::Root<JS::Value>, u32>;
-using SerializationRecord = IPC::MessageDataType;
 
-enum class SerializeType : u8 {
-    Unknown = 0,
-    DOMException = 1,
-    DOMRectReadOnly = 2,
-    DOMRect = 3,
-    Blob = 4,
-    ImageBitmap = 5,
-    CryptoKey = 6,
-    File = 7,
-    FileList = 8,
-    DOMMatrixReadOnly = 9,
-    DOMMatrix = 10,
-    DOMPointReadOnly = 11,
-    DOMPoint = 12,
-    DOMQuad = 13,
-    ImageData = 14,
+enum class SerializationType : u8 {
+    IPC,
+    Storage,
+};
+
+enum class CheckFullyConsumed : u8 {
+    No,
+    Yes,
 };
 
 enum class TransferType : u8 {
@@ -45,6 +40,61 @@ enum class TransferType : u8 {
     WritableStream = 5,
     TransformStream = 6,
     ImageBitmap = 7,
+    OffscreenCanvas = 8,
 };
+
+// The per-interface payload version encoded after every SerializableObject's interface name in
+// storage records. The decoder requires an exact match, so a bump orphans stored records of every
+// type unless migration support is added alongside it.
+static constexpr u64 serializable_payload_version = 1;
+
+// A storage-golden expectation, not a deserializer rule.
+enum class Expectation : u8 {
+    PositiveGolden,
+    DocumentedReject,
+};
+
+struct ValueTagExpectation {
+    ValueTag tag;
+    Expectation expectation;
+};
+
+// Only tags listed here decode as values. Empty and EndObject are reserved.
+static constexpr Array<ValueTagExpectation, 25> s_value_tag_expectations { {
+    { ValueTag::UndefinedPrimitive, Expectation::PositiveGolden },
+    { ValueTag::NullPrimitive, Expectation::PositiveGolden },
+    { ValueTag::BooleanPrimitive, Expectation::PositiveGolden },
+    { ValueTag::NumberPrimitive, Expectation::PositiveGolden },
+    { ValueTag::StringPrimitive, Expectation::PositiveGolden },
+    { ValueTag::BigIntPrimitive, Expectation::PositiveGolden },
+    { ValueTag::BooleanObject, Expectation::PositiveGolden },
+    { ValueTag::NumberObject, Expectation::PositiveGolden },
+    { ValueTag::StringObject, Expectation::PositiveGolden },
+    { ValueTag::BigIntObject, Expectation::PositiveGolden },
+    { ValueTag::DateObject, Expectation::PositiveGolden },
+    { ValueTag::RegExpObject, Expectation::PositiveGolden },
+    { ValueTag::MapObject, Expectation::PositiveGolden },
+    { ValueTag::SetObject, Expectation::PositiveGolden },
+    { ValueTag::ArrayObject, Expectation::PositiveGolden },
+    { ValueTag::ErrorObject, Expectation::PositiveGolden },
+    { ValueTag::Object, Expectation::PositiveGolden },
+    { ValueTag::ObjectReference, Expectation::PositiveGolden },
+    { ValueTag::GrowableSharedArrayBuffer, Expectation::DocumentedReject },
+    { ValueTag::SharedArrayBuffer, Expectation::DocumentedReject },
+    { ValueTag::ResizeableArrayBuffer, Expectation::PositiveGolden },
+    { ValueTag::ArrayBuffer, Expectation::PositiveGolden },
+    { ValueTag::ArrayBufferView, Expectation::PositiveGolden },
+    { ValueTag::SerializableObject, Expectation::PositiveGolden },
+    { ValueTag::Int32Primitive, Expectation::PositiveGolden },
+} };
+
+static constexpr bool value_tag_is_decodable(ValueTag tag)
+{
+    for (auto const& entry : s_value_tag_expectations) {
+        if (entry.tag == tag)
+            return true;
+    }
+    return false;
+}
 
 }

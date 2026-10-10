@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <AK/Vector.h>
+#include <LibIPC/Forward.h>
+
 namespace Gfx {
 
 struct ShapeFeature {
@@ -17,5 +20,37 @@ struct ShapeFeature {
 };
 
 using ShapeFeatures = Vector<ShapeFeature, 4>;
+
+}
+
+namespace IPC {
+
+template<>
+ErrorOr<void> encode(Encoder&, Gfx::ShapeFeature const&);
+
+template<>
+ErrorOr<Gfx::ShapeFeature> decode(Decoder&);
+
+}
+
+namespace AK {
+
+template<>
+struct Traits<Gfx::ShapeFeatures> : public DefaultTraits<Gfx::ShapeFeatures> {
+    static unsigned hash(Gfx::ShapeFeatures const& feature)
+    {
+        u32 hash = 0;
+
+        for (auto const& feature : feature) {
+            hash = pair_int_hash(hash, feature.tag[0]);
+            hash = pair_int_hash(hash, feature.tag[1]);
+            hash = pair_int_hash(hash, feature.tag[2]);
+            hash = pair_int_hash(hash, feature.tag[3]);
+            hash = pair_int_hash(hash, feature.value);
+        }
+
+        return hash;
+    }
+};
 
 }

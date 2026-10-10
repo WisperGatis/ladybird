@@ -8,8 +8,15 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/IDBRequestPrototype.h>
+#include <LibWeb/Bindings/IDBRequest.h>
 #include <LibWeb/DOM/EventTarget.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
+
+namespace Web::HTML {
+
+class WindowOrWorkerGlobalScopeMixin;
+
+}
 
 namespace Web::IndexedDB {
 
@@ -17,28 +24,31 @@ using IDBRequestSource = Variant<Empty, GC::Ref<IDBObjectStore>, GC::Ref<IDBInde
 
 // https://w3c.github.io/IndexedDB/#request-api
 class IDBRequest : public DOM::EventTarget {
-    WEB_PLATFORM_OBJECT(IDBRequest, DOM::EventTarget);
+    WEB_WRAPPABLE(IDBRequest, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(IDBRequest);
 
 public:
     virtual ~IDBRequest() override;
 
-    [[nodiscard]] static GC::Ref<IDBRequest> create(JS::Realm&, IDBRequestSource);
+    [[nodiscard]] static GC::Ref<IDBRequest> create(GC::Ref<DOM::EventTarget> relevant_global_object, IDBRequestSource);
 
     [[nodiscard]] bool done() const { return m_done; }
     [[nodiscard]] bool processed() const { return m_processed; }
     [[nodiscard]] IDBRequestSource source() const { return m_source; }
     [[nodiscard]] GC::Ptr<IDBTransaction> transaction() const { return m_transaction; }
+    static constexpr size_t transaction_offset() { return offsetof(IDBRequest, m_transaction); }
     [[nodiscard]] String uuid() const { return m_uuid; }
 
-    [[nodiscard]] Bindings::IDBRequestReadyState ready_state() const;
+    [[nodiscard]] HTML::WindowOrWorkerGlobalScopeMixin& relevant_global_scope() const;
+    [[nodiscard]] JS::Object& relevant_global_object() const;
     [[nodiscard]] GC::Ptr<WebIDL::DOMException> error() const;
     [[nodiscard]] WebIDL::ExceptionOr<JS::Value> result() const;
+    [[nodiscard]] Bindings::IDBRequestReadyState ready_state() const;
 
     void set_done(bool done) { m_done = done; }
     void set_result(JS::Value result) { m_result = result; }
     void set_error(Optional<GC::Ptr<WebIDL::DOMException>> error) { m_error = error; }
-    void set_processed(bool processed);
+    void set_processed(bool processed) { m_processed = processed; }
     void set_source(IDBRequestSource source) { m_source = source; }
     void set_transaction(GC::Ptr<IDBTransaction> transaction) { m_transaction = transaction; }
 
@@ -49,36 +59,16 @@ public:
     void set_onerror(WebIDL::CallbackType*);
     WebIDL::CallbackType* onerror();
 
-    void register_request_observer(Badge<IDBRequestObserver>, IDBRequestObserver&);
-    void unregister_request_observer(Badge<IDBRequestObserver>, IDBRequestObserver&);
+    [[nodiscard]] bool aborted() const { return m_aborted; }
+    void set_aborted(bool aborted) { m_aborted = aborted; }
 
 protected:
-    explicit IDBRequest(JS::Realm&, IDBRequestSource);
+    IDBRequest(GC::Ref<DOM::EventTarget> relevant_global_object, IDBRequestSource);
 
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Visitor& visitor) override;
+    virtual EventTarget* get_parent(DOM::Event const&) override;
 
 private:
-    template<typename GetNotifier, typename... Args>
-    void notify_each_request_observer(GetNotifier&& get_notifier, Args&&... args)
-    {
-        ScopeGuard guard { [&]() { m_request_observers_being_notified.clear_with_capacity(); } };
-        m_request_observers_being_notified.ensure_capacity(m_request_observers.size());
-
-        for (auto observer : m_request_observers)
-            m_request_observers_being_notified.unchecked_append(observer);
-
-        for (auto request_observer : m_request_observers_being_notified) {
-            if (auto notifier = get_notifier(*request_observer))
-                notifier->function()(forward<Args>(args)...);
-        }
-    }
-
-    // IDBRequest should not visit IDBRequestObserver to avoid leaks.
-    // It's responsibility of object that requires IDBRequestObserver to keep it alive.
-    HashTable<GC::RawRef<IDBRequestObserver>> m_request_observers;
-    Vector<GC::Ref<IDBRequestObserver>> m_request_observers_being_notified;
-
     // A request has a processed flag which is initially false.
     bool m_processed { false };
 
@@ -91,9 +81,13 @@ private:
 
     // A request has a source object.
     IDBRequestSource m_source;
+    GC::Ref<DOM::EventTarget> m_global_object;
 
     // A request has a transaction which is initially null.
     GC::Ptr<IDBTransaction> m_transaction;
+
+    // AD-HOC: Set to true to prevent queued operations and result events from executing.
+    bool m_aborted { false };
 
     // NOTE: Used for debug purposes
     String m_uuid;

@@ -4,9 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGRadialGradientElementPrototype.h>
-#include <LibWeb/Painting/PaintStyle.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGRadialGradientElement.h>
 
@@ -19,47 +17,35 @@ SVGRadialGradientElement::SVGRadialGradientElement(DOM::Document& document, DOM:
 {
 }
 
-void SVGRadialGradientElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGRadialGradientElement);
-    Base::initialize(realm);
-}
-
-void SVGRadialGradientElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGRadialGradientElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     // FIXME: These are <length> or <coordinate> in the spec, but all examples seem to allow percentages
     // and unitless values.
     if (name == SVG::AttributeNames::cx) {
-        m_cx = AttributeParser::parse_number_percentage(value.value_or(String {}));
-        m_paint_style = nullptr;
+        m_cx = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::cy) {
-        m_cy = AttributeParser::parse_number_percentage(value.value_or(String {}));
-        m_paint_style = nullptr;
+        m_cy = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::fx) {
-        m_fx = AttributeParser::parse_number_percentage(value.value_or(String {}));
-        m_paint_style = nullptr;
+        m_fx = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::fy) {
-        m_fy = AttributeParser::parse_number_percentage(value.value_or(String {}));
-        m_paint_style = nullptr;
+        m_fy = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::fr) {
-        m_fr = AttributeParser::parse_number_percentage(value.value_or(String {}));
-        m_paint_style = nullptr;
+        m_fr = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::r) {
-        m_r = AttributeParser::parse_number_percentage(value.value_or(String {}));
-        m_paint_style = nullptr;
+        m_r = parse_number_percentage(value.value_or({}));
     }
 }
 
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementFXAttribute
 NumberPercentage SVGRadialGradientElement::start_circle_x() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return start_circle_x_impl(seen_gradients);
 }
 
-NumberPercentage SVGRadialGradientElement::start_circle_x_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGRadialGradientElement::start_circle_x_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_fx.has_value())
         return *m_fx;
@@ -75,11 +61,11 @@ NumberPercentage SVGRadialGradientElement::start_circle_x_impl(HashTable<SVGGrad
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementFYAttribute
 NumberPercentage SVGRadialGradientElement::start_circle_y() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return start_circle_y_impl(seen_gradients);
 }
 
-NumberPercentage SVGRadialGradientElement::start_circle_y_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGRadialGradientElement::start_circle_y_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_fy.has_value())
         return *m_fy;
@@ -95,11 +81,11 @@ NumberPercentage SVGRadialGradientElement::start_circle_y_impl(HashTable<SVGGrad
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementFRAttribute
 NumberPercentage SVGRadialGradientElement::start_circle_radius() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return start_circle_radius_impl(seen_gradients);
 }
 
-NumberPercentage SVGRadialGradientElement::start_circle_radius_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGRadialGradientElement::start_circle_radius_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     // Note: A negative value is an error.
     if (m_fr.has_value() && m_fr->value() >= 0)
@@ -115,11 +101,11 @@ NumberPercentage SVGRadialGradientElement::start_circle_radius_impl(HashTable<SV
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementCXAttribute
 NumberPercentage SVGRadialGradientElement::end_circle_x() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return end_circle_x_impl(seen_gradients);
 }
 
-NumberPercentage SVGRadialGradientElement::end_circle_x_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGRadialGradientElement::end_circle_x_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_cx.has_value())
         return *m_cx;
@@ -131,11 +117,11 @@ NumberPercentage SVGRadialGradientElement::end_circle_x_impl(HashTable<SVGGradie
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementCYAttribute
 NumberPercentage SVGRadialGradientElement::end_circle_y() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return end_circle_y_impl(seen_gradients);
 }
 
-NumberPercentage SVGRadialGradientElement::end_circle_y_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGRadialGradientElement::end_circle_y_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_cy.has_value())
         return *m_cy;
@@ -147,11 +133,11 @@ NumberPercentage SVGRadialGradientElement::end_circle_y_impl(HashTable<SVGGradie
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementRAttribute
 NumberPercentage SVGRadialGradientElement::end_circle_radius() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return end_circle_radius_impl(seen_gradients);
 }
 
-NumberPercentage SVGRadialGradientElement::end_circle_radius_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGRadialGradientElement::end_circle_radius_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     // Note: A negative value is an error.
     if (m_r.has_value() && m_r->value() >= 0)
@@ -161,89 +147,17 @@ NumberPercentage SVGRadialGradientElement::end_circle_radius_impl(HashTable<SVGG
     return NumberPercentage::create_percentage(50);
 }
 
-Optional<Painting::PaintStyle> SVGRadialGradientElement::to_gfx_paint_style(SVGPaintContext const& paint_context) const
+void SVGRadialGradientElement::push_paint_server_description(void* sink) const
 {
-    auto units = gradient_units();
-    Gfx::FloatPoint start_center;
-    float start_radius = 0.0f;
-    Gfx::FloatPoint end_center;
-    float end_radius = 0.0f;
-
-    if (units == GradientUnits::ObjectBoundingBox) {
-        // If gradientUnits="objectBoundingBox", the user coordinate system for attributes ‘cx’, ‘cy’, ‘r’, ‘fx’, ‘fy’, and ‘fr’
-        // is established using the bounding box of the element to which the gradient is applied (see Object bounding box units)
-        // and then applying the transform specified by attribute ‘gradientTransform’. Percentages represent values relative
-        // to the bounding box for the object.
-        start_center = Gfx::FloatPoint { start_circle_x().value(), start_circle_y().value() };
-        start_radius = start_circle_radius().value();
-        end_center = Gfx::FloatPoint { end_circle_x().value(), end_circle_y().value() };
-        end_radius = end_circle_radius().value();
-    } else {
-        // GradientUnits::UserSpaceOnUse
-        // If gradientUnits="userSpaceOnUse", ‘cx’, ‘cy’, ‘r’, ‘fx’, ‘fy’, and ‘fr’ represent values in the coordinate system
-        // that results from taking the current user coordinate system in place at the time when the gradient element is
-        // referenced (i.e., the user coordinate system for the element referencing the gradient element via a fill or stroke property)
-        // and then applying the transform specified by attribute ‘gradientTransform’.
-        // Percentages represent values relative to the current SVG viewport.
-        // Note: The start/end centers will be in relative units here.
-        // They will be resolved at paint time using the gradient paint transform.
-        start_center = Gfx::FloatPoint {
-            start_circle_x().resolve_relative_to(paint_context.viewport.width()),
-            start_circle_y().resolve_relative_to(paint_context.viewport.height()),
-        };
-        // FIXME: Where in the spec does it say what axis the radius is relative to?
-        start_radius = start_circle_radius().resolve_relative_to(paint_context.viewport.width());
-        end_center = Gfx::FloatPoint {
-            end_circle_x().resolve_relative_to(paint_context.viewport.width()),
-            end_circle_y().resolve_relative_to(paint_context.viewport.height()),
-        };
-        end_radius = end_circle_radius().resolve_relative_to(paint_context.viewport.width());
-    }
-
-    if (!m_paint_style) {
-        m_paint_style = Painting::SVGRadialGradientPaintStyle::create(start_center, start_radius, end_center, end_radius);
-        // FIXME: Update stops in DOM changes:
-        add_color_stops(*m_paint_style);
-    } else {
-        m_paint_style->set_start_center(start_center);
-        m_paint_style->set_start_radius(start_radius);
-        m_paint_style->set_end_center(end_center);
-        m_paint_style->set_end_radius(end_radius);
-    }
-    m_paint_style->set_gradient_transform(gradient_paint_transform(paint_context));
-    m_paint_style->set_spread_method(to_painting_spread_method(spread_method()));
-    m_paint_style->set_color_space(color_space());
-    return *m_paint_style;
-}
-
-GC::Ref<SVGAnimatedLength> SVGRadialGradientElement::cx() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGRadialGradientElement::cy() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGRadialGradientElement::fx() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGRadialGradientElement::fy() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGRadialGradientElement::fr() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGRadialGradientElement::r() const
-{
-    return fake_animated_length_fixme();
+    auto description = base_paint_server_description(Layout::RustFFI::FfiSvgGradientKind::Radial);
+    description.cx = Layout::to_ffi_number_percentage(end_circle_x());
+    description.cy = Layout::to_ffi_number_percentage(end_circle_y());
+    description.r = Layout::to_ffi_number_percentage(end_circle_radius());
+    description.fx = Layout::to_ffi_number_percentage(start_circle_x());
+    description.fy = Layout::to_ffi_number_percentage(start_circle_y());
+    description.fr = Layout::to_ffi_number_percentage(start_circle_radius());
+    Layout::RustFFI::layout_arena_svg_paint_resources_push_gradient(sink, &description);
+    push_color_stops(sink);
 }
 
 }

@@ -7,7 +7,7 @@
 #pragma once
 
 #include <AK/Badge.h>
-#include <AK/String.h>
+#include <AK/Utf16View.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/HTML/AudioTrack.h>
@@ -15,25 +15,29 @@
 namespace Web::HTML {
 
 class AudioTrackList final : public DOM::EventTarget {
-    WEB_PLATFORM_OBJECT(AudioTrackList, DOM::EventTarget);
+    WEB_WRAPPABLE(AudioTrackList, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(AudioTrackList);
 
 public:
-    void add_track(Badge<HTMLMediaElement>, GC::Ref<AudioTrack>);
-    void remove_all_tracks(Badge<HTMLMediaElement>);
+    static GC::Ref<AudioTrackList> create();
+
+    void add_track(GC::Ref<AudioTrack>);
+    void remove_all_tracks();
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-audiotracklist-length
     size_t length() const { return m_audio_tracks.size(); }
 
-    GC::Ptr<AudioTrack> get_track_by_id(StringView id) const;
+    GC::Ptr<AudioTrack> item(size_t index) const;
+    GC::Ptr<AudioTrack> get_track_by_id(Utf16View id) const;
     bool has_enabled_track() const;
 
     template<typename Callback>
-    void for_each_enabled_track(Callback&& callback)
+    void for_each_track(Callback&& callback)
     {
         for (auto& audio_track : m_audio_tracks) {
-            if (audio_track->enabled())
-                callback(*audio_track);
+            auto iteration_decision = callback(*audio_track);
+            if (iteration_decision == IterationDecision::Break)
+                break;
         }
     }
 
@@ -47,12 +51,9 @@ public:
     WebIDL::CallbackType* onremovetrack();
 
 private:
-    explicit AudioTrackList(JS::Realm&);
+    explicit AudioTrackList();
 
     virtual void visit_edges(Visitor&) override;
-
-    virtual void initialize(JS::Realm&) override;
-    virtual JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const& property_name) const override;
 
     Vector<GC::Ref<AudioTrack>> m_audio_tracks;
 };

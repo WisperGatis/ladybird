@@ -6,83 +6,52 @@
 
 #pragma once
 
+#include <AK/Span.h>
+#include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
-#include <LibGfx/TextLayout.h>
-#include <LibUnicode/Segmenter.h>
+#include <AK/Vector.h>
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/DOM/Text.h>
-#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/Box.h>
 
 namespace Web::Layout {
 
-class LineBoxFragment;
+class GeneratedTextNode;
 
-class TextNode final : public Node {
-    GC_CELL(TextNode, Node);
-    GC_DECLARE_ALLOCATOR(TextNode);
-
+class TextNode : public Node {
 public:
-    TextNode(DOM::Document&, DOM::Text&);
+    TextNode(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~TextNode() override;
 
-    DOM::Text const& dom_node() const { return static_cast<DOM::Text const&>(*Node::dom_node()); }
+    DOM::Text const& dom_node() const
+    {
+        auto const* text = TextNode::dom_text();
+        VERIFY(text);
+        return *text;
+    }
+    // Null for generated text, and for a text node kept after its DOM node was removed.
+    virtual DOM::Text const* dom_text() const { return static_cast<DOM::Text const*>(Node::dom_node()); }
 
-    Utf16String const& text_for_rendering() const;
+    virtual Utf16String const& text() const { return dom_node().data(); }
 
-    struct Chunk {
-        Utf16View view;
-        NonnullRefPtr<Gfx::Font const> font;
-        size_t start { 0 };
-        size_t length { 0 };
-        bool has_breaking_newline { false };
-        bool has_breaking_tab { false };
-        bool is_all_whitespace { false };
-        Gfx::GlyphRun::TextType text_type;
-    };
-
-    class ChunkIterator {
-    public:
-        ChunkIterator(TextNode const&, bool should_wrap_lines, bool should_respect_linebreaks);
-        ChunkIterator(TextNode const&, Utf16View const&, Unicode::Segmenter&, bool should_wrap_lines, bool should_respect_linebreaks);
-
-        bool should_wrap_lines() const { return m_should_wrap_lines; }
-        bool should_respect_linebreaks() const { return m_should_respect_linebreaks; }
-        bool should_collapse_whitespace() const { return m_should_collapse_whitespace; }
-
-        Optional<Chunk> next();
-        Optional<Chunk> peek(size_t);
-
-        Chunk create_empty_chunk();
-
-    private:
-        Optional<Chunk> next_without_peek();
-        Optional<Chunk> try_commit_chunk(size_t start, size_t end, bool has_breaking_newline, bool has_breaking_tab, Gfx::Font const&, Gfx::GlyphRun::TextType) const;
-
-        bool const m_should_wrap_lines;
-        bool const m_should_respect_linebreaks;
-        bool m_should_collapse_whitespace;
-        Utf16View m_view;
-        Gfx::FontCascadeList const& m_font_cascade_list;
-
-        Unicode::Segmenter& m_grapheme_segmenter;
-        size_t m_current_index { 0 };
-
-        Vector<Chunk> m_peek_queue;
-    };
-
-    void invalidate_text_for_rendering();
-
-    Unicode::Segmenter& grapheme_segmenter() const;
-
-    virtual GC::Ptr<Painting::Paintable> create_paintable() const override;
+    Utf16String rendered_text_for_dom(bool collapse_whitespace) const;
+    RustFFI::FfiTextSourceRange word_range_at(size_t dom_offset) const;
 
 private:
     virtual bool is_text_node() const final { return true; }
+};
 
-    void compute_text_for_rendering();
+class GeneratedTextNode final : public TextNode {
+public:
+    GeneratedTextNode(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
+    virtual ~GeneratedTextNode() override;
 
-    Optional<Utf16String> m_text_for_rendering;
-    mutable OwnPtr<Unicode::Segmenter> m_grapheme_segmenter;
+    virtual DOM::Text const* dom_text() const override { return nullptr; }
+    virtual Utf16String const& text() const override { return m_text; }
+
+private:
+    Utf16String m_text;
 };
 
 template<>

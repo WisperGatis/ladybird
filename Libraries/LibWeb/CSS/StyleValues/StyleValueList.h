@@ -19,44 +19,70 @@ public:
         Space,
         Comma,
     };
-    static ValueComparingNonnullRefPtr<StyleValueList> create(StyleValueVector&& values, Separator separator)
+    enum class Collapsible {
+        Yes,
+        No,
+    };
+    static ValueComparingNonnullRefPtr<StyleValueList> create(StyleValueVector&& values, Separator separator, Collapsible collapsible = Collapsible::Yes)
     {
-        return adopt_ref(*new (nothrow) StyleValueList(move(values), separator));
+        return adopt_ref(*new (nothrow) StyleValueList(move(values), separator, collapsible));
     }
 
-    size_t size() const { return m_properties.values.size(); }
-    StyleValueVector const& values() const { return m_properties.values; }
+    size_t size() const { return m_value->value_list.values.length; }
+    StyleValueVector values() const
+    {
+        auto const& values = m_value->value_list.values;
+        StyleValueVector result;
+        result.ensure_capacity(values.length);
+        for (size_t i = 0; i < values.length; ++i) {
+            auto* child_data = static_cast<StyleValueFFI::StyleValueData const*>(values.pointer[i].pointer);
+            result.unchecked_append(StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data)));
+        }
+        return result;
+    }
     ValueComparingNonnullRefPtr<StyleValue const> value_at(size_t i, bool allow_loop) const
     {
         if (allow_loop)
-            return m_properties.values[i % size()];
-        return m_properties.values[i];
+            return value_at(i % size());
+        return value_at(i);
     }
 
-    virtual String to_string(SerializationMode) const override;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, FlyString const& associated_property) const override;
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
+    StyleValueVector subdivide_into_iterations(PropertyNameAndID const&) const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    Separator separator() const { return static_cast<Separator>(m_value->value_list.separator); }
 
-    bool properties_equal(StyleValueList const& other) const { return m_properties == other.m_properties; }
-
-    Separator separator() const { return m_properties.separator; }
-
-    virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
+    void set_style_sheet(StyleSheetState*);
 
 private:
-    StyleValueList(StyleValueVector&& values, Separator separator)
-        : StyleValueWithDefaultOperators(Type::ValueList)
-        , m_properties { .separator = separator, .values = move(values) }
+    friend class StyleValue;
+
+    explicit StyleValueList(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::ValueList, data)
     {
     }
 
-    struct Properties {
-        Separator separator;
-        StyleValueVector values;
-        bool operator==(Properties const&) const;
-    } m_properties;
+    StyleValueList(StyleValueVector&& values, Separator separator, Collapsible collapsible = Collapsible::Yes)
+        : StyleValueWithDefaultOperators(Type::ValueList, make_value_list_data(values, separator, collapsible))
+    {
+    }
+
+    ValueComparingNonnullRefPtr<StyleValue const> value_at(size_t i) const
+    {
+        auto* child_data = static_cast<StyleValueFFI::StyleValueData const*>(m_value->value_list.values.pointer[i].pointer);
+        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data));
+    }
+
+    static StyleValueFFI::StyleValueData const* make_value_list_data(StyleValueVector const& values, Separator separator, Collapsible collapsible)
+    {
+        Vector<StyleValueFFI::StyleValueData const*> pointers;
+        pointers.ensure_capacity(values.size());
+        for (auto const& value : values)
+            pointers.unchecked_append(StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()));
+        return StyleValueFFI::rust_style_value_create_value_list(pointers.data(), pointers.size(), to_underlying(separator), collapsible == Collapsible::Yes);
+    }
+
+    Collapsible collapsible() const { return m_value->value_list.collapsible ? Collapsible::Yes : Collapsible::No; }
 };
 
 }

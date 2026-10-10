@@ -1,9 +1,18 @@
 Harness status: OK
 
-Found 687 tests
+Found 697 tests
 
-665 Pass
-22 Fail
+667 Pass
+30 Fail
+Fail	alignment-baseline: baseline
+Fail	alignment-baseline: text-bottom
+Fail	alignment-baseline: alphabetic
+Fail	alignment-baseline: ideographic
+Fail	alignment-baseline: middle
+Fail	alignment-baseline: central
+Fail	alignment-baseline: mathematical
+Fail	alignment-baseline: text-top
+Fail	alignment-baseline: inherit
 Pass	background-attachment: scroll
 Pass	background-attachment: fixed
 Pass	background-attachment: inherit
@@ -192,6 +201,21 @@ Pass	background-repeat: repeat-x
 Pass	background-repeat: repeat-y
 Pass	background-repeat: no-repeat
 Pass	background-repeat: inherit
+Fail	baseline-shift: sub
+Fail	baseline-shift: super
+Fail	baseline-shift: top
+Fail	baseline-shift: center
+Fail	baseline-shift: bottom
+Fail	baseline-shift: 5%
+Fail	baseline-shift: .5%
+Fail	baseline-shift: 0px
+Fail	baseline-shift: 1px
+Fail	baseline-shift: .1em
+Fail	baseline-shift: inherit
+Fail	baseline-source: auto
+Fail	baseline-source: first
+Fail	baseline-source: last
+Fail	baseline-source: inherit
 Pass	border-collapse: collapse
 Pass	border-collapse: separate
 Pass	border-collapse: inherit
@@ -382,7 +406,7 @@ Pass	float: right
 Pass	float: none
 Pass	float: inherit
 Pass	font-family: Arial
-Pass	font-family: 'Lucida Grande'
+Fail	font-family: 'Lucida Grande'
 Pass	font-family: serif
 Pass	font-family: sans-serif
 Pass	font-family: inherit
@@ -471,8 +495,8 @@ Pass	list-style-type: upper-roman
 Pass	list-style-type: lower-greek
 Pass	list-style-type: lower-latin
 Pass	list-style-type: upper-latin
-Fail	list-style-type: armenian
-Fail	list-style-type: georgian
+Pass	list-style-type: armenian
+Pass	list-style-type: georgian
 Pass	list-style-type: lower-alpha
 Pass	list-style-type: upper-alpha
 Pass	list-style-type: none
@@ -585,21 +609,21 @@ Pass	padding-left: .1em
 Pass	padding-left: 5%
 Pass	padding-left: .5%
 Pass	padding-left: inherit
-Fail	page-break-after: auto
-Fail	page-break-after: always
-Fail	page-break-after: avoid
-Fail	page-break-after: left
-Fail	page-break-after: right
-Fail	page-break-after: inherit
-Fail	page-break-before: auto
-Fail	page-break-before: always
-Fail	page-break-before: avoid
-Fail	page-break-before: left
-Fail	page-break-before: right
-Fail	page-break-before: inherit
-Fail	page-break-inside: avoid
-Fail	page-break-inside: auto
-Fail	page-break-inside: inherit
+Pass	page-break-after: auto
+Pass	page-break-after: always
+Pass	page-break-after: avoid
+Pass	page-break-after: left
+Pass	page-break-after: right
+Pass	page-break-after: inherit
+Pass	page-break-before: auto
+Pass	page-break-before: always
+Pass	page-break-before: avoid
+Pass	page-break-before: left
+Pass	page-break-before: right
+Pass	page-break-before: inherit
+Pass	page-break-inside: avoid
+Pass	page-break-inside: auto
+Pass	page-break-inside: inherit
 Pass	position: static
 Pass	position: relative
 Pass	position: absolute
@@ -648,20 +672,6 @@ Pass	unicode-bidi: normal
 Pass	unicode-bidi: embed
 Pass	unicode-bidi: bidi-override
 Pass	unicode-bidi: inherit
-Pass	vertical-align: baseline
-Pass	vertical-align: sub
-Pass	vertical-align: super
-Pass	vertical-align: top
-Pass	vertical-align: text-top
-Pass	vertical-align: middle
-Pass	vertical-align: bottom
-Pass	vertical-align: text-bottom
-Pass	vertical-align: 5%
-Pass	vertical-align: .5%
-Pass	vertical-align: 0px
-Pass	vertical-align: 1px
-Pass	vertical-align: .1em
-Pass	vertical-align: inherit
 Pass	visibility: visible
 Pass	visibility: hidden
 Pass	visibility: collapse

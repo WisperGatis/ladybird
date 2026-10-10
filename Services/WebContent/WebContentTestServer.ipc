@@ -1,0 +1,6 @@
+#include <LibWebCommon/Page/PageId.h>
+
+endpoint WebContentTestServer
+{
+    reset_session_history_for_testing(Web::PageId page_id) =|
+}

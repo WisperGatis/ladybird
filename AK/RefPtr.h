@@ -6,8 +6,6 @@
 
 #pragma once
 
-#define REFPTR_SCRUB_BYTE 0xe0
-
 #include <AK/Assertions.h>
 #include <AK/Error.h>
 #include <AK/Format.h>
@@ -16,6 +14,7 @@
 #include <AK/StdLibExtras.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -29,6 +28,8 @@ class [[nodiscard]] RefPtr {
     friend class NonnullRefPtr;
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     enum AdoptTag {
         Adopt
     };
@@ -100,10 +101,7 @@ public:
 
     ALWAYS_INLINE ~RefPtr()
     {
-        clear();
-#ifdef SANITIZE_PTRS
-        m_ptr = reinterpret_cast<T*>(explode_byte(REFPTR_SCRUB_BYTE));
-#endif
+        unref_if_not_null(m_ptr);
     }
 
     template<typename U>
@@ -341,6 +339,7 @@ inline void swap(RefPtr<T>& a, RefPtr<U>& b)
 template<typename T>
 inline RefPtr<T> adopt_ref_if_nonnull(T* object)
 {
+    static_assert(AllocatedWithKmalloc<T>, "T must allocate with AK_ALLOC_WITH_KMALLOC");
     if (object)
         return RefPtr<T>(RefPtr<T>::Adopt, *object);
     return {};

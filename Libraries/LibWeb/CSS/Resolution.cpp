@@ -7,6 +7,8 @@
 
 #include <LibWeb/CSS/Resolution.h>
 #include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ResolutionStyleValue.h>
 
 namespace Web::CSS {
 
@@ -21,23 +23,15 @@ Resolution Resolution::make_dots_per_pixel(double value)
     return { value, ResolutionUnit::Dppx };
 }
 
-String Resolution::to_string(SerializationMode serialization_mode) const
+Resolution Resolution::from_style_value(NonnullRefPtr<StyleValue const> const& style_value)
 {
-    // https://drafts.csswg.org/cssom/#serialize-a-css-value
-    // -> <resolution>
-    // The resolution in dots per CSS pixel serialized as per <number> followed by the literal string "dppx".
-    // AD-HOC: WPT expects us to serialize using the actual unit, like for other dimensions.
-    //         https://github.com/w3c/csswg-drafts/issues/12616
-    if (serialization_mode == SerializationMode::ResolvedValue) {
-        StringBuilder builder;
-        serialize_a_number(builder, to_dots_per_pixel());
-        builder.append("dppx"sv);
-        return builder.to_string_without_validation();
-    }
-    StringBuilder builder;
-    serialize_a_number(builder, raw_value());
-    builder.append(unit_name());
-    return builder.to_string_without_validation();
+    if (style_value->is_resolution())
+        return style_value->as_resolution().resolution();
+
+    if (style_value->is_calculated())
+        return style_value->as_calculated().resolve_resolution({}).value();
+
+    VERIFY_NOT_REACHED();
 }
 
 double Resolution::to_dots_per_pixel() const

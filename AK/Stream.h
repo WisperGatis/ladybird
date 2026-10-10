@@ -22,6 +22,8 @@ namespace AK {
 /// of a Stream should return EBADF as an error.
 class Stream {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     /// Reads into a buffer, with the maximum size being the size of the buffer.
     /// The amount of bytes read can be smaller than the size of the buffer.
     /// Returns either the bytes that were read, or an errno in the case of
@@ -29,7 +31,8 @@ public:
     virtual ErrorOr<Bytes> read_some(Bytes) = 0;
     /// Tries to fill the entire buffer through reading. Returns whether the
     /// buffer was filled without an error.
-    virtual ErrorOr<void> read_until_filled(Bytes buffer)
+    // NOTE: See the note on FixedMemoryStream::read_some() for why this needs explicit default visibility.
+    [[gnu::visibility("default")]] virtual ErrorOr<void> read_until_filled(Bytes buffer)
     {
         size_t nread = 0;
         while (nread < buffer.size()) {

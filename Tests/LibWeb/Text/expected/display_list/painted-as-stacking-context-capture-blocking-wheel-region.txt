@@ -1,0 +1,5 @@
+PASS: quiet without listeners (work + checks)
+PASS: add passive listener (work + checks)
+PASS: add blocking listener (work + checks)
+PASS: quiet with blocking listener (work + checks)
+PASS: remove blocking listener (work + checks)

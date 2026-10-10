@@ -8,9 +8,12 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/ImageBitmap.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/TagNames.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/WebDriver/Screenshot.h>
@@ -18,12 +21,17 @@
 namespace Web::WebDriver {
 
 // https://w3c.github.io/webdriver/#dfn-draw-a-bounding-box-from-the-framebuffer
-ErrorOr<GC::Ref<HTML::HTMLCanvasElement>, WebDriver::Error> draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_context, DOM::Element& element, Gfx::IntRect rect)
+void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_context, DOM::Element& element, Gfx::IntRect rect, DrawBoundingBoxCallback&& callback)
 {
+    HTML::TemporaryExecutionContext execution_context { element.document().relevant_settings_object() };
+
     // 1. If either the initial viewport's width or height is 0 CSS pixels, return error with error code unable to capture screen.
-    auto viewport_rect = browsing_context.top_level_traversable()->viewport_rect();
-    if (viewport_rect.is_empty())
-        return Error::from_code(ErrorCode::UnableToCaptureScreen, "Viewport is empty"sv);
+    // NB: Another process hosts the top-level traversable when the browsing context is in an isolated frame.
+    auto viewport_rect = browsing_context.active_document()->navigable()->local_root()->viewport_rect();
+    if (viewport_rect.is_empty()) {
+        callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Viewport is empty"sv));
+        return;
+    }
 
     auto viewport_device_rect = browsing_context.page().enclosing_device_rect(viewport_rect).to_type<int>();
 
@@ -42,10 +50,12 @@ ErrorOr<GC::Ref<HTML::HTMLCanvasElement>, WebDriver::Error> draw_bounding_box_fr
     MUST(canvas.set_height(paint_height));
 
     // FIXME: 5. Let context, a canvas context mode, be the result of invoking the 2D context creation algorithm given canvas as the target.
-    MUST(canvas.create_2d_context({}));
-    canvas.allocate_painting_surface_if_needed();
-    if (!canvas.surface())
-        return Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to allocate painting surface"sv);
+    canvas.create_2d_context({});
+    canvas.ensure_backing_storage();
+    if (!canvas.canvas_rendering_context_2d()) {
+        callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to create 2D context"sv));
+        return;
+    }
 
     // 6. Complete implementation specific steps equivalent to drawing the region of the framebuffer specified by the following coordinates onto context:
     //    - X coordinate: rectangle x coordinate
@@ -54,42 +64,47 @@ ErrorOr<GC::Ref<HTML::HTMLCanvasElement>, WebDriver::Error> draw_bounding_box_fr
     //    - Height: paint height
     Gfx::IntRect paint_rect { rect.x(), rect.y(), paint_width, paint_height };
 
-    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, canvas.surface()->size()));
-    auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(bitmap);
-    IGNORE_USE_IN_ESCAPING_LAMBDA bool did_paint = false;
+    auto bitmap = MUST(Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, Gfx::IntSize { paint_width, paint_height }));
     HTML::PaintConfig paint_config { .canvas_fill_rect = paint_rect };
-    browsing_context.active_document()->navigable()->start_display_list_rendering(painting_surface, paint_config, [&did_paint] {
-        did_paint = true;
+    browsing_context.active_document()->navigable()->render_screenshot(bitmap, paint_config, [bitmap, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)] mutable {
+        HTML::TemporaryExecutionContext execution_context { element->document().relevant_settings_object() };
+
+        auto image_bitmap = HTML::ImageBitmap::create();
+        image_bitmap->set_bitmap(bitmap);
+        if (canvas->canvas_rendering_context_2d()->draw_image(image_bitmap, 0, 0).is_exception()) {
+            callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to draw the screenshot to the canvas"sv));
+            return;
+        }
+
+        // 7. Return success with canvas.
+        callback(move(canvas));
     });
-    HTML::main_thread_event_loop().spin_until(GC::create_function(HTML::main_thread_event_loop().heap(), [&] {
-        return did_paint;
-    }));
-
-    canvas.surface()->write_from_bitmap(*bitmap);
-
-    // 7. Return success with canvas.
-    return canvas;
 }
 
 // https://w3c.github.io/webdriver/#dfn-encoding-a-canvas-as-base64
 Response encode_canvas_element(HTML::HTMLCanvasElement& canvas)
 {
-    // FIXME: 1. If the canvas element’s bitmap’s origin-clean flag is set to false, return error with error code unable to capture screen.
+    // 1. If the canvas element’s bitmap’s origin-clean flag is set to false, return error with error code unable to capture screen.
+    if (!canvas.is_origin_clean())
+        return Error::from_code(ErrorCode::UnableToCaptureScreen, "Canvas is not origin-clean"sv);
 
     // 2. If the canvas element’s bitmap has no pixels (i.e. either its horizontal dimension or vertical dimension is zero) then return error with error code unable to capture screen.
-    if (canvas.surface()->size().is_empty())
+    if (!canvas.canvas_surface_content_size().has_value())
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
 
     // 3. Let file be a serialization of the canvas element’s bitmap as a file, using "image/png" as an argument.
     // 4. Let data url be a data: URL representing file. [RFC2397]
-    auto data_url = canvas.to_data_url("image/png"sv, JS::js_undefined());
+    auto data_url_result = canvas.to_data_url("image/png"sv, {});
+    if (data_url_result.is_exception())
+        return Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to serialize canvas"sv);
+    auto data_url = data_url_result.release_value();
 
     // 5. Let index be the index of "," in data url.
-    auto index = data_url.find_byte_offset(',');
+    auto index = data_url.utf16_view().find_code_unit_offset(',');
     VERIFY(index.has_value());
 
     // 6. Let encoded string be a substring of data url using (index + 1) as the start argument.
-    auto encoded_string = MUST(data_url.substring_from_byte_offset(*index + 1));
+    auto encoded_string = MUST(data_url.utf16_view().substring_view(*index + 1).to_utf8());
 
     // 7. Return success with data encoded string.
     return JsonValue { move(encoded_string) };

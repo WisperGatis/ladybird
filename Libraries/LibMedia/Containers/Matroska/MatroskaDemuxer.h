@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Gregory Bertilson <zaggy1024@gmail.com>
+ * Copyright (c) 2022-2025, Gregory Bertilson <gregory@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -7,45 +7,61 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Mutex.h>
+#include <LibMedia/ContainerID.h>
 #include <LibMedia/Demuxer.h>
+#include <LibMedia/DemuxerScanThread.h>
+#include <LibMedia/Export.h>
+#include <LibMedia/Forward.h>
+#include <LibMedia/IncrementallyPopulatedStream.h>
 
 #include "Reader.h"
 
 namespace Media::Matroska {
 
-class MatroskaDemuxer final : public Demuxer {
+class MEDIA_API MatroskaDemuxer final : public Demuxer {
 public:
-    // FIXME: We should instead accept some abstract data streaming type so that the demuxer
-    //        can work with non-contiguous data.
-    static DecoderErrorOr<NonnullOwnPtr<MatroskaDemuxer>> from_file(StringView filename);
-    static DecoderErrorOr<NonnullOwnPtr<MatroskaDemuxer>> from_mapped_file(NonnullOwnPtr<Core::MappedFile> mapped_file);
+    static DecoderErrorOr<NonnullRefPtr<Demuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool supports_container_mime_type(ContainerMimeType);
+    static bool supports_codec_in_container(ContainerID, CodecID);
 
-    static DecoderErrorOr<NonnullOwnPtr<MatroskaDemuxer>> from_data(ReadonlyBytes data);
+    MatroskaDemuxer(NonnullRefPtr<MediaStream> const& stream, Reader&& reader);
+    ~MatroskaDemuxer();
 
-    MatroskaDemuxer(Reader&& reader)
-        : m_reader(move(reader))
-    {
-    }
+    virtual DecoderErrorOr<void> create_context_for_track(Track const&) override;
 
-    DecoderErrorOr<Vector<Track>> get_tracks_for_type(TrackType type) override;
-    DecoderErrorOr<Optional<Track>> get_preferred_track_for_type(TrackType type) override;
+    virtual DecoderErrorOr<Vector<Track>> get_tracks_for_type(TrackType) override;
+    virtual DecoderErrorOr<Optional<Track>> get_preferred_track_for_type(TrackType) override;
 
-    DecoderErrorOr<Optional<AK::Duration>> seek_to_most_recent_keyframe(Track track, AK::Duration timestamp, Optional<AK::Duration> earliest_available_sample = OptionalNone()) override;
+    virtual AK::Duration select_fast_seek_target_for_track(Track const&, AK::Duration target, SeekMode) override;
+    virtual DecoderErrorOr<DemuxerSeekResult> seek_to_most_recent_keyframe(Track const&, AK::Duration timestamp, DemuxerSeekOptions) override;
 
-    DecoderErrorOr<AK::Duration> duration_of_track(Track const& track) override;
-    DecoderErrorOr<AK::Duration> total_duration() override;
+    virtual DecoderErrorOr<AK::Duration> duration_of_track(Track const&) override;
+    virtual DecoderErrorOr<AK::Duration> total_duration() override;
 
-    DecoderErrorOr<CodecID> get_codec_id_for_track(Track track) override;
+    virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND override;
+    virtual void set_scan_state_change_handler(ScanStateChangeHandler) override;
 
-    DecoderErrorOr<ReadonlyBytes> get_codec_initialization_data_for_track(Track track) override;
+    virtual DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track const&) override;
 
-    DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track track) override;
+    virtual void set_blocking_reads_aborted_for_track(Track const&) override;
+    virtual void reset_blocking_reads_aborted_for_track(Track const&) override;
+    virtual void set_read_blocked_change_handler_for_track(Track const&, ReadBlockedChangeHandler) override;
 
 private:
+    struct BufferedScanPayload {
+        Reader reader;
+        NonnullRefPtr<MediaStreamCursor> scan_cursor;
+    };
+
+    void start_buffered_scan_thread(Reader&& scan_reader);
+
     struct TrackStatus {
         SampleIterator iterator;
         Optional<Block> block;
+        SampleIterator::Frames frames;
         size_t frame_index { 0 };
+        bool needs_codec_configuration { true };
 
         TrackStatus(SampleIterator&& iterator)
             : iterator(iterator)
@@ -53,11 +69,13 @@ private:
         }
     };
 
-    DecoderErrorOr<TrackStatus*> get_track_status(Track track);
-    static CodecID get_codec_id_for_string(FlyString const& codec_id);
+    TrackStatus& get_track_status(Track const&);
 
+    NonnullRefPtr<MediaStream> m_stream;
     Reader m_reader;
+    RefPtr<DemuxerScanThread<BufferedScanPayload>> m_buffered_scan_thread;
 
+    mutable Mutex m_track_statuses_mutex;
     HashMap<Track, TrackStatus> m_track_statuses;
 };
 

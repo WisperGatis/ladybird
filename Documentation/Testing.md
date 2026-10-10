@@ -48,6 +48,69 @@ CTEST_OUTPUT_ON_FAILURE=1 ninja test
 ctest --output-on-failure
 ```
 
+### JavaScript tests
+
+Build `test-js` to build the runtime runner and `js`, and prepare the shared
+AST/bytecode snapshot runner. From the build directory, run:
+
+```sh
+ninja test-js
+./bin/test-js
+./bin/test-js --suite runtime -f array
+./bin/test-js --suite ast --suite bytecode -f class
+./bin/test-js --suite bytecode --rebaseline -f class
+```
+
+Set `LADYBIRD_SOURCE_DIR` to the repository root before running the command.
+Without `--suite`, the command runs runtime, AST, and bytecode tests, continuing
+through suite failures and returning a nonzero status if any suite fails.
+CTest registers this as a single `test-js` test.
+
+`-f` / `--filter` accepts repeatable, case-insensitive substring globs across
+all selected suites. `--jobs N` controls snapshot parallelism. `--rebaseline`
+updates only the selected snapshot expectations; without `--suite`, it updates
+both AST and bytecode expectations. It never updates expectations for a script
+that exits unsuccessfully.
+
+`-j` / `--json` produces one JSON document with `suites` and `failed_suites`.
+`--per-file` includes individual runtime results. When selecting only
+`--suite runtime`, both options retain the original runtime JSON format.
+`--test262-parser-tests` selects only the runtime suite and retains its JSON
+format for the test262 results collector.
+Additional runtime options and custom test roots are forwarded to the runtime
+runner, `test-js-runtime`; use `--suite runtime --help-runtime` to list its
+options.
+
+For a native debugging session, run `test-js-runtime` directly with the
+original runtime options.
+
+### Inspecting test-web results
+
+At the end of a run, `test-web` prints the location of its results directory.
+Open `index.html` there for the interactive report, or summarize the saved
+results from the repository root:
+
+```sh
+python3 Meta/test-results.py Build/release/path-to-results
+python3 Meta/test-results.py Build/release/path-to-results --details -f your-test
+```
+
+The summary lists failed, timed out, and crashed tests with artifact paths and
+suggested rerun commands. `--details` also prints text diffs and captured logs,
+including helper process logs for the whole run. The optional filter is a
+substring of the artifact name; it does not change the run's summary counts.
+The reader accepts either a results directory or its `results.js` file and
+does not execute the JavaScript or rerun tests. A successful read exits with
+status zero even when the saved run contains failures.
+
+Rerun commands are intended for the original build directory. Restore any
+custom options from the recorded invocation, such as the test root, timeouts,
+or repetition count. The reader uses this checkout's `Tests/LibWeb` to
+distinguish query variants from literal `@` characters in filenames; use
+`--test-root` for a different source tree. Repeated results omit the `run-N/`
+artifact prefix when constructing the filter. No rerun command is suggested
+if the corresponding source file cannot be found.
+
 ### Running with Sanitizers
 
 CI runs host tests with Address Sanitizer and Undefined Sanitizer instrumentation enabled. These tools catch many
@@ -74,7 +137,7 @@ The Sanitizer test preset already sets these environment variables.
 ```sh
 export ASAN_OPTIONS='strict_string_checks=1:check_initialization_order=1:strict_init_order=1:detect_stack_use_after_return=1:allocator_may_return_null=1'
 export UBSAN_OPTIONS='print_stacktrace=1:print_summary=1:halt_on_error=1'
-cmake -GNinja -S Meta/Lagom -B Build/lagom -DENABLE_ADDRESS_SANITIZER=ON -DENABLE_UNDEFINED_SANITIZER=ON
+cmake -GNinja -B Build/lagom -DENABLE_ADDRESS_SANITIZER=ON -DENABLE_UNDEFINED_SANITIZER=ON
 cd Build/lagom
 ninja
 CTEST_OUTPUT_ON_FAILURE=1 LADYBIRD_SOURCE_DIR=${PWD}/../.. ninja test
@@ -142,7 +205,7 @@ For Ref and Screenshot tests, you will need to supply the equivalently rendering
 tests, you can generate the reference screenshot itself by running Ladybird in headless mode:
 
 ```bash
-./Meta/ladybird.py run ladybird --headless --layout-test-mode Tests/LibWeb/Screenshot/input/your-new-test-name.html
+./Meta/ladybird.py run ladybird --headless --test-mode Tests/LibWeb/Screenshot/input/your-new-test-name.html
 
 # This will log something like: "Saved screenshot to: ~/Downloads/screenshot-2025-06-07-08-37-45.png"
 

@@ -1,0 +1,3 @@
+initial animated left: 10px
+resized animated left: 20px
+resized back animated left: 10px

@@ -9,10 +9,11 @@
 #include <AK/ByteStringImpl.h>
 #include <AK/Format.h>
 #include <AK/Forward.h>
-#include <AK/RefPtr.h>
+#include <AK/NonnullRefPtr.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringUtils.h>
 #include <AK/Traits.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -38,6 +39,8 @@ namespace AK {
 
 class ByteString {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     ~ByteString() = default;
 
     ByteString()
@@ -317,8 +320,7 @@ struct Traits<ByteString> : public DefaultTraits<ByteString> {
     static unsigned hash(ByteString const& s) { return s.impl()->hash(); }
 };
 
-// FIXME: Rename this to indicate that it's about ASCII-only case insensitivity.
-struct CaseInsensitiveStringTraits : public Traits<ByteString> {
+struct CaseInsensitiveASCIIStringTraits : public Traits<ByteString> {
     static unsigned hash(ByteString const& s) { return s.impl()->case_insensitive_hash(); }
     static bool equals(ByteString const& a, ByteString const& b) { return a.equals_ignoring_ascii_case(b); }
 };
@@ -328,6 +330,6 @@ ByteString escape_html_entities(StringView html);
 }
 
 #if USING_AK_GLOBALLY
-using AK::CaseInsensitiveStringTraits;
+using AK::CaseInsensitiveASCIIStringTraits;
 using AK::escape_html_entities;
 #endif

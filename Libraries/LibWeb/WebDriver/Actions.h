@@ -15,11 +15,11 @@
 #include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/UIEvents/MouseButton.h>
-#include <LibWeb/WebDriver/Error.h>
 #include <LibWeb/WebDriver/InputSource.h>
-#include <LibWeb/WebDriver/Response.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/UIEvents/MouseButton.h>
+#include <LibWebCommon/WebDriver/Error.h>
+#include <LibWebCommon/WebDriver/Response.h>
 
 namespace Web::WebDriver {
 
@@ -131,7 +131,6 @@ WEB_API ErrorOr<Vector<Vector<ActionObject>>, WebDriver::Error> extract_an_actio
 
 WEB_API void wait_for_an_action_queue_token(InputState&);
 WEB_API GC::Ref<JS::Cell> dispatch_actions(InputState&, Vector<Vector<ActionObject>>, HTML::BrowsingContext&, ActionsOptions, OnActionsComplete);
-ErrorOr<void, WebDriver::Error> dispatch_tick_actions(InputState&, ReadonlySpan<ActionObject>, AK::Duration, HTML::BrowsingContext&, ActionsOptions const&);
 WEB_API GC::Ref<JS::Cell> dispatch_list_of_actions(InputState&, Vector<ActionObject>, HTML::BrowsingContext&, ActionsOptions, OnActionsComplete);
 WEB_API GC::Ref<JS::Cell> dispatch_actions_for_a_string(Web::WebDriver::InputState&, String const& input_id, Web::WebDriver::InputSource&, StringView text, Web::HTML::BrowsingContext&, Web::WebDriver::OnActionsComplete);
 

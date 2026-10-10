@@ -1,0 +1,6 @@
+[Exposed=Window]
+interface NavigationActivation {
+    [DirectGetter] readonly attribute NavigationHistoryEntry? from;
+    [DirectGetter] readonly attribute NavigationHistoryEntry entry;
+    readonly attribute NavigationType navigationType;
+};

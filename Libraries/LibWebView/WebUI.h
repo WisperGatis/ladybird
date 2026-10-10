@@ -10,10 +10,15 @@
 #include <AK/HashMap.h>
 #include <AK/JsonValue.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Span.h>
 #include <AK/String.h>
+#include <AK/StringView.h>
+#include <AK/Types.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/Transport.h>
+#include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/Forward.h>
 #include <WebContent/WebUIClientEndpoint.h>
 #include <WebContent/WebUIServerEndpoint.h>
@@ -24,13 +29,29 @@ class WEBVIEW_API WebUI
     : public IPC::ConnectionToServer<WebUIClientEndpoint, WebUIServerEndpoint>
     , public WebUIClientEndpoint {
 public:
-    static ErrorOr<RefPtr<WebUI>> create(WebContentClient&, String host);
+    enum class PageType {
+        Static,
+        Dynamic,
+    };
+
+    struct Page {
+        StringView host;
+        StringView title;
+        PageType type;
+    };
+
+    static ReadonlySpan<Page> pages();
+    static Optional<Page const&> page_for_host(StringView);
+    static ErrorOr<RefPtr<WebUI>> create(WebContentClient&, Web::PageId page_id, String host);
     virtual ~WebUI();
 
     String const& host() const { return m_host; }
+    Web::PageId page_id() const { return m_page_id; }
 
 protected:
-    WebUI(WebContentClient&, NonnullOwnPtr<IPC::Transport>, String host);
+    WebUI(WebContentClient&, Web::PageId, NonnullOwnPtr<IPC::Transport>, String host);
+
+    WebContentClient& client() const { return m_client; }
 
     using Interface = Function<void(JsonValue)>;
 
@@ -42,22 +63,23 @@ private:
     virtual void received_message(String name, JsonValue data) override;
 
     WebContentClient& m_client;
+    Web::PageId m_page_id;
     String m_host;
 
     HashMap<StringView, Interface> m_interfaces;
 };
 
-#define WEB_UI(WebUIType)                                                                                                  \
-public:                                                                                                                    \
-    static NonnullRefPtr<WebUIType> create(WebContentClient& client, NonnullOwnPtr<IPC::Transport> transport, String host) \
-    {                                                                                                                      \
-        return adopt_ref(*new WebUIType(client, move(transport), move(host)));                                             \
-    }                                                                                                                      \
-                                                                                                                           \
-private:                                                                                                                   \
-    WebUIType(WebContentClient& client, NonnullOwnPtr<IPC::Transport> transport, String host)                              \
-        : WebView::WebUI(client, move(transport), move(host))                                                              \
-    {                                                                                                                      \
+#define WEB_UI(WebUIType)                                                                                                                       \
+public:                                                                                                                                         \
+    static NonnullRefPtr<WebUIType> create(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host) \
+    {                                                                                                                                           \
+        return adopt_ref(*new WebUIType(client, page_id, move(transport), move(host)));                                                         \
+    }                                                                                                                                           \
+                                                                                                                                                \
+private:                                                                                                                                        \
+    WebUIType(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host)                              \
+        : WebView::WebUI(client, page_id, move(transport), move(host))                                                                          \
+    {                                                                                                                                           \
     }
 
 }

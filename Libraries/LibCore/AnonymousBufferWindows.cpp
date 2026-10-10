@@ -30,7 +30,10 @@ AnonymousBufferImpl::~AnonymousBufferImpl()
 
 ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> AnonymousBufferImpl::create(size_t size)
 {
-    HANDLE map_handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, size >> 32, size & 0xFFFFFFFF, NULL);
+    // CreateFileMapping rejects a zero-size mapping backed by INVALID_HANDLE_VALUE, so allocate at least one byte and
+    // track the logical size separately.
+    auto map_size = max(size, 1uz);
+    HANDLE map_handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, map_size >> 32, map_size & 0xFFFFFFFF, NULL);
     if (!map_handle)
         return Error::from_windows_error();
 
@@ -39,15 +42,22 @@ ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> AnonymousBufferImpl::create(size_t s
 
 ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> AnonymousBufferImpl::create(int fd, size_t size)
 {
-    void* ptr = MapViewOfFile(to_handle(fd), FILE_MAP_ALL_ACCESS, 0, 0, size);
-    if (!ptr)
-        return Error::from_windows_error();
+    void* ptr = nullptr;
+    if (size > 0) {
+        ptr = MapViewOfFile(to_handle(fd), FILE_MAP_ALL_ACCESS, 0, 0, size);
+        if (!ptr) {
+            auto error = Error::from_windows_error();
+            CloseHandle(to_handle(fd));
+            return error;
+        }
+    }
 
     return adopt_ref(*new AnonymousBufferImpl(fd, size, ptr));
 }
 
-ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size)
+ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size, Sealability)
 {
+    // FIXME: Support sealability on Windows.
     auto impl = TRY(AnonymousBufferImpl::create(size));
     return AnonymousBuffer(move(impl));
 }
@@ -56,6 +66,34 @@ ErrorOr<AnonymousBuffer> AnonymousBuffer::create_from_anon_fd(int fd, size_t siz
 {
     auto impl = TRY(AnonymousBufferImpl::create(fd, size));
     return AnonymousBuffer(move(impl));
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(Sealability sealability) const
+{
+    return snapshot(0, size(), sealability);
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(size_t offset, size_t size, Sealability sealability) const
+{
+    if (!is_valid())
+        return Error::from_string_literal("Cannot snapshot an invalid anonymous buffer");
+
+    if (offset > this->size() || size > this->size() - offset)
+        return Error::from_string_literal("Anonymous buffer snapshot range is out of bounds");
+
+    auto copy = TRY(create_with_size(size, sealability));
+    bytes().slice(offset, size).copy_to({ copy.data<u8>(), copy.size() });
+    return copy;
+}
+
+ErrorOr<void> AnonymousBuffer::validate_backing_size() const
+{
+    if (!is_valid())
+        return Error::from_string_literal("Cannot validate the backing store of an invalid anonymous buffer");
+
+    // MapViewOfFile refuses a view that extends past the section, so the mapping AnonymousBufferImpl::create made
+    // already proved the section covers the size.
+    return {};
 }
 
 }

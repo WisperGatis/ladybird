@@ -4,9 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
+#include <AK/ConditionVariable.h>
 #include <LibTest/TestCase.h>
-
+#include <LibThreading/Thread.h>
+#include <LibUnicode/DateTimeFormat.h>
+#include <LibUnicode/ICU.h>
 #include <LibUnicode/Locale.h>
+#include <LibUnicode/NumberFormat.h>
 
 TEST_CASE(is_unicode_language_subtag)
 {
@@ -188,6 +193,18 @@ TEST_CASE(parse_unicode_locale_id_with_unicode_locale_extension)
     pass("en-u-fff-gggg-xx-yyyy"sv, { { "fff"sv, "gggg"sv }, { { "xx"sv, "yyyy"sv } } });
 }
 
+TEST_CASE(parse_unicode_locale_id_rejects_non_ascii_utf16_extension_parts)
+{
+    auto fail = [](Utf16View locale) {
+        auto locale_id = Unicode::parse_unicode_locale_id(locale);
+        EXPECT(!locale_id.has_value());
+    };
+
+    fail(u"en-\uFF55-ab-foo"sv);
+    fail(u"en-u-\uFF41b-foo"sv);
+    fail(u"en-t-\uFF4B0-foo"sv);
+}
+
 TEST_CASE(parse_unicode_locale_id_with_transformed_extension)
 {
     struct TransformedExtension {
@@ -366,12 +383,27 @@ TEST_CASE(canonicalize_unicode_locale_id)
     test("EN-U-1K-TRUE"sv, "en-u-1k"sv);
     test("en-u-1k-true-abcd"sv, "en-u-1k-true-abcd"sv);
     test("EN-U-1K-TRUE-ABCD"sv, "en-u-1k-true-abcd"sv);
+
+    // Keys for which "yes" is alased to "true" in the CLDR, which is then removed.
     test("en-u-kb-yes"sv, "en-u-kb"sv);
     test("EN-U-KB-YES"sv, "en-u-kb"sv);
+    test("en-u-kc-yes"sv, "en-u-kc"sv);
+    test("en-u-kh-yes"sv, "en-u-kh"sv);
+    test("en-u-kk-yes"sv, "en-u-kk"sv);
+    test("en-u-kn-yes"sv, "en-u-kn"sv);
+
+    // Keys for which "yes" is not alased to "true" in the CLDR, which is then preserved.
+    test("en-u-ka-yes"sv, "en-u-ka-yes"sv);
+    test("EN-U-KA-YES"sv, "en-u-ka-yes"sv);
+    test("en-u-kf-yes"sv, "en-u-kf-yes"sv);
+    test("en-u-kr-yes"sv, "en-u-kr-yes"sv);
+    test("en-u-ks-yes"sv, "en-u-ks-yes"sv);
+    test("en-u-kv-yes"sv, "en-u-kv-yes"sv);
+
+    test("en-u-ka-yes-kb-yes"sv, "en-u-ka-yes-kb"sv);
     test("en-u-kb-yes-abcd"sv, "en-u-kb-yes-abcd"sv);
     test("EN-U-KB-YES-ABCD"sv, "en-u-kb-yes-abcd"sv);
-    test("en-u-ka-yes"sv, "en-u-ka"sv);
-    test("EN-U-KA-YES"sv, "en-u-ka"sv);
+
     test("en-u-1k-names"sv, "en-u-1k-names"sv);
     test("EN-U-1K-NAMES"sv, "en-u-1k-names"sv);
     test("en-u-ks-primary"sv, "en-u-ks-level1"sv);
@@ -514,4 +546,83 @@ TEST_CASE(supports_locale_aliases)
     EXPECT(Unicode::is_locale_available("zh-Hant"sv));
     EXPECT(Unicode::is_locale_available("zh-TW"sv));
     EXPECT(Unicode::is_locale_available("zh-Hant-TW"sv));
+}
+
+TEST_CASE(locale_caches_and_canonicalization_can_run_on_several_threads)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA Mutex mutex;
+    IGNORE_USE_IN_ESCAPING_LAMBDA ConditionVariable condition { mutex };
+    IGNORE_USE_IN_ESCAPING_LAMBDA size_t waiting = 0;
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Optional<Utf16String>, 8> results;
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t index = 0; index < results.size(); ++index) {
+        auto thread = Threading::Thread::construct("LocaleCache"sv, [&, index] {
+            {
+                MutexLocker locker(mutex);
+                ++waiting;
+                if (waiting == results.size())
+                    condition.broadcast();
+                else
+                    condition.wait_while([&] { return waiting < results.size(); });
+            }
+            for (size_t iteration = 0; iteration < 16; ++iteration) {
+                results[index] = Unicode::LocaleData::canonicalize("EN-us"sv);
+                auto locale = Unicode::LocaleData::for_locale("EN-us"sv);
+                VERIFY(locale.has_value());
+                (void)locale->standard_display_names();
+                (void)locale->dialect_display_names();
+                (void)locale->numbering_system();
+                (void)locale->date_time_pattern_generator();
+                (void)locale->time_zone_names();
+                VERIFY(Unicode::TimeZoneData::for_time_zone("UTC"_utf16).has_value());
+            }
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+    for (auto const& result : results)
+        EXPECT_EQ(result, "en-US"_utf16);
+}
+
+TEST_CASE(number_formatter_outlives_creating_thread)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA OwnPtr<Unicode::NumberFormat> formatter;
+    auto thread = Threading::Thread::construct("NumberFormat"sv, [&] {
+        Unicode::RoundingOptions rounding_options;
+        rounding_options.type = Unicode::RoundingType::FractionDigits;
+        rounding_options.min_fraction_digits = 0;
+        rounding_options.max_fraction_digits = 3;
+        formatter = Unicode::NumberFormat::create("en-US"_utf16, {}, rounding_options);
+        return 0;
+    });
+    thread->start();
+    MUST(thread->join());
+
+    // The creating thread's locale cache has been destroyed. Initialize the
+    // locale-dependent plural rules and range formatter on this thread.
+    formatter->create_plural_rules(Unicode::PluralForm::Cardinal);
+    EXPECT_EQ(formatter->select_plural(1.0), Unicode::PluralCategory::One);
+    EXPECT_EQ(formatter->select_plural(2.0), Unicode::PluralCategory::Other);
+    EXPECT_EQ(formatter->format(1234.0), "1,234"_utf16);
+    EXPECT_EQ(formatter->format_range(1.0, 2.0), "1–2"_utf16);
+    EXPECT_EQ(formatter->select_plural_range(1.0, 2.0), Unicode::PluralCategory::Other);
+}
+
+TEST_CASE(date_time_formatter_outlives_creating_thread)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA OwnPtr<Unicode::DateTimeFormat> formatter;
+    auto thread = Threading::Thread::construct("DateTimeFormat"sv, [&] {
+        formatter = Unicode::DateTimeFormat::create_for_date_and_time_style(
+            "en-US"_utf16, "UTC"_utf16, {}, {}, Unicode::DateTimeStyle::Medium, {});
+        return 0;
+    });
+    thread->start();
+    MUST(thread->join());
+
+    // Initialize the interval formatter only after the creating thread exits.
+    EXPECT_EQ(formatter->format(0), "Jan 1, 1970"_utf16);
+    EXPECT_EQ(formatter->format_range(0, 86400000), "Jan 1 – 2, 1970"_utf16);
 }
