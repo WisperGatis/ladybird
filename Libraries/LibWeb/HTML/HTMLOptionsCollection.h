@@ -9,36 +9,35 @@
 #include <AK/Variant.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
-using HTMLOptionOrOptGroupElement = Variant<GC::Root<HTMLOptionElement>, GC::Root<HTMLOptGroupElement>>;
-using HTMLElementOrElementIndex = Variant<GC::Root<HTMLElement>, i32>;
+using HTMLOptionOrOptGroupElement = Variant<GC::Ref<HTMLOptionElement>, GC::Ref<HTMLOptGroupElement>>;
+using HTMLElementOrElementIndex = Variant<GC::Ref<HTMLElement>, i32>;
+using NullableHTMLElementOrElementIndex = Variant<GC::Ref<HTMLElement>, i32, Empty>;
 
 class HTMLOptionsCollection final : public DOM::HTMLCollection {
-    WEB_PLATFORM_OBJECT(HTMLOptionsCollection, DOM::HTMLCollection);
+    WEB_WRAPPABLE(HTMLOptionsCollection, DOM::HTMLCollection);
     GC_DECLARE_ALLOCATOR(HTMLOptionsCollection);
 
 public:
     [[nodiscard]] static GC::Ref<HTMLOptionsCollection> create(DOM::ParentNode& root, ESCAPING Function<bool(DOM::Element const&)> filter);
     virtual ~HTMLOptionsCollection() override;
 
-    WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, JS::Value) override;
+    WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, Optional<GC::Ref<DOM::Element>>);
 
     WebIDL::ExceptionOr<void> set_length(WebIDL::UnsignedLong);
 
-    WebIDL::ExceptionOr<void> add(HTMLOptionOrOptGroupElement element, Optional<HTMLElementOrElementIndex> before = {});
+    WebIDL::ExceptionOr<void> add(HTMLOptionOrOptGroupElement element, NullableHTMLElementOrElementIndex before = { Empty {} });
 
     void remove(WebIDL::Long);
 
     WebIDL::Long selected_index() const;
-    void set_selected_index(WebIDL::Long);
+    WebIDL::ExceptionOr<void> set_selected_index(WebIDL::Long);
 
 private:
     HTMLOptionsCollection(DOM::ParentNode& root, ESCAPING Function<bool(DOM::Element const&)> filter);
-
-    virtual void initialize(JS::Realm&) override;
 };
 
 }

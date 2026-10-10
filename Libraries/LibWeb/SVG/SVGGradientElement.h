@@ -7,46 +7,26 @@
 #pragma once
 
 #include <AK/IterationDecision.h>
-#include <LibGfx/PaintStyle.h>
-#include <LibWeb/Painting/PaintStyle.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibGC/RootHashTable.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGStopElement.h>
 #include <LibWeb/SVG/SVGURIReference.h>
 
 namespace Web::SVG {
 
-struct SVGPaintContext {
-    Gfx::FloatRect viewport;
-    Gfx::FloatRect path_bounding_box;
-    Gfx::AffineTransform paint_transform;
-};
-
-inline Painting::SVGGradientPaintStyle::SpreadMethod to_painting_spread_method(SpreadMethod spread_method)
-{
-    switch (spread_method) {
-    case SpreadMethod::Pad:
-        return Painting::SVGGradientPaintStyle::SpreadMethod::Pad;
-    case SpreadMethod::Reflect:
-        return Painting::SVGGradientPaintStyle::SpreadMethod::Reflect;
-    case SpreadMethod::Repeat:
-        return Painting::SVGGradientPaintStyle::SpreadMethod::Repeat;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
-
 class SVGGradientElement
     : public SVGElement
     , public SVGURIReferenceMixin<SupportsXLinkHref::Yes> {
-    WEB_PLATFORM_OBJECT(SVGGradientElement, SVGElement);
+    WEB_WRAPPABLE(SVGGradientElement, SVGElement);
 
 public:
     virtual ~SVGGradientElement() override = default;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&) const = 0;
+    virtual void push_paint_server_description(void* sink) const = 0;
 
     GradientUnits gradient_units() const;
 
@@ -59,25 +39,25 @@ public:
 protected:
     SVGGradientElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    Layout::RustFFI::FfiSvgGradientDescription base_paint_server_description(Layout::RustFFI::FfiSvgGradientKind) const;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    GC::Ptr<SVGGradientElement const> linked_gradient(HashTable<SVGGradientElement const*>& seen_gradients) const;
-
-    Gfx::AffineTransform gradient_paint_transform(SVGPaintContext const&) const;
+    GC::Ptr<SVGGradientElement const> linked_gradient(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const;
 
     template<VoidFunction<SVGStopElement> Callback>
     void for_each_color_stop(Callback const& callback) const
     {
-        HashTable<SVGGradientElement const*> seen_gradients;
+        GC::RootHashTable<SVGGradientElement const*> seen_gradients;
         return for_each_color_stop_impl(callback, seen_gradients);
     }
 
-    void add_color_stops(Painting::SVGGradientPaintStyle&) const;
+    void push_color_stops(void* sink) const;
 
 private:
+    virtual bool is_svg_gradient_element() const final { return true; }
+
     template<VoidFunction<SVGStopElement> Callback>
-    void for_each_color_stop_impl(Callback const& callback, HashTable<SVGGradientElement const*>& seen_gradients) const
+    void for_each_color_stop_impl(Callback const& callback, GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
     {
         bool color_stops_found = false;
         for_each_child_of_type<SVG::SVGStopElement>([&](auto& stop) {
@@ -91,9 +71,9 @@ private:
         }
     }
 
-    GradientUnits gradient_units_impl(HashTable<SVGGradientElement const*>& seen_gradients) const;
-    SpreadMethod spread_method_impl(HashTable<SVGGradientElement const*>& seen_gradients) const;
-    Optional<Gfx::AffineTransform> gradient_transform_impl(HashTable<SVGGradientElement const*>& seen_gradients) const;
+    GradientUnits gradient_units_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const;
+    SpreadMethod spread_method_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const;
+    Optional<Gfx::AffineTransform> gradient_transform_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const;
 
     // https://svgwg.org/svg2-draft/pservers.html#LinearGradientAttributes
     Optional<GradientUnits> m_gradient_units = {};
@@ -101,5 +81,12 @@ private:
     Optional<SpreadMethod> m_spread_method = {};
     Optional<Gfx::AffineTransform> m_gradient_transform = {};
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGGradientElement>() const { return is_svg_gradient_element(); }
 
 }

@@ -15,25 +15,19 @@
 #include <LibGfx/CMYKBitmap.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/Size.h>
-#include <LibGfx/VectorGraphic.h>
 #include <LibMedia/Color/CodingIndependentCodePoints.h>
 
 namespace Gfx {
-
-class Bitmap;
 
 struct ImageFrameDescriptor {
     NonnullRefPtr<Bitmap> image;
     int duration { 0 };
 };
 
-struct VectorImageFrameDescriptor {
-    NonnullRefPtr<VectorGraphic> image;
-    int duration { 0 };
-};
-
 class Metadata {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     Metadata() = default;
     virtual ~Metadata() = default;
 
@@ -58,11 +52,12 @@ enum class NaturalFrameFormat {
     RGB,
     Grayscale,
     CMYK,
-    Vector,
 };
 
 class ImageDecoderPlugin {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual ~ImageDecoderPlugin() = default;
 
     // Each plugin should implement these static functions and register them in ImageDecoder.cpp
@@ -85,6 +80,14 @@ public:
 
     virtual ErrorOr<ImageFrameDescriptor> frame(size_t index, Optional<IntSize> ideal_size = {}) = 0;
 
+    // Returns the duration of a frame in milliseconds without decoding pixel data.
+    // Not all formats support this; the default returns 0.
+    virtual int frame_duration(size_t index)
+    {
+        (void)index;
+        return 0;
+    }
+
     virtual Optional<Metadata const&> metadata() { return OptionalNone {}; }
 
     virtual ErrorOr<Optional<Media::CodingIndependentCodePoints>> cicp() { return OptionalNone {}; }
@@ -92,7 +95,6 @@ public:
 
     virtual NaturalFrameFormat natural_frame_format() const { return NaturalFrameFormat::RGB; }
     virtual ErrorOr<NonnullRefPtr<CMYKBitmap>> cmyk_frame() { VERIFY_NOT_REACHED(); }
-    virtual ErrorOr<VectorImageFrameDescriptor> vector_frame(size_t) { VERIFY_NOT_REACHED(); }
 
 protected:
     ImageDecoderPlugin() = default;
@@ -112,6 +114,7 @@ public:
     size_t first_animated_frame_index() const { return m_plugin->first_animated_frame_index(); }
 
     ErrorOr<ImageFrameDescriptor> frame(size_t index, Optional<IntSize> ideal_size = {}) const { return m_plugin->frame(index, ideal_size); }
+    int frame_duration(size_t index) const { return m_plugin->frame_duration(index); }
 
     Optional<Metadata const&> metadata() const { return m_plugin->metadata(); }
     ErrorOr<ColorSpace> color_space();
@@ -121,9 +124,6 @@ public:
 
     // Call only if natural_frame_format() == NaturalFrameFormat::CMYK.
     ErrorOr<NonnullRefPtr<CMYKBitmap>> cmyk_frame() { return m_plugin->cmyk_frame(); }
-
-    // Call only if natural_frame_format() == NaturalFrameFormat::Vector.
-    ErrorOr<VectorImageFrameDescriptor> vector_frame(size_t index) { return m_plugin->vector_frame(index); }
 
 private:
     explicit ImageDecoder(NonnullOwnPtr<ImageDecoderPlugin>);

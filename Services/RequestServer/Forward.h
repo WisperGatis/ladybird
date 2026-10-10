@@ -8,10 +8,12 @@
 
 namespace RequestServer {
 
-class CacheEntry;
-class CacheEntryReader;
-class CacheEntryWriter;
-class CacheIndex;
-class DiskCache;
+class ConnectionFromClient;
+class ControlConnectionFromClient;
+class Request;
+class RequestPipe;
+
+struct DNSInfo;
+struct Resolver;
 
 }

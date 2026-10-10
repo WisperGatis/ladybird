@@ -8,27 +8,100 @@
 
 #include <AK/IntrusiveList.h>
 #include <AK/NeverDestroyed.h>
-#include <AK/NonnullOwnPtr.h>
 #include <LibGC/BlockAllocator.h>
+#include <LibGC/CellTypeInfo.h>
 #include <LibGC/Forward.h>
 #include <LibGC/HeapBlock.h>
+#include <LibGC/Ptr.h>
 
-#define GC_DECLARE_ALLOCATOR(ClassName) \
+// The default allocator, which isolates different Cell types from being allocated in the same blocks.
+#define GC_DECLARE_ALLOCATOR(ClassName)    \
+    using gc_allocator_marker = ClassName; \
     static GC::TypeIsolatingCellAllocator<ClassName> cell_allocator
 
 #define GC_DEFINE_ALLOCATOR(ClassName) \
-    GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName }
+    GC::TypeIsolatingCellAllocator<ClassName> ClassName::cell_allocator { #ClassName##sv }
 
 namespace GC {
 
+class GC_API CellAllocatorDescriptorBase {
+    AK_MAKE_NONCOPYABLE(CellAllocatorDescriptorBase);
+    AK_MAKE_NONMOVABLE(CellAllocatorDescriptorBase);
+
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    Optional<StringView> class_name() const { return m_class_name; }
+    CellTypeInfo const& type_info() const { return m_type_info; }
+    size_t cell_size() const { return m_type_info.cell_size; }
+
+    CellAllocator& for_heap(Heap&);
+
+    void forget_heap(Badge<Heap>, Heap& heap)
+    {
+        if (m_last_heap == &heap) {
+            m_last_heap = nullptr;
+            m_last_allocator = nullptr;
+        }
+    }
+
+protected:
+    CellAllocatorDescriptorBase(CellTypeInfo const& type_info, StringView class_name)
+        : m_type_info(type_info)
+        , m_class_name(class_name)
+    {
+    }
+
+private:
+    CellTypeInfo const& m_type_info;
+    Optional<StringView> m_class_name;
+
+    Heap* m_last_heap { nullptr };
+    CellAllocator* m_last_allocator { nullptr };
+};
+
 class GC_API CellAllocator {
 public:
-    CellAllocator(size_t cell_size, char const* class_name = nullptr);
-    ~CellAllocator() = default;
+    AK_ALLOC_WITH_KMALLOC;
 
-    size_t cell_size() const { return m_cell_size; }
+    explicit CellAllocator(CellAllocatorDescriptorBase&);
+    ~CellAllocator();
 
-    Cell* allocate_cell(Heap&);
+    static BlockAllocator& shared_block_allocator();
+
+    CellAllocatorDescriptorBase const& descriptor() const { return m_descriptor; }
+    Optional<StringView> class_name() const { return m_descriptor.class_name(); }
+    size_t cell_size() const { return m_descriptor.cell_size(); }
+    CellTypeInfo const& type_info() const { return m_descriptor.type_info(); }
+
+    // Cells come from a list of free cells that the allocator took from one
+    // of its blocks (the local block) at once, so allocating is usually just
+    // popping that list.
+    //
+    // Invariants of the local free list:
+    // - Its cells are dead and belong to the local block, which is in the
+    //   full block list while it has a local free list.
+    // - The local block is never pending incremental sweep: the list is filled
+    //   from swept or new blocks only, and handed back to its block whenever a
+    //   collection starts. So cells from it never need marking.
+    // - The list is empty when its head is at the start of a block (or null),
+    //   which is where following the link of the last cell leads (see
+    //   HeapBlock::follow_freelist_link()).
+    ALWAYS_INLINE Cell* allocate_cell(Heap& heap)
+    {
+        if (auto* cell = m_local_free_list.ptr(); !HeapBlock::is_end_of_freelist(cell)) [[likely]] {
+            m_local_free_list = HeapBlock::next_free_cell(cell);
+            ASAN_UNPOISON_MEMORY_REGION(cell, cell_size());
+            return cell;
+        }
+        return allocate_cell_slow(heap);
+    }
+
+    // Hands the local free list back to the local block.
+    void give_back_local_free_list(Badge<Heap>);
+
+    // For code that pops the local free list itself, see gc_heap_allocator_local_free_list().
+    RawPtr<Cell>* local_free_list(Badge<CAPI>) { return &m_local_free_list; }
 
     template<typename Callback>
     IterationDecision for_each_block(Callback callback)
@@ -44,40 +117,53 @@ public:
         return IterationDecision::Continue;
     }
 
-    void block_did_become_empty(Badge<Heap>, HeapBlock&);
+    void block_did_become_empty(Badge<Heap>, HeapBlock&, DeferDecommit = DeferDecommit::Yes);
     void block_did_become_usable(Badge<Heap>, HeapBlock&);
+
+    bool has_blocks_pending_sweep() const { return !m_blocks_pending_sweep.is_empty(); }
 
     IntrusiveListNode<CellAllocator> m_list_node;
     using List = IntrusiveList<&CellAllocator::m_list_node>;
 
+    IntrusiveListNode<CellAllocator> m_sweep_list_node;
+    using SweepList = IntrusiveList<&CellAllocator::m_sweep_list_node>;
+
     BlockAllocator& block_allocator() { return m_block_allocator; }
-    FlatPtr min_block_address() const { return m_min_block_address; }
-    FlatPtr max_block_address() const { return m_max_block_address; }
 
 private:
-    char const* const m_class_name { nullptr };
-    size_t const m_cell_size;
+    friend class Heap;
 
-    BlockAllocator m_block_allocator;
+    Cell* allocate_cell_slow(Heap&);
+
+    CellAllocatorDescriptorBase& m_descriptor;
+    RawPtr<Cell> m_local_free_list;
+    HeapBlock* m_local_block { nullptr };
+
+    BlockAllocator& m_block_allocator;
 
     using BlockList = IntrusiveList<&HeapBlock::m_list_node>;
+    using SweepBlockList = IntrusiveList<&HeapBlock::m_sweep_list_node>;
     BlockList m_full_blocks;
     BlockList m_usable_blocks;
-    FlatPtr m_min_block_address { explode_byte(0xff) };
-    FlatPtr m_max_block_address { 0 };
+    SweepBlockList m_blocks_pending_sweep;
 };
 
 template<typename T>
-class GC_API TypeIsolatingCellAllocator {
+class GC_API TypeIsolatingCellAllocator final : public CellAllocatorDescriptorBase {
 public:
     using CellType = T;
 
-    TypeIsolatingCellAllocator(char const* class_name)
-        : allocator(sizeof(T), class_name)
+    explicit TypeIsolatingCellAllocator(StringView class_name)
+        : CellAllocatorDescriptorBase(cell_type_info_for<T>, class_name)
     {
     }
-
-    NeverDestroyed<CellAllocator> allocator;
 };
+
+// Heap::allocate<T>() takes every cell from T::cell_allocator, and a subclass of T must declare an allocator of its own,
+// so a cell that came from T::cell_allocator is exactly a T. This identifies a cell's type without reading its vtable.
+inline bool cell_was_allocated_from(Cell const& cell, CellAllocatorDescriptorBase const& descriptor)
+{
+    return &HeapBlock::from_cell(&cell)->cell_allocator().descriptor() == &descriptor;
+}
 
 }

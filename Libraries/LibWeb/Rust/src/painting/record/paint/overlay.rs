@@ -1,0 +1,194 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use crate::painting::paint_read::{GeometryRead, PaintRead};
+use crate::painting::record::trace::Observer;
+
+use crate::css::css_pixels::CssPixels;
+use crate::layout::node_data::{NodeKind, NodeSlotId};
+use crate::painting::chrome_geometry::{
+    ChromeGeometry, is_chrome_mirrored, scrollbar_colors_for_paint, scrollbar_is_enlarged,
+};
+use crate::painting::display_list::commands::VISUAL_VIEWPORT_NODE_INDEX;
+use crate::painting::display_list::recorder::{FillPathParams, PaintStyleOrColor};
+use crate::painting::ffi::ScrollDirection;
+use crate::painting::force_dark::ForceDarkRole;
+use crate::painting::record::PaintRecorder;
+use libgfx_rust::{Color, FloatPoint, IntRect, LineStyle, ShouldAntiAlias, WindingRule};
+
+pub(crate) fn paint_overlay<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
+    let is_viewport = recorder.source.node_kind_if_live(paintable) == Some(NodeKind::Viewport);
+    let own_scroll_node_index = recorder.data(paintable).own_scroll_node_index;
+    if !is_viewport
+        && own_scroll_node_index == VISUAL_VIEWPORT_NODE_INDEX
+        && !recorder.hit_test_facts(paintable).has_resizer
+    {
+        return;
+    }
+    let converter = recorder.converter;
+    let chrome_geometry = ChromeGeometry::for_recording(recorder.source, recorder.inputs);
+    let style = recorder.source.node_style_if_live(paintable);
+    let paints_scrollbars = style.is_some_and(|style| {
+        !is_viewport && style.misc_reset().scrollbar_width != crate::css::css_enums::scrollbar_width::NONE
+    });
+
+    if paints_scrollbars {
+        let (thumb_color, track_color) = scrollbar_colors_for_paint(
+            recorder.source,
+            paintable,
+            recorder.inputs.uncaptured.root_background_source,
+            recorder
+                .inputs
+                .uncaptured
+                .canvas_color
+                .blend(recorder.inputs.uncaptured.background_color),
+        );
+        let scroll_node_index = own_scroll_node_index;
+        for direction in [ScrollDirection::Vertical, ScrollDirection::Horizontal] {
+            let enlarged = scrollbar_is_enlarged(recorder.source, paintable, direction);
+            let Some(scrollbar) = chrome_geometry.compute_scrollbar_data(paintable, direction, enlarged, None) else {
+                continue;
+            };
+            recorder.record_compositor_scrollbar_painted_by_display_list(
+                paintable,
+                direction,
+                (thumb_color, track_color),
+                enlarged,
+            );
+            recorder.recorder.paint_scrollbar(
+                scroll_node_index,
+                converter.rounded_device_rect(scrollbar.gutter_rect),
+                converter.rounded_device_rect(scrollbar.thumb_rect),
+                converter.rounded_device_rect(scrollbar.track_rect),
+                scrollbar.thumb_travel_to_scroll_ratio.to_double(),
+                thumb_color,
+                track_color,
+                direction == ScrollDirection::Vertical,
+                ForceDarkRole::Background,
+            );
+        }
+    }
+
+    if let Some(mut css_rect) = chrome_geometry.absolute_resizer_rect(paintable) {
+        let bottom_left_resizer = is_chrome_mirrored(recorder.source, paintable);
+        let padding = recorder.inputs.uncaptured.chrome_metrics.resize_gripper_padding;
+        let two = CssPixels::from_integer(2);
+        let half = padding.div_as_fraction(two);
+        let negative_half = (-padding).div_as_fraction(two);
+        css_rect.x += half;
+        css_rect.width -= padding;
+        css_rect.y += half;
+        css_rect.height -= padding;
+        css_rect = css_rect.translated(if bottom_left_resizer { half } else { negative_half }, negative_half);
+        let rect = converter.rounded_device_rect(css_rect);
+        let dark = Color::from_rgba(0, 0, 0, 100);
+        let light = Color::from_rgba(255, 255, 255, 100);
+        let mut paint_resizer_line = |step: i32, color: Color| {
+            let from = libgfx_rust::IntPoint {
+                x: if bottom_left_resizer {
+                    rect.x + step
+                } else {
+                    rect.right() - step
+                },
+                y: rect.bottom(),
+            };
+            let to = libgfx_rust::IntPoint {
+                x: if bottom_left_resizer { rect.x } else { rect.right() },
+                y: rect.bottom() - step,
+            };
+            recorder.recorder.draw_line(
+                from,
+                to,
+                color,
+                1,
+                LineStyle::Solid,
+                Color::TRANSPARENT,
+                ForceDarkRole::Foreground,
+            );
+        };
+        let third = rect.width / 3;
+        let mut step = third - 1;
+        while step < rect.width {
+            paint_resizer_line(step, light);
+            paint_resizer_line(step + 1, dark);
+            if third == 0 {
+                break;
+            }
+            step += third;
+        }
+    }
+
+    paint_middle_button_scroll_indicator(recorder, paintable);
+}
+
+fn paint_middle_button_scroll_indicator<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
+    const CIRCLE_COLOR: Color = Color::from_rgba(255, 255, 255, 220);
+    const ARROW_COLOR: Color = Color::from_rgb(64, 64, 64);
+    const RADIUS: i32 = 16;
+    const ARROW_SIZE: f32 = 6.0;
+    const ARROW_OFFSET: f32 = 8.0;
+
+    if recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport) {
+        return;
+    }
+    let Some(origin) = recorder.inputs.uncaptured.middle_button_scroll_origin else {
+        return;
+    };
+    let device_origin = recorder.converter.rounded_device_point(origin);
+    let circle = IntRect::new(
+        device_origin.x - RADIUS,
+        device_origin.y - RADIUS,
+        RADIUS * 2,
+        RADIUS * 2,
+    );
+    recorder
+        .recorder
+        .fill_rect_with_uniform_rounded_corners(circle, CIRCLE_COLOR, RADIUS, ForceDarkRole::None);
+    recorder
+        .recorder
+        .draw_ellipse(circle, ARROW_COLOR, 1, ForceDarkRole::None);
+
+    let x = device_origin.x as f32;
+    let y = device_origin.y as f32;
+    let mut paint_arrow = |p1: FloatPoint, p2: FloatPoint, p3: FloatPoint| {
+        let mut builder = libgfx_rust::path::PathBuilder::new();
+        builder.move_to(p1.x, p1.y);
+        builder.line_to(p2.x, p2.y);
+        builder.line_to(p3.x, p3.y);
+        builder.close();
+        let path = builder.build();
+        recorder.recorder.fill_path(FillPathParams {
+            force_dark_role: ForceDarkRole::None,
+            path: &path,
+            opacity: 1.0,
+            paint_style_or_color: PaintStyleOrColor::Color(ARROW_COLOR),
+            winding_rule: WindingRule::EvenOdd,
+            should_anti_alias: ShouldAntiAlias::Yes,
+        });
+    };
+    let point = |x: f32, y: f32| FloatPoint { x, y };
+    // FIXME: We could paint a subset of these arrows depending on which direction the container may be scrolled.
+    paint_arrow(
+        point(x, y - ARROW_OFFSET - ARROW_SIZE),
+        point(x - ARROW_SIZE, y - ARROW_OFFSET),
+        point(x + ARROW_SIZE, y - ARROW_OFFSET),
+    );
+    paint_arrow(
+        point(x, y + ARROW_OFFSET + ARROW_SIZE),
+        point(x - ARROW_SIZE, y + ARROW_OFFSET),
+        point(x + ARROW_SIZE, y + ARROW_OFFSET),
+    );
+    paint_arrow(
+        point(x - ARROW_OFFSET - ARROW_SIZE, y),
+        point(x - ARROW_OFFSET, y - ARROW_SIZE),
+        point(x - ARROW_OFFSET, y + ARROW_SIZE),
+    );
+    paint_arrow(
+        point(x + ARROW_OFFSET + ARROW_SIZE, y),
+        point(x + ARROW_OFFSET, y - ARROW_SIZE),
+        point(x + ARROW_OFFSET, y + ARROW_SIZE),
+    );
+}

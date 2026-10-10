@@ -1,0 +1,3 @@
+PASS: quiet before reordering (work + checks)
+PASS: move B behind A (work + checks)
+PASS: move B in front of A (work + checks)

@@ -6,30 +6,47 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
+#include <AK/NumericLimits.h>
 #include <AK/TypeCasts.h>
 #include <AK/Utf16String.h>
 #include <LibGfx/Font/Font.h>
-#include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/TypefaceSkia.h>
 #include <LibGfx/TextLayout.h>
+#include <RustFFI.h>
+
+#if defined(USE_FONTCONFIG)
+#    include <LibGfx/Font/GlobalFontConfig.h>
+#endif
 
 #include <core/SkFont.h>
 #include <core/SkFontMetrics.h>
 #include <core/SkFontTypes.h>
 
+#include <harfbuzz/hb-ot.h>
 #include <harfbuzz/hb.h>
+
+extern "C" {
+void ladybird_gfx_font_snapshot(void const*, Gfx::FFI::FfiFontSnapshot*);
+u32 ladybird_gfx_font_glyph_id(void const*, u32);
+bool ladybird_gfx_font_contains_glyph(void const*, u32);
+bool ladybird_gfx_font_is_emoji_font(void const*);
+void ladybird_gfx_font_ref(void const*);
+void ladybird_gfx_font_unref(void const*);
+}
 
 namespace Gfx {
 
-Font::Font(NonnullRefPtr<Typeface const> typeface, float point_width, float point_height, unsigned dpi_x, unsigned dpi_y)
-    : m_typeface(move(typeface))
+static Atomic<u64> s_next_id { 1 };
+
+Font::Font(NonnullRefPtr<Typeface const> typeface, float point_width, float point_height, FontVariationSettings const variations, ShapeFeatures const& features)
+    : m_id(s_next_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
+    , m_typeface(move(typeface))
     , m_point_width(point_width)
     , m_point_height(point_height)
+    , m_font_variation_settings(move(variations))
+    , m_shape_features(features)
 {
-    float const units_per_em = m_typeface->units_per_em();
-    m_x_scale = (point_width * dpi_x) / (POINTS_PER_INCH * units_per_em);
-    m_y_scale = (point_height * dpi_y) / (POINTS_PER_INCH * units_per_em);
-
     m_pixel_size = m_point_height * (DEFAULT_DPI / POINTS_PER_INCH);
 
     auto const* sk_typeface = as<TypefaceSkia>(*m_typeface).sk_typeface();
@@ -39,47 +56,30 @@ Font::Font(NonnullRefPtr<Typeface const> typeface, float point_width, float poin
     font.getMetrics(&skMetrics);
 
     FontPixelMetrics metrics;
-    metrics.size = font.getSize();
     metrics.x_height = skMetrics.fXHeight;
     metrics.advance_of_ascii_zero = font.measureText("0", 1, SkTextEncoding::kUTF8);
     metrics.ascent = -skMetrics.fAscent;
     metrics.descent = skMetrics.fDescent;
-    metrics.line_gap = skMetrics.fLeading;
 
     m_pixel_metrics = metrics;
 }
 
-ScaledFontMetrics Font::metrics() const
+float Font::width(Utf16View const& view) const { return measure_text_width(view, *this); }
+
+NonnullRefPtr<Font> Font::invisible_variant() const
 {
-    SkFontMetrics sk_metrics;
-    skia_font(1).getMetrics(&sk_metrics);
-
-    ScaledFontMetrics metrics;
-    metrics.ascender = -sk_metrics.fAscent;
-    metrics.descender = sk_metrics.fDescent;
-    metrics.line_gap = sk_metrics.fLeading;
-    metrics.x_height = sk_metrics.fXHeight;
-    return metrics;
-}
-
-float Font::width(Utf16View const& view) const { return measure_text_width(view, *this, {}); }
-
-float Font::glyph_width(u32 code_point) const
-{
-    auto string = Utf16String::from_code_point(code_point);
-    return measure_text_width(string.utf16_view(), *this, {});
-}
-
-NonnullRefPtr<Font> Font::scaled_with_size(float point_size) const
-{
-    if (point_size == m_point_height && point_size == m_point_width)
-        return *const_cast<Font*>(this);
-    return m_typeface->font(point_size);
+    auto font = adopt_ref(*new Font(m_typeface, m_point_width, m_point_height, m_font_variation_settings, m_shape_features));
+    font->m_is_invisible = true;
+    return font;
 }
 
 NonnullRefPtr<Font> Font::with_size(float point_size) const
 {
-    return scaled_with_size(point_size);
+    if (point_size == m_point_height && point_size == m_point_width)
+        return *const_cast<Font*>(this);
+
+    // FIXME: Should we be discarding m_font_variation_settings and m_shape_features here?
+    return m_typeface->font(point_size);
 }
 
 float Font::pixel_size() const
@@ -98,51 +98,209 @@ Font::~Font()
         hb_font_destroy(m_harfbuzz_font);
 }
 
-Font const& Font::bold_variant() const
+static int scale_for_harfbuzz(float pixel_size)
 {
-    if (m_bold_variant)
-        return *m_bold_variant;
-    m_bold_variant = Gfx::FontDatabase::the().get(family(), point_size(), 700, Gfx::FontWidth::Normal, 0);
-    if (!m_bold_variant)
-        m_bold_variant = this;
-    return *m_bold_variant;
+    auto scaled_pixel_size = static_cast<double>(pixel_size) * text_shaping_resolution;
+    if (__builtin_isnan(scaled_pixel_size))
+        return 0;
+    if (scaled_pixel_size >= NumericLimits<int>::max())
+        return NumericLimits<int>::max();
+    if (scaled_pixel_size <= NumericLimits<int>::min())
+        return NumericLimits<int>::min();
+    return static_cast<int>(scaled_pixel_size);
 }
 
 hb_font_t* Font::harfbuzz_font() const
 {
-    if (!m_harfbuzz_font) {
+    call_once(m_harfbuzz_font_once, [&] {
         m_harfbuzz_font = hb_font_create(typeface().harfbuzz_typeface());
-        hb_font_set_scale(m_harfbuzz_font, pixel_size() * text_shaping_resolution, pixel_size() * text_shaping_resolution);
-        hb_font_set_ptem(m_harfbuzz_font, point_size());
-    }
+        auto harfbuzz_scale = scale_for_harfbuzz(pixel_size());
+        hb_font_set_scale(m_harfbuzz_font, harfbuzz_scale, harfbuzz_scale);
+        // HarfBuzz uses ptem for AAT 'trak' table lookup; use CSS pixels instead of physical points here.
+        hb_font_set_ptem(m_harfbuzz_font, pixel_size());
+
+        auto variations = m_font_variation_settings.axes;
+        if (!variations.is_empty()) {
+            Vector<hb_variation_t> hb_list;
+            hb_list.ensure_capacity(variations.size());
+
+            for (auto const& axis : variations) {
+                hb_list.unchecked_append(hb_variation_t { axis.key.to_u32(), axis.value });
+            }
+
+            hb_font_set_variations(m_harfbuzz_font, hb_list.data(), hb_list.size());
+        }
+        hb_font_make_immutable(m_harfbuzz_font);
+    });
     return m_harfbuzz_font;
 }
+
+#if defined(USE_FONTCONFIG)
+static Optional<FontHintingStyle> s_hinting_override_for_testing;
+
+static SkFontHinting to_skia_hinting(FontHintingStyle style)
+{
+    switch (style) {
+    case FontHintingStyle::None:
+        return SkFontHinting::kNone;
+    case FontHintingStyle::Slight:
+        return SkFontHinting::kSlight;
+    case FontHintingStyle::Normal:
+        return SkFontHinting::kNormal;
+    case FontHintingStyle::Full:
+        return SkFontHinting::kFull;
+    }
+    VERIFY_NOT_REACHED();
+}
+#endif
+
+void force_hinting_for_testing([[maybe_unused]] Optional<FontHintingStyle> style)
+{
+#if defined(USE_FONTCONFIG)
+    s_hinting_override_for_testing = style;
+#endif
+}
+
+#if defined(USE_FONTCONFIG)
+// The scale's bits sit above, bit 0 says the word holds an answer, bits 1 and 2 carry the style
+// and bit 3 the autohinting flag.
+static constexpr u64 hinting_memo_holds_answer = 1;
+
+static u64 encode_hinting_memo(float scale, FontHintingOptions options)
+{
+    return (static_cast<u64>(bit_cast<u32>(scale)) << 32)
+        | hinting_memo_holds_answer
+        | (static_cast<u64>(to_underlying(options.style)) << 1)
+        | (static_cast<u64>(options.force_autohinting) << 3);
+}
+
+FontHintingOptions Font::hinting_options(float scale) const
+{
+    auto memo = m_hinting_memo.load(AK::MemoryOrder::memory_order_relaxed);
+    if ((memo & hinting_memo_holds_answer) != 0 && bit_cast<float>(static_cast<u32>(memo >> 32)) == scale) {
+        return FontHintingOptions {
+            .style = static_cast<FontHintingStyle>((memo >> 1) & 3),
+            .force_autohinting = ((memo >> 3) & 1) != 0,
+        };
+    }
+
+    auto options = GlobalFontConfig::the().hinting_for_font(family(), pixel_size() * scale, weight(), slope());
+    m_hinting_memo.store(encode_hinting_memo(scale, options), AK::MemoryOrder::memory_order_relaxed);
+    return options;
+}
+#endif
 
 SkFont Font::skia_font(float scale) const
 {
     auto const& sk_typeface = as<TypefaceSkia>(*m_typeface).sk_typeface();
     auto sk_font = SkFont { sk_ref_sp(sk_typeface), pixel_size() * scale };
     sk_font.setSubpixel(true);
+
+#if defined(USE_FONTCONFIG)
+    if (s_hinting_override_for_testing.has_value()) {
+        sk_font.setHinting(to_skia_hinting(*s_hinting_override_for_testing));
+    } else {
+        auto options = hinting_options(scale);
+        sk_font.setHinting(to_skia_hinting(options.style));
+        sk_font.setForceAutoHinting(options.force_autohinting);
+    }
+#endif
+
     return sk_font;
 }
 
-Font::ShapingCache::~ShapingCache()
+static bool hb_face_has_table(hb_face_t* face, hb_tag_t tag)
 {
-    clear();
+    hb_blob_t* blob = hb_face_reference_table(face, tag);
+    unsigned len = hb_blob_get_length(blob);
+    hb_blob_destroy(blob);
+    return len > 0;
 }
 
-void Font::ShapingCache::clear()
+bool Font::is_emoji_font() const
 {
-    for (auto& it : map) {
-        hb_buffer_destroy(it.value);
+    if (m_is_emoji_font.load(AK::MemoryOrder::memory_order_relaxed) == TriState::Unknown) {
+        // NOTE: This is a heuristic approach to determine if a font is an emoji font.
+        //       AFAIK there is no definitive way to know this from the font data itself.
+
+        // 1. If the family name contains "emoji", it's probably an emoji font.
+        bool name_contains_emoji = family().bytes_as_string_view().contains("emoji"sv);
+
+        // 2. Check for color font tables and absence of regular text glyphs.
+        auto* hb_font = harfbuzz_font();
+        hb_face_t* face = hb_font_get_face(hb_font);
+
+        // hb_ot_color_has_layers() only reports COLRv0 layered glyphs; COLRv1 fonts (e.g. Noto Color Emoji's COLRv1
+        // build) carry a paint graph instead, reported by hb_ot_color_has_paint().
+        bool has_colr = hb_ot_color_has_layers(face) || hb_ot_color_has_paint(face);
+        bool has_svg = hb_ot_color_has_svg(face);
+
+        bool has_sbix = hb_face_has_table(face, HB_TAG('s', 'b', 'i', 'x'));
+        bool has_cbdt = hb_face_has_table(face, HB_TAG('C', 'B', 'D', 'T'));
+        bool has_cblc = hb_face_has_table(face, HB_TAG('C', 'B', 'L', 'C'));
+        bool has_any_color = has_colr || has_svg || has_sbix || (has_cbdt && has_cblc);
+
+        auto looks_like_text = [&]() {
+            hb_codepoint_t uppercase_a_glyph_id = 0;
+            hb_codepoint_t lowercase_a_glyph_id = 0;
+            bool has_uppercase_a = hb_font_get_nominal_glyph(hb_font, 'A', &uppercase_a_glyph_id);
+            bool has_lowercase_a = hb_font_get_nominal_glyph(hb_font, 'a', &lowercase_a_glyph_id);
+            return has_uppercase_a && has_lowercase_a;
+        }();
+
+        auto verdict = (name_contains_emoji && !looks_like_text) || (has_any_color && !looks_like_text) ? TriState::True : TriState::False;
+        m_is_emoji_font.store(verdict, AK::MemoryOrder::memory_order_relaxed);
+        return verdict == TriState::True;
     }
-    map.clear();
-    for (auto& buffer : single_ascii_character_map) {
-        if (buffer) {
-            hb_buffer_destroy(buffer);
-            buffer = nullptr;
-        }
-    }
+
+    return m_is_emoji_font.load(AK::MemoryOrder::memory_order_relaxed) == TriState::True;
 }
 
+}
+
+extern "C" void ladybird_gfx_font_snapshot(void const* font, Gfx::FFI::FfiFontSnapshot* out_snapshot)
+{
+    VERIFY(font);
+    VERIFY(out_snapshot);
+    auto const& typed_font = *static_cast<Gfx::Font const*>(font);
+    auto const& metrics = typed_font.pixel_metrics();
+    *out_snapshot = {
+        .id = typed_font.id(),
+        .ascent = metrics.ascent,
+        .descent = metrics.descent,
+        .x_height = metrics.x_height,
+        .zero_advance = metrics.advance_of_ascii_zero,
+        .pixel_size = typed_font.pixel_size(),
+        .point_size = typed_font.point_size(),
+    };
+}
+
+extern "C" u32 ladybird_gfx_font_glyph_id(void const* font, u32 code_point)
+{
+    VERIFY(font);
+    return static_cast<Gfx::Font const*>(font)->glyph_id_for_code_point(code_point);
+}
+
+extern "C" bool ladybird_gfx_font_contains_glyph(void const* font, u32 code_point)
+{
+    VERIFY(font);
+    return static_cast<Gfx::Font const*>(font)->contains_glyph(code_point);
+}
+
+extern "C" bool ladybird_gfx_font_is_emoji_font(void const* font)
+{
+    VERIFY(font);
+    return static_cast<Gfx::Font const*>(font)->is_emoji_font();
+}
+
+extern "C" void ladybird_gfx_font_ref(void const* font)
+{
+    VERIFY(font);
+    static_cast<Gfx::Font const*>(font)->ref();
+}
+
+extern "C" void ladybird_gfx_font_unref(void const* font)
+{
+    VERIFY(font);
+    static_cast<Gfx::Font const*>(font)->unref();
 }

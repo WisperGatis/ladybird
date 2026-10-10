@@ -6,9 +6,16 @@
 
 #pragma once
 
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventTarget.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Page/Page.h>
 
 namespace Web::DOM {
 
@@ -23,17 +30,20 @@ concept SelectionChangeTarget = DerivedFrom<T, EventTarget> && requires(T t) {
 template<SelectionChangeTarget T>
 void schedule_a_selectionchange_event(T& target, Document& document)
 {
+    // NB: Style must observe every range change, even when the event is already queued.
+    document.set_needs_highlight_style_update(CSS::PseudoElement::Selection);
+
     // 1. If target's has scheduled selectionchange event is true, abort these steps.
     if (target.has_scheduled_selectionchange_event())
         return;
 
-    // AD-HOC (https://github.com/w3c/selection-api/issues/338):
+    // AD-HOC: See https://github.com/w3c/selection-api/issues/338
     // Set target's has scheduled selectionchange event to true
     target.set_scheduled_selectionchange_event(true);
 
     // 2. Queue a task on the user interaction task source to fire a selectionchange event on
     //    target.
-    queue_global_task(HTML::Task::Source::UserInteraction, relevant_global_object(document), GC::create_function(document.heap(), [&] {
+    queue_global_task(HTML::Task::Source::UserInteraction, relevant_global_object(document), GC::create_function(GC::Heap::the(), [&] {
         fire_a_selectionchange_event(target, document);
     }));
 }
@@ -53,8 +63,19 @@ void fire_a_selectionchange_event(T& target, Document& document)
     event_init.bubbles = DerivedFrom<T, Element>;
     event_init.cancelable = false;
 
-    auto event = DOM::Event::create(document.realm(), HTML::EventNames::selectionchange, event_init);
+    auto event = DOM::Event::create(
+        HTML::EventNames::selectionchange,
+        event_init,
+        HighResolutionTime::current_high_resolution_time(relevant_global_object(document)));
     target.dispatch_event(event);
+
+    // AD-HOC: When the selection changes, inform the UI to update the primary pasteboard.
+    if (auto& page = document.page(); page.enable_primary_paste()) {
+        if (auto navigable = page.hosted_focused_navigable()) {
+            if (auto text = navigable->selected_text(); !text.is_empty())
+                page.client().page_did_update_primary_selection(text);
+        }
+    }
 }
 
 }

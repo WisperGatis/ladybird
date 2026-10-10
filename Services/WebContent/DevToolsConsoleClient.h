@@ -11,7 +11,7 @@
 #include <LibJS/Console.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Forward.h>
-#include <LibWebView/ConsoleOutput.h>
+#include <LibWebCommon/WebView/ConsoleOutput.h>
 #include <WebContent/Forward.h>
 #include <WebContent/WebContentConsoleClient.h>
 
@@ -23,20 +23,20 @@ class DevToolsConsoleClient final : public WebContentConsoleClient {
 
 public:
     static GC::Ref<DevToolsConsoleClient> create(JS::Realm&, JS::Console&, PageClient&);
+    static JsonValue serialize_value(JS::Realm&, JS::Value);
     virtual ~DevToolsConsoleClient() override;
 
 private:
-    DevToolsConsoleClient(JS::Realm&, JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
+    DevToolsConsoleClient(JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
 
     virtual void handle_result(JS::Value) override;
-    virtual void report_exception(JS::Error const&, bool) override;
+    virtual void report_exception(Utf16View name, Utf16View message, JS::ErrorData const&, bool) override;
     virtual void end_group() override { }
     virtual void clear() override { }
 
-    virtual void send_messages(i32 start_index) override;
     virtual JS::ThrowCompletionOr<JS::Value> printer(JS::Console::LogLevel, PrinterArguments) override;
 
-    Vector<WebView::ConsoleOutput> m_console_output;
+    void send_console_output(WebView::ConsoleOutput);
 };
 
 }

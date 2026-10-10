@@ -6,25 +6,30 @@
 
 #pragma once
 
+#include <AK/Optional.h>
+#include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
+#include <AK/Vector.h>
 #include <LibJS/Forward.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/AnalyserNode.h>
 #include <LibWeb/WebAudio/AudioNode.h>
+#include <LibWeb/WebAudio/Rendering/FFT.h>
 #include <LibWeb/WebIDL/Buffers.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
+namespace Media {
+
+class SpscAudioFrameRing;
+
+}
+
 namespace Web::WebAudio {
 
-// https://webaudio.github.io/web-audio-api/#AnalyserOptions
-struct AnalyserOptions : AudioNodeOptions {
-    unsigned long fft_size { 2048 };
-    double max_decibels { -30 };
-    double min_decibels { -100 };
-    double smoothing_time_constant { 0.8 };
-};
+using AnalyserOptions = Bindings::AnalyserOptions;
 
 // https://webaudio.github.io/web-audio-api/#AnalyserNode
 class AnalyserNode : public AudioNode {
-    WEB_PLATFORM_OBJECT(AnalyserNode, AudioNode);
+    WEB_WRAPPABLE(AnalyserNode, AudioNode);
     GC_DECLARE_ALLOCATOR(AnalyserNode);
 
 public:
@@ -33,10 +38,10 @@ public:
     virtual WebIDL::UnsignedLong number_of_inputs() override { return 1; }
     virtual WebIDL::UnsignedLong number_of_outputs() override { return 1; }
 
-    WebIDL::ExceptionOr<void> get_float_frequency_data(GC::Root<WebIDL::BufferSource> const& array);   // Float32Array
-    WebIDL::ExceptionOr<void> get_byte_frequency_data(GC::Root<WebIDL::BufferSource> const& array);    // Uint8Array
-    WebIDL::ExceptionOr<void> get_float_time_domain_data(GC::Root<WebIDL::BufferSource> const& array); // Float32Array
-    WebIDL::ExceptionOr<void> get_byte_time_domain_data(GC::Root<WebIDL::BufferSource> const& array);  // Uint8Array
+    WebIDL::ExceptionOr<void> get_float_frequency_data(GC::Ref<JS::Float32Array>);
+    WebIDL::ExceptionOr<void> get_byte_frequency_data(GC::Ref<JS::Uint8Array>);
+    WebIDL::ExceptionOr<void> get_float_time_domain_data(GC::Ref<JS::Float32Array>);
+    WebIDL::ExceptionOr<void> get_byte_time_domain_data(GC::Ref<JS::Uint8Array>);
 
     unsigned long fft_size() const { return m_fft_size; }
     unsigned long frequency_bin_count() const { return m_fft_size / 2; }
@@ -49,19 +54,28 @@ public:
     WebIDL::ExceptionOr<void> set_min_decibels(double);
     WebIDL::ExceptionOr<void> set_smoothing_time_constant(double);
 
-    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> create(JS::Realm&, GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
-    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> construct_impl(JS::Realm&, GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
+    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> create(GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
+    static WebIDL::ExceptionOr<void> validate_options(AnalyserOptions const&);
+    static WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> create_for_constructor(GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
 
 protected:
-    AnalyserNode(JS::Realm&, GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
-
-    virtual void initialize(JS::Realm&) override;
+    AnalyserNode(GC::Ref<BaseAudioContext>, AnalyserOptions const& = {});
 
 private:
+    // https://webaudio.github.io/web-audio-api/#dom-analysernode-fftsize
+    // The maximum allowed fftSize; the node must keep this many past sample-frames around so
+    // that growing fftSize immediately exposes older data.
+    static constexpr unsigned long MAX_FFT_SIZE = 32768;
+
     unsigned long m_fft_size;
+    OwnPtr<Rendering::FFT> m_fft;
     double m_max_decibels;
     double m_min_decibels;
     double m_smoothing_time_constant;
+
+    void set_fft_size_without_validation(unsigned long);
+
+    void drain_time_domain_ring();
 
     // https://webaudio.github.io/web-audio-api/#current-frequency-data
     Vector<f32> current_frequency_data();
@@ -80,6 +94,17 @@ private:
 
     // https://webaudio.github.io/web-audio-api/#conversion-to-db
     Vector<f32> conversion_to_dB(Vector<f32> const& X_hat) const;
+
+    RefPtr<Media::SpscAudioFrameRing> m_time_domain_ring;
+
+    Vector<f32> m_history;
+    size_t m_history_write_index { 0 };
+    size_t m_history_valid_frames { 0 };
+
+    // Frequency data computed within the current render quantum, per the spec's requirement
+    // that repeated getter calls in one quantum return identical data.
+    Vector<f32> m_cached_frequency_data;
+    Optional<double> m_frequency_data_cache_time;
 };
 
 }

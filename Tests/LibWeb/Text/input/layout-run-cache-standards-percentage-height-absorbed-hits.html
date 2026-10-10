@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #container { width: 300px; height: 100px; }
+    #cached { width: 200px; overflow: hidden; }
+    #inner { width: 100px; height: 50%; }
+</style>
+<div id="container"><div id="cached"><div id="inner"></div></div></div>
+<script>
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "changing the containing block height",
+                mutate: () => {
+                    heightBefore = inner.getBoundingClientRect().height;
+                    // In standards mode the percentage under an auto-height parent behaves as auto.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(heightBefore, 0, "height before");
+                    equal(inner.getBoundingClientRect().height, 0, "height after");
+                },
+            },
+        ],
+    });
+</script>

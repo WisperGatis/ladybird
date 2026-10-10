@@ -82,6 +82,10 @@ private:                                                                \
                                                                         \
     openssl_type* m_ptr { nullptr };
 
+class OpenSSL_X509 {
+    OPENSSL_WRAPPER_CLASS(OpenSSL_X509, X509, X509);
+};
+
 class OpenSSL_BN {
     OPENSSL_WRAPPER_CLASS(OpenSSL_BN, BIGNUM, BN);
 
@@ -98,6 +102,14 @@ public:
 
 class OpenSSL_PKEY_CTX {
     OPENSSL_WRAPPER_CLASS(OpenSSL_PKEY_CTX, EVP_PKEY_CTX, EVP_PKEY_CTX);
+};
+
+class OpenSSL_MAC {
+    OPENSSL_WRAPPER_CLASS(OpenSSL_MAC, EVP_MAC, EVP_MAC);
+};
+
+class OpenSSL_MAC_CTX {
+    OPENSSL_WRAPPER_CLASS(OpenSSL_MAC_CTX, EVP_MAC_CTX, EVP_MAC_CTX);
 };
 
 class OpenSSL_MD_CTX {
@@ -124,5 +136,7 @@ ErrorOr<OpenSSL_BN> unsigned_big_integer_to_openssl_bignum(UnsignedBigInteger co
 ErrorOr<UnsignedBigInteger> openssl_bignum_to_unsigned_big_integer(OpenSSL_BN const& bn);
 
 ErrorOr<StringView> hash_kind_to_openssl_digest_name(Hash::HashKind hash);
+
+ErrorOr<ByteBuffer> get_byte_buffer_param_from_key(OpenSSL_PKEY& key, char const* key_name);
 
 }

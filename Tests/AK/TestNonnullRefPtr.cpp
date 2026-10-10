@@ -9,6 +9,7 @@
 #include <AK/ByteString.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
 
 struct Object : public RefCounted<Object> {
     int x;
@@ -70,6 +71,8 @@ TEST_CASE(destroy_self_owning_refcounted_object)
         {
         }
         struct Inner {
+            AK_ALLOC_WITH_KMALLOC;
+
             explicit Inner(SelfOwningRefCounted& self)
                 : self(self)
             {

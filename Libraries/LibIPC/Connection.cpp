@@ -6,8 +6,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <AK/Vector.h>
-#include <LibCore/Socket.h>
 #include <LibIPC/Connection.h>
 #include <LibIPC/Message.h>
 #include <LibIPC/Stub.h>
@@ -35,19 +35,31 @@ bool ConnectionBase::is_open() const
 
 ErrorOr<void> ConnectionBase::post_message(Message const& message)
 {
-    return post_message(TRY(message.encode()));
+    auto buffer = TRY(message.encode());
+    return post_message(buffer);
 }
 
-ErrorOr<void> ConnectionBase::post_message(MessageBuffer buffer)
+ErrorOr<void> ConnectionBase::post_message(MessageBuffer& buffer)
 {
     // NOTE: If this connection is being shut down, but has not yet been destroyed,
     //       the socket will be closed. Don't try to send more messages.
     if (!m_transport->is_open())
         return Error::from_string_literal("Trying to post_message during IPC shutdown");
 
-    MUST(buffer.transfer_message(*m_transport));
+    TRY(buffer.transfer_message(*m_transport));
 
     return {};
+}
+
+ErrorOr<void> ConnectionBase::post_sync_request(Message const& request)
+{
+    auto result = post_message(request);
+    // NB: No response can come if the peer has closed the connection. If that peer owns this process, then shut down
+    // rather than hand the failure to a caller that may have no way to carry on — as WebKit's sendSyncMessage() does
+    // (thru didFailToSendSyncMessage) for a connection with setShouldExitOnSyncMessageSendFailure().
+    if (result.is_error() && m_peer_owns_this_process && !is_open())
+        shutdown();
+    return result;
 }
 
 void ConnectionBase::shutdown()
@@ -62,17 +74,59 @@ void ConnectionBase::shutdown_with_error(Error const& error)
     shutdown();
 }
 
+Vector<NonnullOwnPtr<Message>> ConnectionBase::take_unprocessed_messages(u32 endpoint_magic, i32 message_id)
+{
+    VERIFY(m_owner_thread_id.is_current_thread());
+    Vector<NonnullOwnPtr<Message>> taken;
+    // A handler can make a synchronous request while older messages still await dispatch
+    // in its batch. Take those first, including batches suspended by nested event loops.
+    for (auto batch : m_dispatching_message_batches) {
+        for (auto& message : batch) {
+            if (message && message->endpoint_magic() == endpoint_magic && message->message_id() == message_id)
+                taken.append(message.release_nonnull());
+        }
+    }
+    m_unprocessed_messages.remove_all_matching([&](auto& message) {
+        if (message->endpoint_magic() != endpoint_magic || message->message_id() != message_id)
+            return false;
+        taken.append(message.release_nonnull());
+        return true;
+    });
+    return taken;
+}
+
+void ConnectionBase::dispatch_pending_messages()
+{
+    VERIFY(m_owner_thread_id.is_current_thread());
+    m_transport->wait_until_incoming_is_current();
+    drain_messages_from_peer();
+    handle_messages();
+}
+
 void ConnectionBase::handle_messages()
 {
+    VERIFY(m_owner_thread_id.is_current_thread());
     auto messages = move(m_unprocessed_messages);
+    m_dispatching_message_batches.append(messages.span());
+    ScopeGuard remove_batch = [&] { m_dispatching_message_batches.take_last(); };
     for (auto& message : messages) {
-        if (message->endpoint_magic() != m_local_endpoint_magic)
+        if (!message)
+            continue;
+        auto current_message = message.release_nonnull();
+        if (current_message->endpoint_magic() != m_local_endpoint_magic)
             continue;
 
-        if (!is_open())
-            dbgln("Handling message while connection closed: {}", message->message_name());
+        if (!is_open()) {
+            // NB: A peer that owns this process has closed the connection, so there's nothing left to do here but shut
+            // down; see set_peer_owns_this_process().
+            if (m_peer_owns_this_process) {
+                shutdown();
+                return;
+            }
+            dbgln("Handling message while connection closed: {}", current_message->message_name());
+        }
 
-        auto handler_result = m_local_stub.handle(move(message));
+        auto handler_result = m_local_stub.handle(move(current_message));
         if (handler_result.is_error()) {
             dbgln("IPC::ConnectionBase::handle_messages: {}", handler_result.error());
             continue;
@@ -95,14 +149,31 @@ void ConnectionBase::wait_for_transport_to_become_readable()
 
 ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 {
+    VERIFY(m_owner_thread_id.is_current_thread());
+    bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
-        if (auto message = try_parse_message(raw_message.bytes, raw_message.fds)) {
+        auto bytes = raw_message.bytes.bytes();
+        if (auto message = try_parse_message(bytes, raw_message.attachments)) {
             m_unprocessed_messages.append(message.release_nonnull());
         } else {
-            dbgln("Failed to parse IPC message {:hex-dump}", raw_message.bytes);
-            VERIFY_NOT_REACHED();
+            dbgln("Failed to parse IPC message {:hex-dump}", bytes);
+            parse_error = true;
         }
     });
+
+    if (parse_error) {
+        dbgln("IPC::ConnectionBase ({:p}): Disconnecting peer after failing to parse a message", this);
+        schedule_shutdown = Transport::ShouldShutdown::Yes;
+    }
+
+    // NB: Once a peer that owns this process has closed the connection, whatever it sent before closing is moot — and
+    // dispatching that would run handlers on a connection that's closed under them. So, drop it all and shut down now,
+    // rather than after one last dispatch; see set_peer_owns_this_process().
+    if (schedule_shutdown == Transport::ShouldShutdown::Yes && m_peer_owns_this_process) {
+        m_unprocessed_messages.clear();
+        shutdown();
+        return PeerEOF::Yes;
+    }
 
     if (!m_unprocessed_messages.is_empty()) {
         deferred_invoke([this] {
@@ -122,9 +193,10 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 
 OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id)
 {
-    for (;;) {
-        // Double check we don't already have the event waiting for us.
-        // Otherwise we might end up blocked for a while for no reason.
+    VERIFY(m_owner_thread_id.is_current_thread());
+    bool peer_disconnected_during_wait = false;
+
+    auto take_matching_message = [&]() -> OwnPtr<IPC::Message> {
         for (size_t i = 0; i < m_unprocessed_messages.size(); ++i) {
             auto& message = m_unprocessed_messages[i];
             if (message->endpoint_magic() != endpoint_magic)
@@ -132,29 +204,54 @@ OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32
             if (message->message_id() == message_id)
                 return m_unprocessed_messages.take(i);
         }
+        return {};
+    };
+
+    for (;;) {
+        // Double check we don't already have the event waiting for us.
+        // Otherwise we might end up blocked for a while for no reason.
+        if (auto message = take_matching_message())
+            return message;
 
         if (!is_open())
             break;
 
         wait_for_transport_to_become_readable();
-        if (drain_messages_from_peer() == PeerEOF::Yes)
+        if (drain_messages_from_peer() == PeerEOF::Yes) {
+            peer_disconnected_during_wait = true;
             break;
+        }
+    }
+
+    // The EOF-reporting drain can deliver the awaited response in the same batch. A peer replying then exiting produces
+    // that. Take the response instead of failing; the drain-scheduled deferred handle_messages/shutdown still run after-
+    // wards. So, other messages from that final batch are dispatched in order before the connection close is acted on.
+    if (peer_disconnected_during_wait) {
+        if (auto message = take_matching_message())
+            return message;
     }
 
     dbgln("Failed to receive message_id: {}", message_id);
 
     if (!m_unprocessed_messages.is_empty()) {
-        m_transport->close();
-
         dbgln("Transport shutdown with unprocessed messages left: {}", m_unprocessed_messages.size());
         for (size_t i = 0; i < m_unprocessed_messages.size(); ++i) {
             auto& message = m_unprocessed_messages[i];
             dbgln(" Message {:03} is: {:2}-{}", i, message->message_id(), message->message_name());
         }
+    }
 
-        dbgln("Handling remaining messages before returning to caller");
-        handle_messages();
-        dbgln("Messages handled, returning to caller");
+    if (peer_disconnected_during_wait) {
+        // Don't dispatch any remaining queued messages here. wait_for_specific_endpoint_message_impl can be entered
+        // from any sync IPC call — including from inside a constructor whose members are still being initialized. (See
+        // issue #9582. PageHost's constructor issues a sync IPC before ConnectionFromClient::m_page_host has been
+        // assigned.) Re-entering arbitrary handlers from here can hit uninitialized state and crash. shutdown() closes
+        // the transport and calls die(). That exits processes cleanly — the same as queued close_server message would.
+        shutdown();
+    } else if (m_peer_owns_this_process && !is_open()) {
+        // NB: A peer that owns this process may also have been found gone before the wait began — e.g. by the
+        // transport's IO thread, right after the request was posted; see set_peer_owns_this_process().
+        shutdown();
     }
 
     return {};

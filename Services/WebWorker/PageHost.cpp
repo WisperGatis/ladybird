@@ -4,18 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/VM.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibGC/Heap.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <WebWorker/ConnectionFromClient.h>
 #include <WebWorker/PageHost.h>
+#include <WebWorker/WebWorkerCompositorHost.h>
 
 namespace WebWorker {
 
 GC_DEFINE_ALLOCATOR(PageHost);
 
-GC::Ref<PageHost> PageHost::create(JS::VM& vm, ConnectionFromClient& client)
+GC::Ref<PageHost> PageHost::create(ConnectionFromClient& client)
 {
-    return vm.heap().allocate<PageHost>(client);
+    return GC::Heap::the().allocate<PageHost>(client);
 }
 
 PageHost::~PageHost() = default;
@@ -57,6 +58,16 @@ Web::DevicePixelRect PageHost::screen_rect() const
     return {};
 }
 
+double PageHost::zoom_level() const
+{
+    return 1.0;
+}
+
+double PageHost::device_pixel_ratio() const
+{
+    return 1.0;
+}
+
 double PageHost::device_pixels_per_css_pixel() const
 {
     return 1.0;
@@ -77,9 +88,25 @@ Web::CSS::PreferredMotion PageHost::preferred_motion() const
     return Web::CSS::PreferredMotion::Auto;
 }
 
-String PageHost::page_did_request_cookie(URL::URL const& url, Web::Cookie::Source source)
+// NB: A worker process hosts one environment, which the UI process knows to be the requesting one.
+HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL const& url, HTTP::Cookie::Source source)
 {
     return m_client.did_request_cookie(url, source);
+}
+
+bool PageHost::page_did_is_known_hsts_host(String const& domain)
+{
+    return m_client.did_is_known_hsts_host(domain);
+}
+
+void PageHost::page_did_report_worker_exception(Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno)
+{
+    m_client.async_did_report_worker_exception(message, filename, lineno, colno);
+}
+
+void PageHost::page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const& message)
+{
+    m_client.async_did_post_broadcast_channel_message(message);
 }
 
 void PageHost::request_file(Web::FileRequest request)
@@ -87,9 +114,56 @@ void PageHost::request_file(Web::FileRequest request)
     m_client.request_file(move(request));
 }
 
+URL::BlobURLEntry::Token PageHost::page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const& environment, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)
+{
+    return m_client.did_add_blob_url_entry(environment.id, url, entry);
+}
+
+void PageHost::page_did_remove_blob_url_entries(Web::HTML::EnvironmentSettingsObject const& environment, Vector<Utf16String> const& urls)
+{
+    m_client.did_remove_blob_url_entries(environment.id, urls);
+}
+
+Optional<Web::FileAPI::SerializedBlobURLEntry> PageHost::page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token)
+{
+    return m_client.did_request_blob_url_entry(url, token);
+}
+
+Web::HTML::WorkerAgentId PageHost::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
+{
+    return m_client.start_worker_agent(move(request));
+}
+
+void PageHost::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
+{
+    m_client.async_close_worker_agent(agent_id, owner_token);
+}
+
+void PageHost::ensure_compositor_host()
+{
+    if (m_compositor_host)
+        return;
+    m_compositor_host = create_web_worker_compositor_host(m_client);
+}
+
+void PageHost::compositor_process_lost()
+{
+    page().notify_all_webgl_contexts_lost();
+}
+
+void PageHost::did_finish_loading_worker_script(bool worker_is_secure_context)
+{
+    m_client.async_did_finish_loading_worker_script(worker_is_secure_context);
+}
+
+void PageHost::did_fail_loading_worker_script()
+{
+    m_client.async_did_fail_loading_worker_script();
+}
+
 PageHost::PageHost(ConnectionFromClient& client)
     : m_client(client)
-    , m_page(Web::Page::create(Web::Bindings::main_thread_vm(), *this))
+    , m_page(Web::Page::create(*this))
 {
     setup_palette();
 }

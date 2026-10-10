@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script>
+    asyncTest(async done => {
+        const server = httpTestServer();
+
+        async function createRedirectedDocument(label, crossOrigin, timingAllowOrigin) {
+            const finalURL = new URL(await server.createEcho("GET", `/navigation-timing-redirect-final-${label}`, {
+                status: 200,
+                headers: { "Content-Type": "text/html" },
+                body: `
+                    <!DOCTYPE html>
+                    <script>
+                        const entry = performance.getEntriesByType("navigation")[0];
+                        parent.postMessage({
+                            label: "${label}",
+                            redirectCount: entry ? entry.redirectCount : "missing",
+                            legacyRedirectCount: performance.navigation.redirectCount,
+                            fetchStartFollowsRedirects: entry ? entry.fetchStart > 0 && entry.fetchStart >= entry.redirectEnd : "missing",
+                            redirectEndExposed: entry ? entry.redirectEnd > 0 : "missing",
+                        }, "*");
+                    <\/script>
+                `,
+            }));
+            if (crossOrigin)
+                finalURL.hostname = uniqueLocalhostHostname("navigation-timing-redirect-final");
+
+            let location = finalURL.href;
+            if (crossOrigin) {
+                const intermediateHeaders = { Location: finalURL.href };
+                if (timingAllowOrigin)
+                    intermediateHeaders["Timing-Allow-Origin"] = finalURL.origin;
+
+                const intermediateURL = new URL(await server.createEcho("GET", `/navigation-timing-redirect-intermediate-${label}`, {
+                    status: 302,
+                    headers: intermediateHeaders,
+                }));
+                intermediateURL.hostname = uniqueLocalhostHostname("navigation-timing-redirect-intermediate");
+                location = intermediateURL.href;
+            }
+
+            const headers = { Location: location };
+            if (timingAllowOrigin)
+                headers["Timing-Allow-Origin"] = finalURL.origin;
+
+            return server.createEcho("GET", `/navigation-timing-redirect-initial-${label}`, {
+                status: 302,
+                headers,
+            });
+        }
+
+        const navigations = [];
+        for (const [label, crossOrigin, timingAllowOrigin] of [
+            ["cross-origin", true, false],
+            ["cross-origin-with-tao", true, true],
+            ["same-origin", false, false],
+        ]) {
+            navigations.push({
+                label,
+                url: await createRedirectedDocument(label, crossOrigin, timingAllowOrigin),
+            });
+        }
+
+        addEventListener("message", event => {
+            if (event.data.type !== "navigation-timing-redirect-counts")
+                return;
+
+            const results = event.data.results;
+            results.sort((a, b) => a.label.localeCompare(b.label));
+            for (const result of results) {
+                println(`${result.label} redirect count: ${result.redirectCount}`);
+                println(`${result.label} legacy redirect count: ${result.legacyRedirectCount}`);
+                println(`${result.label} fetch start follows redirects: ${result.fetchStartFollowsRedirects}`);
+                println(`${result.label} redirect end exposed: ${result.redirectEndExposed}`);
+            }
+            done();
+        });
+
+        const runnerURL = await server.createEcho("GET", "/navigation-timing-redirect-runner", {
+            status: 200,
+            headers: { "Content-Type": "text/html" },
+            body: `
+                <!DOCTYPE html>
+                <body>
+                <script>
+                    const navigations = ${JSON.stringify(navigations)};
+                    const results = [];
+                    addEventListener("message", event => {
+                        results.push(event.data);
+                        if (results.length === navigations.length)
+                            parent.postMessage({ type: "navigation-timing-redirect-counts", results }, "*");
+                    });
+
+                    for (const navigation of navigations) {
+                        const frame = document.createElement("iframe");
+                        frame.src = navigation.url;
+                        document.body.appendChild(frame);
+                    }
+                <\/script>
+            `,
+        });
+
+        {
+            const frame = document.createElement("iframe");
+            frame.src = runnerURL;
+            document.body.appendChild(frame);
+        }
+    });
+</script>

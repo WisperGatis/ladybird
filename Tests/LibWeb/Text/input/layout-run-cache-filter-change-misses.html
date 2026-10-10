@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #spacer { width: 100px; height: 50px; }
+    #cached {
+        width: 300px;
+        overflow: hidden;
+    }
+    #inner { width: 120px; height: 40px; }
+</style>
+<div id="spacer"></div>
+<div id="cached">
+    <div id="inner"></div>
+</div>
+<script>
+    layoutTest({
+        steps: [
+            {
+                name: "a filter change invalidates the cached run",
+                mutate: () => {
+                    // A filter establishes a fixed-position containing block.
+                    cached.style.filter = "blur(1px)";
+                    spacer.style.height = "80px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+            },
+        ],
+    });
+</script>

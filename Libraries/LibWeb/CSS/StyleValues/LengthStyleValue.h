@@ -20,23 +20,22 @@ public:
     static ValueComparingNonnullRefPtr<LengthStyleValue const> create(Length const&);
     virtual ~LengthStyleValue() override = default;
 
-    Length const& length() const { return m_length; }
-    virtual double raw_value() const override { return m_length.raw_value(); }
-    virtual FlyString unit_name() const override { return m_length.unit_name(); }
-
-    virtual String to_string(SerializationMode serialization_mode) const override { return m_length.to_string(serialization_mode); }
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-
-    bool equals(StyleValue const& other) const override;
+    Length length() const { return Length(m_value->length.value, static_cast<LengthUnit>(m_value->length.unit)); }
+    virtual double raw_value() const override { return m_value->length.value; }
+    virtual Utf16FlyString unit_name() const override { return length().unit_name(); }
 
 private:
-    explicit LengthStyleValue(Length const& length)
-        : DimensionStyleValue(Type::Length)
-        , m_length(length)
+    friend class StyleValue;
+
+    explicit LengthStyleValue(StyleValueFFI::StyleValueData const* data)
+        : DimensionStyleValue(Type::Length, data)
     {
     }
 
-    Length m_length;
+    explicit LengthStyleValue(Length const& length)
+        : DimensionStyleValue(Type::Length, StyleValueFFI::rust_style_value_create_length(length.raw_value(), to_underlying(length.unit())))
+    {
+    }
 };
 
 }

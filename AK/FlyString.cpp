@@ -6,22 +6,34 @@
 
 #include <AK/FlyString.h>
 #include <AK/HashTable.h>
+#include <AK/Mutex.h>
 #include <AK/Singleton.h>
 #include <AK/String.h>
 #include <AK/StringData.h>
 #include <AK/StringView.h>
 #include <AK/Utf8View.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
 struct FlyStringTableHashTraits : public Traits<Detail::StringData const*> {
     static u32 hash(Detail::StringData const* string) { return string->hash(); }
     static bool equals(Detail::StringData const* a, Detail::StringData const* b) { return *a == *b; }
+    static constexpr bool may_have_slow_equality_check() { return true; }
 };
 
-static auto& all_fly_strings()
+struct FlyStringTable {
+    AK_ALLOC_WITH_KMALLOC;
+
+    // Interned data only removes itself once its destructor holds this mutex, so lookups must try_ref() entries, and
+    // nothing may drop a string reference while holding it.
+    Mutex mutex;
+    HashTable<Detail::StringData const*, FlyStringTableHashTraits> strings;
+};
+
+static FlyStringTable& fly_string_table()
 {
-    static Singleton<HashTable<Detail::StringData const*, FlyStringTableHashTraits>> table;
+    static Singleton<FlyStringTable> table;
     return *table;
 }
 
@@ -31,8 +43,15 @@ ErrorOr<FlyString> FlyString::from_utf8(StringView string)
         return FlyString {};
     if (string.length() <= Detail::MAX_SHORT_STRING_BYTE_COUNT)
         return FlyString { TRY(String::from_utf8(string)) };
-    if (auto it = all_fly_strings().find(string.hash(), [&](auto& entry) { return entry->bytes_as_string_view() == string; }); it != all_fly_strings().end())
-        return FlyString { Detail::StringBase(**it) };
+
+    {
+        auto& table = fly_string_table();
+        MutexLocker locker { table.mutex };
+        auto it = table.strings.find(string.hash(), [&](auto& entry) { return entry->bytes_as_string_view() == string; });
+        if (it != table.strings.end() && (*it)->try_ref())
+            return FlyString { Detail::StringBase(adopt_ref(**it)) };
+    }
+
     return FlyString { TRY(String::from_utf8(string)) };
 }
 
@@ -42,8 +61,15 @@ FlyString FlyString::from_utf8_without_validation(ReadonlyBytes string)
         return FlyString {};
     if (string.size() <= Detail::MAX_SHORT_STRING_BYTE_COUNT)
         return FlyString { String::from_utf8_without_validation(string) };
-    if (auto it = all_fly_strings().find(StringView(string).hash(), [&](auto& entry) { return entry->bytes_as_string_view() == string; }); it != all_fly_strings().end())
-        return FlyString { Detail::StringBase(**it) };
+
+    {
+        auto& table = fly_string_table();
+        MutexLocker locker { table.mutex };
+        auto it = table.strings.find(StringView(string).hash(), [&](auto& entry) { return entry->bytes_as_string_view() == string; });
+        if (it != table.strings.end() && (*it)->try_ref())
+            return FlyString { Detail::StringBase(adopt_ref(**it)) };
+    }
+
     return FlyString { String::from_utf8_without_validation(string) };
 }
 
@@ -61,15 +87,18 @@ FlyString::FlyString(String const& string)
         return;
     }
 
-    auto it = all_fly_strings().find(string.m_impl.data);
-    if (it == all_fly_strings().end()) {
-        m_data = string;
-        all_fly_strings().set(string.m_impl.data);
-        string.m_impl.data->set_fly_string(true);
-    } else {
+    auto& table = fly_string_table();
+    MutexLocker locker { table.mutex };
+
+    if (auto it = table.strings.find(string.m_impl.data); it != table.strings.end() && (*it)->try_ref()) {
         m_data.m_impl.data = *it;
-        m_data.m_impl.data->ref();
+        return;
     }
+
+    // Replaces any equal entry that is waiting to be removed by its destructor.
+    m_data = string;
+    table.strings.set(string.m_impl.data);
+    string.m_impl.data->mark_as_fly_string({});
 }
 
 FlyString& FlyString::operator=(String const& string)
@@ -116,7 +145,9 @@ Detail::StringBase FlyString::data(Badge<String>) const
 
 size_t FlyString::number_of_fly_strings()
 {
-    return all_fly_strings().size();
+    auto& table = fly_string_table();
+    MutexLocker locker { table.mutex };
+    return table.strings.size();
 }
 
 unsigned Traits<FlyString>::hash(FlyString const& fly_string)
@@ -208,7 +239,13 @@ namespace Detail {
 
 void did_destroy_fly_string_data(Badge<Detail::StringData>, Detail::StringData const& string_data)
 {
-    all_fly_strings().remove(&string_data);
+    auto& table = fly_string_table();
+    MutexLocker locker { table.mutex };
+
+    // An equal string may have replaced this entry while the destructor waited for the mutex.
+    auto it = table.strings.find(string_data.hash(), [&](auto const& entry) { return entry == &string_data; });
+    if (it != table.strings.end())
+        table.strings.remove(it);
 }
 
 }

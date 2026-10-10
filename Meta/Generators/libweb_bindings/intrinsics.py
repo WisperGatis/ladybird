@@ -1,0 +1,728 @@
+# Copyright (c) 2026-present, the Ladybird developers.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+from dataclasses import dataclass
+from dataclasses import field
+from typing import List
+from typing import Optional
+from typing import Set
+from typing import TextIO
+
+from Generators.libweb_bindings.cpp_types import fully_qualified_name_for_interface
+from Generators.libweb_bindings.cpp_types import implementation_header_for_interface
+from Generators.libweb_bindings.named_and_indexed_properties import create_named_properties_object_function_name
+from Generators.libweb_bindings.named_and_indexed_properties import interface_supports_named_properties
+from Generators.libweb_bindings.named_and_indexed_properties import named_properties_object_name
+from Generators.libweb_bindings.overload_resolution import parameter_list_length
+from Generators.libweb_bindings.wrappers import create_wrapper_function_name
+from Generators.libweb_bindings.wrappers import interface_needs_wrapper as wrapper_interface_needs_wrapper
+from Utils.utils import title_case_to_snake_case
+from Utils.webidl_parser import Interface
+from Utils.webidl_parser import Module
+from Utils.webidl_parser import Parser
+
+ALL_WORKERS_EXPOSURE = {
+    "DedicatedWorker",
+    "SharedWorker",
+    "ServiceWorker",
+    "AudioWorklet",
+}
+
+ALL_EXPOSURE = ALL_WORKERS_EXPOSURE | {
+    "Window",
+    "Worklet",
+}
+
+
+@dataclass
+class InterfaceSets:
+    intrinsics: List[Interface] = field(default_factory=list)
+    window_exposed: List[Interface] = field(default_factory=list)
+    dedicated_worker_exposed: List[Interface] = field(default_factory=list)
+    shared_worker_exposed: List[Interface] = field(default_factory=list)
+    audio_worklet_exposed: List[Interface] = field(default_factory=list)
+
+    def add_interface(self, interface: Interface) -> None:
+        exposed_value = interface.extended_attributes.get("Exposed")
+        if exposed_value is None:
+            raise RuntimeError(f"Interface {interface.name} is missing extended attribute Exposed")
+
+        exposures = parse_exposure_set(interface.name, exposed_value)
+
+        self.intrinsics.append(interface)
+
+        if "Window" in exposures:
+            self.window_exposed.append(interface)
+
+        if "DedicatedWorker" in exposures:
+            self.dedicated_worker_exposed.append(interface)
+
+        if "SharedWorker" in exposures:
+            self.shared_worker_exposed.append(interface)
+
+        # "Worklet" is the union of all worklet global scope types; AudioWorklet is the only one we have.
+        if "AudioWorklet" in exposures or "Worklet" in exposures:
+            self.audio_worklet_exposed.append(interface)
+
+
+@dataclass
+class LegacyConstructor:
+    name: str
+    constructor_class: str
+    length: int
+
+
+def collect_interface_sets(modules: List[Module]) -> InterfaceSets:
+    interface_sets = InterfaceSets()
+
+    for module in modules:
+        interface = module.interface
+        if interface is None:
+            continue
+        if not should_have_interface_object(interface):
+            continue
+        interface_sets.add_interface(interface)
+
+    return interface_sets
+
+
+def parse_exposure_set(interface_name: str, exposed_value: str) -> Set[str]:
+    exposed_value = exposed_value.strip()
+
+    if exposed_value == "*":
+        return set(ALL_EXPOSURE)
+    if exposed_value == "Nobody":
+        return set()
+
+    def parse_single_candidate(candidate: str) -> Optional[Set[str]]:
+        if candidate == "Window":
+            return {"Window"}
+        if candidate == "Worker":
+            return set(ALL_WORKERS_EXPOSURE)
+        if candidate == "DedicatedWorker":
+            return {"DedicatedWorker"}
+        if candidate == "SharedWorker":
+            return {"SharedWorker"}
+        if candidate == "ServiceWorker":
+            return {"ServiceWorker"}
+        if candidate == "AudioWorklet":
+            return {"AudioWorklet"}
+        if candidate == "LayoutWorklet":
+            return {"LayoutWorklet"}
+        if candidate == "PaintWorklet":
+            return {"PaintWorklet"}
+        if candidate == "Worklet":
+            return {"Worklet"}
+        return None
+
+    if (parsed_candidate := parse_single_candidate(exposed_value)) is not None:
+        return parsed_candidate
+
+    if exposed_value.startswith("(") and exposed_value.endswith(")"):
+        exposures: Set[str] = set()
+        for candidate in exposed_value[1:-1].split(","):
+            candidate_name = candidate.strip()
+            if (parsed_candidate := parse_single_candidate(candidate_name)) is None:
+                raise RuntimeError(
+                    f"Unknown Exposed attribute candidate {candidate_name} in {exposed_value!r} in {interface_name}"
+                )
+            exposures.update(parsed_candidate)
+
+        if exposures:
+            return exposures
+
+    raise RuntimeError(f"Unknown Exposed attribute {exposed_value!r} in {interface_name}")
+
+
+def should_have_interface_object(interface: Interface) -> bool:
+    if interface.is_callback_interface:
+        return bool(interface.constants)
+    return True
+
+
+def interface_needs_wrapper(interface: Interface) -> bool:
+    if interface.is_namespace or interface.is_callback_interface:
+        return False
+
+    if interface.parent_name or interface.has_non_constant_member:
+        return True
+
+    if "LegacyNoInterfaceObject" in interface.extended_attributes:
+        return True
+
+    if interface.has_special_member:
+        return True
+
+    if interface.named_property_getter is not None or interface.indexed_property_getter is not None:
+        return True
+
+    return not interface.constants
+
+
+def interface_prototype_has_immutable_prototype(interface: Interface) -> bool:
+    # NB: This currently assumes only Workers and Window can be globals.
+    return (
+        "Global" in interface.extended_attributes
+        or interface.name == "WorkerGlobalScope"
+        or interface.name == "EventTarget"
+    )
+
+
+# NB: The host class name is the internal class name that LibJS prints in errors, such as "[object Node] is not a
+#     constructor".
+def interface_prototype_host_class(interface: Interface) -> str:
+    flags = "JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT"
+    if interface_prototype_has_immutable_prototype(interface):
+        flags += " | JS_HOST_CLASS_IMMUTABLE_PROTOTYPE"
+    return f'JS::make_host_class(JS_HOST_CLASS_OBJECT, "{interface.name}"sv, &interface_prototype_object_parent_host_class, nullptr, &metadata, {flags})'
+
+
+def interface_constructor_host_class(name: str, metadata_variable: str) -> str:
+    return f'JS::make_host_class(JS_HOST_CLASS_FUNCTION, "{name}"sv, &interface_constructor_parent_host_class, &interface_constructor_hooks, &{metadata_variable}, JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT | JS_HOST_CLASS_HAS_CONSTRUCTOR)'
+
+
+def lookup_legacy_constructor(interface: Interface) -> Optional[LegacyConstructor]:
+    legacy_factory_function = interface.extended_attributes.get("LegacyFactoryFunction")
+    if not legacy_factory_function:
+        return None
+
+    name, opening_parenthesis, rest_of_argument_list = legacy_factory_function.partition("(")
+    parameters = []
+    if opening_parenthesis:
+        argument_list = opening_parenthesis + rest_of_argument_list
+        parameters = Parser(interface.path, argument_list).parse_parenthesized_parameters()
+
+    constructor_name = name.strip()
+    return LegacyConstructor(
+        name=constructor_name,
+        constructor_class=f"{constructor_name}Constructor",
+        length=parameter_list_length(parameters),
+    )
+
+
+def write_intrinsic_definitions_header(out: TextIO, interface_sets: InterfaceSets) -> None:
+    out.write(
+        """#pragma once
+
+#include <AK/Types.h>
+
+namespace Web::Bindings {
+
+enum class InterfaceName : u16 {
+    Unknown = 0,
+"""
+    )
+
+    for index, interface in enumerate(interface_sets.intrinsics, start=1):
+        out.write(f"    {interface.name} = {index},\n")
+
+    out.write(
+        """};
+
+bool is_exposed(InterfaceName, JS::Realm&);
+
+}
+"""
+    )
+
+
+def write_intrinsic_definitions_implementation(out: TextIO, interface_sets: InterfaceSets) -> None:
+    out.write(
+        """#include <LibGC/DeferGC.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/Intrinsics.h>
+#include <LibJS/Runtime/Object.h>
+#include <LibWeb/Bindings/InterfaceObject.h>
+#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
+#include <LibWeb/HTML/SharedWorkerGlobalScope.h>
+#include <LibWeb/WebAudio/AudioWorkletGlobalScope.h>
+"""
+    )
+
+    for interface in interface_sets.intrinsics:
+        out.write(f"#include <LibWeb/Bindings/{interface.implemented_name}.h>\n")
+
+        legacy_constructor = lookup_legacy_constructor(interface)
+        if legacy_constructor is not None:
+            out.write(f"#include <LibWeb/Bindings/{legacy_constructor.constructor_class}.h>\n")
+
+    out.write(
+        """
+namespace Web::Bindings {
+"""
+    )
+
+    write_secure_context_switch(out, interface_sets.intrinsics)
+    write_experimental_switch(out, interface_sets.intrinsics)
+    write_experimental_name_switch(out, interface_sets.intrinsics)
+    write_global_exposed_switch(out, "window", interface_sets.window_exposed)
+    write_global_exposed_switch(out, "dedicated_worker", interface_sets.dedicated_worker_exposed)
+    write_global_exposed_switch(out, "shared_worker", interface_sets.shared_worker_exposed)
+    write_global_exposed_switch(out, "audio_worklet", interface_sets.audio_worklet_exposed)
+
+    out.write(
+        """
+// An interface, callback interface, namespace, or member construct is exposed in a given realm realm if the following steps return true:
+bool is_exposed(InterfaceName name, JS::Realm& realm)
+{
+    auto const& global_object = realm.global_object();
+
+    // 1. If construct’s exposure set is not *, and realm.[[GlobalObject]] does not implement an interface that is in construct’s exposure set, then return false.
+    if (HTML::window_from_global_object(global_object)) {
+       if (!is_window_exposed(name))
+           return false;
+    } else if (impl_from<HTML::DedicatedWorkerGlobalScope>(&global_object)) {
+       if (!is_dedicated_worker_exposed(name))
+           return false;
+    } else if (impl_from<HTML::SharedWorkerGlobalScope>(&global_object)) {
+        if (!is_shared_worker_exposed(name))
+            return false;
+    } else if (impl_from<WebAudio::AudioWorkletGlobalScope>(&global_object)) {
+        if (!is_audio_worklet_exposed(name))
+            return false;
+    } else {
+        TODO(); // FIXME: ServiceWorkerGlobalScope and non-audio WorkletGlobalScopes.
+    }
+
+    // 2. If realm’s settings object is not a secure context, and construct is conditionally exposed on
+    //    [SecureContext], then return false.
+    if (is_secure_context_interface(name) && HTML::is_non_secure_context(principal_host_defined_environment_settings_object(realm)))
+        return false;
+
+    // AD-HOC: Do not expose experimental interfaces unless the global switch or a site-compatibility rule says so.
+    if (is_experimental_interface(name) && !HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(principal_host_defined_environment_settings_object(realm), experimental_interface_name(name)))
+        return false;
+
+    // FIXME: 3. If realm’s settings object’s cross-origin isolated capability is false, and construct is
+    //           conditionally exposed on [CrossOriginIsolated], then return false.
+
+    // 4. Return true.
+    return true;
+}
+
+"""
+    )
+
+    for interface in interface_sets.intrinsics:
+        if interface.is_namespace:
+            write_namespace_creation(out, interface, interface_sets.intrinsics)
+        else:
+            write_interface_creation(out, interface)
+            write_iterator_prototype_creation(out, interface)
+
+    out.write(
+        """}
+"""
+    )
+
+
+def write_secure_context_switch(out: TextIO, interfaces: List[Interface]) -> None:
+    out.write(
+        """static constexpr bool is_secure_context_interface(InterfaceName name)
+{
+    switch (name) {
+"""
+    )
+    for interface in interfaces:
+        if "SecureContext" not in interface.extended_attributes:
+            continue
+        out.write(f"    case InterfaceName::{interface.name}:\n")
+
+    out.write(
+        """        return true;
+    default:
+        return false;
+    }
+}
+"""
+    )
+
+
+def write_experimental_name_switch(out: TextIO, interfaces: List[Interface]) -> None:
+    # The name a site-compatibility rule lists to expose the interface for the sites it matches.
+    out.write(
+        """static constexpr StringView experimental_interface_name(InterfaceName name)
+{
+    switch (name) {
+"""
+    )
+    for interface in interfaces:
+        if "Experimental" not in interface.extended_attributes:
+            continue
+        out.write(f'    case InterfaceName::{interface.name}:\n        return "{interface.name}"sv;\n')
+
+    out.write(
+        """    default:
+        return {};
+    }
+}
+
+"""
+    )
+
+
+def write_experimental_switch(out: TextIO, interfaces: List[Interface]) -> None:
+    out.write(
+        """static constexpr bool is_experimental_interface(InterfaceName name)
+{
+    switch (name) {
+"""
+    )
+    for interface in interfaces:
+        if "Experimental" not in interface.extended_attributes:
+            continue
+        out.write(f"    case InterfaceName::{interface.name}:\n")
+
+    out.write(
+        """        return true;
+    default:
+        return false;
+    }
+}
+"""
+    )
+
+
+def write_global_exposed_switch(out: TextIO, global_name: str, interfaces: List[Interface]) -> None:
+    out.write(
+        f"""static constexpr bool is_{global_name}_exposed(InterfaceName name)
+{{
+    switch (name) {{
+"""
+    )
+
+    for interface in interfaces:
+        out.write(f"    case InterfaceName::{interface.name}:\n")
+
+    out.write(
+        """        return true;
+    default:
+        return false;
+    }
+}
+"""
+    )
+
+
+def write_namespace_creation(out: TextIO, interface: Interface, interfaces: List[Interface]) -> None:
+    out.write(
+        f"""template<>
+void Intrinsics::create_web_namespace<{interface.namespace_class}>(JS::Realm& realm)
+{{
+    // https://webidl.spec.whatwg.org/#namespace-object
+    auto namespace_object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+    {interface.namespace_class}::initialize(realm, namespace_object);
+    m_namespaces.set("{interface.name}"_utf16_fly_string, namespace_object);
+
+    [[maybe_unused]] static constexpr u8 attr = JS::Attribute::Writable | JS::Attribute::Configurable;
+"""
+    )
+
+    for owned_interface in interfaces:
+        if owned_interface.extended_attributes.get("LegacyNamespace") != interface.name:
+            continue
+
+        out.write(
+            f"""    namespace_object->define_intrinsic_accessor("{owned_interface.name}"_utf16_fly_string, attr, [](auto& realm) -> JS::Value {{ return &Bindings::ensure_web_constructor<{owned_interface.prototype_class}>(realm, "{interface.name}.{owned_interface.name}"_utf16_fly_string); }});
+"""
+        )
+
+    out.write(
+        """}
+"""
+    )
+
+
+def write_interface_creation(out: TextIO, interface: Interface) -> None:
+    if interface.is_callback_interface:
+        out.write(
+            f"""template<>
+WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototype_class}>(JS::Realm& realm)
+{{
+    static constexpr InterfaceObjectMetadata metadata {{
+        .namespaced_name = "{interface.namespaced_name}"sv,
+        .utf16_name = "{interface.name}"sv,
+        .utf16_namespaced_name = "{interface.namespaced_name}"sv,
+        .initialize_constructor = &{interface.constructor_class}::initialize,
+        .initialize_prototype = &{interface.prototype_class}::initialize,
+        .prototype_host_class = {interface_prototype_host_class(interface)},
+        .constructor_host_class = {interface_constructor_host_class(interface.name, "metadata")},
+    }};
+    create_web_prototype_and_constructor(realm, metadata);
+}}
+"""
+        )
+        return
+
+    out.write(
+        f"""template<>
+WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototype_class}>(JS::Realm& realm)
+{{
+"""
+    )
+
+    out.write(
+        f"""    static constexpr InterfaceObjectMetadata metadata {{
+        .namespaced_name = "{interface.namespaced_name}"sv,
+        .utf16_name = "{interface.name}"sv,
+        .utf16_namespaced_name = "{interface.namespaced_name}"sv,
+        .initialize_constructor = &{interface.constructor_class}::initialize,
+        .initialize_prototype = &{interface.prototype_class}::initialize,
+        .construct = &{interface.constructor_class}::construct,
+        .prototype_host_class = {interface_prototype_host_class(interface)},
+        .constructor_host_class = {interface_constructor_host_class(interface.name, "metadata")},
+    }};
+"""
+    )
+
+    # https://webidl.spec.whatwg.org/#named-properties-object
+    # The interface prototype object's [[Prototype]] is its named properties object, so that has to exist first.
+    if interface_supports_named_properties(interface):
+        out.write(
+            f"""    auto named_properties_object = {create_named_properties_object_function_name(interface)}(realm);
+    m_prototypes.set("{named_properties_object_name(interface)}"_utf16_fly_string, named_properties_object);
+"""
+        )
+
+    out.write("    create_web_prototype_and_constructor(realm, metadata);\n")
+
+    legacy_constructor = lookup_legacy_constructor(interface)
+    if legacy_constructor is not None:
+        out.write(
+            f"""
+    // https://webidl.spec.whatwg.org/#legacy-factory-functions
+    static constexpr InterfaceObjectMetadata legacy_factory_function_metadata {{
+        .namespaced_name = "{legacy_constructor.name}"sv,
+        .utf16_name = "{legacy_constructor.name}"sv,
+        .utf16_namespaced_name = "{legacy_constructor.name}"sv,
+        .ensure_interface_prototype_object = [](JS::Realm& realm) -> JS::Object& {{ return Web::Bindings::ensure_web_prototype<{interface.prototype_class}>(realm, "{interface.namespaced_name}"_utf16_fly_string); }},
+        .construct = &{legacy_constructor.constructor_class}::construct,
+        .function_length = {legacy_constructor.length},
+        .constructor_host_class = {interface_constructor_host_class(legacy_constructor.name, "legacy_factory_function_metadata")},
+    }};
+    create_legacy_factory_function(realm, legacy_factory_function_metadata);
+"""
+        )
+
+    out.write(
+        """}
+"""
+    )
+
+
+# https://webidl.spec.whatwg.org/#dfn-iterator-prototype-object
+# https://webidl.spec.whatwg.org/#dfn-asynchronous-iterator-prototype-object
+def write_iterator_prototype_creation(out: TextIO, interface: Interface) -> None:
+    iterator_prototypes = []
+    if interface.iterable is not None and interface.iterable.key_type is not None:
+        iterator_prototypes.append((f"{interface.name}Iterator", "iterator_prototype"))
+    if interface.async_iterable is not None:
+        iterator_prototypes.append((f"{interface.name}AsyncIterator", "async_iterator_prototype"))
+
+    for iterator_name, parent_prototype_intrinsic in iterator_prototypes:
+        out.write(
+            f"""template<>
+WEB_API void Intrinsics::create_web_prototype_and_constructor<{iterator_name}Prototype>(JS::Realm& realm)
+{{
+    auto prototype = JS::Object::create(realm, realm.intrinsics().{parent_prototype_intrinsic}());
+    {iterator_name}Prototype::initialize(realm, prototype);
+    m_prototypes.set("{iterator_name}"_utf16_fly_string, prototype);
+}}
+"""
+        )
+
+
+def write_exposed_interface_header(out: TextIO, class_name: str) -> None:
+    snake_name = title_case_to_snake_case(class_name)
+    out.write(
+        f"""#pragma once
+
+#include <LibJS/Forward.h>
+
+namespace Web::Bindings {{
+
+void add_{snake_name}_exposed_interfaces(JS::Object&);
+
+}}
+"""
+    )
+
+
+def write_exposed_interface_implementation(out: TextIO, class_name: str, exposed_interfaces: List[Interface]) -> None:
+    snake_name = title_case_to_snake_case(class_name)
+    out.write(
+        f"""#include <LibJS/Runtime/Object.h>
+#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/Bindings/{class_name}ExposedInterfaces.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+"""
+    )
+
+    for interface in exposed_interfaces:
+        out.write(f"#include <LibWeb/Bindings/{interface.implemented_name}.h>\n")
+
+    out.write(
+        f"""
+namespace Web::Bindings {{
+
+void add_{snake_name}_exposed_interfaces(JS::Object& global)
+{{
+    static constexpr u8 attr = JS::Attribute::Writable | JS::Attribute::Configurable;
+
+    [[maybe_unused]] bool is_secure_context = HTML::is_secure_context(HTML::relevant_settings_object(global));
+    [[maybe_unused]] auto& global_settings = HTML::relevant_settings_object(global);
+"""
+    )
+
+    for interface in exposed_interfaces:
+        if interface.is_namespace:
+            write_namespace_global_accessor(out, interface)
+            continue
+
+        if "LegacyNamespace" in interface.extended_attributes:
+            continue
+
+        if "LegacyNoInterfaceObject" in interface.extended_attributes:
+            continue
+
+        if not should_have_interface_object(interface):
+            continue
+
+        write_interface_global_accessor(out, class_name, interface)
+
+    out.write(
+        """}
+
+}
+"""
+    )
+
+
+def write_interface_global_accessor(out: TextIO, class_name: str, interface: Interface) -> None:
+    indentation = "    "
+
+    def write_constructor_accessor(name: str, constructor_name: str) -> None:
+        out.write(
+            f'{indentation}global.define_intrinsic_accessor("{name}"_utf16_fly_string, attr, [](auto& realm) -> JS::Value {{ return &ensure_web_constructor<{interface.prototype_class}>(realm, "{constructor_name}"_utf16_fly_string); }});\n'
+        )
+
+    if "SecureContext" in interface.extended_attributes:
+        out.write(
+            """    if (is_secure_context) {
+"""
+        )
+        indentation += "    "
+
+    if "Experimental" in interface.extended_attributes:
+        out.write(
+            f"""{indentation}if (HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(global_settings, "{interface.name}"sv)) {{
+"""
+        )
+        indentation += "    "
+
+    write_constructor_accessor(interface.namespaced_name, interface.namespaced_name)
+
+    if class_name == "Window":
+        legacy_window_alias = interface.extended_attributes.get("LegacyWindowAlias")
+        if legacy_window_alias:
+            if legacy_window_alias.startswith("(") and legacy_window_alias.endswith(")"):
+                aliases = [alias.strip() for alias in legacy_window_alias[1:-1].split(",")]
+            else:
+                aliases = [legacy_window_alias]
+
+            for alias in aliases:
+                write_constructor_accessor(alias, interface.namespaced_name)
+
+    legacy_constructor = lookup_legacy_constructor(interface)
+    if legacy_constructor is not None:
+        write_constructor_accessor(legacy_constructor.name, legacy_constructor.name)
+
+    if "Experimental" in interface.extended_attributes:
+        indentation = indentation[:-4]
+        out.write(
+            f"""{indentation}}}
+"""
+        )
+
+    if "SecureContext" in interface.extended_attributes:
+        indentation = indentation[:-4]
+        out.write(
+            f"""{indentation}}}
+"""
+        )
+
+
+def write_namespace_global_accessor(out: TextIO, interface: Interface) -> None:
+    out.write(
+        f"""    global.define_intrinsic_accessor("{interface.name}"_utf16_fly_string, attr, [](auto& realm) -> JS::Value {{ return &ensure_web_namespace<{interface.namespace_class}>(realm, "{interface.name}"_utf16_fly_string); }});
+"""
+    )
+
+
+def interface_inherits_from(
+    interface: Interface, inherited_interface_name: str, interfaces_by_name: dict[str, Interface]
+) -> bool:
+    parent_name = interface.parent_name
+    while parent_name:
+        if parent_name == inherited_interface_name:
+            return True
+        parent = interfaces_by_name.get(parent_name)
+        if parent is None:
+            return False
+        parent_name = parent.parent_name
+    return False
+
+
+def write_wrapper_factory_implementation(out: TextIO, interface_sets: InterfaceSets) -> None:
+    interfaces = [interface for interface in interface_sets.intrinsics if wrapper_interface_needs_wrapper(interface)]
+    out.write(
+        """#include <AK/Assertions.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibWeb/CookieStore/BindingsGlue.h>
+#include <LibWeb/DOM/BindingsGlue.h>
+#include <LibWeb/Fetch/BindingsGlue.h>
+#include <LibWeb/HTML/BindingsGlue.h>
+#include <LibWeb/Streams/BindingsGlue.h>
+#include <LibWeb/WebAssembly/BindingsGlue.h>
+#include <LibWeb/WebGL/BindingsGlue.h>
+#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+"""
+    )
+
+    for interface in interfaces:
+        out.write(f"#include <LibWeb/Bindings/{interface.implemented_name}.h>\n")
+        out.write(f"#include <{implementation_header_for_interface(interface)}>\n")
+
+    out.write(
+        """
+namespace Web::Bindings {
+
+GC::Ref<JS::HostObject> create_wrapper_for_wrappable(JS::Realm& realm, GC::Ref<Wrappable> wrappable)
+{
+    switch (wrappable->interface_name()) {
+"""
+    )
+
+    for interface in interfaces:
+        out.write(
+            f"""    case InterfaceName::{interface.name}:
+        return {create_wrapper_function_name(interface)}(realm, GC::Ref {{ static_cast<{fully_qualified_name_for_interface(interface)}&>(*wrappable) }});
+"""
+        )
+
+    out.write(
+        """    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+}
+"""
+    )

@@ -1,6 +1,3 @@
-#import <DOM/HTMLCollection.idl>
-#import <DOM/Node.idl>
-
 // https://dom.spec.whatwg.org/#parentnode
 interface mixin ParentNode {
     [SameObject] readonly attribute HTMLCollection children;
@@ -8,9 +5,9 @@ interface mixin ParentNode {
     readonly attribute Element? lastElementChild;
     readonly attribute unsigned long childElementCount;
 
-    [CEReactions, Unscopable] undefined prepend((Node or Utf16DOMString)... nodes);
-    [CEReactions, Unscopable] undefined append((Node or Utf16DOMString)... nodes);
-    [CEReactions, Unscopable] undefined replaceChildren((Node or Utf16DOMString)... nodes);
+    [CEReactions, Unscopable] undefined prepend((Node or DOMString)... nodes);
+    [CEReactions, Unscopable] undefined append((Node or DOMString)... nodes);
+    [CEReactions, Unscopable] undefined replaceChildren((Node or DOMString)... nodes);
 
     [CEReactions] undefined moveBefore(Node node, Node? child);
 

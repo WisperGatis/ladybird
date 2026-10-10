@@ -8,9 +8,10 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibJS/Forward.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::DOM {
 
@@ -21,10 +22,12 @@ struct BoundaryPoint {
 };
 
 // https://dom.spec.whatwg.org/#abstractrange
-class AbstractRange : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(AbstractRange, Bindings::PlatformObject);
+class WEB_API AbstractRange : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(AbstractRange, Bindings::GCAllocatedWrappable);
 
 public:
+    static constexpr size_t start_container_offset() { return offsetof(AbstractRange, m_start_container); }
+    static constexpr size_t end_container_offset() { return offsetof(AbstractRange, m_end_container); }
     virtual ~AbstractRange() override;
 
     BoundaryPoint start() const { return { m_start_container, m_start_offset }; }
@@ -53,8 +56,7 @@ public:
 protected:
     AbstractRange(GC::Ref<Node> start_container, WebIDL::UnsignedLong start_offset, GC::Ref<Node> end_container, WebIDL::UnsignedLong end_offset);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     GC::Ref<Node> m_start_container;
     WebIDL::UnsignedLong m_start_offset;

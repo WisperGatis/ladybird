@@ -1,0 +1,364 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! Builds everything the crate shares with the interpreter: the layout file flapc compiles interpreter.flap against,
+//! computed from the crate's own layout module, the interpreter itself, assembled into the crate's static library,
+//! and the static assertions that keep the crate's types in line with that layout. It also generates the C headers
+//! of the embedding ABI, LibJS/Embedding/ABI.h from src/embedding and LibJS/Embedding/Layout.h from the layout module, and the frontend's
+//! instruction types from interpreter.flap.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// The build script only reads the layout, so most of what the crate uses goes unused here.
+#[allow(dead_code)]
+#[path = "src/layout/mod.rs"]
+mod layout;
+
+#[path = "generate/layout_forward.rs"]
+mod layout_forward;
+
+#[path = "src/gc/class_id.rs"]
+mod class_id;
+
+#[path = "generate/abi_header.rs"]
+mod abi_header;
+
+#[path = "generate/c_type_spelling.rs"]
+mod c_type_spelling;
+
+#[path = "generate/fixture.rs"]
+mod fixture;
+
+#[path = "generate/instructions.rs"]
+mod instructions;
+
+#[path = "generate/layout_table.rs"]
+mod layout_table;
+
+#[path = "generate/layout_header.rs"]
+mod layout_header;
+
+#[path = "generate/ops.rs"]
+mod ops;
+
+#[path = "generate/runtime_functions.rs"]
+mod runtime_functions;
+
+const KIB: u64 = 1024;
+const GIB: u64 = 1024 * 1024 * KIB;
+const TIB: u64 = 1024 * GIB;
+
+struct Target {
+    architecture: flapc::Architecture,
+    object_format: flapc::ObjectFormat,
+    is_apple: bool,
+}
+
+fn target() -> Target {
+    let architecture = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH");
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    let pointer_width = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").expect("CARGO_CFG_TARGET_POINTER_WIDTH");
+    let endian = env::var("CARGO_CFG_TARGET_ENDIAN").expect("CARGO_CFG_TARGET_ENDIAN");
+    assert!(
+        pointer_width == "64" && endian == "little",
+        "the interpreter supports 64-bit little-endian targets only"
+    );
+    // The layout is computed on the build machine, so it has to lay out types the way the target does.
+    const {
+        assert!(
+            cfg!(target_pointer_width = "64") && cfg!(target_endian = "little"),
+            "the build machine must be 64-bit little-endian as well"
+        );
+    }
+
+    let architecture = match architecture.as_str() {
+        "x86_64" => flapc::Architecture::X86_64,
+        "aarch64" => flapc::Architecture::Aarch64,
+        other => panic!("the interpreter does not support {other}"),
+    };
+    let is_apple = os == "macos" || os == "ios";
+    let object_format = match os.as_str() {
+        _ if is_apple => flapc::ObjectFormat::MachO,
+        "windows" => flapc::ObjectFormat::Coff,
+        _ => flapc::ObjectFormat::Elf,
+    };
+    Target {
+        architecture,
+        object_format,
+        is_apple,
+    }
+}
+
+/// Mirrors GC::HEAP_REGION_SIZE in Libraries/LibGC/HeapRegion.h, whose choice depends on the target and on whether
+/// LibGC is built with ThreadSanitizer, which Rust's own cfg cannot see.
+fn heap_region_size(target: &Target, thread_sanitizer: bool) -> u64 {
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    let address_space_is_small = matches!(target.architecture, flapc::Architecture::Aarch64) && os != "macos";
+    if address_space_is_small || thread_sanitizer {
+        128 * GIB
+    } else {
+        4 * TIB
+    }
+}
+
+fn main() {
+    let manifest_directory = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let output_directory = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let libjs_directory = manifest_directory.join("..");
+    let interpreter_source = libjs_directory.join("Interpreter/interpreter.flap");
+    let layout_fixture = libjs_directory.join("Flap/tests/interpreter-layout.conf");
+
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=generate");
+    println!("cargo:rerun-if-changed=src/layout");
+    println!("cargo:rerun-if-changed=src/gc/class_id.rs");
+    println!("cargo:rerun-if-changed=src/embedding");
+    println!("cargo:rerun-if-changed={}", interpreter_source.display());
+    println!("cargo:rerun-if-changed={}", layout_fixture.display());
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+
+    instructions::generate(&interpreter_source, &output_directory).expect("generate the frontend's instruction types");
+
+    let target = target();
+    let address_sanitizer = env::var_os("CARGO_FEATURE_ADDRESS_SANITIZER").is_some();
+    let thread_sanitizer = env::var_os("CARGO_FEATURE_THREAD_SANITIZER").is_some();
+    let configuration = layout_table::LayoutConfiguration {
+        heap_region_offset_mask: heap_region_size(&target, thread_sanitizer) - 1,
+        // Mirrors GC::PrimitiveStorage::default_cage_size.
+        primitive_storage_cage_offset_mask: 4 * TIB - 1,
+        // Instrumented frames need more room before the stack is considered exhausted.
+        vm_stack_space_limit: if address_sanitizer { 96 * KIB } else { 32 * KIB },
+    };
+    println!(
+        "cargo:rustc-env=LIBJS_RUNTIME_HEAP_REGION_OFFSET_MASK={}",
+        configuration.heap_region_offset_mask
+    );
+    println!(
+        "cargo:rustc-env=LIBJS_RUNTIME_PRIMITIVE_STORAGE_CAGE_OFFSET_MASK={}",
+        configuration.primitive_storage_cage_offset_mask
+    );
+    println!(
+        "cargo:rustc-env=LIBJS_RUNTIME_VM_STACK_SPACE_LIMIT={}",
+        configuration.vm_stack_space_limit
+    );
+
+    let layout = layout_table::generate(&configuration);
+    let generated = fixture::parse(&layout.text);
+    let fixture_text = fs::read_to_string(&layout_fixture).expect("read the interpreter layout fixture");
+    if let Err(problems) = fixture::check_against_fixture(&generated, &fixture::parse(&fixture_text)) {
+        panic!("the Rust interpreter layout does not match the one the interpreter expects:\n{problems}");
+    }
+    write_if_changed(&output_directory.join("layout.conf"), &layout.text);
+    write_if_changed(
+        &output_directory.join("layout_static_assertions.rs"),
+        &layout.static_assertions,
+    );
+
+    let embedding_header_directory = output_directory.join("LibJS/Embedding");
+    fs::create_dir_all(&embedding_header_directory).expect("create the directory of the embedding headers");
+    abi_header::generate(
+        &manifest_directory.join("src/embedding/mod.rs"),
+        &embedding_header_directory.join("ABI.h"),
+    );
+    let layout_header = layout_header::generate();
+    write_if_changed(&embedding_header_directory.join("Layout.h"), &layout_header.text);
+    write_if_changed(
+        &output_directory.join("layout_header_static_assertions.rs"),
+        &layout_header.static_assertions,
+    );
+
+    let interpreter_source_text = fs::read_to_string(&interpreter_source).expect("read interpreter.flap");
+    let interpreter_source_name = interpreter_source.display().to_string();
+    // The interpreter is built twice from interpreter.flap: the plain variant, and a profiling variant whose
+    // @profiling inline functions collect feedback for the optimizing JIT. Executables pick the variant their frames
+    // run with through their dispatch tables, so both are linked in, and the runtime defines every function either
+    // of them calls. Without the JIT, only the plain variant is assembled, but the runtime still defines the
+    // functions of both, so that its interface with the interpreter is the same in every build.
+    let jit = env::var_os("CARGO_FEATURE_JIT").is_some();
+    let source = || flapc::CompilationUnit {
+        source: flapc::SourceInput {
+            name: &interpreter_source_name,
+            contents: &interpreter_source_text,
+        },
+        constants: Some(flapc::SourceInput {
+            name: "layout.conf",
+            contents: &layout.text,
+        }),
+    };
+    let mut functions: Vec<flapc::runtime_interface::RuntimeFunction> = Vec::new();
+    let mut assemblies = Vec::new();
+    for profiling in [false, true] {
+        let compiler = interpreter_compiler(&target, profiling);
+        let prepared = compiler
+            .prepare(source())
+            .unwrap_or_else(|error| panic!("flapc failed to compile the interpreter:\n{error}"));
+        let variant_functions = compiler
+            .runtime_functions(&prepared)
+            .unwrap_or_else(|error| panic!("flapc could not list the interpreter's runtime functions:\n{error}"));
+        for function in variant_functions {
+            match functions.iter().find(|existing| existing.symbol == function.symbol) {
+                Some(existing) => assert!(
+                    *existing == function,
+                    "the interpreter variants call {} in different ways",
+                    function.symbol
+                ),
+                None => functions.push(function),
+            }
+        }
+        if profiling && !jit {
+            continue;
+        }
+        let assembly = compiler
+            .compile_prepared(&prepared)
+            .unwrap_or_else(|error| panic!("flapc failed to compile the interpreter:\n{error}"));
+        assemblies.push((profiling, assembly));
+    }
+    let instructions = flapc::metadata::parse_flap_metadata(&interpreter_source_name, &interpreter_source_text)
+        .unwrap_or_else(|error| panic!("parse the interpreter's bytecode definitions: {error}"));
+    add_jit_only_slow_paths(&target, &instructions, &mut functions);
+    functions.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    let instructions_with_values = functions
+        .iter()
+        .filter_map(|function| match &function.kind {
+            flapc::runtime_interface::RuntimeFunctionKind::SlowPath { op, .. }
+            | flapc::runtime_interface::RuntimeFunctionKind::Try { op, .. } => Some(op.clone()),
+            _ => None,
+        })
+        .collect();
+    write_if_changed(
+        &output_directory.join("bytecode_ops.rs"),
+        &ops::generate(&instructions, &instructions_with_values),
+    );
+    write_if_changed(
+        &output_directory.join("runtime_functions.rs"),
+        &runtime_functions::generate(&functions, &instructions),
+    );
+
+    let assembly_paths = assemblies
+        .iter()
+        .map(|(profiling, assembly)| {
+            let file_name = if *profiling {
+                "interpreter_profiling.S"
+            } else {
+                "interpreter.S"
+            };
+            let assembly_path = output_directory.join(file_name);
+            write_if_changed(&assembly_path, assembly.as_str());
+            assembly_path
+        })
+        .collect::<Vec<_>>();
+    assemble_interpreter(&target, &assembly_paths);
+}
+
+/// Slow paths that only the optimizing JIT's code calls, with the instruction whose operands they take. JIT code calls
+/// them with the interpreter's calling convention for that instruction's slow path, so they are generated like the
+/// interpreter's.
+const JIT_ONLY_SLOW_PATHS: &[(&str, &str)] = &[
+    ("asm_slow_path_get_initialized_binding", "GetInitializedBinding"),
+    ("asm_slow_path_initialize_lexical_binding", "InitializeLexicalBinding"),
+    ("asm_slow_path_initialize_variable_binding", "InitializeVariableBinding"),
+    ("asm_slow_path_get_by_id_from_jit", "GetById"),
+    ("asm_slow_path_get_by_value_from_jit", "GetByValue"),
+    ("asm_slow_path_put_by_value_from_jit", "PutByValue"),
+];
+
+fn add_jit_only_slow_paths(
+    target: &Target,
+    instructions: &[flapc::metadata::InstructionDefinition],
+    functions: &mut Vec<flapc::runtime_interface::RuntimeFunction>,
+) {
+    let record_form_only = matches!(target.object_format, flapc::ObjectFormat::Coff);
+    for (symbol, op) in JIT_ONLY_SLOW_PATHS {
+        assert!(
+            !functions.iter().any(|function| function.symbol == *symbol),
+            "the interpreter calls the JIT-only slow path {symbol}"
+        );
+        let definition = instructions
+            .iter()
+            .find(|definition| definition.name == *op)
+            .unwrap_or_else(|| panic!("the JIT-only slow path {symbol} is for an unknown instruction {op}"));
+        let layout = flapc::metadata::SlowPathLayout::new(definition);
+        functions.push(flapc::runtime_interface::RuntimeFunction {
+            symbol: (*symbol).to_string(),
+            kind: flapc::runtime_interface::RuntimeFunctionKind::SlowPath {
+                op: (*op).to_string(),
+                abi: layout.abi(record_form_only),
+                layout,
+            },
+        });
+    }
+}
+
+fn interpreter_compiler(target: &Target, profiling: bool) -> flapc::Compiler {
+    flapc::Compiler::new(flapc::CompileOptions {
+        target: flapc::Target {
+            architecture: target.architecture,
+            object_format: target.object_format,
+        },
+        has_jscvt: target.is_apple && matches!(target.architecture, flapc::Architecture::Aarch64),
+        enable_assertions: true,
+        profiling,
+    })
+}
+
+/// The minimum macOS version rustc builds the crate's own code for, which the assembled interpreter has to match.
+fn rust_macos_deployment_target() -> Option<String> {
+    if let Ok(target) = env::var("MACOSX_DEPLOYMENT_TARGET") {
+        return Some(target);
+    }
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let target = env::var("TARGET").ok()?;
+    let output = std::process::Command::new(rustc)
+        .args(["--print", "deployment-target", "--target", &target])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .strip_prefix("MACOSX_DEPLOYMENT_TARGET=")
+        .map(str::to_string)
+}
+
+fn assemble_interpreter(target: &Target, assembly_paths: &[PathBuf]) {
+    let mut build = cc::Build::new();
+    build.files(assembly_paths);
+    if target.is_apple
+        && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos")
+        && let Some(deployment_target) = rust_macos_deployment_target()
+    {
+        build.flag(format!("-mmacosx-version-min={deployment_target}"));
+    }
+    if env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|environment| environment == "msvc") {
+        // flapc writes GNU assembly, which MSVC's cl.exe cannot assemble. Ladybird builds for Windows with clang-cl.
+        if !build
+            .try_get_compiler()
+            .is_ok_and(|compiler| compiler.is_like_clang_cl())
+        {
+            build.compiler("clang-cl");
+        }
+        // Given -Fo, clang-cl writes the preprocessed assembly to the working directory, which cargo makes the source
+        // directory of the crate.
+        let output_directory = assembly_paths[0]
+            .parent()
+            .expect("the assembly is in the output directory");
+        env::set_current_dir(output_directory)
+            .unwrap_or_else(|error| panic!("enter {}: {error}", output_directory.display()));
+    }
+    if matches!(target.architecture, flapc::Architecture::X86_64) {
+        build.flag_if_supported("-malign-branch-boundary=32");
+        build.flag_if_supported("-malign-branch=fused,jcc");
+    }
+    build.compile("libjs_runtime_interpreter");
+}
+
+fn write_if_changed(path: &Path, contents: &str) {
+    if fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+        return;
+    }
+    fs::write(path, contents).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+}

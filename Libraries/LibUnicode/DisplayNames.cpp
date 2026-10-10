@@ -5,8 +5,10 @@
  */
 
 #include <AK/Array.h>
+#include <AK/ByteString.h>
 #include <LibUnicode/DisplayNames.h>
 #include <LibUnicode/ICU.h>
+#include <LibUnicode/TextMapping.h>
 
 #include <unicode/dtptngen.h>
 #include <unicode/localebuilder.h>
@@ -16,7 +18,7 @@
 
 namespace Unicode {
 
-LanguageDisplay language_display_from_string(StringView language_display)
+LanguageDisplay language_display_from_string(Utf16View language_display)
 {
     if (language_display == "standard"sv)
         return LanguageDisplay::Standard;
@@ -25,13 +27,13 @@ LanguageDisplay language_display_from_string(StringView language_display)
     VERIFY_NOT_REACHED();
 }
 
-StringView language_display_to_string(LanguageDisplay language_display)
+Utf16String language_display_to_string(LanguageDisplay language_display)
 {
     switch (language_display) {
     case LanguageDisplay::Standard:
-        return "standard"sv;
+        return "standard"_utf16;
     case LanguageDisplay::Dialect:
-        return "dialect"sv;
+        return "dialect"_utf16;
     default:
         VERIFY_NOT_REACHED();
     }
@@ -161,11 +163,15 @@ Optional<Utf16String> date_time_field_display_name(StringView locale, StringView
     if (!locale_data.has_value())
         return {};
 
+    auto pattern_generator = locale_data->date_time_pattern_generator();
+    if (!pattern_generator.has_value())
+        return {};
+
     auto icu_field = icu_date_time_field(field);
     auto icu_style = icu_date_time_style(style);
 
     icu::UnicodeString result;
-    result = locale_data->date_time_pattern_generator().getFieldDisplayName(icu_field, icu_style);
+    result = pattern_generator->getFieldDisplayName(icu_field, icu_style);
 
     return icu_string_to_utf16_string(result);
 }
@@ -233,25 +239,17 @@ Optional<Utf16String> currency_display_name(StringView locale, StringView curren
     return icu_string_to_utf16_string(result, length);
 }
 
-Optional<Utf16String> currency_numeric_display_name(StringView locale, StringView currency)
-{
-    UErrorCode status = U_ZERO_ERROR;
-
-    auto locale_data = LocaleData::for_locale(locale);
-    if (!locale_data.has_value())
-        return {};
-
-    auto icu_currency = icu_currency_code(currency);
-
-    i32 length = 0;
-    UChar const* result = ucurr_getPluralName(icu_currency.data(), locale_data->locale().getName(), nullptr, "other", &length, &status);
-
-    if (icu_failure(status))
-        return {};
-    if ((status == U_USING_DEFAULT_WARNING) && (result == icu_currency.data()))
-        return {};
-
-    return icu_string_to_utf16_string(result, length);
 }
 
+extern "C" bool unicode_time_zone_display_name(u8 const* locale, size_t locale_length, u8 const* time_zone, size_t time_zone_length, bool in_dst, double time, UnicodeTextMappingOutput output)
+{
+    auto name = Unicode::time_zone_display_name(StringView { locale, locale_length }, StringView { time_zone, time_zone_length },
+        in_dst ? Unicode::TimeZoneOffset::InDST::Yes : Unicode::TimeZoneOffset::InDST::No, time);
+    if (!name.has_value())
+        return false;
+    auto view = name->utf16_view();
+    auto* destination = output.allocate_text(output.context, view.length_in_code_units());
+    for (size_t i = 0; i < view.length_in_code_units(); ++i)
+        destination[i] = view.code_unit_at(i);
+    return true;
 }

@@ -6,9 +6,8 @@
 
 #pragma once
 
-#include <AK/Badge.h>
+#include <AK/AtomicRefCounted.h>
 #include <AK/NonnullRefPtr.h>
-#include <AK/RefCounted.h>
 #include <AK/Span.h>
 #include <AK/Types.h>
 #include <AK/kmalloc.h>
@@ -22,17 +21,12 @@ enum ShouldChomp {
 
 size_t allocation_size_for_stringimpl(size_t length);
 
-class ByteStringImpl : public RefCounted<ByteStringImpl> {
+class ByteStringImpl : public AtomicRefCounted<ByteStringImpl> {
 public:
     static NonnullRefPtr<ByteStringImpl const> create_uninitialized(size_t length, char*& buffer);
     static NonnullRefPtr<ByteStringImpl const> create(char const* cstring, ShouldChomp = NoChomp);
     static NonnullRefPtr<ByteStringImpl const> create(char const* cstring, size_t length, ShouldChomp = NoChomp);
     static NonnullRefPtr<ByteStringImpl const> create(ReadonlyBytes, ShouldChomp = NoChomp);
-
-    void operator delete(void* ptr)
-    {
-        kfree_sized(ptr, allocation_size_for_stringimpl(static_cast<ByteStringImpl*>(ptr)->m_length));
-    }
 
     static ByteStringImpl& the_empty_stringimpl();
 
@@ -60,25 +54,26 @@ public:
 
     unsigned hash() const
     {
-        if (!m_has_hash)
+        if (!atomic_load(&m_has_hash, memory_order_acquire))
             compute_hash();
-        return m_hash;
+        return atomic_load(&m_hash, memory_order_relaxed);
     }
 
     unsigned existing_hash() const
     {
-        return m_hash;
+        return atomic_load(&m_hash, memory_order_relaxed);
     }
 
     unsigned case_insensitive_hash() const;
 
 private:
+    friend struct EmptyByteStringImpl;
+
     enum ConstructTheEmptyStringImplTag {
         ConstructTheEmptyStringImpl
     };
-    explicit ByteStringImpl(ConstructTheEmptyStringImplTag)
+    explicit constexpr ByteStringImpl(ConstructTheEmptyStringImplTag)
     {
-        m_inline_buffer[0] = '\0';
     }
 
     enum ConstructWithInlineBufferTag {

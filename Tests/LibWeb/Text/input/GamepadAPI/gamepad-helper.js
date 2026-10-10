@@ -1,6 +1,6 @@
 (() => {
-    globalThis.handleSDLInputEvents = () => {
-        internals.handleSDLInputEvents();
+    globalThis.pumpGamepadEvents = () => {
+        internals.pumpGamepadEvents();
         return new Promise(resolve => {
             setTimeout(() => resolve(), 0);
         });
@@ -28,17 +28,13 @@
 
     globalThis.listenForGamepadConnected = () => {
         window.addEventListener("gamepadconnected", ({ gamepad }) => {
-            println(
-                `Received gamepadconnected event for '${gamepad.id}' at index ${gamepad.index}`
-            );
+            println(`Received gamepadconnected event for '${gamepad.id}' at index ${gamepad.index}`);
         });
     };
 
     globalThis.listenForGamepadDisconnected = () => {
         window.addEventListener("gamepaddisconnected", ({ gamepad }) => {
-            println(
-                `Received gamepaddisconnected event for '${gamepad.id}' at index ${gamepad.index}`
-            );
+            println(`Received gamepaddisconnected event for '${gamepad.id}' at index ${gamepad.index}`);
         });
     };
 })();

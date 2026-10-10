@@ -8,13 +8,15 @@
 #pragma once
 
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/QuickSort.h>
 #include <AK/RefCounted.h>
 #include <AK/Vector.h>
+#include <LibGfx/AffineTransform.h>
 #include <LibGfx/Color.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Gradients.h>
-#include <LibGfx/ImmutableBitmap.h>
 #include <LibGfx/Rect.h>
 
 namespace Gfx {
@@ -27,10 +29,7 @@ public:
 
 class SolidColorPaintStyle : public PaintStyle {
 public:
-    static ErrorOr<NonnullRefPtr<SolidColorPaintStyle>> create(Color color)
-    {
-        return adopt_nonnull_ref_or_enomem(new (nothrow) SolidColorPaintStyle(color));
-    }
+    static ErrorOr<NonnullRefPtr<SolidColorPaintStyle>> create(Color color);
 
     bool is_visible() const override { return m_color.alpha() > 0; }
 
@@ -89,23 +88,19 @@ public:
         NoRepeat
     };
 
-    static ErrorOr<NonnullRefPtr<CanvasPatternPaintStyle>> create(RefPtr<ImmutableBitmap> image, Repetition repetition)
-    {
-        return adopt_nonnull_ref_or_enomem(new (nothrow) CanvasPatternPaintStyle(image, repetition));
-    }
+    static ErrorOr<NonnullRefPtr<CanvasPatternPaintStyle>> create(Optional<DecodedImageFrame> image, Repetition repetition);
 
-    RefPtr<ImmutableBitmap> image() const { return m_image; }
+    Optional<DecodedImageFrame> image() const;
     Repetition repetition() const { return m_repetition; }
+    Optional<AffineTransform> const& transform() const { return m_transform; }
+    void set_transform(AffineTransform const& transform) { m_transform = transform; }
 
 private:
-    CanvasPatternPaintStyle(RefPtr<ImmutableBitmap> image, Repetition repetition)
-        : m_image(image)
-        , m_repetition(repetition)
-    {
-    }
+    CanvasPatternPaintStyle(Optional<DecodedImageFrame> image, Repetition repetition);
 
-    RefPtr<ImmutableBitmap> m_image;
+    Optional<DecodedImageFrame> m_image;
     Repetition m_repetition { Repetition::Repeat };
+    Optional<AffineTransform> m_transform;
 };
 
 // The following paint styles implement the gradients required for the HTML canvas.
@@ -114,10 +109,7 @@ private:
 
 class CanvasLinearGradientPaintStyle : public GradientPaintStyle {
 public:
-    static ErrorOr<NonnullRefPtr<CanvasLinearGradientPaintStyle>> create(FloatPoint p0, FloatPoint p1)
-    {
-        return adopt_nonnull_ref_or_enomem(new (nothrow) CanvasLinearGradientPaintStyle(p0, p1));
-    }
+    static ErrorOr<NonnullRefPtr<CanvasLinearGradientPaintStyle>> create(FloatPoint p0, FloatPoint p1);
 
     FloatPoint start_point() const { return m_p0; }
     FloatPoint end_point() const { return m_p1; }
@@ -135,10 +127,7 @@ private:
 
 class CanvasConicGradientPaintStyle : public GradientPaintStyle {
 public:
-    static ErrorOr<NonnullRefPtr<CanvasConicGradientPaintStyle>> create(FloatPoint center, float start_angle = 0.0f)
-    {
-        return adopt_nonnull_ref_or_enomem(new (nothrow) CanvasConicGradientPaintStyle(center, start_angle));
-    }
+    static ErrorOr<NonnullRefPtr<CanvasConicGradientPaintStyle>> create(FloatPoint center, float start_angle = 0.0f);
 
     FloatPoint center() const { return m_center; }
     float start_angle() const { return m_start_angle; }
@@ -156,10 +145,7 @@ private:
 
 class CanvasRadialGradientPaintStyle : public GradientPaintStyle {
 public:
-    static ErrorOr<NonnullRefPtr<CanvasRadialGradientPaintStyle>> create(FloatPoint start_center, float start_radius, FloatPoint end_center, float end_radius)
-    {
-        return adopt_nonnull_ref_or_enomem(new (nothrow) CanvasRadialGradientPaintStyle(start_center, start_radius, end_center, end_radius));
-    }
+    static ErrorOr<NonnullRefPtr<CanvasRadialGradientPaintStyle>> create(FloatPoint start_center, float start_radius, FloatPoint end_center, float end_radius);
 
     Gfx::FloatPoint start_center() const { return m_start_center; }
     float start_radius() const { return m_start_radius; }

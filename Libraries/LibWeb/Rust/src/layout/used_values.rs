@@ -1,0 +1,1017 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use super::*;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum SizeConstraint {
+    #[default]
+    None,
+    MinContent,
+    MaxContent,
+}
+
+pub use crate::css::css_pixels::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct OptionalCssPixels {
+    pub value: CssPixels,
+    pub has_value: bool,
+}
+
+impl From<Option<CssPixels>> for OptionalCssPixels {
+    fn from(value: Option<CssPixels>) -> Self {
+        Self {
+            value: value.unwrap_or_default(),
+            has_value: value.is_some(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct OptionalCssPixelRect {
+    pub value: FfiCssPixelRect,
+    pub has_value: bool,
+}
+
+impl From<Option<FfiCssPixelRect>> for OptionalCssPixelRect {
+    fn from(value: Option<FfiCssPixelRect>) -> Self {
+        Self {
+            value: value.unwrap_or_default(),
+            has_value: value.is_some(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct OptionalIntRect {
+    pub value: libgfx_rust::IntRect,
+    pub has_value: bool,
+}
+
+impl From<Option<libgfx_rust::IntRect>> for OptionalIntRect {
+    fn from(value: Option<libgfx_rust::IntRect>) -> Self {
+        Self {
+            value: value.unwrap_or_default(),
+            has_value: value.is_some(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) struct LineBoxFragmentCoordinate {
+    pub line_box_index: usize,
+    pub fragment_index: usize,
+}
+
+pub(crate) struct SealableCell<T> {
+    value: Cell<T>,
+    sealed: Cell<bool>,
+}
+
+/// Lazily owns interior-mutable data without reserving space for `T` in every
+/// `UsedValues` entry.
+pub(crate) struct LazyRefCell<T> {
+    value: OnceCell<Box<RefCell<T>>>,
+}
+
+impl<T> LazyRefCell<T> {
+    pub(crate) const fn new() -> Self {
+        Self { value: OnceCell::new() }
+    }
+
+    pub(crate) fn get(&self) -> Option<&RefCell<T>> {
+        self.value.get().map(Box::as_ref)
+    }
+
+    pub(crate) fn get_or_init(&self, initialize: impl FnOnce() -> T) -> &RefCell<T> {
+        self.value.get_or_init(|| Box::new(RefCell::new(initialize()))).as_ref()
+    }
+}
+
+impl<T> std::fmt::Debug for LazyRefCell<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LazyRefCell")
+            .field("initialized", &self.value.get().is_some())
+            .finish()
+    }
+}
+
+impl<T: Copy + std::fmt::Debug> std::fmt::Debug for SealableCell<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.get().fmt(formatter)
+    }
+}
+
+impl<T: Copy> SealableCell<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self {
+            value: Cell::new(value),
+            sealed: Cell::new(false),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> T {
+        self.value.get()
+    }
+
+    #[track_caller]
+    #[inline]
+    pub(crate) fn set(&self, value: T) {
+        assert!(!self.sealed.get(), "write to a sealed committed box metric");
+        self.value.set(value);
+    }
+
+    pub(crate) fn seal(&self) {
+        self.sealed.set(true);
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed.get()
+    }
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct LineData {
+    pub(crate) line_boxes: Vec<line_box::LineBoxData>,
+    pub(crate) inline_box_pieces: Vec<inline_formatting_context::InlineBoxPieceData>,
+    pub(crate) lines_after_clamp_point_rect: Option<Box<FfiCssPixelRect>>,
+}
+
+#[derive(Default)]
+pub(crate) enum LineDataState {
+    #[default]
+    Empty,
+    Building(Box<LineData>),
+    Finished(std::sync::Arc<inline_content::InlineContent>),
+}
+
+impl std::fmt::Debug for LineDataState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "Empty",
+            Self::Building(_) => "Building",
+            Self::Finished(_) => "Finished",
+        })
+    }
+}
+
+impl LineDataState {
+    pub(crate) fn building(&self) -> &LineData {
+        match self {
+            Self::Building(data) => data,
+            Self::Empty => panic!("line building accessed line data before it began"),
+            Self::Finished(_) => panic!("line building accessed finalized inline content"),
+        }
+    }
+
+    pub(crate) fn building_mut(&mut self) -> &mut LineData {
+        match self {
+            Self::Building(data) => data,
+            Self::Empty => panic!("line building mutated line data before it began"),
+            Self::Finished(_) => panic!("line building mutated finalized inline content"),
+        }
+    }
+
+    pub(crate) fn lines(&self) -> impl DoubleEndedIterator<Item = inline_content::LineRecord> + '_ {
+        let (building, finished) = match self {
+            Self::Empty => (&[][..], &[][..]),
+            Self::Building(data) => (data.line_boxes.as_slice(), &[][..]),
+            Self::Finished(data) => (&[][..], data.lines.as_slice()),
+        };
+        building
+            .iter()
+            .map(line_box::LineBoxData::retained_metrics)
+            .chain(finished.iter().copied())
+    }
+
+    pub(crate) fn last_line(&self) -> Option<inline_content::LineRecord> {
+        self.lines().next_back()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CommittedSvgFacts {
+    pub(crate) viewport_transform: Option<svg_formatting_context::FfiAffineTransform>,
+    pub(crate) viewport_size: Option<FfiCssPixelSize>,
+    pub(crate) view_box: Option<svg_formatting_context::FfiSvgViewBox>,
+    pub(crate) element_transform: Option<svg_formatting_context::FfiAffineTransform>,
+    pub(crate) additional_element_transform: Option<svg_formatting_context::FfiAffineTransform>,
+    pub(crate) mask_area_facts: Option<svg_formatting_context::SvgMaskAreaFacts>,
+    pub(crate) viewport_percentage_basis: CssPixels,
+    pub(crate) resource_content_units_are_object_bounding_box: bool,
+}
+
+impl CommittedSvgFacts {
+    fn install_present_into(self, target: &mut Self) {
+        if let Some(transform) = self.viewport_transform {
+            target.viewport_transform = Some(transform);
+        }
+        if let Some(size) = self.viewport_size {
+            target.viewport_size = Some(size);
+        }
+        if let Some(view_box) = self.view_box {
+            target.view_box = Some(view_box);
+        }
+        if let Some(transform) = self.element_transform {
+            target.element_transform = Some(transform);
+        }
+        if let Some(transform) = self.additional_element_transform {
+            target.additional_element_transform = Some(transform);
+        }
+        if let Some(facts) = self.mask_area_facts {
+            target.mask_area_facts = Some(facts);
+        }
+        target.viewport_percentage_basis = self.viewport_percentage_basis;
+        target.resource_content_units_are_object_bounding_box = self.resource_content_units_are_object_bounding_box;
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct UsedValuesRareData {
+    pub(crate) computed_svg_path: Option<std::sync::Arc<libgfx_rust::path::OwnedPath>>,
+    pub(crate) svg_text_character_cells: Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>>,
+    pub(crate) svg: CommittedSvgFacts,
+    pub(crate) grid_layout_data: Option<std::sync::Arc<grid_formatting_context::GridLayoutData>>,
+    pub(crate) flex_layout_data: Option<std::sync::Arc<formatting_context::FlexLayoutData>>,
+    pub(crate) used_grid_tracks: Option<std::sync::Arc<grid_formatting_context::OwnedUsedGridTracks>>,
+    pub(crate) collapsed_table_borders: Option<std::sync::Arc<table_formatting_context::OwnedCollapsedTableBorders>>,
+    pub(crate) abspos_layout_inputs: Option<abspos_inputs::AbsposLayoutInputs>,
+}
+
+impl UsedValuesRareData {
+    pub(crate) fn install_present_payloads_into(self, record: &UsedValues) {
+        let Self {
+            computed_svg_path,
+            svg_text_character_cells,
+            svg,
+            grid_layout_data,
+            flex_layout_data,
+            used_grid_tracks,
+            collapsed_table_borders,
+            abspos_layout_inputs,
+        } = self;
+        debug_assert!(
+            abspos_layout_inputs.is_none(),
+            "a run authored a parent-owned rare payload on its root record"
+        );
+        if computed_svg_path.is_none()
+            && svg_text_character_cells.is_none()
+            && svg == CommittedSvgFacts::default()
+            && grid_layout_data.is_none()
+            && flex_layout_data.is_none()
+            && used_grid_tracks.is_none()
+            && collapsed_table_borders.is_none()
+        {
+            return;
+        }
+        let mut rare = record.rare_data_mut();
+        if let Some(path) = computed_svg_path {
+            rare.computed_svg_path = Some(path);
+        }
+        if let Some(cells) = svg_text_character_cells {
+            rare.svg_text_character_cells = Some(cells);
+        }
+        svg.install_present_into(&mut rare.svg);
+        if let Some(data) = grid_layout_data {
+            rare.grid_layout_data = Some(data);
+        }
+        if let Some(data) = flex_layout_data {
+            rare.flex_layout_data = Some(data);
+        }
+        if let Some(tracks) = used_grid_tracks {
+            rare.used_grid_tracks = Some(tracks);
+        }
+        if let Some(borders) = collapsed_table_borders {
+            rare.collapsed_table_borders = Some(borders);
+        }
+    }
+}
+
+/// The per-box geometry stored in a Rust-owned layout pass.
+#[derive(Debug)]
+pub(crate) struct UsedValues {
+    pub content_inline_size: SealableCell<CssPixels>,
+    pub content_block_size: SealableCell<CssPixels>,
+
+    pub margin_left: SealableCell<CssPixels>,
+    pub margin_right: SealableCell<CssPixels>,
+    pub margin_top: SealableCell<CssPixels>,
+    pub margin_bottom: SealableCell<CssPixels>,
+
+    pub border_left: SealableCell<CssPixels>,
+    pub border_right: SealableCell<CssPixels>,
+    pub border_top: SealableCell<CssPixels>,
+    pub border_bottom: SealableCell<CssPixels>,
+
+    pub padding_left: SealableCell<CssPixels>,
+    pub padding_right: SealableCell<CssPixels>,
+    pub padding_top: SealableCell<CssPixels>,
+    pub padding_bottom: SealableCell<CssPixels>,
+
+    pub inset_left: SealableCell<CssPixels>,
+    pub inset_right: SealableCell<CssPixels>,
+    pub inset_top: SealableCell<CssPixels>,
+    pub inset_bottom: SealableCell<CssPixels>,
+
+    pub has_definite_inline_size: Cell<bool>,
+    pub has_definite_block_size: Cell<bool>,
+    /// A button, or the anonymous wrapper of its content, whose automatic block size was made definite only so the
+    /// content can be centered within a larger min-height. Percentages inside the button still treat it as indefinite.
+    pub has_definite_block_size_only_for_button_content_alignment: Cell<bool>,
+    pub uses_collapsing_borders_model: Cell<bool>,
+    /// In the collapsing borders model, whether this is the table box rather than a cell. Both store the full widths
+    /// of the collapsed borders at their edges, of which only a part lies inside the box (see border_left_collapsed()
+    /// and friends): the table's border area lies outside the grid, so it owns the part of an outer border on the far
+    /// side of the first or last grid line, while a cell owns the part on the inner side of its grid lines.
+    pub is_collapsed_borders_table_box: Cell<bool>,
+    pub has_line_clamp_point: Cell<bool>,
+    pub is_invisible_for_line_clamp: Cell<bool>,
+    pub clamped_content_is_scrollable_overflow: Cell<bool>,
+
+    // For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
+    // columns it spans, so painting can find the cells that originate in a column (CSS 2.2 §17.5.1).
+    pub table_column_index: Cell<u32>,
+    pub table_column_span: Cell<u32>,
+    // For table cells: whether every column the cell spans has 'visibility: collapse', which removes the cell from
+    // the display along with the columns (CSS 2.2 §17.5.5).
+    pub hidden_by_collapsed_columns: Cell<bool>,
+
+    pub inline_size_constraint: Cell<SizeConstraint>,
+    pub block_size_constraint: Cell<SizeConstraint>,
+
+    // Keep these as separate cells: content_offset is read by placement code
+    // even where has_content_offset is false.
+    pub has_content_offset: SealableCell<bool>,
+    pub content_offset: SealableCell<FfiCssPixelPoint>,
+    pub placed_in: Cell<crate::layout::node_data::NodeSlotId>,
+
+    // Keep baseline payloads separate so resetting the presence bits does not
+    // perturb the payloads observed by the existing derivation flow.
+    pub has_first_baseline: Cell<bool>,
+    pub first_baseline: Cell<CssPixels>,
+    pub has_last_baseline: Cell<bool>,
+    pub last_baseline: Cell<CssPixels>,
+
+    // Layout outputs, deliberately outside the cell state.
+    pub depends_on_percentage_block_size: Cell<bool>,
+    pub has_descendant_that_depends_on_percentage_block_size: Cell<bool>,
+
+    pub(crate) line_data: RefCell<LineDataState>,
+    pub(crate) rare_data: LazyRefCell<UsedValuesRareData>,
+}
+
+impl Default for UsedValues {
+    fn default() -> Self {
+        let zero = CssPixels::from_raw(0);
+        Self {
+            content_inline_size: SealableCell::new(zero),
+            content_block_size: SealableCell::new(zero),
+            margin_left: SealableCell::new(zero),
+            margin_right: SealableCell::new(zero),
+            margin_top: SealableCell::new(zero),
+            margin_bottom: SealableCell::new(zero),
+            border_left: SealableCell::new(zero),
+            border_right: SealableCell::new(zero),
+            border_top: SealableCell::new(zero),
+            border_bottom: SealableCell::new(zero),
+            padding_left: SealableCell::new(zero),
+            padding_right: SealableCell::new(zero),
+            padding_top: SealableCell::new(zero),
+            padding_bottom: SealableCell::new(zero),
+            inset_left: SealableCell::new(zero),
+            inset_right: SealableCell::new(zero),
+            inset_top: SealableCell::new(zero),
+            inset_bottom: SealableCell::new(zero),
+            has_definite_inline_size: Cell::new(false),
+            has_definite_block_size: Cell::new(false),
+            has_definite_block_size_only_for_button_content_alignment: Cell::new(false),
+            uses_collapsing_borders_model: Cell::new(false),
+            is_collapsed_borders_table_box: Cell::new(false),
+            has_line_clamp_point: Cell::new(false),
+            is_invisible_for_line_clamp: Cell::new(false),
+            clamped_content_is_scrollable_overflow: Cell::new(false),
+            table_column_index: Cell::new(0),
+            table_column_span: Cell::new(0),
+            hidden_by_collapsed_columns: Cell::new(false),
+            inline_size_constraint: Cell::new(SizeConstraint::None),
+            block_size_constraint: Cell::new(SizeConstraint::None),
+            has_content_offset: SealableCell::new(false),
+            content_offset: SealableCell::new(FfiCssPixelPoint::default()),
+            placed_in: Cell::new(crate::layout::node_data::NodeSlotId::INVALID),
+            has_first_baseline: Cell::new(false),
+            first_baseline: Cell::new(zero),
+            has_last_baseline: Cell::new(false),
+            last_baseline: Cell::new(zero),
+            depends_on_percentage_block_size: Cell::new(false),
+            has_descendant_that_depends_on_percentage_block_size: Cell::new(false),
+            line_data: RefCell::new(LineDataState::Empty),
+            rare_data: LazyRefCell::new(),
+        }
+    }
+}
+
+impl UsedValues {
+    /// Resolves the left and right margins, borders and padding of `style`, with percentages against `basis`.
+    pub(crate) fn resolve_horizontal_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+        self.margin_left.set(style.margin_left().to_px(basis));
+        self.margin_right.set(style.margin_right().to_px(basis));
+        self.border_left.set(style.border_left_width());
+        self.border_right.set(style.border_right_width());
+        self.padding_left.set(style.padding_left().to_px(basis));
+        self.padding_right.set(style.padding_right().to_px(basis));
+    }
+
+    /// Resolves the top and bottom margins, borders and padding of `style`, with percentages against `basis`.
+    pub(crate) fn resolve_vertical_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+        self.margin_top.set(style.margin_top().to_px(basis));
+        self.margin_bottom.set(style.margin_bottom().to_px(basis));
+        self.border_top.set(style.border_top_width());
+        self.border_bottom.set(style.border_bottom_width());
+        self.padding_top.set(style.padding_top().to_px(basis));
+        self.padding_bottom.set(style.padding_bottom().to_px(basis));
+    }
+
+    /// Resolves every margin, border and padding of `style`, with percentages against `basis`.
+    pub(crate) fn resolve_box_model(&self, style: &ComputedValuesView<'_>, basis: CssPixels) {
+        self.resolve_horizontal_box_model(style, basis);
+        self.resolve_vertical_box_model(style, basis);
+    }
+
+    pub(crate) fn rare_data_mut(&self) -> RefMut<'_, UsedValuesRareData> {
+        self.rare_data.get_or_init(UsedValuesRareData::default).borrow_mut()
+    }
+
+    pub(crate) fn line_data_ref(&self) -> Option<Ref<'_, LineDataState>> {
+        let state = self.line_data.borrow();
+        (!matches!(*state, LineDataState::Empty)).then_some(state)
+    }
+
+    pub(crate) fn ensure_line_data(&self) {
+        let mut state = self.line_data.borrow_mut();
+        if matches!(*state, LineDataState::Empty) {
+            *state = LineDataState::Building(Box::default());
+        }
+    }
+
+    pub(crate) fn building_line_data(&self) -> Ref<'_, LineData> {
+        Ref::map(self.line_data.borrow(), LineDataState::building)
+    }
+
+    pub(crate) fn building_line_data_mut(&self) -> RefMut<'_, LineData> {
+        RefMut::map(self.line_data.borrow_mut(), LineDataState::building_mut)
+    }
+
+    pub(crate) fn set_finished_line_data(&self, content: std::sync::Arc<inline_content::InlineContent>) {
+        *self.line_data.borrow_mut() = LineDataState::Finished(content);
+    }
+
+    pub(crate) fn finish_line_data(
+        &self,
+        callbacks: &LayoutPass<'_>,
+    ) -> Option<std::sync::Arc<inline_content::InlineContent>> {
+        let mut state = self.line_data.borrow_mut();
+        let content = match &mut *state {
+            LineDataState::Empty => return None,
+            LineDataState::Finished(content) => return Some(content.clone()),
+            LineDataState::Building(data) => std::sync::Arc::new(inline_content::InlineContent::finish(
+                std::mem::take(data.as_mut()),
+                callbacks.arena(),
+                self.content_inline_size.get(),
+            )),
+        };
+        *state = LineDataState::Finished(content.clone());
+        Some(content)
+    }
+
+    pub(crate) fn content_baselines_from_cells(&self) -> DerivedBaselines {
+        DerivedBaselines {
+            first: self.has_first_baseline.get().then(|| self.first_baseline.get()),
+            last: self.has_last_baseline.get().then(|| self.last_baseline.get()),
+        }
+    }
+
+    /// Seals every box metric that is copied from a committed fragment into
+    /// its paint record. Called when the box is placed: after placement, none
+    /// of these may change again.
+    pub(crate) fn seal_committed_box_metrics(&self) {
+        self.content_inline_size.seal();
+        self.content_block_size.seal();
+        self.margin_left.seal();
+        self.margin_right.seal();
+        self.margin_top.seal();
+        self.margin_bottom.seal();
+        self.border_left.seal();
+        self.border_right.seal();
+        self.border_top.seal();
+        self.border_bottom.seal();
+        self.padding_left.seal();
+        self.padding_right.seal();
+        self.padding_top.seal();
+        self.padding_bottom.seal();
+        self.inset_left.seal();
+        self.inset_right.seal();
+        self.inset_top.seal();
+        self.inset_bottom.seal();
+        self.has_content_offset.seal();
+        self.content_offset.seal();
+    }
+
+    pub(crate) fn own_metrics_are_sealed(&self) -> bool {
+        self.content_inline_size.is_sealed()
+    }
+
+    pub(crate) fn seal_own_metrics(&self) {
+        self.content_inline_size.seal();
+        self.content_block_size.seal();
+        self.margin_left.seal();
+        self.margin_right.seal();
+        self.margin_top.seal();
+        self.margin_bottom.seal();
+        self.border_left.seal();
+        self.border_right.seal();
+        self.border_top.seal();
+        self.border_bottom.seal();
+        self.padding_left.seal();
+        self.padding_right.seal();
+        self.padding_top.seal();
+        self.padding_bottom.seal();
+    }
+}
+
+macro_rules! used_values_cell_state {
+    ($($field:ident: $type:ty,)+) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) struct UsedValuesCellState {
+            $(pub(crate) $field: $type,)+
+        }
+
+        impl UsedValuesCellState {
+            pub(crate) fn capture(used: &UsedValues) -> Self {
+                Self {
+                    $($field: used.$field.get(),)+
+                }
+            }
+
+            pub(crate) fn apply_to_record(&self, used: &UsedValues) {
+                $(
+                    if used.$field.get() != self.$field {
+                        used.$field.set(self.$field);
+                    }
+                )+
+            }
+        }
+    };
+}
+
+used_values_cell_state! {
+    content_inline_size: CssPixels,
+    content_block_size: CssPixels,
+    margin_left: CssPixels,
+    margin_right: CssPixels,
+    margin_top: CssPixels,
+    margin_bottom: CssPixels,
+    border_left: CssPixels,
+    border_right: CssPixels,
+    border_top: CssPixels,
+    border_bottom: CssPixels,
+    padding_left: CssPixels,
+    padding_right: CssPixels,
+    padding_top: CssPixels,
+    padding_bottom: CssPixels,
+    inset_left: CssPixels,
+    inset_right: CssPixels,
+    inset_top: CssPixels,
+    inset_bottom: CssPixels,
+    has_definite_inline_size: bool,
+    has_definite_block_size: bool,
+    has_definite_block_size_only_for_button_content_alignment: bool,
+    uses_collapsing_borders_model: bool,
+    is_collapsed_borders_table_box: bool,
+    has_line_clamp_point: bool,
+    is_invisible_for_line_clamp: bool,
+    clamped_content_is_scrollable_overflow: bool,
+    table_column_index: u32,
+    table_column_span: u32,
+    hidden_by_collapsed_columns: bool,
+    inline_size_constraint: SizeConstraint,
+    block_size_constraint: SizeConstraint,
+    has_content_offset: bool,
+    content_offset: FfiCssPixelPoint,
+    has_first_baseline: bool,
+    first_baseline: CssPixels,
+    has_last_baseline: bool,
+    last_baseline: CssPixels,
+}
+
+impl UsedValuesCellState {
+    pub(crate) fn materialize_record(&self) -> UsedValues {
+        let record = UsedValues::default();
+        self.apply_to_record(&record);
+        if self.has_content_offset {
+            record.seal_committed_box_metrics();
+        }
+        record
+    }
+}
+
+impl UsedValues {
+    pub(crate) fn mirror_box_metrics_and_size_constraints_into(&self, scratch: &UsedValues) {
+        scratch.margin_left.set(self.margin_left.get());
+        scratch.margin_right.set(self.margin_right.get());
+        scratch.margin_top.set(self.margin_top.get());
+        scratch.margin_bottom.set(self.margin_bottom.get());
+        scratch.border_left.set(self.border_left.get());
+        scratch.border_right.set(self.border_right.get());
+        scratch.border_top.set(self.border_top.get());
+        scratch.border_bottom.set(self.border_bottom.get());
+        scratch.padding_left.set(self.padding_left.get());
+        scratch.padding_right.set(self.padding_right.get());
+        scratch.padding_top.set(self.padding_top.get());
+        scratch.padding_bottom.set(self.padding_bottom.get());
+        scratch.content_inline_size.set(self.content_inline_size.get());
+        scratch.content_block_size.set(self.content_block_size.get());
+        scratch.inline_size_constraint.set(self.inline_size_constraint.get());
+        scratch.block_size_constraint.set(self.block_size_constraint.get());
+    }
+
+    pub(crate) fn has_definite_inline_size(&self) -> bool {
+        self.has_definite_inline_size.get() && self.inline_size_constraint.get() == SizeConstraint::None
+    }
+
+    pub(crate) fn has_definite_block_size(&self) -> bool {
+        self.has_definite_block_size.get() && self.block_size_constraint.get() == SizeConstraint::None
+    }
+
+    pub(crate) fn set_content_inline_size(&self, value: CssPixels) {
+        assert!(!self.has_content_offset.get());
+        // Negative inline sizes are not allowed in CSS. We have a bug somewhere! Clamp to 0 to avoid doing too much damage.
+        self.content_inline_size
+            .set(clamp_to_max_dimension_value(value.max(CssPixels::default())));
+        self.has_definite_inline_size.set(true);
+    }
+
+    pub(crate) fn set_content_block_size(&self, value: CssPixels) {
+        assert!(!self.has_content_offset.get());
+        // Negative block sizes are not allowed in CSS. We have a bug somewhere! Clamp to 0 to avoid doing too much damage.
+        self.content_block_size
+            .set(clamp_to_max_dimension_value(value.max(CssPixels::default())));
+    }
+
+    pub(crate) fn set_box_metrics_from_fragment(&self, fragment: &fragment_tree::Fragment) {
+        self.set_content_inline_size(fragment.content_inline_size);
+        self.set_content_block_size(fragment.content_block_size);
+        self.margin_left.set(fragment.margin_left);
+        self.margin_right.set(fragment.margin_right);
+        self.margin_top.set(fragment.margin_top);
+        self.margin_bottom.set(fragment.margin_bottom);
+        self.border_left.set(fragment.border_left);
+        self.border_right.set(fragment.border_right);
+        self.border_top.set(fragment.border_top);
+        self.border_bottom.set(fragment.border_bottom);
+        self.padding_left.set(fragment.padding_left);
+        self.padding_right.set(fragment.padding_right);
+        self.padding_top.set(fragment.padding_top);
+        self.padding_bottom.set(fragment.padding_bottom);
+    }
+
+    fn collapsed_border_share(&self, width: CssPixels, start_edge: bool) -> CssPixels {
+        collapsed_border_share(width, start_edge, self.is_collapsed_borders_table_box.get())
+    }
+
+    pub(crate) fn border_left_collapsed(&self, collapsed: bool) -> CssPixels {
+        if collapsed {
+            self.collapsed_border_share(self.border_left.get(), true)
+        } else {
+            self.border_left.get()
+        }
+    }
+
+    pub(crate) fn border_right_collapsed(&self, collapsed: bool) -> CssPixels {
+        if collapsed {
+            self.collapsed_border_share(self.border_right.get(), false)
+        } else {
+            self.border_right.get()
+        }
+    }
+
+    pub(crate) fn border_top_collapsed(&self, collapsed: bool) -> CssPixels {
+        if collapsed {
+            self.collapsed_border_share(self.border_top.get(), true)
+        } else {
+            self.border_top.get()
+        }
+    }
+
+    pub(crate) fn border_bottom_collapsed(&self, collapsed: bool) -> CssPixels {
+        if collapsed {
+            self.collapsed_border_share(self.border_bottom.get(), false)
+        } else {
+            self.border_bottom.get()
+        }
+    }
+
+    pub(crate) fn border_box_left(&self, collapsed: bool) -> CssPixels {
+        self.border_left_collapsed(collapsed) + self.padding_left.get()
+    }
+
+    pub(crate) fn border_box_right(&self, collapsed: bool) -> CssPixels {
+        self.border_right_collapsed(collapsed) + self.padding_right.get()
+    }
+
+    pub(crate) fn border_box_top(&self, collapsed: bool) -> CssPixels {
+        self.border_top_collapsed(collapsed) + self.padding_top.get()
+    }
+
+    pub(crate) fn border_box_bottom(&self, collapsed: bool) -> CssPixels {
+        self.border_bottom_collapsed(collapsed) + self.padding_bottom.get()
+    }
+
+    pub(crate) fn horizontal_margin_border_padding(&self) -> CssPixels {
+        self.margin_left.get()
+            + self.border_left.get()
+            + self.padding_left.get()
+            + self.padding_right.get()
+            + self.border_right.get()
+            + self.margin_right.get()
+    }
+
+    pub(crate) fn border_box_inline_size(&self, collapsed: bool) -> CssPixels {
+        self.border_box_left(collapsed) + self.content_inline_size.get() + self.border_box_right(collapsed)
+    }
+
+    pub(crate) fn border_box_block_size(&self, collapsed: bool) -> CssPixels {
+        self.border_box_top(collapsed) + self.content_block_size.get() + self.border_box_bottom(collapsed)
+    }
+
+    pub(crate) fn margin_box_bottom(&self, collapsed: bool) -> CssPixels {
+        self.margin_bottom.get() + self.border_box_bottom(collapsed)
+    }
+
+    pub(crate) fn margin_box_top(&self, collapsed: bool) -> CssPixels {
+        self.margin_top.get() + self.border_box_top(collapsed)
+    }
+
+    pub(crate) fn margin_box_inline_size(&self, collapsed: bool) -> CssPixels {
+        self.margin_left.get()
+            + self.border_box_left(collapsed)
+            + self.content_inline_size.get()
+            + self.border_box_right(collapsed)
+            + self.margin_right.get()
+    }
+
+    pub(crate) fn margin_box_block_size(&self, collapsed: bool) -> CssPixels {
+        self.margin_top.get()
+            + self.border_box_top(collapsed)
+            + self.content_block_size.get()
+            + self.margin_box_bottom(collapsed)
+    }
+
+    pub(crate) fn available_inner_space_or_constraints_from(&self, outer: AvailableSpace) -> AvailableSpace {
+        use AvailableSize;
+
+        let mut inline_size = match self.inline_size_constraint.get() {
+            SizeConstraint::MinContent => AvailableSize::MinContent,
+            SizeConstraint::MaxContent => AvailableSize::MaxContent,
+            SizeConstraint::None if self.has_definite_inline_size.get() => {
+                AvailableSize::definite(self.content_inline_size.get())
+            }
+            SizeConstraint::None => AvailableSize::Indefinite,
+        };
+        let mut block_size = match self.block_size_constraint.get() {
+            SizeConstraint::MinContent => AvailableSize::MinContent,
+            SizeConstraint::MaxContent => AvailableSize::MaxContent,
+            SizeConstraint::None if self.has_definite_block_size.get() => {
+                AvailableSize::definite(self.content_block_size.get())
+            }
+            SizeConstraint::None => AvailableSize::Indefinite,
+        };
+        if inline_size == AvailableSize::Indefinite
+            && matches!(outer.inline_size, AvailableSize::MinContent | AvailableSize::MaxContent)
+        {
+            inline_size = outer.inline_size;
+        }
+        if block_size == AvailableSize::Indefinite
+            && matches!(outer.block_size, AvailableSize::MinContent | AvailableSize::MaxContent)
+        {
+            block_size = outer.block_size;
+        }
+        AvailableSpace {
+            inline_size,
+            block_size,
+        }
+    }
+}
+
+/// The part of a collapsed border that lies after its grid line (below or right of it), the rest lying before it.
+/// A collapsed border "is centered on the grid line" (CSS 2.2 §17.6.2), but layout keeps box edges on whole CSS
+/// pixels, so the border is split on whole pixels, an odd width giving its extra pixel to the part before the line.
+/// Every box on a grid line splits the border the same way, so the shares of the boxes on both sides of the line add
+/// up to the border width: a 1px border takes 1px of layout space, not a rounded-up half on each side.
+/// https://www.w3.org/TR/CSS22/tables.html#collapsing-borders
+pub(crate) fn collapsed_border_part_after_line(width: CssPixels) -> CssPixels {
+    if width <= CssPixels::default() {
+        return CssPixels::default();
+    }
+    (width / 2usize).floor()
+}
+
+/// The part of a collapsed border that lies before its grid line, see collapsed_border_part_after_line().
+pub(crate) fn collapsed_border_part_before_line(width: CssPixels) -> CssPixels {
+    if width <= CssPixels::default() {
+        return CssPixels::default();
+    }
+    width - collapsed_border_part_after_line(width)
+}
+
+/// The part of a collapsed border of the given width that lies inside a box on the border's grid line; `start_edge`
+/// says whether the line is at the box's top or left edge rather than its bottom or right one. A cell lies inside its
+/// grid lines, so it owns the part after the line at its start edges and the part before the line at its end edges;
+/// the table box lies around the grid and owns the opposite parts of its outer borders.
+pub(crate) fn collapsed_border_share(width: CssPixels, start_edge: bool, is_table_box: bool) -> CssPixels {
+    if start_edge != is_table_box {
+        collapsed_border_part_after_line(width)
+    } else {
+        collapsed_border_part_before_line(width)
+    }
+}
+
+pub(crate) fn create_used_values(
+    callbacks: &LayoutPass<'_>,
+    node: Node,
+    constraints: ContainingBlockConstraints,
+) -> UsedValues {
+    assert!(!node.is_invalid());
+    let facts = NodeFacts::new(callbacks, node);
+
+    let style = StyleValues::for_node(callbacks, node);
+    let percentage_basis_inline_size = constraints.percentage_basis_inline_size;
+    let percentage_basis_block_size = constraints.percentage_basis_block_size;
+
+    // NOTE: In the code below, we decide if `node` has definite inline
+    // and/or block size. This attempts to cover all the *general* cases
+    // where CSS considers sizes to be definite. If `node` has definite
+    // values for min/max-width or min/max-height and a definite preferred
+    // size in the same axis, we clamp the preferred size here as well.
+    //
+    // There are additional cases where CSS considers values to be
+    // definite. We model all of those by considering sizes definite once
+    // they are assigned through set_content_inline_size() or
+    // set_content_block_size().
+    let used = UsedValues::default();
+
+    #[derive(Clone, Copy)]
+    enum Axis {
+        Inline,
+        Block,
+    }
+
+    let containing_block_size_for_axis = |axis: Axis| match axis {
+        Axis::Inline => percentage_basis_inline_size.unwrap_or_default(),
+        Axis::Block => percentage_basis_block_size.unwrap_or_default(),
+    };
+    let containing_block_has_definite_size = |axis: Axis| match axis {
+        Axis::Inline => percentage_basis_inline_size.is_some(),
+        Axis::Block => percentage_basis_block_size.is_some(),
+    };
+
+    let adjust_for_box_sizing = |unadjusted: crate::layout::CssPixels, computed_size: &ComputedSize, axis: Axis| {
+        // box-sizing: content-box and automatic sizes need no
+        // adjustment.
+        if style.box_sizing() == box_sizing::CONTENT_BOX || computed_size.is_auto() {
+            return unadjusted;
+        }
+
+        // box-sizing: border-box subtracts the relevant border and
+        // padding. Block-axis padding percentages also resolve against
+        // the containing block's inline size.
+        let inline_basis = percentage_basis_inline_size.unwrap_or_default();
+        let border_and_padding = match axis {
+            Axis::Inline => {
+                style.border_left_width()
+                    + style.padding_left().to_px(inline_basis)
+                    + style.border_right_width()
+                    + style.padding_right().to_px(inline_basis)
+            }
+            Axis::Block => {
+                style.border_top_width()
+                    + style.padding_top().to_px(inline_basis)
+                    + style.border_bottom_width()
+                    + style.padding_bottom().to_px(inline_basis)
+            }
+        };
+        unadjusted - border_and_padding
+    };
+
+    let is_definite_size = |size: &ComputedSize, axis: Axis| -> Option<crate::layout::CssPixels> {
+        // A definite size can be determined without performing
+        // layout: a length, an initial-containing-block size, or a
+        // percentage/formula resolved solely against definite sizes.
+        if size.is_auto() {
+            // The inline size of a non-flex-item block is definite when
+            // it is auto and its containing block has a definite inline
+            // size. This is the stretch-fit case from css-sizing-3.
+            // Replaced boxes remain content-based until layout.
+            if matches!(axis, Axis::Inline)
+                && !facts.is_replaced_box()
+                && !facts.is_floating()
+                && !facts.is_absolutely_positioned()
+                && facts.display().is_block_outside()
+                && facts.parent_is_unfloated_flow_container()
+                && containing_block_has_definite_size(Axis::Inline)
+            {
+                let available = containing_block_size_for_axis(Axis::Inline);
+                return Some(clamp_to_max_dimension_value(
+                    available - used.horizontal_margin_border_padding(),
+                ));
+            }
+            return None;
+        }
+
+        if !size.is_length_percentage() {
+            return None;
+        }
+        if size.contains_percentage() && !containing_block_has_definite_size(axis) {
+            return None;
+        }
+        let basis = if size.contains_percentage() {
+            containing_block_size_for_axis(axis)
+        } else {
+            crate::layout::CssPixels::default()
+        };
+        Some(clamp_to_max_dimension_value(adjust_for_box_sizing(
+            size.to_px(basis),
+            size,
+            axis,
+        )))
+    };
+
+    let min_inline_size = is_definite_size(style.min_width(), Axis::Inline);
+    let max_inline_size = is_definite_size(style.max_width(), Axis::Inline);
+    let min_block_size = is_definite_size(style.min_height(), Axis::Block);
+    let max_block_size = is_definite_size(style.max_height(), Axis::Block);
+    let mut content_inline_size = is_definite_size(style.width(), Axis::Inline);
+    let mut content_block_size = is_definite_size(style.height(), Axis::Block);
+
+    used.has_definite_inline_size.set(content_inline_size.is_some());
+    used.has_definite_block_size.set(content_block_size.is_some());
+    if let Some(size) = content_inline_size.as_mut() {
+        if let Some(minimum) = min_inline_size {
+            *size = clamp_to_max_dimension_value((*size).max(minimum));
+        }
+        if let Some(maximum) = max_inline_size {
+            *size = clamp_to_max_dimension_value((*size).min(maximum));
+        }
+    }
+    if let Some(size) = content_block_size.as_mut() {
+        if let Some(minimum) = min_block_size {
+            *size = clamp_to_max_dimension_value((*size).max(minimum));
+        }
+        if let Some(maximum) = max_block_size {
+            *size = clamp_to_max_dimension_value((*size).min(maximum));
+        }
+    }
+    used.content_inline_size.set(content_inline_size.unwrap_or_default());
+    used.content_block_size.set(content_block_size.unwrap_or_default());
+
+    used
+}
+
+pub(crate) fn used_values_from_committed_fragment_link(callbacks: &LayoutPass<'_>, node: Node) -> Option<UsedValues> {
+    let link = callbacks.committed_fragment_link(node)?;
+    let fragment = &link.fragment;
+
+    // Skip normal node initialization: resolving computed sizes requires
+    // percentage bases, and every resulting geometry field is replaced by
+    // the previously committed value immediately.
+    let used = UsedValues::default();
+    used.set_box_metrics_from_fragment(fragment);
+    used.has_definite_inline_size.set(true);
+    used.has_definite_block_size.set(true);
+    used.content_offset.set(link.committed_offset);
+    used.placed_in.set(link.containing_block);
+    used.table_column_index.set(fragment.table_column_index);
+    used.table_column_span.set(fragment.table_column_span);
+    used.hidden_by_collapsed_columns
+        .set(fragment.hidden_by_collapsed_columns);
+    used.inset_left.set(link.inset_left);
+    used.inset_right.set(link.inset_right);
+    used.inset_top.set(link.inset_top);
+    used.inset_bottom.set(link.inset_bottom);
+    // Materialization is this box's placement: the previously committed
+    // geometry is final from the moment it is adopted.
+    used.has_content_offset.set(true);
+    used.seal_committed_box_metrics();
+
+    Some(used)
+}

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+promiseTest(async () => {
+    const image = new Image();
+    image.src = "../../../Assets/120.png?image-decode-source-change";
+
+    const promise = image.decode();
+    image.src = "../../../Assets/120.png?image-decode-source-changed";
+
+    try {
+        await promise;
+        println("FAIL: decode resolved after source changed");
+    } catch (error) {
+        println(error.name === "EncodingError" ? "PASS" : `FAIL: ${error.name}`);
+    }
+});
+</script>

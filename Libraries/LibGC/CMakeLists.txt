@@ -1,30 +1,42 @@
 set(SOURCES
     BlockAllocator.cpp
+    CAPI.cpp
     Cell.cpp
     CellAllocator.cpp
+    ConservativeHashMap.cpp
+    ConservativeHashTable.cpp
+    ConservativeRangeProvider.cpp
     ConservativeVector.cpp
-    ForeignCell.cpp
+    CrossHeapMember.cpp
+    ExternalEntityTable.cpp
     Root.cpp
     RootHashMap.cpp
+    RootHashTable.cpp
     RootVector.cpp
     Heap.cpp
+    HeapGroup.cpp
     HeapBlock.cpp
+    PrimitiveStorage.cpp
+    Timer.cpp
     WeakBlock.cpp
     WeakContainer.cpp
 )
 
 ladybird_lib(LibGC gc EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibGC PRIVATE LibCore)
+target_link_libraries(LibGC PUBLIC LibThreading)
 
-if (ENABLE_SWIFT)
-    generate_clang_module_map(LibGC)
-    target_sources(LibGC PRIVATE
-        Heap+Swift.swift
-    )
-    target_link_libraries(LibGC PRIVATE AK)
-    add_swift_target_properties(LibGC LAGOM_LIBRARIES AK)
+# The first word of a GC::ForeignCell belongs to its foreign implementation rather than holding a vtable pointer, so
+# UBSan's vptr checks misfire whenever LibGC handles such a cell as a GC::Cell.
+if (ENABLE_UNDEFINED_SANITIZER)
+    target_compile_options(LibGC PRIVATE -fno-sanitize=vptr)
 endif()
 
-# TODO: Use lagom_generate_export_header and annotate entire LibGC with export macros
+if(cpptrace_FOUND AND LADYBIRD_ENABLE_CPPTRACE)
+    target_link_libraries(LibGC PRIVATE cpptrace::cpptrace)
+    target_compile_definitions(LibGC PRIVATE LIBGC_HAS_CPPTRACE=1)
+endif()
+
+# TODO: Use ladybird_generate_export_header and annotate entire LibGC with export macros
 include(GenerateExportHeader)
 generate_export_header(LibGC EXPORT_MACRO_NAME GC_API EXPORT_FILE_NAME "Export.h")

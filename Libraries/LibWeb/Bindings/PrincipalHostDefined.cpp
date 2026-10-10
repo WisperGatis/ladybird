@@ -8,14 +8,32 @@
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Page/Page.h>
 
 namespace Web::Bindings {
 
-void PrincipalHostDefined::visit_edges(JS::Cell::Visitor& visitor)
+GC_DEFINE_ALLOCATOR(PrincipalHostDefined);
+
+PrincipalHostDefined::PrincipalHostDefined(GC::Ref<HTML::EnvironmentSettingsObject> environment_settings_object, GC::Ref<Intrinsics> intrinsics, GC::Ref<WrapperWorld> wrapper_world, GC::Ref<Page> page)
+    : HostDefined(intrinsics, wrapper_world, environment_settings_object->realm(), PrincipalRealmUnderConstruction::Yes)
+    , environment_settings_object(environment_settings_object)
+    , page(page)
 {
-    HostDefined::visit_edges(visitor);
+}
+
+GC::Ref<HostDefined> create_principal_host_defined(GC::Ref<HTML::EnvironmentSettingsObject> environment_settings_object, GC::Ref<Intrinsics> intrinsics, GC::Ref<Page> page)
+{
+    auto* agent = static_cast<HTML::Agent*>(environment_settings_object->realm().vm().agent());
+    VERIFY(agent);
+    return environment_settings_object->heap().allocate<PrincipalHostDefined>(environment_settings_object, intrinsics, agent->main_world(), page);
+}
+
+void PrincipalHostDefined::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
     visitor.visit(environment_settings_object);
     visitor.visit(page);
 }

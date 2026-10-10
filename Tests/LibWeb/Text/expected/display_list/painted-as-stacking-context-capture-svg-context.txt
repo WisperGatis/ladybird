@@ -1,0 +1,2 @@
+PASS: quiet SVG with external paint server (work)
+PASS: edit external gradient (work)

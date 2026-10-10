@@ -6,61 +6,40 @@
 
 #pragma once
 
+#include <AK/Utf16FlyString.h>
+#include <LibGC/Cell.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/Environment.h>
-#include <LibJS/Runtime/EnvironmentCoordinate.h>
 #include <LibJS/Runtime/PropertyKey.h>
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
-Reference make_private_reference(VM&, Value base_value, Utf16FlyString const& private_identifier);
-
+// 6.2.5 The Reference Record Specification Type, https://tc39.es/ecma262/#sec-reference-record-specification-type
+// The Reference Records that VM::resolve_binding() resolves an identifier to: unresolvable, or with an Environment
+// Record as their base.
 class JS_API Reference {
 public:
     enum class BaseType : u8 {
         Unresolvable,
-        Value,
         Environment,
     };
 
-    Reference(BaseType type, PropertyKey name, bool strict)
-        : m_base_type(type)
-        , m_name(move(name))
+    Reference(BaseType type, PropertyKey name, Strict strict)
+        : m_name(move(name))
+        , m_base_type(type)
         , m_strict(strict)
     {
+        VERIFY(type == BaseType::Unresolvable);
     }
 
-    Reference(Value base, PropertyKey name, Optional<Value> this_value, bool strict = false)
-        : m_base_type(BaseType::Value)
-        , m_base_value(base)
-        , m_name(move(name))
-        , m_this_value(this_value)
-        , m_strict(strict)
-    {
-    }
-
-    Reference(Environment& base, Utf16FlyString referenced_name, bool strict = false, Optional<EnvironmentCoordinate> environment_coordinate = {})
-        : m_base_type(BaseType::Environment)
+    Reference(Environment& base, Utf16FlyString referenced_name, Strict strict)
+        : m_name(move(referenced_name))
         , m_base_environment(&base)
-        , m_name(move(referenced_name))
+        , m_base_type(BaseType::Environment)
         , m_strict(strict)
-        , m_environment_coordinate(move(environment_coordinate))
     {
-    }
-
-    Reference(Value base, PrivateName name)
-        : m_base_type(BaseType::Value)
-        , m_base_value(base)
-        , m_name(move(name))
-        , m_strict(true)
-    {
-    }
-
-    Value base() const
-    {
-        VERIFY(m_base_type == BaseType::Value);
-        return m_base_value;
     }
 
     Environment& base_environment() const
@@ -69,43 +48,14 @@ public:
         return *m_base_environment;
     }
 
-    PropertyKey const& name() const { return m_name.get<PropertyKey>(); }
-    PrivateName const& private_name() const { return m_name.get<PrivateName>(); }
-    bool is_strict() const { return m_strict; }
+    PropertyKey const& name() const { return m_name; }
+    bool is_strict() const { return m_strict == Strict::Yes; }
 
     // 6.2.4.2 IsUnresolvableReference ( V ), https://tc39.es/ecma262/#sec-isunresolvablereference
     bool is_unresolvable() const { return m_base_type == BaseType::Unresolvable; }
 
     // 6.2.4.1 IsPropertyReference ( V ), https://tc39.es/ecma262/#sec-ispropertyreference
-    bool is_property_reference() const
-    {
-        if (is_unresolvable())
-            return false;
-        if (m_base_type == BaseType::Environment)
-            return false;
-        return true;
-    }
-
-    // 6.2.4.7 GetThisValue ( V ), https://tc39.es/ecma262/#sec-getthisvalue
-    Value get_this_value() const
-    {
-        VERIFY(is_property_reference());
-        if (is_super_reference())
-            return m_this_value.value();
-        return m_base_value;
-    }
-
-    // 6.2.4.3 IsSuperReference ( V ), https://tc39.es/ecma262/#sec-issuperreference
-    bool is_super_reference() const
-    {
-        return m_this_value.has_value();
-    }
-
-    // 6.2.4.4 IsPrivateReference ( V ), https://tc39.es/ecma262/#sec-isprivatereference
-    bool is_private_reference() const
-    {
-        return m_name.has<PrivateName>();
-    }
+    bool is_property_reference() const { return false; }
 
     // Note: Non-standard helper.
     bool is_environment_reference() const
@@ -113,29 +63,23 @@ public:
         return m_base_type == BaseType::Environment;
     }
 
-    ThrowCompletionOr<void> initialize_referenced_binding(VM&, Value value, Environment::InitializeBindingHint hint = Environment::InitializeBindingHint::Normal) const;
-
     ThrowCompletionOr<void> put_value(VM&, Value);
     ThrowCompletionOr<Value> get_value(VM&) const;
     ThrowCompletionOr<bool> delete_(VM&);
 
-    bool is_valid_reference() const { return true; }
-
-    Optional<EnvironmentCoordinate> environment_coordinate() const { return m_environment_coordinate; }
+    void visit_edges(GC::Cell::Visitor& visitor)
+    {
+        visitor.visit(m_base_environment);
+        m_name.visit_edges(visitor);
+    }
 
 private:
     Completion throw_reference_error(VM&) const;
 
+    PropertyKey m_name;
+    GC::Ptr<Environment> m_base_environment;
     BaseType m_base_type { BaseType::Unresolvable };
-    union {
-        Value m_base_value {};
-        mutable Environment* m_base_environment;
-    };
-    Variant<PropertyKey, PrivateName> m_name;
-    Optional<Value> m_this_value;
-    bool m_strict { false };
-
-    Optional<EnvironmentCoordinate> m_environment_coordinate;
+    Strict m_strict { Strict::No };
 };
 
 }

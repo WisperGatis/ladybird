@@ -6,44 +6,46 @@
  */
 
 #include <AK/TypeCasts.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Gamepad/EventNames.h>
 #include <LibWeb/Gamepad/Gamepad.h>
 #include <LibWeb/Gamepad/GamepadEvent.h>
+#include <LibWeb/Gamepad/GamepadRegistry.h>
 #include <LibWeb/Gamepad/NavigatorGamepad.h>
 #include <LibWeb/HTML/Navigator.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-
-#include <SDL3/SDL_gamepad.h>
+#include <LibWeb/Page/Page.h>
 
 namespace Web::Gamepad {
 
 // https://w3c.github.io/gamepad/#dom-navigator-getgamepads
 WebIDL::ExceptionOr<GC::RootVector<GC::Ptr<Gamepad>>> NavigatorGamepadPartial::get_gamepads()
 {
-    auto& navigator = as<HTML::Navigator>(*this);
-    auto& realm = navigator.realm();
-    auto& heap = realm.heap();
-
     // 1. Let doc be the current global object's associated Document.
-    auto& window = as<HTML::Window>(HTML::current_principal_global_object());
+    auto& window = HTML::current_window();
     auto& document = window.associated_document();
 
     // 2. If doc is null or doc is not fully active, then return an empty list.
-    GC::RootVector<GC::Ptr<Gamepad>> gamepads { heap };
+    GC::RootVector<GC::Ptr<Gamepad>> gamepads;
     if (!document.is_fully_active())
         return gamepads;
 
     // 3. If doc is not allowed to use the "gamepad" permission, then throw a "SecurityError" DOMException and abort these steps.
     if (!document.is_allowed_to_use_feature(DOM::PolicyControlledFeature::Gamepad))
-        return WebIDL::SecurityError::create(realm, "Not allowed to use gamepads"_utf16);
+        return WebIDL::SecurityError::create("Not allowed to use gamepads"_utf16);
+
+    // AD-HOC: Tell the UI process that this process consumes gamepad input.
+    window.page().client().page_did_start_using_gamepads();
 
     // 4. If this.[[hasGamepadGesture]] is false, then return an empty list.
     if (!m_has_gamepad_gesture)
         return gamepads;
 
     // 5. Let now be the current high resolution time given the current global object.
-    auto now = HighResolutionTime::current_high_resolution_time(window);
+    auto now = HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window));
 
     // 6. Let gamepads be an empty list.
     // NOTE: Already done.
@@ -91,35 +93,35 @@ size_t NavigatorGamepadPartial::select_an_unused_gamepad_index(Badge<Gamepad>)
 }
 
 // https://w3c.github.io/gamepad/#event-gamepadconnected
-void NavigatorGamepadPartial::handle_gamepad_connected(SDL_JoystickID sdl_joystick_id)
+void NavigatorGamepadPartial::handle_gamepad_connected(GamepadDescription const& description)
 {
     // When a gamepad becomes available on the system, run the following steps:
-    if (m_available_gamepads.contains_slow(sdl_joystick_id))
+    if (m_available_gamepads.contains_slow(description.handle))
         return;
-
-    m_available_gamepads.append(sdl_joystick_id);
 
     // 1. Let document be the current global object's associated Document; otherwise null.
     // FIXME: We can't use the current global object here, since it's not executing in a scripting context.
     // NOTE: NavigatorGamepad is only available on Window.
     // NOTE: document is never null.
     auto& navigator = as<HTML::Navigator>(*this);
-    auto& realm = navigator.realm();
-    auto& window = as<HTML::Window>(HTML::relevant_global_object(navigator));
+    auto& window = navigator.window();
+    auto& realm = window.principal_realm();
+    auto& global = realm.global_object();
     auto& document = window.associated_document();
 
     // 2. If document is not null and is not allowed to use the "gamepad" permission, then abort these steps.
     if (!document.is_allowed_to_use_feature(DOM::PolicyControlledFeature::Gamepad))
         return;
 
+    m_available_gamepads.append(description.handle);
+
     // 3. Queue a global task on the gamepad task source with the current global object to perform the following steps:
-    HTML::queue_global_task(HTML::Task::Source::Gamepad, window, GC::create_function(realm.heap(), [&realm, &document, sdl_joystick_id] mutable {
+    HTML::queue_global_task(HTML::Task::Source::Gamepad, global, GC::create_function(GC::Heap::the(), [&window, &document, description = description] mutable {
         // 1. Let gamepad be a new Gamepad representing the gamepad.
-        auto gamepad = Gamepad::create(realm, sdl_joystick_id);
+        auto gamepad = Gamepad::create(window, description);
 
         // 2. Let navigator be gamepad's relevant global object's Navigator object.
-        auto& gamepad_window = as<HTML::Window>(HTML::relevant_global_object(gamepad));
-        auto navigator = gamepad_window.navigator();
+        auto navigator = window.navigator();
 
         // 3. Set navigator.[[gamepads]][gamepad.index] to gamepad.
         navigator->m_gamepads[gamepad->index()] = gamepad;
@@ -132,60 +134,67 @@ void NavigatorGamepadPartial::handle_gamepad_connected(SDL_JoystickID sdl_joysti
             // 2. If document is not null and is fully active, then fire an event named gamepadconnected at gamepad's
             //    relevant global object using GamepadEvent with its gamepad attribute initialized to gamepad.
             if (document.is_fully_active()) {
-                auto gamepad_connected_event_init = GamepadEventInit {
-                    {
-                        .bubbles = false,
-                        .cancelable = false,
-                        .composed = false,
-                    },
-                    gamepad,
-                };
-                auto gamepad_connected_event = MUST(GamepadEvent::construct_impl(realm, EventNames::gamepadconnected, gamepad_connected_event_init));
-                gamepad_window.dispatch_event(gamepad_connected_event);
+                GamepadEventInit gamepad_connected_event_init { {}, gamepad };
+                auto gamepad_connected_event = GamepadEvent::create(EventNames::gamepadconnected, gamepad_connected_event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window)));
+                window.dispatch_event(gamepad_connected_event);
             }
         }
     }));
 }
 
 // https://w3c.github.io/gamepad/#dfn-receives-new-button-or-axis-input-values
-void NavigatorGamepadPartial::handle_gamepad_updated(Badge<EventHandler>, SDL_JoystickID sdl_joystick_id)
+void NavigatorGamepadPartial::handle_gamepad_updated(Badge<EventHandler>, GamepadState const& state)
 {
     // When the system receives new button or axis input values, run the following steps:
-    // 1. Let gamepad be the Gamepad object representing the device that received new button or axis input values.
-    auto gamepad = m_gamepads.find_if([&sdl_joystick_id](GC::Ptr<Gamepad> gamepad) {
-        return gamepad && gamepad->sdl_joystick_id() == sdl_joystick_id;
-    });
-
-    if (gamepad.is_end())
+    if (!m_available_gamepads.contains_slow(state.handle))
         return;
 
     // 2. Queue a global task on the gamepad task source with gamepad's relevant global object to update gamepad state
     //    for gamepad.
-    auto& global = HTML::relevant_global_object(**gamepad);
-    HTML::queue_global_task(HTML::Task::Source::Gamepad, global, GC::create_function(global.heap(), [gamepad = GC::Ref { **gamepad }] {
-        gamepad->update_gamepad_state({});
+    // AD-HOC: Step 1 runs in the task. A newly available gamepad is created by an earlier task on the same task
+    //         source, so input received before that task has run still reaches the gamepad.
+    auto& window = as<HTML::Navigator>(*this).window();
+    HTML::queue_global_task(HTML::Task::Source::Gamepad, window.principal_realm().global_object(), GC::create_function(GC::Heap::the(), [&window, state] {
+        // 1. Let gamepad be the Gamepad object representing the device that received new button or axis input values.
+        auto navigator = window.navigator();
+        auto gamepad = navigator->m_gamepads.find_if([&state](GC::Ptr<Gamepad> gamepad) {
+            return gamepad && gamepad->handle() == state.handle;
+        });
+
+        if (gamepad.is_end())
+            return;
+
+        (*gamepad)->set_latest_state({}, state);
+        (*gamepad)->update_gamepad_state({});
     }));
 }
 
-void NavigatorGamepadPartial::handle_gamepad_disconnected(Badge<EventHandler>, SDL_JoystickID sdl_joystick_id)
+void NavigatorGamepadPartial::handle_gamepad_disconnected(Badge<EventHandler>, GamepadHandle handle)
 {
     // When a gamepad becomes unavailable on the system, run the following steps:
-    m_available_gamepads.remove_first_matching([&sdl_joystick_id](SDL_JoystickID available_gamepad) {
-        return sdl_joystick_id == available_gamepad;
+    auto was_available = m_available_gamepads.remove_first_matching([&handle](GamepadHandle available_gamepad) {
+        return handle == available_gamepad;
     });
 
-    // 1. Let gamepad be the Gamepad representing the unavailable device.
-    auto gamepad = m_gamepads.find_if([&sdl_joystick_id](GC::Ptr<Gamepad> gamepad) {
-        return gamepad && gamepad->sdl_joystick_id() == sdl_joystick_id;
-    });
-
-    if (gamepad.is_end())
+    if (!was_available)
         return;
 
     // 2. Queue a global task on the gamepad task source with gamepad's relevant global object to perform the
     //    following steps:
-    auto& window = as<HTML::Window>(HTML::relevant_global_object(**gamepad));
-    HTML::queue_global_task(HTML::Task::Source::Gamepad, window, GC::create_function(window.heap(), [gamepad = GC::Ref { **gamepad }, &window] {
+    // AD-HOC: Step 1 runs in the task. A newly available gamepad is created by an earlier task on the same task
+    //         source, so a gamepad that becomes unavailable before that task has run is still removed.
+    auto& window = as<HTML::Navigator>(*this).window();
+    HTML::queue_global_task(HTML::Task::Source::Gamepad, window.principal_realm().global_object(), GC::create_function(GC::Heap::the(), [&window, handle] {
+        // 1. Let gamepad be the Gamepad representing the unavailable device.
+        auto matching_gamepad = window.navigator()->m_gamepads.first_matching([&handle](GC::Ptr<Gamepad> gamepad) {
+            return gamepad && gamepad->handle() == handle;
+        });
+
+        if (!matching_gamepad.has_value())
+            return;
+
+        auto gamepad = GC::Ref { **matching_gamepad };
+
         // 1. Set gamepad.[[connected]] to false.
         gamepad->set_connected({}, false);
 
@@ -196,15 +205,8 @@ void NavigatorGamepadPartial::handle_gamepad_disconnected(Badge<EventHandler>, S
         //    gamepaddisconnected at gamepad's relevant global object using GamepadEvent with its gamepad attribute
         //    initialized to gamepad.
         if (gamepad->exposed() && document.is_fully_active()) {
-            auto gamepad_disconnected_event_init = GamepadEventInit {
-                {
-                    .bubbles = false,
-                    .cancelable = false,
-                    .composed = false,
-                },
-                gamepad,
-            };
-            auto gamepad_disconnected_event = MUST(GamepadEvent::construct_impl(window.realm(), EventNames::gamepaddisconnected, gamepad_disconnected_event_init));
+            GamepadEventInit gamepad_disconnected_event_init { {}, gamepad };
+            auto gamepad_disconnected_event = GamepadEvent::create(EventNames::gamepaddisconnected, gamepad_disconnected_event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window)));
             window.dispatch_event(gamepad_disconnected_event);
         }
 
@@ -224,18 +226,9 @@ void NavigatorGamepadPartial::handle_gamepad_disconnected(Badge<EventHandler>, S
 
 void NavigatorGamepadPartial::check_for_connected_gamepads()
 {
-    // "(SDL_JoystickID *) Returns a 0 terminated array of joystick instance IDs or NULL on failure; call
-    // SDL_GetError() for more information. This should be freed with SDL_free() when it is no longer needed."
-    int gamepad_count = 0;
-    SDL_JoystickID* connected_gamepads = SDL_GetGamepads(&gamepad_count);
-    if (!connected_gamepads)
-        return;
-
-    for (int gamepad_index = 0; gamepad_index < gamepad_count; ++gamepad_index) {
-        handle_gamepad_connected(connected_gamepads[gamepad_index]);
-    }
-
-    SDL_free(connected_gamepads);
+    GamepadRegistry::the().for_each_connected_gamepad([this](GamepadDescription const& description) {
+        handle_gamepad_connected(description);
+    });
 }
 
 void NavigatorGamepadPartial::set_has_gamepad_gesture(Badge<Gamepad>, bool value)
@@ -245,9 +238,7 @@ void NavigatorGamepadPartial::set_has_gamepad_gesture(Badge<Gamepad>, bool value
 
 GC::RootVector<GC::Ptr<Gamepad>> NavigatorGamepadPartial::gamepads(Badge<Gamepad>) const
 {
-    auto& navigator = as<HTML::Navigator>(*this);
-    auto& realm = navigator.realm();
-    return { realm.heap(), m_gamepads };
+    return GC::RootVector<GC::Ptr<Gamepad>> { as<HTML::Navigator>(*this).m_gamepads };
 }
 
 }

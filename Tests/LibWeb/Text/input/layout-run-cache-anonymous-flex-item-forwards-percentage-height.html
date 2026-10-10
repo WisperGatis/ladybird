@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #flex { display: flex; align-items: flex-start; width: 300px; height: 100px; }
+    #inline-block { display: inline-block; width: 20px; height: 50%; }
+    #plain { width: 50px; }
+    #plain div { height: 30px; }
+</style>
+<div id="flex">
+    x<span id="inline-block"></span>
+    <div id="plain"><div></div></div>
+</div>
+<script>
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "anonymous flex item forwards the changed percentage basis",
+                mutate: () => {
+                    heightBefore = document.getElementById("inline-block").getBoundingClientRect().height;
+                    flex.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          Box<DIV>#flex/flex RUN (cache=miss)
+                            BlockContainer(anonymous)/block (measurement, intrinsic) RUN (cache=bypass)
+                            BlockContainer(anonymous)/block RUN (cache=miss)
+                            BlockContainer<SPAN>#inline-block/block RUN (cache=miss)
+                            BlockContainer<DIV>#plain/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "inline-block height before");
+                    equal(document.getElementById("inline-block").getBoundingClientRect().height, 100, "inline-block height after");
+                },
+            },
+        ],
+    });
+</script>

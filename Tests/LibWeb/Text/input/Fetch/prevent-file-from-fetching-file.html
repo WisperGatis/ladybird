@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        try {
+            await fetch(`file://${window.location.pathname}`);
+            println('FAIL: no exception was thrown');
+        } catch (e) {
+            println(e);
+        }
+    });
+</script>

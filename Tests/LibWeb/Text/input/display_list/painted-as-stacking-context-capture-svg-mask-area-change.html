@@ -1,0 +1,95 @@
+<!doctype html>
+<html id="html">
+<script src="../include.js"></script>
+<script src="recording-test.js"></script>
+<style>
+    body { margin: 0; }
+</style>
+<body id="body">
+<svg id="svg" width="200" height="200">
+    <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="0" height="200">
+        <rect id="mask-rect" width="200" height="200" fill="white"/>
+    </mask>
+    <g id="group" mask="url(#m)"><rect id="masked" width="100" height="100"/></g>
+</svg>
+<script>
+displayListTest({
+    setup: removeBodyWhitespace,
+    steps: [
+        {
+            name: "quiet empty mask",
+            check: equal => { equal(document.elementFromPoint(50, 50) === masked, false, "empty mask excludes hit"); },
+            expect: `
+                damage: rows=0 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport COPY
+            `
+        },
+        {
+            name: "expand mask area",
+            mutate: () => { m.setAttribute("width", "200"); },
+            check: equal => { equal(document.elementFromPoint(50, 50), masked, "expanded mask includes hit"); },
+            expect: `
+                damage: rows=8 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport ASSEMBLE
+                  @viewport/preamble COPY
+                  @viewport/background/hit-test COPY
+                  @viewport/scroll-metadata COPY
+                  @viewport/background COPY
+                  @viewport/border COPY
+                  BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
+                  @viewport/foreground/hit-test COPY
+                  @viewport/foreground COPY
+                  BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML>#html ASSEMBLE
+                    BlockContainer<HTML>#html/preamble COPY
+                    BlockContainer<HTML>#html/background/hit-test COPY
+                    BlockContainer<HTML>#html/scroll-metadata COPY
+                    BlockContainer<HTML>#html/background COPY
+                    BlockContainer<HTML>#html/border COPY
+                    BlockContainer<BODY>#body/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<BODY>#body/background/hit-test COPY
+                      BlockContainer<BODY>#body/scroll-metadata COPY
+                      BlockContainer<BODY>#body/background COPY
+                      BlockContainer<BODY>#body/border COPY
+                      SVGSVGBox<svg>#svg/descendants(background-and-borders) ASSEMBLE
+                    BlockContainer<BODY>#body/descendants(inline-background-and-borders) ASSEMBLE
+                      SVGSVGBox<svg>#svg/descendants(inline-background-and-borders) ASSEMBLE
+                    BlockContainer<HTML>#html/foreground/hit-test COPY
+                    BlockContainer<HTML>#html/foreground COPY
+                    BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/foreground/hit-test COPY
+                      SVGSVGBox<svg>#svg ASSEMBLE
+                        SVGSVGBox<svg>#svg/background/hit-test RECORD
+                        SVGSVGBox<svg>#svg/scroll-metadata RECORD (empty)
+                        SVGSVGBox<svg>#svg/background SKIP
+                        SVGSVGBox<svg>#svg/border SKIP
+                        SVGSVGBox<svg>#svg/svg RECORD
+                          SVGSVGBox<svg>#svg/foreground/hit-test RECORD (empty)
+                          SVGSVGBox<svg>#svg/foreground RECORD (empty)
+                          SVGGraphicsBox<g>#group/svg RECORD
+                            SVGGraphicsBox<g>#group/svg-mask RECORD
+                              SVGMaskBox<mask>#m/background RECORD (empty)
+                              SVGMaskBox<mask>#m/border RECORD (empty)
+                              SVGMaskBox<mask>#m/svg RECORD
+                                SVGMaskBox<mask>#m/foreground RECORD (empty)
+                                SVGGeometryBox<rect>#mask-rect/svg RECORD
+                                  SVGGeometryBox<rect>#mask-rect/foreground RECORD
+                            SVGGraphicsBox<g>#group/foreground/hit-test RECORD (empty)
+                            SVGGraphicsBox<g>#group/foreground RECORD (empty)
+                            SVGGeometryBox<rect>#masked/svg RECORD
+                              SVGGeometryBox<rect>#masked/foreground/hit-test RECORD
+                              SVGGeometryBox<rect>#masked/foreground RECORD
+                      BlockContainer<BODY>#body/foreground COPY
+                      SVGSVGBox<svg>#svg/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/outline COPY
+                      BlockContainer<BODY>#body/overlay/hit-test COPY
+                      BlockContainer<BODY>#body/overlay COPY
+                    BlockContainer<HTML>#html/outline COPY
+                  @viewport/outline COPY
+            `
+        }
+    ]
+});
+</script>

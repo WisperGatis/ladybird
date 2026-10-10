@@ -11,10 +11,12 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
+#include <LibWeb/HTML/Scripting/EnvironmentSettingsSnapshot.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/ReferrerPolicy/AbstractOperations.h>
-#include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWeb/SecureContexts/AbstractOperations.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::ReferrerPolicy {
 
@@ -22,17 +24,18 @@ namespace Web::ReferrerPolicy {
 ReferrerPolicy parse_a_referrer_policy_from_a_referrer_policy_header(Fetch::Infrastructure::Response const& response)
 {
     // 1. Let policy-tokens be the result of extracting header list values given `Referrer-Policy` and response’s header list.
-    auto policy_tokens_or_failure = Fetch::Infrastructure::extract_header_list_values("Referrer-Policy"sv.bytes(), response.header_list());
-    auto policy_tokens = policy_tokens_or_failure.has<Vector<ByteBuffer>>() ? policy_tokens_or_failure.get<Vector<ByteBuffer>>() : Vector<ByteBuffer> {};
+    auto policy_tokens_or_failure = response.header_list()->extract_header_list_values("Referrer-Policy"sv);
 
     // 2. Let policy be the empty string.
     auto policy = ReferrerPolicy::EmptyString;
 
     // 3. For each token in policy-tokens, if token is a referrer policy and token is not the empty string, then set policy to token.
-    for (auto token : policy_tokens) {
-        auto referrer_policy = from_string(token);
-        if (referrer_policy.has_value() && referrer_policy.value() != ReferrerPolicy::EmptyString)
-            policy = referrer_policy.release_value();
+    if (auto const* policy_tokens = policy_tokens_or_failure.get_pointer<Vector<ByteString>>()) {
+        for (auto const& token : *policy_tokens) {
+            auto referrer_policy = from_string(token);
+            if (referrer_policy.has_value() && referrer_policy.value() != ReferrerPolicy::EmptyString)
+                policy = referrer_policy.release_value();
+        }
     }
 
     // 4. Return policy.
@@ -67,13 +70,25 @@ Optional<URL::URL> determine_requests_referrer(Fetch::Infrastructure::Request co
             // Note: If request’s referrer is "no-referrer", Fetch will not call into this algorithm.
             VERIFY(referrer == Fetch::Infrastructure::Request::Referrer::Client);
 
+            // NB: A snapshot of an environment in another process — a navigation's fetch client, once the navigation
+            //     continues in the process hosting its target — has a global object from this process, so it answers
+            //     from the global object it was taken from.
+            if (auto const* snapshot = as_if<HTML::EnvironmentSettingsSnapshot>(*environment)) {
+                if (auto const* window = snapshot->serialized_global().get_pointer<HTML::SerializedWindow>()) {
+                    if (snapshot->origin().is_opaque())
+                        return {};
+                    return window->associated_document.url;
+                }
+                return environment->creation_url;
+            }
+
             // FIXME: Add a const global_object() getter to ESO
             auto& global_object = const_cast<HTML::EnvironmentSettingsObject&>(*environment).global_object();
 
             // 1. If environment’s global object is a Window object, then
-            if (is<HTML::Window>(global_object)) {
+            if (auto const* window = HTML::window_from_global_object(global_object)) {
                 // 1. Let document be the associated Document of environment’s global object.
-                auto const& document = static_cast<HTML::Window const&>(global_object).associated_document();
+                auto const& document = window->associated_document();
 
                 // 2. If document’s origin is an opaque origin, return no referrer.
                 if (document.origin().is_opaque())
@@ -108,8 +123,11 @@ Optional<URL::URL> determine_requests_referrer(Fetch::Infrastructure::Request co
 
     // 6. If the result of serializing referrerURL is a string whose length is greater than 4096, set referrerURL to
     //    referrerOrigin.
-    if (referrer_url.has_value() && referrer_url.value().serialize().bytes().size() > 4096)
-        referrer_url = referrer_origin;
+    if (referrer_url.has_value()) {
+        auto serialized_referrer_url = referrer_url.value().serialize();
+        if (serialized_referrer_url.bytes().size() > 4096)
+            referrer_url = referrer_origin;
+    }
 
     // 7. The user agent MAY alter referrerURL or referrerOrigin at this point to enforce arbitrary policy
     //    considerations in the interests of minimizing data leakage. For example, the user agent could strip the URL
@@ -222,7 +240,7 @@ Optional<URL::URL> strip_url_for_use_as_referrer(Optional<URL::URL> url, OriginO
     // 6. If the origin-only flag is true, then:
     if (origin_only == OriginOnly::Yes) {
         // 1. Set url’s path to « the empty string ».
-        url->set_paths({ ""sv });
+        url->set_path(Array { ""sv });
 
         // 2. Set url’s query to null.
         url->set_query({});

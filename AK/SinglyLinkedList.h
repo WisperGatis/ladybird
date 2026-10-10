@@ -12,6 +12,7 @@
 #include <AK/StdLibExtras.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -19,13 +20,11 @@ template<typename ListType, typename ElementType>
 class SinglyLinkedListIterator {
 public:
     SinglyLinkedListIterator() = default;
+    bool operator==(SinglyLinkedListIterator const& other) const { return m_node == other.m_node; }
     bool operator!=(SinglyLinkedListIterator const& other) const { return m_node != other.m_node; }
     SinglyLinkedListIterator& operator++()
     {
-        if (m_removed)
-            m_removed = false;
-        else
-            m_prev = m_node;
+        m_prev = m_node;
         m_node = m_next;
         if (m_next)
             m_next = m_next->next;
@@ -33,21 +32,14 @@ public:
     }
     ElementType& operator*()
     {
-        VERIFY(!m_removed);
         return m_node->value;
     }
     ElementType* operator->()
     {
-        VERIFY(!m_removed);
         return &m_node->value;
     }
     bool is_end() const { return !m_node; }
     bool is_begin() const { return !m_prev; }
-    void remove(ListType& list)
-    {
-        m_removed = true;
-        list.remove(*this);
-    }
 
 private:
     friend ListType;
@@ -60,13 +52,14 @@ private:
     typename ListType::Node* m_node { nullptr };
     typename ListType::Node* m_prev { nullptr };
     typename ListType::Node* m_next { nullptr };
-    bool m_removed { false };
 };
 
 template<typename T, typename TSizeCalculationPolicy>
 class SinglyLinkedList {
 private:
     struct Node {
+        AK_ALLOC_WITH_KMALLOC;
+
         explicit Node(T&& v)
             : value(move(v))
         {
@@ -276,7 +269,7 @@ public:
         MUST(try_insert_after(iterator, forward<U>(value)));
     }
 
-    void remove(Iterator& iterator)
+    [[nodiscard]] Iterator remove(Iterator const& iterator)
     {
         VERIFY(!iterator.is_end());
         if (m_head == iterator.m_node)
@@ -286,7 +279,14 @@ public:
         if (iterator.m_prev)
             iterator.m_prev->next = iterator.m_node->next;
         m_size_policy.decrease_size(iterator.m_node->value);
-        delete iterator.m_node;
+        Iterator new_iterator;
+        auto* node = iterator.m_node;
+        auto* next = node->next;
+        new_iterator.m_node = next;
+        new_iterator.m_next = next ? next->next : nullptr;
+        new_iterator.m_prev = iterator.m_prev;
+        delete node;
+        return new_iterator;
     }
 
 private:

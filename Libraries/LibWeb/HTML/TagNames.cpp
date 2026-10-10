@@ -9,7 +9,12 @@
 namespace Web::HTML::TagNames {
 
 #define __ENUMERATE_HTML_TAG(name, tag) \
-    FlyString name = tag##_fly_string;
+    Utf16FlyString const& name = *new Utf16FlyString(tag##_utf16_fly_string);
+ENUMERATE_HTML_TAGS
+#undef __ENUMERATE_HTML_TAG
+
+#define __ENUMERATE_HTML_TAG(name, tag) \
+    extern "C" WEB_API FlatPtr const ladybird_html_tag_name_##name = name.raw_identity();
 ENUMERATE_HTML_TAGS
 #undef __ENUMERATE_HTML_TAG
 

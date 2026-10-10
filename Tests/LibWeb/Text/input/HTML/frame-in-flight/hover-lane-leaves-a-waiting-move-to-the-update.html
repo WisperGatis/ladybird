@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<style>
+    body { margin: 0; }
+    #box { width: 100px; height: 100px; outline: 1px solid rgb(0, 0, 255); }
+    #box:hover { width: 150px; outline-color: rgb(0, 128, 0); }
+</style>
+<div id="box"></div>
+<script>
+    // A pointer move that waits for the next tick of the clock lane as a rendering update begins is the update's to
+    // hover, as the newest move the compositor told of: the update's frame shows it, and no tick of the lane hovers it
+    // before then.
+    asyncTest(async done => {
+        await whileLaneHovers(() => internals.moveHoverPointer(50, 50));
+        await twoFrames();
+        println(`box matches :hover: ${box.matches(":hover")}`);
+        println(`last frame presented by: ${internals.lastFramePresentedBy(document)}`);
+        done();
+    });
+</script>

@@ -6,22 +6,17 @@
  */
 
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/HTML/HTMLHtmlElement.h>
-#include <LibWeb/Layout/BlockContainer.h>
+#include <LibWeb/HTML/HTMLImageElement.h>
+#include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/Layout/Box.h>
-#include <LibWeb/Layout/FormattingContext.h>
-#include <LibWeb/Layout/TableWrapper.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Layout/ImageProvider.h>
+#include <LibWeb/Layout/NodeArena.h>
 
 namespace Web::Layout {
 
-Box::Box(DOM::Document& document, DOM::Node* node, GC::Ref<CSS::ComputedProperties> style)
-    : NodeWithStyleAndBoxModelMetrics(document, node, move(style))
-{
-}
-
-Box::Box(DOM::Document& document, DOM::Node* node, NonnullOwnPtr<CSS::ComputedValues> computed_values)
-    : NodeWithStyleAndBoxModelMetrics(document, node, move(computed_values))
+Box::Box(DOM::Document& document, BindToPreparedArenaSlot bind, Compositing::RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
+    : NodeWithStyle(document, bind, slot, kind)
 {
 }
 
@@ -29,69 +24,47 @@ Box::~Box()
 {
 }
 
-Optional<CSSPixels> Box::natural_width() const
+static ImageProvider const* image_provider_for_element(DOM::Element const& element)
 {
-    // https://drafts.csswg.org/css-contain-2/#containment-size
-    // Replaced elements must be treated as having a natural width and height of 0 and no natural aspect
-    // ratio.
-    if (has_size_containment())
-        return 0;
-    return m_natural_width;
-}
-Optional<CSSPixels> Box::natural_height() const
-{
-    // https://drafts.csswg.org/css-contain-2/#containment-size
-    // Replaced elements must be treated as having a natural width and height of 0 and no natural aspect
-    // ratio.
-    if (has_size_containment())
-        return 0;
-    return m_natural_height;
-}
-Optional<CSSPixelFraction> Box::natural_aspect_ratio() const
-{
-    // https://drafts.csswg.org/css-contain-2/#containment-size
-    // Replaced elements must be treated as having a natural width and height of 0 and no natural aspect
-    // ratio.
-    if (has_size_containment())
-        return {};
-    return m_natural_aspect_ratio;
+    if (auto const* image = as_if<HTML::HTMLImageElement>(element))
+        return image;
+    if (auto const* input = as_if<HTML::HTMLInputElement>(element))
+        return input;
+    if (auto const* object = as_if<HTML::HTMLObjectElement>(element))
+        return object;
+    return nullptr;
 }
 
-void Box::visit_edges(Cell::Visitor& visitor)
+ImageProvider* Box::owned_image_provider() const
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_contained_abspos_children);
+    return static_cast<ImageProvider*>(RustFFI::document_host_owned_image_provider(document_host(), Node::slot_id(this)));
 }
 
-GC::Ptr<Painting::Paintable> Box::create_paintable() const
+ImageProvider const* Box::image_provider_if_any() const
 {
-    return Painting::PaintableBox::create(*this);
+    VERIFY(kind() == RustFFI::NodeKind::ImageBox);
+    if (auto const* owned = owned_image_provider())
+        return owned;
+    auto const* element = as_if<DOM::Element>(dom_node());
+    return element ? image_provider_for_element(*element) : nullptr;
 }
 
-Painting::PaintableBox* Box::paintable_box()
+ImageProvider const& Box::image_provider() const
 {
-    return static_cast<Painting::PaintableBox*>(Node::first_paintable());
+    auto const* image_provider = image_provider_if_any();
+    VERIFY(image_provider);
+    return *image_provider;
 }
 
-Painting::PaintableBox const* Box::paintable_box() const
+void Box::set_owned_image_provider(NonnullOwnPtr<ImageProvider> image_provider)
 {
-    return static_cast<Painting::PaintableBox const*>(Node::first_paintable());
+    VERIFY(kind() == RustFFI::NodeKind::ImageBox);
+    RustFFI::document_host_set_owned_image_provider(document_host(), Node::slot_id(this), image_provider.leak_ptr());
 }
 
-Optional<CSSPixelFraction> Box::preferred_aspect_ratio() const
+bool Box::is_partial_relayout_boundary() const
 {
-    auto computed_aspect_ratio = computed_values().aspect_ratio();
-    if (computed_aspect_ratio.use_natural_aspect_ratio_if_available && natural_aspect_ratio().has_value())
-        return natural_aspect_ratio();
-
-    if (!computed_aspect_ratio.preferred_ratio.has_value())
-        return {};
-
-    auto ratio = computed_aspect_ratio.preferred_ratio.release_value();
-    if (ratio.is_degenerate())
-        return {};
-
-    return CSSPixelFraction(ratio.numerator(), ratio.denominator());
+    return RustFFI::render_state_node_is_partial_relayout_boundary(document_host(), Node::slot_id(this));
 }
 
 }

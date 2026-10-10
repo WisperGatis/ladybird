@@ -1,0 +1,39 @@
+#include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
+#include <LibURL/Origin.h>
+#include <LibWebCommon/Gamepad/GamepadSnapshot.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/Page/PageId.h>
+
+endpoint WebContentTestClient routed by Web::PageId page_id
+{
+    did_finish_test(Web::PageId page_id, String text) =|
+    did_set_test_timeout(Web::PageId page_id, double milliseconds) =|
+    did_receive_reference_test_metadata(Web::PageId page_id, JsonValue result) =|
+
+    did_expire_cookies_with_time_offset(AK::Duration offset) => ()
+    did_store_hsts_policy_for_testing(String domain, HTTP::HSTS::ParsedHSTSPolicy policy) => ()
+    did_simulate_worker_request_server_connection_loss(Web::PageId page_id) => ()
+    [NotRouted] did_spoof_document_origin_for_testing(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, URL::Origin origin) => ()
+
+    [NotRouted] did_request_ui_process_session_history_for_testing(Web::PageId page_id) => (String session_history)
+    [NotRouted] did_request_site_isolation_process_tree_for_testing(Web::PageId page_id) => (String process_tree)
+    [NotRouted] did_request_has_populated_document_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) => (bool has_populated_document)
+    did_request_crash_of_remote_frame_processes_for_testing(Web::PageId page_id) =|
+    did_request_stop_loading_for_testing(Web::PageId page_id) =|
+    did_request_reload_for_testing(Web::PageId page_id) =|
+    did_request_traverse_history_by_delta_for_testing(Web::PageId page_id, i32 delta) =|
+
+    did_reset_session_history_for_testing(Web::PageId page_id, Web::HTML::SessionHistoryEntryDescriptor active_entry) =|
+    [NotRouted] did_request_capture_session_history_snapshot_for_testing(Web::PageId page_id) => (bool captured)
+    [NotRouted] did_request_restore_session_history_snapshot_for_testing(Web::PageId page_id) => (bool restored)
+    [NotRouted] did_request_register_session_store_tab_for_testing(Web::PageId page_id) => (bool registered)
+    [NotRouted] did_request_session_store_tab_state_for_testing(Web::PageId page_id) => (String state)
+
+    create_virtual_gamepad() => (Optional<Web::Gamepad::VirtualGamepad> virtual_gamepad)
+    set_virtual_gamepad_button(Web::Gamepad::GamepadHandle handle, i32 button, bool down) =|
+    set_virtual_gamepad_axis(Web::Gamepad::GamepadHandle handle, i32 axis, i16 value) =|
+    disconnect_virtual_gamepad(Web::Gamepad::GamepadHandle handle) =|
+    pump_gamepad_events() => (Vector<Web::Gamepad::GamepadChangeEvent> events)
+    get_virtual_gamepad_received_rumble_effects(Web::Gamepad::GamepadHandle handle) => (Vector<Web::Gamepad::ReceivedDualRumbleEffect> dual_rumble_effects, Vector<Web::Gamepad::ReceivedTriggerRumbleEffect> trigger_rumble_effects)
+}

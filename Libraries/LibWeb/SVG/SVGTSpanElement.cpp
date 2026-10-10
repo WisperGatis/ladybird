@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGTSpanElementPrototype.h>
-#include <LibWeb/Layout/SVGTextBox.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/SVG/SVGTSpanElement.h>
 #include <LibWeb/SVG/SVGTextElement.h>
 
@@ -18,18 +18,12 @@ SVGTSpanElement::SVGTSpanElement(DOM::Document& document, DOM::QualifiedName qua
 {
 }
 
-void SVGTSpanElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTSpanElement);
-    Base::initialize(realm);
-}
-
-GC::Ptr<Layout::Node> SVGTSpanElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+CSS::ElementBoxKind SVGTSpanElement::box_kind() const
 {
     // Text must be within an SVG <text> element.
-    if (shadow_including_first_ancestor_of_type<SVGTextElement>())
-        return heap().allocate<Layout::SVGTextBox>(document(), *this, move(style));
-    return {};
+    if (first_flat_tree_ancestor_of_type<SVGTextElement>())
+        return CSS::ElementBoxKind::SvgText;
+    return CSS::ElementBoxKind::NoBox;
 }
 
 }

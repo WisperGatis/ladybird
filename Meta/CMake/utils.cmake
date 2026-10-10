@@ -13,12 +13,18 @@ function(ladybird_generated_sources target_name)
 endfunction()
 
 function(ladybird_testjs_test test_src sub_dir)
-    cmake_parse_arguments(PARSE_ARGV 2 LADYBIRD_TEST "" "CUSTOM_MAIN" "LIBS")
+    cmake_parse_arguments(PARSE_ARGV 2 LADYBIRD_TEST "NO_TEST" "CUSTOM_MAIN;NAME" "LIBS")
     if ("${LADYBIRD_TEST_CUSTOM_MAIN}" STREQUAL "")
         set(LADYBIRD_TEST_CUSTOM_MAIN "$<TARGET_OBJECTS:JavaScriptTestRunnerMain>")
     endif()
     list(APPEND LADYBIRD_TEST_LIBS LibJS LibCore LibFileSystem)
+    set(test_options)
+    if (LADYBIRD_TEST_NO_TEST)
+        list(APPEND test_options NO_TEST)
+    endif()
     ladybird_test(${test_src} ${sub_dir}
+        ${test_options}
+        NAME "${LADYBIRD_TEST_NAME}"
         CUSTOM_MAIN "${LADYBIRD_TEST_CUSTOM_MAIN}"
         LIBS ${LADYBIRD_TEST_LIBS})
 endfunction()
@@ -41,18 +47,38 @@ function(remove_path_if_version_changed version version_file cache_path)
 endfunction()
 
 function(invoke_generator_impl name generator primary_source header implementation)
-    cmake_parse_arguments(invoke_generator_impl "" "" "command;arguments;dependencies" ${ARGN})
+    cmake_parse_arguments(invoke_generator_impl "" "extra_header" "command;arguments;dependencies" ${ARGN})
+
+    set(extra_outputs)
+    set(extra_commands)
+
+    if (invoke_generator_impl_extra_header)
+        set(extra_outputs "${invoke_generator_impl_extra_header}")
+        list(APPEND extra_commands
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${invoke_generator_impl_extra_header}.tmp"
+                    "${invoke_generator_impl_extra_header}"
+            COMMAND "${CMAKE_COMMAND}" -E remove
+                    "${invoke_generator_impl_extra_header}.tmp"
+        )
+    endif()
+
     add_custom_command(
-        OUTPUT "${header}" "${implementation}"
-        COMMAND ${invoke_generator_impl_command} ${generator} -h "${header}.tmp" -c "${implementation}.tmp" ${invoke_generator_impl_arguments}
+        OUTPUT "${header}" "${implementation}" ${extra_outputs}
+        COMMAND ${invoke_generator_impl_command} ${generator}
+                -h "${header}.tmp"
+                -c "${implementation}.tmp"
+                ${invoke_generator_impl_arguments}
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${header}.tmp" "${header}"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${implementation}.tmp" "${implementation}"
         COMMAND "${CMAKE_COMMAND}" -E remove "${header}.tmp" "${implementation}.tmp"
+        ${extra_commands}
         VERBATIM
         DEPENDS ${generator} ${invoke_generator_impl_dependencies} "${primary_source}"
     )
 
-    add_custom_target("generate_${name}" DEPENDS "${header}" "${implementation}")
+    add_custom_target("generate_${name}" DEPENDS
+        "${header}" "${implementation}" ${extra_outputs})
     add_dependencies(ladybird_codegen_accumulator "generate_${name}")
     list(APPEND CURRENT_LIB_GENERATED "${name}")
     set(CURRENT_LIB_GENERATED ${CURRENT_LIB_GENERATED} PARENT_SCOPE)
@@ -72,17 +98,46 @@ function(invoke_cpp_generator name generator primary_source header implementatio
 endfunction()
 
 function(invoke_py_generator name script primary_source header implementation)
-    cmake_parse_arguments(invoke_py_generator "" "" "arguments" ${ARGN})
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    cmake_parse_arguments(invoke_py_generator "" "EXTRA_HEADER" "arguments;dependencies" ${ARGN})
+
+    set(py_generator_arguments ${invoke_py_generator_arguments})
+    if (invoke_py_generator_EXTRA_HEADER)
+        list(APPEND py_generator_arguments
+            -x "${invoke_py_generator_EXTRA_HEADER}.tmp")
+    endif()
+
     invoke_generator_impl(
         ${name}
-        "${LADYBIRD_PROJECT_ROOT}/Meta/${script}"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/${script}"
         ${primary_source}
         ${header}
         ${implementation}
         command ${Python3_EXECUTABLE}
-        arguments ${invoke_py_generator_arguments}
+        arguments ${py_generator_arguments}
+        dependencies ${invoke_py_generator_dependencies}
+        extra_header "${invoke_py_generator_EXTRA_HEADER}"
     )
+endfunction()
+
+function(invoke_py_header_generator name script primary_source header)
+    cmake_parse_arguments(invoke_py_header_generator "" "" "arguments;dependencies" ${ARGN})
+
+    set(script_path "${LADYBIRD_SOURCE_DIR}/Meta/Generators/${script}")
+    add_custom_command(
+        OUTPUT "${header}"
+        COMMAND ${Python3_EXECUTABLE} "${script_path}"
+                -h "${header}.tmp"
+                ${invoke_py_header_generator_arguments}
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${header}.tmp" "${header}"
+        COMMAND "${CMAKE_COMMAND}" -E remove "${header}.tmp"
+        VERBATIM
+        DEPENDS "${script_path}" ${invoke_py_header_generator_dependencies} "${primary_source}"
+    )
+
+    add_custom_target("generate_${name}" DEPENDS "${header}")
+    add_dependencies(ladybird_codegen_accumulator "generate_${name}")
+    list(APPEND CURRENT_LIB_GENERATED "${name}")
+    set(CURRENT_LIB_GENERATED ${CURRENT_LIB_GENERATED} PARENT_SCOPE)
 endfunction()
 
 function(invoke_idl_generator cpp_name idl_name generator primary_source header implementation idl)
@@ -97,6 +152,29 @@ function(invoke_idl_generator cpp_name idl_name generator primary_source header 
         COMMAND "${CMAKE_COMMAND}" -E remove "${header}.tmp" "${implementation}.tmp" "${idl}.tmp"
         VERBATIM
         DEPENDS ${generator} ${invoke_idl_generator_dependencies} "${primary_source}"
+    )
+
+    add_custom_target("generate_${cpp_name}" DEPENDS "${header}" "${implementation}" "${idl}")
+    add_custom_target("generate_${idl_name}" DEPENDS "generate_${cpp_name}")
+    add_dependencies(ladybird_codegen_accumulator "generate_${cpp_name}")
+    add_dependencies(ladybird_codegen_accumulator "generate_${idl_name}")
+    list(APPEND CURRENT_LIB_GENERATED "${name}")
+    set(CURRENT_LIB_GENERATED ${CURRENT_LIB_GENERATED} PARENT_SCOPE)
+endfunction()
+
+function(invoke_py_idl_generator cpp_name idl_name script primary_source header implementation idl)
+    cmake_parse_arguments(invoke_py_idl_generator "" "" "arguments;dependencies" ${ARGN})
+
+    set(script_path "${LADYBIRD_SOURCE_DIR}/Meta/Generators/${script}")
+    add_custom_command(
+        OUTPUT "${header}" "${implementation}" "${idl}"
+        COMMAND ${Python3_EXECUTABLE} "${script_path}" -h "${header}.tmp" -c "${implementation}.tmp" -i "${idl}.tmp" ${invoke_py_idl_generator_arguments}
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${header}.tmp" "${header}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${implementation}.tmp" "${implementation}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${idl}.tmp" "${idl}"
+        COMMAND "${CMAKE_COMMAND}" -E remove "${header}.tmp" "${implementation}.tmp" "${idl}.tmp"
+        VERBATIM
+        DEPENDS "${script_path}" ${invoke_py_idl_generator_dependencies} "${primary_source}"
     )
 
     add_custom_target("generate_${cpp_name}" DEPENDS "${header}" "${implementation}" "${idl}")
@@ -122,20 +200,31 @@ function(download_file_multisource urls path)
         get_filename_component(file "${path}" NAME)
         set(tmp_path "${path}.tmp")
 
-        foreach(url ${urls})
-            message(STATUS "Downloading file ${file} from ${url}")
+        set(download_attempts 3)
+        foreach(attempt RANGE 1 ${download_attempts})
+            foreach(url ${urls})
+                message(STATUS "Downloading file ${file} from ${url} (attempt ${attempt}/${download_attempts})")
 
-            file(DOWNLOAD "${url}" "${tmp_path}" INACTIVITY_TIMEOUT 10 STATUS download_result ${DOWNLOAD_SHA256})
-            list(GET download_result 0 status_code)
-            list(GET download_result 1 error_message)
+                file(DOWNLOAD "${url}" "${tmp_path}" INACTIVITY_TIMEOUT 10 STATUS download_result ${DOWNLOAD_SHA256})
+                list(GET download_result 0 status_code)
+                list(GET download_result 1 error_message)
+
+                if (status_code EQUAL 0)
+                    file(RENAME "${tmp_path}" "${path}")
+                    break()
+                endif()
+
+                file(REMOVE "${tmp_path}")
+                message(WARNING "Failed to download ${url} (attempt ${attempt}/${download_attempts}): ${error_message}")
+            endforeach()
 
             if (status_code EQUAL 0)
-                file(RENAME "${tmp_path}" "${path}")
                 break()
             endif()
 
-            file(REMOVE "${tmp_path}")
-            message(WARNING "Failed to download ${url}: ${error_message}")
+            if (attempt LESS ${download_attempts})
+                execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 2)
+            endif()
         endforeach()
 
         if (NOT status_code EQUAL 0)
@@ -175,8 +264,3 @@ function(add_lagom_library_install_rules target_name)
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 endfunction()
-
-if (NOT COMMAND swizzle_target_properties_for_swift)
-    function(swizzle_target_properties_for_swift target)
-    endfunction()
-endif()

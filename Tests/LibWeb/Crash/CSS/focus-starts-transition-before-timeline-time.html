@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html class="test-wait">
+<style>
+    button {
+        opacity: 0;
+        transition: opacity 1s;
+    }
+
+    button:focus {
+        opacity: 1;
+    }
+</style>
+<button>content</button>
+<script>
+    requestAnimationFrame(() => {
+        document.querySelector("button").focus();
+        document.documentElement.classList.remove("test-wait");
+    });
+</script>
+</html>

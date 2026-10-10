@@ -13,6 +13,8 @@ namespace Gfx {
 
 class MetalTextureImpl final : public MetalTexture {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     MetalTextureImpl(id<MTLTexture> texture)
         : m_texture(texture)
     {
@@ -31,8 +33,27 @@ private:
     id<MTLTexture> m_texture;
 };
 
+static MTLPixelFormat metal_pixel_format(MetalTextureFormat format)
+{
+    switch (format) {
+    case MetalTextureFormat::BGRA8:
+        return MTLPixelFormatBGRA8Unorm;
+    case MetalTextureFormat::R8:
+        return MTLPixelFormatR8Unorm;
+    case MetalTextureFormat::RG8:
+        return MTLPixelFormatRG8Unorm;
+    case MetalTextureFormat::R16:
+        return MTLPixelFormatR16Unorm;
+    case MetalTextureFormat::RG16:
+        return MTLPixelFormatRG16Unorm;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 class MetalContextImpl final : public MetalContext {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     MetalContextImpl(id<MTLDevice> device, id<MTLCommandQueue> queue)
         : m_device(device)
         , m_queue(queue)
@@ -42,17 +63,19 @@ public:
     void const* device() const override { return m_device; }
     void const* queue() const override { return m_queue; }
 
-    OwnPtr<MetalTexture> create_texture_from_iosurface(Core::IOSurfaceHandle const& iosurface) override
+    OwnPtr<MetalTexture> create_texture_from_iosurface(Core::IOSurfaceHandle const& iosurface, MetalTextureFormat format, size_t plane) override
     {
         auto* const descriptor = [[MTLTextureDescriptor alloc] init];
-        descriptor.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        descriptor.width = iosurface.width();
-        descriptor.height = iosurface.height();
+        descriptor.pixelFormat = metal_pixel_format(format);
+        descriptor.width = iosurface.plane_count() > 0 ? iosurface.plane_width(plane) : iosurface.width();
+        descriptor.height = iosurface.plane_count() > 0 ? iosurface.plane_height(plane) : iosurface.height();
         descriptor.storageMode = MTLStorageModeShared;
         descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 
-        id<MTLTexture> texture = [m_device newTextureWithDescriptor:descriptor iosurface:(IOSurfaceRef)iosurface.core_foundation_pointer() plane:0];
+        id<MTLTexture> texture = [m_device newTextureWithDescriptor:descriptor iosurface:(IOSurfaceRef)iosurface.core_foundation_pointer() plane:plane];
         [descriptor release];
+        if (!texture)
+            return {};
         return make<MetalTextureImpl>(texture);
     }
 

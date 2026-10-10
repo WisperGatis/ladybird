@@ -16,6 +16,10 @@ Optional<StorageKey> obtain_a_storage_key(HTML::Environment const& environment)
     // 1. Let key be the result of running obtain a storage key for non-storage purposes with environment.
     auto key = obtain_a_storage_key_for_non_storage_purposes(environment);
 
+    // AD-HOC: file:// URLs are opaque, but other browsers support storage on file:// URLs.
+    if (key.origin.is_opaque_file_origin())
+        key.origin = URL::Origin { "file"_string, String {}, {} };
+
     // 2. If key’s origin is an opaque origin, then return failure.
     if (key.origin.is_opaque())
         return {};
@@ -26,21 +30,18 @@ Optional<StorageKey> obtain_a_storage_key(HTML::Environment const& environment)
     return key;
 }
 
-StorageKey obtain_a_storage_key_for_non_storage_purposes(URL::Origin const& origin)
-{
-    // NOTE: This function exists as there are cases where we don't have the full environment object, but we still need to obtain a storage key.
-    return { origin };
-}
-
 // https://storage.spec.whatwg.org/#obtain-a-storage-key-for-non-storage-purposes
 StorageKey obtain_a_storage_key_for_non_storage_purposes(HTML::Environment const& environment)
 {
     // 1. Let origin be environment’s origin if environment is an environment settings object; otherwise environment’s creation URL’s origin.
-    if (is<HTML::EnvironmentSettingsObject>(environment)) {
-        auto const& settings = static_cast<HTML::EnvironmentSettingsObject const&>(environment);
-        return { settings.origin() };
-    }
-    return { environment.creation_url.origin() };
+    auto origin = [&]() {
+        if (auto const* settings = as_if<HTML::EnvironmentSettingsObject>(environment))
+            return settings->origin();
+        return environment.creation_url.origin();
+    }();
+
+    // 2. Return a tuple consisting of origin.
+    return { move(origin) };
 }
 
 }

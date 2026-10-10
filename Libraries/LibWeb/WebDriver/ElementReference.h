@@ -14,12 +14,12 @@
 #include <LibJS/Runtime/Value.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/WebDriver/Error.h>
+#include <LibWebCommon/PixelUnits.h>
+#include <LibWebCommon/WebDriver/Error.h>
 
 namespace Web::WebDriver {
 
-GC::Ptr<Web::DOM::Node> get_node(HTML::BrowsingContext const&, StringView reference);
+GC::Ptr<Web::DOM::Node> get_node(StringView reference);
 String get_or_create_a_node_reference(HTML::BrowsingContext const&, Web::DOM::Node const&);
 bool node_reference_is_known(HTML::BrowsingContext const&, StringView reference);
 
@@ -58,6 +58,6 @@ bool is_shadow_root_detached(Web::DOM::ShadowRoot const&);
 
 WEB_API String element_rendered_text(DOM::Node&);
 
-CSSPixelPoint in_view_center_point(DOM::Element const& element, CSSPixelRect viewport);
+ErrorOr<CSSPixelPoint, WebDriver::Error> in_view_center_point(DOM::Element const& element);
 
 }

@@ -18,6 +18,31 @@ static ByteBuffer operator""_b(char const* string, size_t length)
     return ByteBuffer::copy(string, length).release_value();
 }
 
+TEST_CASE(test_RSA_rejects_invalid_public_key)
+{
+    Array<u8, 1> message { 42 };
+    auto digest = Crypto::Hash::SHA256::hash(message);
+
+    Array<u8, 128> modulus;
+    modulus.fill(0xff);
+    Array<u8, 128> encoded_message;
+    encoded_message.fill(0xff);
+    encoded_message[0] = 0;
+    encoded_message[1] = 1;
+    constexpr Array<u8, 19> digest_info_prefix {
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20
+    };
+    auto separator = encoded_message.size() - digest_info_prefix.size() - digest.bytes().size() - 1;
+    encoded_message[separator] = 0;
+    __builtin_memcpy(encoded_message.data() + separator + 1, digest_info_prefix.data(), digest_info_prefix.size());
+    __builtin_memcpy(encoded_message.data() + separator + 1 + digest_info_prefix.size(), digest.data, digest.bytes().size());
+
+    Crypto::PK::RSAPublicKey invalid_key { Crypto::UnsignedBigInteger::import_data(modulus), 1 };
+    Crypto::PK::RSA_PKCS1_EMSA verifier { Crypto::Hash::HashKind::SHA256, invalid_key };
+    EXPECT(!TRY_OR_FAIL(verifier.verify(message, encoded_message)));
+}
+
 TEST_CASE(test_RSA_raw_encrypt)
 {
     ByteBuffer data { "hellohellohellohellohellohellohellohellohellohellohellohello123-"_b };
@@ -125,7 +150,7 @@ c8yGzl89pYST
     auto priv_key_info = MUST(Crypto::Certificate::parse_private_key_info(decoder, {}));
     auto keypair = MUST(Crypto::PK::RSA::parse_rsa_key(priv_key_info.raw_key, true, {}));
     auto priv_der = MUST(priv_key_info.rsa.export_as_der());
-    auto rsa_encryption_oid = Array<int, 7> { 1, 2, 840, 113549, 1, 1, 1 };
+    auto rsa_encryption_oid = Array<u32, 7> { 1, 2, 840, 113549, 1, 1, 1 };
     auto wrapped_priv_der = MUST(Crypto::PK::wrap_in_private_key_info(priv_key_info.raw_key, rsa_encryption_oid, nullptr));
     auto priv_pem = MUST(Crypto::encode_pem(wrapped_priv_der, Crypto::PEMType::PrivateKey));
     auto rsa_from_pair = Crypto::PK::RSA(keypair.public_key, keypair.private_key);
@@ -134,7 +159,7 @@ c8yGzl89pYST
     EXPECT_EQ(keypem, StringView(priv_pem));
 
     ByteBuffer msg_buffer = {};
-    msg_buffer.resize(rsa_from_pair.output_size());
+    msg_buffer.resize(rsa_from_pair.public_key().length());
 
     auto msg = msg_buffer.bytes();
     msg.overwrite(0, "WellHelloFriends", 16);
@@ -151,7 +176,7 @@ TEST_CASE(test_RSA_encrypt_decrypt)
     Crypto::PK::RSA rsa(keypair);
 
     ByteBuffer msg_buffer = {};
-    msg_buffer.resize(rsa.output_size());
+    msg_buffer.resize(rsa.public_key().length());
 
     auto msg = msg_buffer.bytes();
     msg.overwrite(0, "WellHelloFriendsWellHelloFriendsWellHelloFriendsWellHelloFriends", 64);
@@ -162,13 +187,34 @@ TEST_CASE(test_RSA_encrypt_decrypt)
     EXPECT(memcmp(dec.data(), "WellHelloFriendsWellHelloFriendsWellHelloFriendsWellHelloFriends", 64) == 0);
 }
 
+TEST_CASE(test_RSA_OAEP_rejects_short_ciphertext)
+{
+    auto keypair = TRY_OR_FAIL(Crypto::PK::RSA::generate_key_pair(1024));
+    Crypto::PK::RSA_OAEP_EME rsa { Crypto::Hash::HashKind::SHA256, keypair };
+    u8 message = 42;
+
+    for (size_t i = 0; i < 4096; ++i) {
+        auto encrypted = TRY_OR_FAIL(rsa.encrypt({ &message, 1 }));
+        if (encrypted[0] != 0)
+            continue;
+
+        auto decrypted = TRY_OR_FAIL(rsa.decrypt(encrypted));
+        EXPECT_EQ(decrypted.size(), 1u);
+        EXPECT_EQ(decrypted[0], message);
+        EXPECT(rsa.decrypt(encrypted.bytes().slice(1)).is_error());
+        return;
+    }
+
+    FAIL("Could not generate an RSA ciphertext with a leading zero");
+}
+
 TEST_CASE(test_RSA_sign_verify)
 {
     auto keypair = TRY_OR_FAIL(Crypto::PK::RSA::generate_key_pair(1024));
     Crypto::PK::RSA rsa(keypair);
 
     ByteBuffer msg_buffer = {};
-    msg_buffer.resize(rsa.output_size());
+    msg_buffer.resize(rsa.public_key().length());
 
     auto msg = msg_buffer.bytes();
     msg.overwrite(0, "WellHelloFriendsWellHelloFriendsWellHelloFriendsWellHelloFriends", 64);
@@ -176,4 +222,46 @@ TEST_CASE(test_RSA_sign_verify)
     auto sig = TRY_OR_FAIL(rsa.sign(msg));
     auto ok = TRY_OR_FAIL(rsa.verify(msg, sig));
     EXPECT_EQ(ok, true);
+}
+
+TEST_CASE(test_RSA_PSS_rejects_short_signature)
+{
+    auto keypair = TRY_OR_FAIL(Crypto::PK::RSA::generate_key_pair(1024));
+    Crypto::PK::RSA_PSS_EMSA rsa { Crypto::Hash::HashKind::SHA256, keypair };
+    rsa.set_salt_length(32);
+    ByteBuffer message { "message"_b };
+
+    for (size_t i = 0; i < 4096; ++i) {
+        auto signature = TRY_OR_FAIL(rsa.sign(message));
+        if (signature[0] != 0)
+            continue;
+
+        EXPECT(TRY_OR_FAIL(rsa.verify(message, signature)));
+        EXPECT(!TRY_OR_FAIL(rsa.verify(message, signature.bytes().slice(1))));
+        return;
+    }
+
+    FAIL("Could not generate an RSA signature with a leading zero");
+}
+
+TEST_CASE(test_RSA_rejects_exponent_one)
+{
+    auto keypair = TRY_OR_FAIL(Crypto::PK::RSA::generate_key_pair(1024));
+    Crypto::PK::RSAPublicKey public_key { keypair.public_key.modulus(), Crypto::UnsignedBigInteger { 1 } };
+    Crypto::PK::RSA_PKCS1_EMSA rsa { Crypto::Hash::HashKind::SHA256, public_key };
+
+    // With e = 1, the EMSA-PKCS1-v1_5 encoding of the message is its own signature.
+    ByteBuffer message { "message"_b };
+    auto digest = Crypto::Hash::SHA256::hash(message);
+    static constexpr Array<u8, 19> sha256_digest_info { 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 };
+
+    auto encoded = TRY_OR_FAIL(ByteBuffer::create_zeroed(public_key.length()));
+    auto padding_end = encoded.size() - sha256_digest_info.size() - digest.bytes().size() - 1;
+    encoded[1] = 0x01;
+    for (size_t i = 2; i < padding_end; ++i)
+        encoded[i] = 0xff;
+    encoded.overwrite(padding_end + 1, sha256_digest_info.data(), sha256_digest_info.size());
+    encoded.overwrite(padding_end + 1 + sha256_digest_info.size(), digest.bytes().data(), digest.bytes().size());
+
+    EXPECT(!TRY_OR_FAIL(rsa.verify(message, encoded)));
 }

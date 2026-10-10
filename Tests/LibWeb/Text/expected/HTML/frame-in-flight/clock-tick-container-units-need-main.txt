@@ -1,0 +1,2 @@
+lane as the task begins: ticking
+lane after a tick: parked

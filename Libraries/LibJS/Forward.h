@@ -16,7 +16,6 @@
 #define JS_DEFINE_NATIVE_FUNCTION(name) \
     JS::ThrowCompletionOr<JS::Value> name([[maybe_unused]] JS::VM& vm)
 
-// NOTE: Proxy is not included here as it doesn't have a prototype - m_proxy_constructor is initialized separately.
 #define JS_ENUMERATE_NATIVE_OBJECTS_EXCLUDING_TEMPLATES                                                                                        \
     __JS_ENUMERATE(AggregateError, aggregate_error, AggregateErrorPrototype, AggregateErrorConstructor, void)                                  \
     __JS_ENUMERATE(Array, array, ArrayPrototype, ArrayConstructor, void)                                                                       \
@@ -40,7 +39,6 @@
     __JS_ENUMERATE(Promise, promise, PromisePrototype, PromiseConstructor, void)                                                               \
     __JS_ENUMERATE(RegExpObject, regexp, RegExpPrototype, RegExpConstructor, void)                                                             \
     __JS_ENUMERATE(Set, set, SetPrototype, SetConstructor, void)                                                                               \
-    __JS_ENUMERATE(ShadowRealm, shadow_realm, ShadowRealmPrototype, ShadowRealmConstructor, void)                                              \
     __JS_ENUMERATE(SharedArrayBuffer, shared_array_buffer, SharedArrayBufferPrototype, SharedArrayBufferConstructor, void)                     \
     __JS_ENUMERATE(StringObject, string, StringPrototype, StringConstructor, void)                                                             \
     __JS_ENUMERATE(SuppressedError, suppressed_error, SuppressedErrorPrototype, SuppressedErrorConstructor, void)                              \
@@ -98,25 +96,6 @@
     __JS_ENUMERATE(PlainYearMonth, plain_year_month, PlainYearMonthPrototype, PlainYearMonthConstructor) \
     __JS_ENUMERATE(ZonedDateTime, zoned_date_time, ZonedDateTimePrototype, ZonedDateTimeConstructor)
 
-#define JS_ENUMERATE_BUILTIN_NAMESPACE_OBJECTS \
-    __JS_ENUMERATE(AtomicsObject, atomics)     \
-    __JS_ENUMERATE(ConsoleObject, console)     \
-    __JS_ENUMERATE(Intl::Intl, intl)           \
-    __JS_ENUMERATE(JSONObject, json)           \
-    __JS_ENUMERATE(MathObject, math)           \
-    __JS_ENUMERATE(ReflectObject, reflect)     \
-    __JS_ENUMERATE(Temporal::Temporal, temporal)
-
-#define JS_ENUMERATE_ITERATOR_PROTOTYPES                         \
-    __JS_ENUMERATE(ArrayIterator, array_iterator)                \
-    __JS_ENUMERATE(AsyncIterator, async_iterator)                \
-    __JS_ENUMERATE(Intl::SegmentIterator, intl_segment_iterator) \
-    __JS_ENUMERATE(IteratorHelper, iterator_helper)              \
-    __JS_ENUMERATE(MapIterator, map_iterator)                    \
-    __JS_ENUMERATE(RegExpStringIterator, regexp_string_iterator) \
-    __JS_ENUMERATE(SetIterator, set_iterator)                    \
-    __JS_ENUMERATE(StringIterator, string_iterator)
-
 #define JS_ENUMERATE_BUILTIN_TYPES \
     JS_ENUMERATE_NATIVE_OBJECTS    \
     JS_ENUMERATE_NATIVE_ERRORS     \
@@ -140,114 +119,69 @@
     __JS_ENUMERATE(toStringTag, to_string_tag)               \
     __JS_ENUMERATE(unscopables, unscopables)
 
-#define JS_ENUMERATE_REGEXP_FLAGS                             \
-    __JS_ENUMERATE(HasIndices, hasIndices, has_indices, d)    \
-    __JS_ENUMERATE(Global, global, global, g)                 \
-    __JS_ENUMERATE(IgnoreCase, ignoreCase, ignore_case, i)    \
-    __JS_ENUMERATE(Multiline, multiline, multiline, m)        \
-    __JS_ENUMERATE(DotAll, dotAll, dot_all, s)                \
-    __JS_ENUMERATE(UnicodeSets, unicodeSets, unicode_sets, v) \
-    __JS_ENUMERATE(Unicode, unicode, unicode, u)              \
-    __JS_ENUMERATE(Sticky, sticky, sticky, y)
-
 namespace JS {
 
-class ASTNode;
-class Accessor;
+enum class Strict : u8 {
+    No,
+    Yes,
+};
+
 class Agent;
-struct AsyncGeneratorRequest;
 class BigInt;
-class BoundFunction;
-class BuiltinIterator;
-struct CachedSourceRange;
 class Cell;
-class ClassExpression;
-struct ClassFieldDefinition;
 class Completion;
 class Console;
+class ConsoleClient;
+class ConsoleObject;
 class CyclicModule;
+class Debugger;
 class DeclarativeEnvironment;
-struct DisposeCapability;
-struct DisposableResource;
-class ECMAScriptFunctionObject;
+class EngineCell;
 class Environment;
-class Error;
+class ErrorData;
+class ErrorDataCell;
 class ErrorType;
 struct ExecutionContext;
-struct ExportEntry;
-class ExportStatement;
-class Expression;
-class ForStatement;
 class FunctionEnvironment;
-class FunctionNode;
-struct FunctionParameter;
-class FunctionParameters;
 class GlobalEnvironment;
 class GlobalObject;
 struct GraphLoadingState;
-struct ImportEntry;
-class ImportStatement;
-class Identifier;
+class HostArray;
+class HostFunction;
+class HostModule;
+class HostObject;
 class Intrinsics;
 class IteratorRecord;
-class MemberExpression;
-class MetaProperty;
-class ModuleEnvironment;
+class JobCallback;
+class JSONObject;
+struct LoadedModuleRequest;
+class MapIterator;
 class Module;
+class ModuleEnvironment;
 struct ModuleRequest;
 class NativeFunction;
 class ObjectEnvironment;
-class Parser;
 struct ParserError;
 class PrimitiveString;
-class Program;
+class PrivateEnvironment;
 class PromiseCapability;
-class PromiseReaction;
+class PromiseJob;
 class PropertyAttributes;
 class PropertyDescriptor;
 class PropertyKey;
 class Realm;
 class Reference;
-class ScopeNode;
 class Script;
+class SetIterator;
 class Shape;
-class Statement;
-class StringOrSymbol;
 class SourceCode;
 struct SourceRange;
 class SourceTextModule;
 class Symbol;
-class Token;
-class VM;
-class PrototypeChainValidity;
-class Value;
-class WrappedFunction;
-enum class DeclarationKind;
-struct AlreadyResolved;
-class JobCallback;
-struct ModuleRequest;
-struct LoadedModuleRequest;
-
-// Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct prototype
-class ProxyObject;
-class ProxyConstructor;
-
-// Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct constructor
-class AsyncFromSyncIteratorPrototype;
-class AsyncGenerator;
-class AsyncGeneratorPrototype;
-class GeneratorPrototype;
-class WrapForValidIteratorPrototype;
-
+class SyntheticModule;
 class TypedArrayBase;
-class TypedArrayConstructor;
-class TypedArrayPrototype;
-
-class AtomicsObject;
-class ConsoleObject;
-class JSONObject;
-class MathObject;
-class ReflectObject;
+class VM;
+class Value;
 
 // Tag type used to differentiate between u8 as used by Uint8Array and u8 as used by Uint8ClampedArray.
 struct ClampedU8;
@@ -261,76 +195,9 @@ JS_ENUMERATE_NATIVE_ERRORS
 JS_ENUMERATE_TYPED_ARRAYS
 #undef __JS_ENUMERATE
 
-#define __JS_ENUMERATE(ClassName, snake_name) \
-    class ClassName;                          \
-    JS_ENUMERATE_BUILTIN_NAMESPACE_OBJECTS
-#undef __JS_ENUMERATE
-
-namespace Intl {
-
-#define __JS_ENUMERATE(ClassName, snake_name, ConstructorName, PrototypeName) \
-    class ClassName;                                                          \
-    class ConstructorName;                                                    \
-    class PrototypeName;
-JS_ENUMERATE_INTL_OBJECTS
-#undef __JS_ENUMERATE
-
-class Intl;
-class IntlObject;
-class MathematicalValue;
-
-// Not included in JS_ENUMERATE_INTL_OBJECTS due to missing distinct constructor
-class Segments;
-class SegmentsPrototype;
-
-struct ResolutionOptionDescriptor;
-
-};
-
-namespace Temporal {
-
-#define __JS_ENUMERATE(ClassName, snake_name, ConstructorName, PrototypeName) \
-    class ClassName;                                                          \
-    class ConstructorName;                                                    \
-    class PrototypeName;
-JS_ENUMERATE_TEMPORAL_OBJECTS
-#undef __JS_ENUMERATE
-
-class Now;
-class Temporal;
-
-struct CalendarDate;
-struct CalendarFields;
-struct DateDuration;
-struct InternalDuration;
-struct ISODate;
-struct ISODateTime;
-struct ISOYearMonth;
-struct ParseResult;
-struct PartialDuration;
-struct Time;
-struct TimeZone;
-struct TimeZoneOffset;
-
-};
-
 template<typename T>
 requires(!IsLvalueReference<T>)
 class ThrowCompletionOr;
-
-namespace Bytecode {
-
-class BasicBlock;
-enum class Builtin : u8;
-class Executable;
-class Generator;
-class Instruction;
-class Interpreter;
-class Operand;
-struct PropertyLookupCache;
-class RegexTable;
-class Register;
-
-}
+using NativeFunctionPointer = ThrowCompletionOr<Value> (*)(VM&);
 
 }

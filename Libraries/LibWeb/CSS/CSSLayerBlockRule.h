@@ -12,28 +12,26 @@ namespace Web::CSS {
 
 // https://drafts.csswg.org/css-cascade-5/#the-csslayerblockrule-interface
 class CSSLayerBlockRule final : public CSSGroupingRule {
-    WEB_PLATFORM_OBJECT(CSSLayerBlockRule, CSSGroupingRule);
+    WEB_WRAPPABLE(CSSLayerBlockRule, CSSGroupingRule);
     GC_DECLARE_ALLOCATOR(CSSLayerBlockRule);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSLayerBlockRule> create(JS::Realm&, FlyString name, CSSRuleList&);
-
-    static FlyString next_unique_anonymous_layer_name();
+    [[nodiscard]] static GC::Ref<CSSLayerBlockRule> create(RustRule, CSSRuleList&);
 
     virtual ~CSSLayerBlockRule() = default;
 
-    FlyString const& name() const { return m_name; }
-    FlyString const& internal_name() const { return m_name_internal; }
-    FlyString internal_qualified_name(Badge<StyleComputer>) const;
+    Utf16View name() const;
+    Utf16FlyString const& internal_name() const;
 
 private:
-    CSSLayerBlockRule(JS::Realm&, FlyString name, CSSRuleList&);
+    CSSLayerBlockRule(RustRule, CSSRuleList&);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual String serialized() const override;
+    virtual Utf16String serialized() const override;
+    virtual void dump(StringBuilder&, int indent_levels) const override;
+    virtual size_t external_memory_size() const override;
 
-    FlyString m_name;
-    FlyString m_name_internal;
+    Parser::ValueParserFFI::LayerNames const& m_names;
+    mutable Optional<Utf16FlyString> m_name_internal;
 };
 
 }

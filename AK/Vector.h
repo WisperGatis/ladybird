@@ -8,6 +8,7 @@
 #pragma once
 
 #include <AK/Assertions.h>
+#include <AK/Checked.h>
 #include <AK/Error.h>
 #include <AK/Find.h>
 #include <AK/Forward.h>
@@ -20,6 +21,7 @@
 #include <AK/TypedTransfer.h>
 #include <AK/kmalloc.h>
 #include <initializer_list>
+#include <string.h>
 
 namespace AK {
 
@@ -59,6 +61,8 @@ private:
     static constexpr bool contains_reference = IsLvalueReference<T>;
     using StorageType = Conditional<contains_reference, RawPtr<RemoveReference<T>>, T>;
 
+    static constexpr HeapPartition storage_partition = (IsArithmetic<StorageType> || IsEnum<StorageType>) ? HeapPartition::Buffer : HeapPartition::General;
+
     using VisibleType = RemoveReference<T>;
 
     template<typename U>
@@ -66,6 +70,8 @@ private:
     static constexpr auto want_fast_last_access = requested_fast_last_access == FastLastAccess::Yes;
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     using ValueType = T;
     Vector()
     {
@@ -286,6 +292,13 @@ public:
         return false;
     }
 
+    template<typename TUnaryPredicate>
+    bool contains(TUnaryPredicate&& predicate) const
+    requires(IsCallableWithArguments<TUnaryPredicate, bool, VisibleType const&>)
+    {
+        return !find_if(forward<TUnaryPredicate>(predicate)).is_end();
+    }
+
     bool contains_in_range(VisibleType const& value, size_t const start, size_t const end) const
     {
         VERIFY(start <= end);
@@ -344,7 +357,7 @@ public:
     ALWAYS_INLINE void unchecked_append(U&& value)
     requires(CanBePlacedInsideVector<U>)
     {
-        VERIFY(m_size < capacity());
+        ASSERT(m_size < capacity());
         if constexpr (want_fast_last_access) {
             ++m_metadata.last_slot;
             ++m_size;
@@ -380,6 +393,27 @@ public:
     requires(!contains_reference)
     {
         MUST(try_empend(forward<Args>(args)...));
+    }
+
+    template<class... Args>
+    ALWAYS_INLINE void unchecked_empend(Args&&... args)
+    requires(!contains_reference)
+    {
+        VERIFY(m_size < capacity());
+        if constexpr (want_fast_last_access) {
+            ++m_metadata.last_slot;
+            ++m_size;
+        } else {
+            ++m_size;
+        }
+
+        StorageType* last_slot;
+        if constexpr (want_fast_last_access)
+            last_slot = m_metadata.last_slot;
+        else
+            last_slot = slot(m_size - 1);
+
+        new (last_slot) StorageType(forward<Args>(args)...);
     }
 
     template<typename U = T>
@@ -452,7 +486,7 @@ public:
     {
         clear_with_capacity();
         if (m_metadata.outline_buffer) {
-            kfree_sized(m_metadata.outline_buffer, m_capacity * sizeof(StorageType));
+            kfree(m_metadata.outline_buffer);
             m_metadata.outline_buffer = nullptr;
         }
         reset_capacity();
@@ -460,8 +494,10 @@ public:
 
     void clear_with_capacity()
     {
-        for (size_t i = 0; i < m_size; ++i)
-            data()[i].~StorageType();
+        if constexpr (!IsTriviallyDestructible<StorageType>) {
+            for (size_t i = 0; i < m_size; ++i)
+                data()[i].~StorageType();
+        }
         m_size = 0;
         if (m_capacity != 0)
             update_metadata();
@@ -471,7 +507,7 @@ public:
     {
         VERIFY(index < m_size);
 
-        if constexpr (Traits<StorageType>::is_trivial()) {
+        if constexpr (IsTriviallyDestructible<StorageType> && IsTriviallyCopyable<StorageType>) {
             TypedTransfer<StorageType>::copy(slot(index), slot(index + 1), m_size - index - 1);
         } else {
             at(index).~StorageType();
@@ -492,7 +528,7 @@ public:
         VERIFY(index + count > index);
         VERIFY(index + count <= m_size);
 
-        if constexpr (Traits<StorageType>::is_trivial()) {
+        if constexpr (IsTriviallyDestructible<StorageType> && IsTriviallyCopyable<StorageType>) {
             TypedTransfer<StorageType>::copy(slot(index), slot(index + count), m_size - index - count);
         } else {
             for (size_t i = index; i < index + count; i++)
@@ -524,7 +560,7 @@ public:
                 ++it;
                 next_remove_index = it != end ? to_index(it) : m_size;
             } else {
-                if constexpr (Traits<StorageType>::is_trivial()) {
+                if constexpr (IsTriviallyDestructible<StorageType> && IsTriviallyCopyable<StorageType>) {
                     __builtin_memcpy(slot(write_index), slot(read_index), sizeof(StorageType));
                 } else {
                     new (slot(write_index)) StorageType(move(raw_at(read_index)));
@@ -560,16 +596,25 @@ public:
     template<typename TUnaryPredicate>
     bool remove_all_matching(TUnaryPredicate const& predicate)
     {
-        bool something_was_removed = false;
-        for (size_t i = 0; i < size();) {
-            if (predicate(at(i))) {
-                remove(i);
-                something_was_removed = true;
-            } else {
-                ++i;
+        size_t write_index = 0;
+        for (size_t read_index = 0; read_index < m_size; ++read_index) {
+            if (predicate(at(read_index))) {
+                TypedTransfer<StorageType>::delete_(slot(read_index), 1);
+                continue;
             }
+            if (read_index != write_index) {
+                TypedTransfer<StorageType>::move(slot(write_index), slot(read_index), 1);
+                TypedTransfer<StorageType>::delete_(slot(read_index), 1);
+            }
+            ++write_index;
         }
-        return something_was_removed;
+
+        if (write_index == m_size)
+            return false;
+
+        m_size = write_index;
+        update_metadata();
+        return true;
     }
 
     ALWAYS_INLINE T take_last()
@@ -655,7 +700,7 @@ public:
             return try_append(forward<U>(value));
         TRY(try_grow_capacity(size() + 1));
         ++m_size;
-        if constexpr (Traits<StorageType>::is_trivial()) {
+        if constexpr (IsTriviallyDestructible<StorageType> && IsTriviallyCopyable<StorageType>) {
             TypedTransfer<StorageType>::move(slot(index + 1), slot(index), m_size - index - 1);
         } else {
             for (size_t i = size() - 1; i > index; --i) {
@@ -713,7 +758,7 @@ public:
         return {};
     }
 
-    ErrorOr<void> try_append(T&& value)
+    ALWAYS_INLINE ErrorOr<void> try_append(T&& value)
     {
         TRY(try_grow_capacity(size() + 1));
         if constexpr (contains_reference)
@@ -725,13 +770,13 @@ public:
         return {};
     }
 
-    ErrorOr<void> try_append(T const& value)
+    ALWAYS_INLINE ErrorOr<void> try_append(T const& value)
     requires(!contains_reference)
     {
         return try_append(T(value));
     }
 
-    ErrorOr<void> try_append(StorageType const* values, size_t count)
+    ALWAYS_INLINE ErrorOr<void> try_append(StorageType const* values, size_t count)
     {
         if (count == 0)
             return {};
@@ -797,7 +842,7 @@ public:
         return {};
     }
 
-    ErrorOr<void> try_grow_capacity(size_t needed_capacity)
+    ALWAYS_INLINE ErrorOr<void> try_grow_capacity(size_t needed_capacity)
     {
         if (m_capacity >= needed_capacity)
             return {};
@@ -808,12 +853,16 @@ public:
     {
         if (m_capacity >= needed_capacity)
             return {};
-        size_t new_capacity = kmalloc_good_size(needed_capacity * sizeof(StorageType)) / sizeof(StorageType);
-        auto* new_buffer = static_cast<StorageType*>(kmalloc_array(new_capacity, sizeof(StorageType)));
+        Checked<size_t> new_size_in_bytes = needed_capacity;
+        new_size_in_bytes *= sizeof(StorageType);
+        if (new_size_in_bytes.has_overflow())
+            return Error::from_errno(ENOMEM);
+        auto* new_buffer = static_cast<StorageType*>(kmalloc(storage_partition, new_size_in_bytes.value()));
         if (new_buffer == nullptr)
             return Error::from_errno(ENOMEM);
+        size_t new_capacity = kmalloc_usable_size(new_buffer) / sizeof(StorageType);
 
-        if constexpr (Traits<StorageType>::is_trivial()) {
+        if constexpr (IsTriviallyCopyable<StorageType>) {
             TypedTransfer<StorageType>::copy(new_buffer, data(), m_size);
         } else {
             for (size_t i = 0; i < m_size; ++i) {
@@ -822,7 +871,7 @@ public:
             }
         }
         if (m_metadata.outline_buffer)
-            kfree_sized(m_metadata.outline_buffer, m_capacity * sizeof(StorageType));
+            kfree(m_metadata.outline_buffer);
         m_metadata.outline_buffer = new_buffer;
         m_capacity = new_capacity;
         update_metadata(); // We have *some* space, we just allocated it.
@@ -839,8 +888,14 @@ public:
 
         TRY(try_ensure_capacity(new_size));
 
-        for (size_t i = size(); i < new_size; ++i)
-            new (slot(i)) StorageType {};
+        if constexpr (IsTriviallyConstructible<StorageType>) {
+            // For trivial types, we can just zero the new memory.
+            size_t old_size = size();
+            memset(slot(old_size), 0, (new_size - old_size) * sizeof(StorageType));
+        } else {
+            for (size_t i = size(); i < new_size; ++i)
+                new (slot(i)) StorageType {};
+        }
         m_size = new_size;
         update_metadata(); // We have *some* space, try_ensure_capacity above ensured nonzero.
         return {};
@@ -893,10 +948,23 @@ public:
             return;
         }
 
-        for (size_t i = new_size; i < size(); ++i)
-            at(i).~StorageType();
+        if constexpr (!IsTriviallyDestructible<StorageType>) {
+            for (size_t i = new_size; i < size(); ++i)
+                at(i).~StorageType();
+        }
         m_size = new_size;
         update_metadata(); // We have *some* space, as new_size can't be zero here.
+    }
+
+    void unsafe_shrink(size_t new_size)
+    requires(want_fast_last_access)
+    {
+        if constexpr (!IsTriviallyDestructible<StorageType>) {
+            for (size_t i = new_size; i < size(); ++i)
+                at(i).~StorageType();
+        }
+        m_size = new_size;
+        update_metadata(); // We have at least an allocation, as we are not freeing anything.
     }
 
     void resize(size_t new_size, bool keep_capacity = false)
@@ -1013,7 +1081,7 @@ public:
     }
 
 private:
-    void reset_capacity()
+    ALWAYS_INLINE void reset_capacity()
     {
         m_capacity = inline_capacity;
     }

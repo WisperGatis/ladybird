@@ -7,15 +7,16 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/Error.h>
-#include <AK/Noncopyable.h>
-#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
+#include <LibCore/Export.h>
 
 namespace Core {
 
-class AnonymousBufferImpl final : public RefCounted<AnonymousBufferImpl> {
+// TODO: Hide the implementation from ABI
+class CORE_API AnonymousBufferImpl final : public AtomicRefCounted<AnonymousBufferImpl> {
 public:
     static ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> create(size_t);
     static ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> create(int fd, size_t);
@@ -34,17 +35,36 @@ private:
     void* m_data { nullptr };
 };
 
-class AnonymousBuffer {
+class CORE_API AnonymousBuffer {
 public:
-    static ErrorOr<AnonymousBuffer> create_with_size(size_t);
+    enum class Sealability {
+        Unsealable,
+        Sealable,
+    };
+
+    static ErrorOr<AnonymousBuffer> create_with_size(size_t, Sealability = Sealability::Unsealable);
     static ErrorOr<AnonymousBuffer> create_from_anon_fd(int fd, size_t);
 
     AnonymousBuffer() = default;
 
     bool is_valid() const { return m_impl; }
 
+    ErrorOr<AnonymousBuffer> snapshot(Sealability = Sealability::Unsealable) const;
+    ErrorOr<AnonymousBuffer> snapshot(size_t offset, size_t size, Sealability = Sealability::Unsealable) const;
+
+    // The size of a received buffer is whatever the peer claimed in the message. If the backing store is
+    // smaller than that, reading the mapping past its end faults, so check before trusting the size.
+    ErrorOr<void> validate_backing_size() const;
+
     int fd() const { return m_impl ? m_impl->fd() : -1; }
     size_t size() const { return m_impl ? m_impl->size() : 0; }
+
+    ReadonlyBytes bytes() const
+    {
+        if (!m_impl)
+            return {};
+        return ReadonlyBytes { m_impl->data(), m_impl->size() };
+    }
 
     template<typename T>
     T* data()

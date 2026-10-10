@@ -1,54 +1,67 @@
 /*
- * Copyright (c) 2021, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2021-2022, Andreas Kling <andreas@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/AST.h>
-#include <LibJS/Lexer.h>
-#include <LibJS/Parser.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/Script.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(Script);
+using namespace EmbeddingABI;
 
 // 16.1.5 ParseScript ( sourceText, realm, hostDefined ), https://tc39.es/ecma262/#sec-parse-script
-Result<GC::Ref<Script>, Vector<ParserError>> Script::parse(StringView source_text, Realm& realm, StringView filename, HostDefined* host_defined, size_t line_number_offset)
+Result<GC::Ref<Script>, Vector<ParserError>> Script::parse(Utf16View source_text, Realm& realm, StringView filename, Utf16View display_filename, GC::Ptr<GC::Cell> host_defined, size_t line_number_offset)
 {
-    // 1. Let script be ParseText(sourceText, Script).
-    auto parser = Parser(Lexer(source_text, filename, line_number_offset));
-    auto script = parser.parse_program();
-
-    // 2. If script is a List of errors, return body.
-    if (parser.has_errors())
-        return parser.errors();
-
-    // 3. Return Script Record { [[Realm]]: realm, [[ECMAScriptCode]]: script, [[HostDefined]]: hostDefined }.
-    return realm.heap().allocate<Script>(realm, filename, move(script), host_defined);
+    ParserErrorCollector errors;
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* script = js_script_parse(
+        vm_to_abi(realm.vm()),
+        realm_to_abi(realm),
+        utf16_view_to_abi(source_text),
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        utf16_view_to_abi(display_filename),
+        host_defined.ptr(),
+        line_number_offset,
+        errors.sink());
+    return record_or_parser_errors_from_abi<Script>(script, errors);
 }
 
-Script::Script(Realm& realm, StringView filename, NonnullRefPtr<Program> parse_node, HostDefined* host_defined)
-    : m_realm(realm)
-    , m_parse_node(move(parse_node))
-    , m_filename(filename)
-    , m_host_defined(host_defined)
+Result<GC::Ref<Script>, Vector<ParserError>> Script::create_from_bytecode_cache(NonnullRefPtr<RustIntegration::DecodedBytecodeCache> bytecode_cache, NonnullRefPtr<SourceCode const> source_code, Realm& realm, StringView filename, GC::Ptr<GC::Cell> host_defined)
 {
+    ParserErrorCollector errors;
+    auto utf16_filename = filename_to_utf16(filename);
+    auto* script = js_bytecode_cache_create_script(
+        vm_to_abi(realm.vm()),
+        decoded_bytecode_cache_to_abi(*bytecode_cache),
+        source_code_to_abi(*source_code),
+        realm_to_abi(realm),
+        utf16_view_to_abi(utf16_filename.utf16_view()),
+        host_defined.ptr(),
+        errors.sink());
+    return record_or_parser_errors_from_abi<Script>(script, errors);
 }
 
-Script::~Script()
+GC::Ptr<GC::Cell> Script::host_defined() const
 {
+    return static_cast<GC::Cell*>(js_script_host_defined(script_to_abi(*this)));
 }
 
-void Script::visit_edges(Cell::Visitor& visitor)
+void Script::begin_bytecode_cache_generation()
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_realm);
-    if (m_host_defined)
-        m_host_defined->visit_host_defined_self(visitor);
-    for (auto const& loaded_module : m_loaded_modules)
-        visitor.visit(loaded_module.module);
+    js_bytecode_cache_script_begin_generation(vm_to_abi(vm()), script_to_abi(*this));
+}
+
+void Script::finish_bytecode_cache_generation_without_install()
+{
+    js_bytecode_cache_script_finish_generation_without_install(vm_to_abi(vm()), script_to_abi(*this));
+}
+
+void Script::install_generated_bytecode_cache(NonnullRefPtr<RustIntegration::DecodedBytecodeCache> bytecode_cache, NonnullRefPtr<SourceCode const> source_code)
+{
+    js_bytecode_cache_script_install_generated(vm_to_abi(vm()), script_to_abi(*this), decoded_bytecode_cache_to_abi(*bytecode_cache), source_code_to_abi(*source_code));
 }
 
 }

@@ -1,0 +1,111 @@
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
+#include <LibGC/Ptr.h>
+#include <LibGfx/AffineTransform.h>
+#include <LibGfx/Forward.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/InvalidateDisplayList.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/Painting/BoxModelMetrics.h>
+#include <LibWeb/Painting/PaintableTypes.h>
+
+namespace Web::Painting {
+
+WEB_API void set_paint_viewport_scrollbars(bool enabled);
+bool should_paint_viewport_scrollbars();
+
+// One url() reference of a filter list, resolved against the SVG <filter> element it names.
+WEB_API GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const&);
+
+Compositing::RustFFI::NodeSlotId committed_row_slot(Layout::Node const&);
+Compositing::RustFFI::NodeSlotId viewport_row_slot(Layout::BegunRead const&, DOM::Document const&);
+Optional<Layout::RustFFI::PaintableData> committed_row(Layout::Node const&);
+
+WEB_API bool has_committed_box(Layout::Node const&);
+WEB_API Layout::Node* layout_node_for_committed_slot(Layout::BegunRead const&, Layout::NodeArena&, Compositing::RustFFI::NodeSlotId);
+
+WEB_API CSSPixelRect absolute_rect(Layout::Node const&);
+WEB_API CSSPixelRect absolute_padding_box_rect(Layout::Node const&);
+WEB_API CSSPixelRect absolute_border_box_rect(Layout::Node const&);
+WEB_API CSSPixelPoint absolute_position(Layout::Node const&);
+WEB_API CSSPixelSize content_size(Layout::Node const&);
+WEB_API CSSPixels content_width(Layout::Node const&);
+WEB_API CSSPixels content_height(Layout::Node const&);
+WEB_API CSSPixels border_box_width(Layout::Node const&);
+WEB_API CSSPixels border_box_height(Layout::Node const&);
+WEB_API BoxModelMetrics box_model(Layout::Node const&);
+WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
+WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
+WEB_API bool has_scrollable_overflow(Layout::Node const&);
+
+WEB_API bool is_visible(Layout::Node const&);
+WEB_API bool visible_for_hit_testing(Layout::Node const&);
+WEB_API bool has_stacking_context(Layout::Node const&);
+WEB_API CSS::Display display(Layout::Node const&);
+WEB_API bool is_positioned(Layout::Node const&);
+WEB_API CSS::StyleRecordID style_record_identity(Layout::Node const&);
+WEB_API bool is_navigable_container_viewport_paintable(Layout::Node const&);
+WEB_API bool is_viewport_paintable(Layout::Node const&);
+WEB_API bool is_paintable_with_lines(Layout::Node const&);
+WEB_API bool is_svg_svg_paintable(Layout::Node const&);
+
+WEB_API CSSPixelRect transform_rect_to_viewport(Layout::Node const&, CSSPixelRect const&, Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform = Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes);
+WEB_API CSSPixelPoint inverse_transform_point(Layout::Node const&, CSSPixelPoint);
+WEB_API CSSPixelPoint transform_to_local_coordinates(Layout::Node const&, CSSPixelPoint);
+
+WEB_API bool has_accumulated_visual_context(Layout::Node const&);
+WEB_API Compositing::ContextRef accumulated_visual_context(Layout::Node const&);
+WEB_API Compositing::ContextRef accumulated_visual_context_for_descendants(Layout::Node const&);
+WEB_API Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const&);
+
+WEB_API Gfx::Path const* committed_svg_path(Layout::Node const&);
+WEB_API Vector<Layout::RustFFI::FfiSvgTextCharacterCell> svg_text_character_cells(Layout::Node const&);
+WEB_API CSSPixelSize svg_viewport_size(Layout::Node const&);
+WEB_API Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const&);
+WEB_API Gfx::AffineTransform svg_element_transform(Layout::Node const&);
+WEB_API CSS::RustStyleValueHandle used_value_for_grid_template(Layout::Node const&, CSS::PropertyID);
+WEB_API Optional<String> grid_layout_json(Layout::Node const&, UniqueNodeID);
+WEB_API Optional<String> flex_layout_json(Layout::Node const&, UniqueNodeID);
+
+WEB_API CSSPixelPoint box_type_agnostic_position(Layout::Node const&);
+WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::BegunRead const&, Layout::Node const&, size_t offset);
+
+// Per-document paint facts the recording inputs carry, resolved once per recording.
+WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(Layout::BegunRead const&, DOM::Document&);
+WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(Layout::BegunRead const&, DOM::Document const&);
+WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(Layout::BegunRead const&, DOM::Document const&, Vector<u8>& path_bytes);
+WEB_API void push_highlight_pseudo_styles(DOM::Element const&);
+
+// The node a layout row stands for, as the arena names it.
+WEB_API DOM::NodeIdentity node_identity_of(Layout::RustFFI::FfiNodeIdentity);
+
+// Marks the box by its row, which asks the render state nothing, so a box held beside a frame in flight is marked
+// without taking the frame in.
+WEB_API void mark_box(Layout::Node const&, Layout::RustFFI::FfiBoxMarks);
+WEB_API Layout::RustFFI::FfiBoxMarks repaint_marks(InvalidateDisplayList);
+// The display lists `marks` leave stale.
+WEB_API InvalidateDisplayList display_list_invalidation_of(Layout::RustFFI::FfiBoxMarks);
+
+WEB_API void set_needs_repaint(Layout::Node const&, InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);
+// Records the document's display list again without damaging any row, for a change that pushes the damage of the rows it
+// changes itself.
+WEB_API void request_document_repaint(DOM::Document const&, InvalidateDisplayList);
+
+WEB_API void repaint_after_style_change(Layout::Node const&, CSS::RequiredInvalidationAfterStyleChange const&);
+
+WEB_API Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform();
+WEB_API Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const&, Compositing::AccumulatedVisualContextTree const&);
+WEB_API Vector<CSSPixelRect> client_rects(Layout::Node const&, Layout::RustFFI::FfiRectToViewportTransform const&);
+WEB_API CSSPixelRect bounding_client_rect(Layout::Node const&, Layout::RustFFI::FfiRectToViewportTransform const&);
+
+WEB_API CSSPixelPoint cumulative_scroll_compensation(Layout::Node const&);
+
+}

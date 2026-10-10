@@ -7,7 +7,7 @@
 #pragma once
 
 #include <LibWeb/Export.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::Painting {
 
@@ -25,8 +25,6 @@ public:
     PixelBox border;
     PixelBox inset;
 
-    PixelBox margin_box() const;
-    PixelBox padding_box() const;
     PixelBox border_box() const;
 };
 

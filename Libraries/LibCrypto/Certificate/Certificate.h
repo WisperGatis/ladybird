@@ -8,6 +8,8 @@
 
 #include <LibCrypto/ASN1/DER.h>
 #include <LibCrypto/PK/EC.h>
+#include <LibCrypto/PK/MLDSA.h>
+#include <LibCrypto/PK/MLKEM.h>
 #include <LibCrypto/PK/RSA.h>
 
 namespace Crypto::Certificate {
@@ -17,16 +19,16 @@ struct AlgorithmIdentifier {
     {
     }
 
-    explicit AlgorithmIdentifier(Vector<int, 9> const& identifier)
+    explicit AlgorithmIdentifier(ASN1::ObjectIdentifier const& identifier)
         : identifier(identifier)
     {
     }
 
-    Vector<int, 9> identifier;
-    Optional<Vector<int>> ec_parameters {};
+    ASN1::ObjectIdentifier identifier;
+    Optional<ASN1::ObjectIdentifier> ec_parameters {};
 };
 
-ErrorOr<Vector<int>> parse_ec_parameters(ASN1::Decoder& decoder, Vector<StringView> current_scope = {});
+ErrorOr<ASN1::ObjectIdentifier> parse_ec_parameters(ASN1::Decoder& decoder, Vector<StringView> current_scope = {});
 
 // https://datatracker.ietf.org/doc/html/rfc5280#section-4.1
 class SubjectPublicKey {
@@ -44,6 +46,8 @@ class PrivateKey {
 public:
     PK::RSAPrivateKey rsa;
     PK::ECPrivateKey ec;
+    PK::MLDSAPrivateKey mldsa;
+    PK::MLKEMPrivateKey mlkem;
 
     AlgorithmIdentifier algorithm;
     ByteBuffer raw_key;

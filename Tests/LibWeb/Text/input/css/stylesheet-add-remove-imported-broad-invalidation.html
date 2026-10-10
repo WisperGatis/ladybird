@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<div id="target">target</div>
+<script>
+    function settleAndReset(triggerElement) {
+        getComputedStyle(triggerElement).color;
+        getComputedStyle(triggerElement).color;
+        internals.resetStyleInvalidationCounters();
+    }
+
+    function verifyRecomputationsStayBounded(label, maximum) {
+        const recomputations = internals.getStyleInvalidationCounters().elementStyleRecomputations;
+        if (recomputations <= maximum)
+            println(`PASS: ${label}`);
+        else
+            println(`FAIL: ${label} (${recomputations} recomputations)`);
+    }
+
+    function verifyTargetWasRecomputed(label) {
+        const color = getComputedStyle(document.getElementById("target")).color;
+        if (color === "rgb(0, 128, 0)")
+            println(`PASS: ${label}`);
+        else
+            println(`FAIL: ${label} (${color})`);
+    }
+
+    async function waitForImportedSheet(styleElement) {
+        while (styleElement.sheet.cssRules.length === 0 || styleElement.sheet.cssRules[0].styleSheet === null)
+            await animationFrame();
+    }
+
+    promiseTest(async () => {
+        const target = document.getElementById("target");
+        settleAndReset(target);
+
+        const layerImportStyle = document.createElement("style");
+        layerImportStyle.textContent = `@import "data:text/css;base64,${btoa("@layer B, A;")}";`;
+        document.head.appendChild(layerImportStyle);
+        await waitForImportedSheet(layerImportStyle);
+
+        getComputedStyle(target).color;
+        // A layer order change can only move declarations that sit in layers, and nothing here does.
+        verifyRecomputationsStayBounded("imported layer-only stylesheet add restyles nothing", 1);
+
+        settleAndReset(target);
+        layerImportStyle.remove();
+
+        getComputedStyle(target).color;
+        verifyRecomputationsStayBounded("imported layer-only stylesheet remove restyles nothing", 1);
+
+        // With a declaration in a layer, reordering the layers has to reach the element it decides
+        // for - and still not the whole document.
+        const layeredStyle = document.createElement("style");
+        layeredStyle.textContent = "@layer A, B; @layer A { #target { color: green } } @layer B { #target { color: blue } }";
+        document.head.appendChild(layeredStyle);
+        settleAndReset(target);
+
+        document.head.insertBefore(layerImportStyle, layeredStyle);
+        await waitForImportedSheet(layerImportStyle);
+
+        getComputedStyle(target).color;
+        verifyTargetWasRecomputed("imported layer reorder reaches the layered element");
+        verifyRecomputationsStayBounded("imported layer reorder stays bounded", 8);
+
+    });
+</script>

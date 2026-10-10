@@ -1,0 +1,15 @@
+PASS: class mutation invalidates affected :has() rule
+PASS: class mutation still invalidates matching :has() rule
+PASS: dir=auto text mutation invalidates :has(:empty)
+PASS: svg camel-case attribute mutation invalidates :has()
+PASS: svg lower-case selector does not match camel-case attribute mutation invalidates :has()
+PASS: checked property mutation invalidates :has()
+PASS: disabled attribute mutation invalidates :has()
+PASS: enabled attribute mutation invalidates :has()
+PASS: required attribute mutation invalidates :has()
+PASS: optional attribute mutation invalidates :has()
+PASS: placeholder shown value mutation invalidates :has()
+PASS: lang attribute mutation invalidates :has()
+PASS: dir attribute mutation invalidates :has()
+PASS: link href mutation invalidates :has()
+PASS: any-link href mutation invalidates :has()

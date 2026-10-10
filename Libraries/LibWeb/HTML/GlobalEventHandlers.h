@@ -13,6 +13,10 @@
 
 #define ENUMERATE_GLOBAL_EVENT_HANDLERS(E)                                    \
     E(onabort, HTML::EventNames::abort)                                       \
+    E(onanimationcancel, HTML::EventNames::animationcancel)                   \
+    E(onanimationend, HTML::EventNames::animationend)                         \
+    E(onanimationiteration, HTML::EventNames::animationiteration)             \
+    E(onanimationstart, HTML::EventNames::animationstart)                     \
     E(onauxclick, UIEvents::EventNames::auxclick)                             \
     E(onbeforeinput, HTML::EventNames::beforeinput)                           \
     E(onbeforematch, HTML::EventNames::beforematch)                           \
@@ -95,6 +99,10 @@
     E(onsuspend, HTML::EventNames::suspend)                                   \
     E(ontimeupdate, HTML::EventNames::timeupdate)                             \
     E(ontoggle, HTML::EventNames::toggle)                                     \
+    E(ontransitioncancel, HTML::EventNames::transitioncancel)                 \
+    E(ontransitionend, HTML::EventNames::transitionend)                       \
+    E(ontransitionrun, HTML::EventNames::transitionrun)                       \
+    E(ontransitionstart, HTML::EventNames::transitionstart)                   \
     E(onvolumechange, HTML::EventNames::volumechange)                         \
     E(onwaiting, HTML::EventNames::waiting)                                   \
     E(onwebkitanimationend, HTML::EventNames::webkitAnimationEnd)             \
@@ -117,7 +125,7 @@ public:
 #undef __ENUMERATE
 
 protected:
-    virtual GC::Ptr<DOM::EventTarget> global_event_handlers_to_event_target(FlyString const& event_name) = 0;
+    virtual GC::Ptr<DOM::EventTarget> global_event_handlers_to_event_target(Utf16FlyString const& event_name) = 0;
 };
 
 }

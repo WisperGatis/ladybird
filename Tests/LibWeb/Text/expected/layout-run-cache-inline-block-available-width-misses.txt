@@ -1,0 +1,1 @@
+PASS: available width forces wrapping (work + checks)

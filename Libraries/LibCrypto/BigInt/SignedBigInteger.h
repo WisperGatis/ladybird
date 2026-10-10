@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
+#include <AK/kmalloc.h>
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
 
 namespace Crypto {
@@ -16,6 +18,8 @@ struct SignedDivisionResult;
 
 class SignedBigInteger {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     template<Signed T>
     SignedBigInteger(T value)
         : SignedBigInteger(static_cast<i64>(value))
@@ -42,8 +46,11 @@ public:
     [[nodiscard]] Bytes export_data(Bytes) const;
 
     [[nodiscard]] static ErrorOr<SignedBigInteger> from_base(u16 N, StringView str);
+    [[nodiscard]] static ErrorOr<SignedBigInteger> from_base(u16 N, Utf16View str);
     [[nodiscard]] ErrorOr<String> to_base(u16 N) const;
+    [[nodiscard]] ErrorOr<Utf16String> to_base_utf16(u16 N) const;
 
+    [[nodiscard]] i64 to_i64() const;
     [[nodiscard]] u64 to_u64() const;
     [[nodiscard]] double to_double(UnsignedBigInteger::RoundingMode rounding_mode = UnsignedBigInteger::RoundingMode::IEEERoundAndTiesToEvenMantissa) const;
 
@@ -58,6 +65,7 @@ public:
     void set_to(SignedBigInteger const& other);
 
     [[nodiscard]] size_t byte_length() const;
+    [[nodiscard]] size_t external_memory_size() const { return m_mp.alloc * sizeof(mp_digit); }
 
     [[nodiscard]] SignedBigInteger plus(SignedBigInteger const& other) const;
     [[nodiscard]] SignedBigInteger minus(SignedBigInteger const& other) const;
@@ -69,6 +77,8 @@ public:
     [[nodiscard]] SignedBigInteger shift_right(size_t num_bits) const;
     [[nodiscard]] SignedBigInteger multiplied_by(SignedBigInteger const& other) const;
     [[nodiscard]] SignedDivisionResult divided_by(SignedBigInteger const& divisor) const;
+    [[nodiscard]] SignedBigInteger quotient(SignedBigInteger const& divisor) const;
+    [[nodiscard]] SignedBigInteger remainder(SignedBigInteger const& divisor) const;
     [[nodiscard]] SignedBigInteger pow(u32 exponent) const;
     [[nodiscard]] ErrorOr<SignedBigInteger> mod_power_of_two(size_t power_of_two) const;
 
@@ -76,6 +86,8 @@ public:
     [[nodiscard]] SignedBigInteger minus(UnsignedBigInteger const& other) const;
     [[nodiscard]] SignedBigInteger multiplied_by(UnsignedBigInteger const& other) const;
     [[nodiscard]] SignedDivisionResult divided_by(UnsignedBigInteger const& divisor) const;
+    [[nodiscard]] SignedBigInteger quotient(UnsignedBigInteger const& divisor) const;
+    [[nodiscard]] SignedBigInteger remainder(UnsignedBigInteger const& divisor) const;
 
     [[nodiscard]] SignedBigInteger negated_value() const;
 
@@ -115,5 +127,5 @@ struct AK::Formatter<Crypto::SignedBigInteger> : AK::Formatter<Crypto::UnsignedB
 inline Crypto::SignedBigInteger
 operator""_sbigint(char const* string, size_t length)
 {
-    return MUST(Crypto::SignedBigInteger::from_base(10, { string, length }));
+    return MUST(Crypto::SignedBigInteger::from_base(10, StringView { string, length }));
 }

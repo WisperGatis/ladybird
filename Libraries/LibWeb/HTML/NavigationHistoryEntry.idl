@@ -1,6 +1,3 @@
-#import <DOM/EventHandler.idl>
-#import <DOM/EventTarget.idl>
-
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#navigationtype
 [Exposed=Window]
 interface NavigationHistoryEntry : EventTarget {
@@ -10,7 +7,7 @@ interface NavigationHistoryEntry : EventTarget {
     readonly attribute long long index;
     readonly attribute boolean sameDocument;
 
-    any getState();
+    [NeedsCallerRealm] any getState();
 
     attribute EventHandler ondispose;
 };

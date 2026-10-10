@@ -1,0 +1,68 @@
+<!doctype html>
+<style>
+    #target {
+        width: 20px;
+        height: 20px;
+        transform: translateX(0);
+        transition: transform 100s linear 500ms;
+    }
+
+    #target.changed {
+        transform: translateX(100px);
+    }
+</style>
+<div id="target"></div>
+<script src="../include.js"></script>
+<script>
+    function nextTask() {
+        const { promise, resolve } = Promise.withResolvers();
+        const channel = new MessageChannel();
+        channel.port1.onmessage = resolve;
+        channel.port2.postMessage(null);
+        return promise;
+    }
+
+    // The rendering update may go on beside the tasks after it, so it is waited for until it has run.
+    async function renderAt(frameTime) {
+        internals.injectRenderingOpportunity(frameTime);
+        do
+            await nextTask();
+        while (internals.frameSchedulerState() !== "idle");
+    }
+
+    asyncTest(async done => {
+        internals.setManualRenderingOpportunities(true);
+        await nextTask();
+        const firstFrameTime = performance.now();
+        await renderAt(firstFrameTime);
+
+        let receivedTransitionStart = false;
+        target.addEventListener("transitionstart", () => receivedTransitionStart = true);
+        target.classList.add("changed");
+
+        for (const offset of [16, 32, 48, 64])
+            await renderAt(firstFrameTime + offset);
+
+        const transition = target.getAnimations()[0];
+        await transition.ready;
+        println(`delayed transition uses the compositor before start: ${internals.getStyleInvalidationCounters().compositorVisualAnimations === 1}`);
+
+        const activeStartTime = transition.startTime + 501;
+        internals.resetStyleInvalidationCounters();
+        internals.fireCompositorAnimationWakeupForTesting(activeStartTime);
+        const counters = internals.getStyleInvalidationCounters();
+
+        transition.currentTime = 501;
+        await renderAt(performance.now());
+
+        println(`delayed compositor effect requests one start frame: ${counters.animationFramePumpRequests === 1}`);
+        println(`delayed compositor effect republishes at active start: ${counters.compositorVisualAnimationUpdates === 1}`);
+        println(`seeking reaches the delayed transition's active phase: ${transition.currentTime >= 500}`);
+        println(`transitionstart fires after seeking and rendering: ${receivedTransitionStart}`);
+        println(`active compositor effect retains an end wake-up: ${internals.getStyleInvalidationCounters().compositorAnimationWakeupTimerActive}`);
+
+        transition.cancel();
+        internals.setManualRenderingOpportunities(false);
+        done();
+    });
+</script>

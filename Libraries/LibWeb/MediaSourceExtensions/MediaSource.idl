@@ -1,7 +1,3 @@
-#import <DOM/EventHandler.idl>
-#import <MediaSourceExtensions/MediaSourceHandle.idl>
-#import <MediaSourceExtensions/SourceBufferList.idl>
-
 // https://w3c.github.io/media-source/#dom-mediasource
 enum ReadyState {
     "closed",
@@ -34,8 +30,8 @@ interface MediaSource : EventTarget {
     static readonly attribute boolean canConstructInDedicatedWorker;
 
     SourceBuffer addSourceBuffer(DOMString type);
-    undefined removeSourceBuffer(SourceBuffer sourceBuffer);
-    undefined endOfStream(optional EndOfStreamError error);
+    [FIXME] undefined removeSourceBuffer(SourceBuffer sourceBuffer);
+    [ImplementedAs=end_of_stream] undefined endOfStream(optional EndOfStreamError error);
     [FIXME] undefined setLiveSeekableRange(double start, double end);
     [FIXME] undefined clearLiveSeekableRange();
     static boolean isTypeSupported(DOMString type);

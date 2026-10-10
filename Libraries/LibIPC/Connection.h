@@ -10,8 +10,9 @@
 
 #include <AK/Forward.h>
 #include <AK/Queue.h>
+#include <AK/ThreadID.h>
 #include <LibCore/EventReceiver.h>
-#include <LibIPC/File.h>
+#include <LibIPC/Attachment.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/Message.h>
 #include <LibIPC/Transport.h>
@@ -26,19 +27,40 @@ public:
 
     [[nodiscard]] bool is_open() const;
     ErrorOr<void> post_message(Message const&);
-    ErrorOr<void> post_message(MessageBuffer);
+    ErrorOr<void> post_message(MessageBuffer&);
 
     void shutdown();
     virtual void die() { }
 
+    // Tells the connection that its peer owns this process — i.e. that the process exists only to serve that peer, and
+    // that die() ends it. Such a process has nothing left to do once that peer has closed the connection. So, the
+    // connection then shuts down rather than be used any further: It drops whatever the peer sent before closing,
+    // rather than dispatch that to handlers that'd find the connection closed under them. And it shuts down on a sync
+    // request, rather than fail one whose caller may have no way to carry on without the response.
+    // Gecko/WebKit/Blink do the same for a child process's connection to its parent, each exiting the process right
+    // there: Gecko SetAbortOnError, Blink TerminateSelfOnDisconnect, WebKit
+    // setDidCloseOnConnectionWorkQueueCallback/setShouldExitOnSyncMessageSendFailure.
+    // NB: Those all exit from their IO thread, which also ends a process whose main thread is stuck in script. This
+    // acts on the connection's own thread only — so it doesn't.
+    void set_peer_owns_this_process(bool value) { m_peer_owns_this_process = value; }
+
     Transport& transport() const { return *m_transport; }
+
+    // Messages of one kind that have arrived and have not been dispatched yet, in
+    // arrival order. A caller that asked the peer for state synchronously reads what the peer sent ahead of
+    // its answer this way, without dispatching anything else out of turn.
+    Vector<NonnullOwnPtr<Message>> take_unprocessed_messages(u32 endpoint_magic, i32 message_id);
+
+    // Dispatch every message the peer has already sent on this connection, without waiting for new ones.
+    void dispatch_pending_messages();
 
 protected:
     explicit ConnectionBase(IPC::Stub&, NonnullOwnPtr<Transport>, u32 local_endpoint_magic);
 
     virtual void shutdown_with_error(Error const&);
-    virtual OwnPtr<Message> try_parse_message(ReadonlyBytes, Queue<File>&) = 0;
+    virtual OwnPtr<Message> try_parse_message(ReadonlyBytes, Queue<Attachment>&) = 0;
 
+    ErrorOr<void> post_sync_request(Message const&);
     OwnPtr<IPC::Message> wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id);
     void wait_for_transport_to_become_readable();
     enum class PeerEOF {
@@ -49,13 +71,18 @@ protected:
 
     void handle_messages();
 
+    AK::ThreadID m_owner_thread_id { AK::ThreadID::current() };
+
     IPC::Stub& m_local_stub;
 
     NonnullOwnPtr<Transport> m_transport;
 
-    Vector<NonnullOwnPtr<Message>> m_unprocessed_messages;
+    Vector<OwnPtr<Message>> m_unprocessed_messages;
+    Vector<Span<OwnPtr<Message>>> m_dispatching_message_batches;
 
     u32 m_local_endpoint_magic { 0 };
+
+    bool m_peer_owns_this_process { false };
 };
 
 template<typename LocalEndpoint, typename PeerEndpoint>
@@ -69,7 +96,7 @@ public:
     template<typename RequestType, typename... Args>
     NonnullOwnPtr<typename RequestType::ResponseType> send_sync(Args&&... args)
     {
-        MUST(post_message(RequestType(forward<Args>(args)...)));
+        MUST(post_sync_request(RequestType(forward<Args>(args)...)));
         auto response = wait_for_specific_endpoint_message<typename RequestType::ResponseType, PeerEndpoint>();
         VERIFY(response);
         return response.release_nonnull();
@@ -78,7 +105,7 @@ public:
     template<typename RequestType, typename... Args>
     OwnPtr<typename RequestType::ResponseType> send_sync_but_allow_failure(Args&&... args)
     {
-        if (post_message(RequestType(forward<Args>(args)...)).is_error())
+        if (post_sync_request(RequestType(forward<Args>(args)...)).is_error())
             return nullptr;
         return wait_for_specific_endpoint_message<typename RequestType::ResponseType, PeerEndpoint>();
     }
@@ -92,15 +119,19 @@ protected:
         return {};
     }
 
-    virtual OwnPtr<Message> try_parse_message(ReadonlyBytes bytes, Queue<File>& fds) override
+    virtual OwnPtr<Message> try_parse_message(ReadonlyBytes bytes, Queue<Attachment>& attachments) override
     {
-        auto local_message = LocalEndpoint::decode_message(bytes, fds);
+        auto local_message = LocalEndpoint::decode_message(bytes, attachments);
         if (!local_message.is_error())
             return local_message.release_value();
 
-        auto peer_message = PeerEndpoint::decode_message(bytes, fds);
+        auto peer_message = PeerEndpoint::decode_message(bytes, attachments);
         if (!peer_message.is_error())
             return peer_message.release_value();
+
+        dbgln("Failed to parse IPC message:");
+        dbgln("  Local endpoint error: {}", local_message.error());
+        dbgln("  Peer endpoint error: {}", peer_message.error());
 
         return nullptr;
     }

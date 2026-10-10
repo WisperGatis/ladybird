@@ -14,6 +14,7 @@
 #include <AK/Function.h>
 #include <AK/Result.h>
 #include <LibCore/EventReceiver.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <pthread.h>
 
 namespace Threading {
@@ -45,11 +46,11 @@ enum class ThreadState : u8 {
 class Thread final
     : public AtomicRefCounted<Thread> {
 public:
-    static NonnullRefPtr<Thread> construct(ESCAPING Function<intptr_t()> action, StringView thread_name = {})
+    static NonnullRefPtr<Thread> construct(StringView thread_name, ESCAPING Function<intptr_t()> action)
     {
         return adopt_ref(*new Thread(move(action), thread_name));
     }
-    static ErrorOr<NonnullRefPtr<Thread>> try_create(ESCAPING Function<intptr_t()> action, StringView thread_name = {})
+    static ErrorOr<NonnullRefPtr<Thread>> try_create(StringView thread_name, ESCAPING Function<intptr_t()> action)
     {
         return adopt_nonnull_ref_or_enomem(new (nothrow) Thread(move(action), thread_name));
     }
@@ -58,6 +59,10 @@ public:
 
     ErrorOr<void> set_priority(int priority);
     ErrorOr<int> get_priority() const;
+
+    void set_stack_size(size_t size) { m_stack_size = size; }
+    // Only takes effect for threads that have not been started yet.
+    void set_qos(Core::Platform::ThreadQoS qos) { m_qos = qos; }
 
     // Only callable in the Startable state.
     void start();
@@ -76,11 +81,13 @@ public:
     bool has_exited() const;
 
 private:
-    explicit Thread(ESCAPING Function<intptr_t()> action, StringView thread_name = {});
+    explicit Thread(ESCAPING Function<intptr_t()> action, StringView thread_name);
     Function<intptr_t()> m_action;
     pthread_t m_tid {};
     ByteString m_thread_name;
     Atomic<ThreadState> m_state { ThreadState::Startable };
+    size_t m_stack_size { 0 };
+    Core::Platform::ThreadQoS m_qos { Core::Platform::ThreadQoS::UserInitiated };
 };
 
 template<typename T>

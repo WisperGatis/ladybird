@@ -1,0 +1,3 @@
+PASS: quiet light canvas (work)
+PASS: change canvas to dark (work)
+PASS: quiet dark canvas (work)

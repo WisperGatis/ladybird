@@ -7,17 +7,22 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/Utf16String.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Ptr.h>
 #include <LibURL/Origin.h>
+#include <LibWeb/Bindings/PerformanceNavigationTiming.h>
+#include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/CrossOrigin/OpenerPolicy.h>
-#include <LibWeb/HTML/CrossOrigin/OpenerPolicyEnforcementResult.h>
 #include <LibWeb/HTML/PolicyContainers.h>
-#include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
+#include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
+#include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcementResult.h>
+#include <LibWebCommon/HTML/NavigationParamsDescriptor.h>
+#include <LibWebCommon/HTML/SandboxingFlagSet.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
@@ -27,10 +32,10 @@ struct NavigationParams : GC::Cell {
     GC_DECLARE_ALLOCATOR(NavigationParams);
 
     // null or a navigation ID
-    Optional<String> id;
+    Optional<Utf16String> id;
 
     // the navigable to be navigated
-    GC::Ptr<Navigable> navigable;
+    GC::Ptr<LocalNavigable> navigable;
 
     // null or a request that started the navigation
     GC::Ptr<Fetch::Infrastructure::Request> request;
@@ -41,8 +46,20 @@ struct NavigationParams : GC::Cell {
     // null or a fetch controller
     GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller { nullptr };
 
+    // AD-HOC: The fetch controller stays in the process that ran the navigation fetch. Navigation params rebuilt from
+    //         a descriptor carry the fetch's timing info here instead, so the new Document's navigation timing entry
+    //         still sees it.
+    RefPtr<Fetch::Infrastructure::FetchTimingInfo> fetch_timing_info { nullptr };
+
+    // AD-HOC: The agent cluster of the agent the UI process obtained for the new Document's window.
+    Optional<u64> agent_cluster_id;
+
+    // AD-HOC: The group of the new top-level browsing context the UI process obtained for the new Document, when a
+    //         browsing context group switch gave it one.
+    Optional<u64> new_browsing_context_group_id;
+
     // null or an algorithm accepting a Document, once it has been created
-    Function<void(DOM::Document&)> commit_early_hints { nullptr };
+    GC::Ptr<GC::Function<void(DOM::Document&)>> commit_early_hints { nullptr };
 
     // an opener policy enforcement result, used for reporting and potentially for causing a browsing context group switch
     OpenerPolicyEnforcementResult coop_enforcement_result;
@@ -59,10 +76,14 @@ struct NavigationParams : GC::Cell {
     // a sandboxing flag set to impose on the new Document
     SandboxingFlagSet final_sandboxing_flag_set = {};
 
+    // a referrer policy, used in the internal ancestor origin objects list creation steps
+    ReferrerPolicy::ReferrerPolicy iframe_element_referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
+
     // an opener policy to use for the new Document
     OpenerPolicy opener_policy;
 
-    // FIXME: a NavigationTimingType used for creating the navigation timing entry for the new Document
+    // a NavigationTimingType used for creating the navigation timing entry for the new Document
+    Bindings::NavigationTimingType navigation_timing_type { Bindings::NavigationTimingType::Navigate };
 
     // a URL or null used to populate the new Document's about base URL
     Optional<URL::URL> about_base_url;
@@ -74,18 +95,20 @@ protected:
     void visit_edges(Visitor& visitor) override;
 
     NavigationParams(
-        Optional<String> id,
-        GC::Ptr<Navigable> navigable,
+        Optional<Utf16String> id,
+        GC::Ptr<LocalNavigable> navigable,
         GC::Ptr<Fetch::Infrastructure::Request> request,
         GC::Ptr<Fetch::Infrastructure::Response> response,
         GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller,
-        Function<void(DOM::Document&)> commit_early_hints,
+        GC::Ptr<GC::Function<void(DOM::Document&)>> commit_early_hints,
         OpenerPolicyEnforcementResult coop_enforcement_result,
         Fetch::Infrastructure::Request::ReservedClientType reserved_environment,
         URL::Origin origin,
         GC::Ptr<PolicyContainer> policy_container,
         SandboxingFlagSet final_sandboxing_flag_set,
+        ReferrerPolicy::ReferrerPolicy iframe_element_referrer_policy,
         OpenerPolicy opener_policy,
+        Bindings::NavigationTimingType navigation_timing_type,
         Optional<URL::URL> about_base_url,
         UserNavigationInvolvement user_involvement)
         : id(move(id))
@@ -93,13 +116,15 @@ protected:
         , request(request)
         , response(response)
         , fetch_controller(fetch_controller)
-        , commit_early_hints(move(commit_early_hints))
+        , commit_early_hints(commit_early_hints)
         , coop_enforcement_result(move(coop_enforcement_result))
         , reserved_environment(reserved_environment)
         , origin(move(origin))
         , policy_container(policy_container)
         , final_sandboxing_flag_set(final_sandboxing_flag_set)
+        , iframe_element_referrer_policy(iframe_element_referrer_policy)
         , opener_policy(opener_policy)
+        , navigation_timing_type(navigation_timing_type)
         , about_base_url(move(about_base_url))
         , user_involvement(user_involvement)
     {
@@ -112,10 +137,10 @@ struct NonFetchSchemeNavigationParams : JS::Cell {
     GC_DECLARE_ALLOCATOR(NonFetchSchemeNavigationParams);
 
     // null or a navigation ID
-    Optional<String> id;
+    Optional<Utf16String> id;
 
     // the navigable to be navigated
-    GC::Ptr<Navigable> navigable;
+    GC::Ptr<LocalNavigable> navigable;
 
     // a URL
     URL::URL url;
@@ -129,19 +154,21 @@ struct NonFetchSchemeNavigationParams : JS::Cell {
     // an origin possibly for use in a user-facing prompt to confirm the invocation of an external software package
     URL::Origin initiator_origin;
 
-    // FIXME: a NavigationTimingType used for creating the navigation timing entry for the new Document
+    // a NavigationTimingType used for creating the navigation timing entry for the new Document
+    Bindings::NavigationTimingType navigation_timing_type { Bindings::NavigationTimingType::Navigate };
 
     // a user navigation involvement used when obtaining a browsing context for the new Document (if one is created)
     UserNavigationInvolvement user_involvement;
 
 protected:
     NonFetchSchemeNavigationParams(
-        Optional<String> id,
-        GC::Ptr<Navigable> navigable,
+        Optional<Utf16String> id,
+        GC::Ptr<LocalNavigable> navigable,
         URL::URL url,
         SandboxingFlagSet target_snapshot_sandboxing_flags,
         bool source_snapshot_has_transient_activation,
         URL::Origin initiator_origin,
+        Bindings::NavigationTimingType navigation_timing_type,
         UserNavigationInvolvement user_involvement)
         : id(move(id))
         , navigable(navigable)
@@ -149,6 +176,7 @@ protected:
         , target_snapshot_sandboxing_flags(target_snapshot_sandboxing_flags)
         , source_snapshot_has_transient_activation(source_snapshot_has_transient_activation)
         , initiator_origin(move(initiator_origin))
+        , navigation_timing_type(navigation_timing_type)
         , user_involvement(user_involvement)
     {
     }
@@ -156,6 +184,8 @@ protected:
     void visit_edges(Visitor& visitor) override;
 };
 
-bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::Response> response, Navigable* navigable, GC::Ref<ContentSecurityPolicy::PolicyList const> csp_list, URL::Origin destination_origin);
+using NavigationParamsVariant = Variant<NavigationParamsNullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
+
+bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::Response> response, LocalNavigable* navigable, GC::Ref<ContentSecurityPolicy::PolicyList const> csp_list, URL::Origin destination_origin);
 
 }

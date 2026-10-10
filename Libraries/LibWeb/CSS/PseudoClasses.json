@@ -1,36 +1,55 @@
 {
+  "-webkit-autofill": {
+    "legacy-alias-for": "autofill"
+  },
   "active": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "any-link": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
+  },
+  "autofill": {
+    "argument": "",
+    "style-engine-state": true
   },
   "buffering": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "checked": {
+    "argument": "",
+    "style-engine-state": true
+  },
+  "current": {
     "argument": ""
   },
   "default": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "defined": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "dir": {
     "argument": "<ident>"
   },
   "disabled": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "empty": {
     "argument": ""
   },
   "enabled": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "even-less-good-value": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "first-child": {
     "argument": ""
@@ -39,13 +58,20 @@
     "argument": ""
   },
   "focus": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "focus-visible": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "focus-within": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
+  },
+  "fullscreen": {
+    "argument": "",
+    "style-engine-state": true
   },
   "has": {
     "argument": "<relative-selector-list>"
@@ -54,19 +80,23 @@
     "argument": "<level>#?"
   },
   "high-value": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "host": {
     "argument": "<compound-selector>?"
   },
   "hover": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "indeterminate": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "invalid": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "is": {
     "argument": "<forgiving-selector-list>"
@@ -81,34 +111,39 @@
     "argument": ""
   },
   "link": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "local-link": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "low-value": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "modal": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "muted": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "not": {
     "argument": "<selector-list>"
   },
   "nth-child": {
-    "argument": "<an+b-of>"
+    "argument": "<a-n-plus-b-of>"
   },
   "nth-last-child": {
-    "argument": "<an+b-of>"
+    "argument": "<a-n-plus-b-of>"
   },
   "nth-last-of-type": {
-    "argument": "<an+b>"
+    "argument": "<a-n-plus-b>"
   },
   "nth-of-type": {
-    "argument": "<an+b>"
+    "argument": "<a-n-plus-b>"
   },
   "only-child": {
     "argument": ""
@@ -117,34 +152,44 @@
     "argument": ""
   },
   "open": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "optimal-value": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "optional": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "popover-open": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "paused": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "placeholder-shown": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "playing": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "read-only": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "read-write": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "required": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "root": {
     "argument": ""
@@ -153,37 +198,47 @@
     "argument": ""
   },
   "seeking": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "stalled": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "state": {
     "argument": "<ident>"
   },
   "suboptimal-value": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "target": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "unchecked": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "user-invalid": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "user-valid": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "valid": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "visited": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "volume-locked": {
-    "argument": ""
+    "argument": "",
+    "style-engine-state": true
   },
   "where": {
     "argument": "<forgiving-selector-list>"

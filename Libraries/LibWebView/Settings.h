@@ -1,28 +1,70 @@
 /*
- * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ * Copyright (c) 2025-2026, Tim Flynn <trflynn89@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #pragma once
 
-#include <AK/Badge.h>
+#include <AK/Array.h>
+#include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/JsonValue.h>
 #include <AK/Optional.h>
+#include <LibHTTP/Cache/DiskCacheSettings.h>
 #include <LibURL/URL.h>
-#include <LibWebView/Autocomplete.h>
+#include <LibWebCommon/HTML/AutoplayPolicy.h>
+#include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/WebView/BrowsingBehavior.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Options.h>
 #include <LibWebView/SearchEngine.h>
 
 namespace WebView {
 
-struct WEBVIEW_API SiteSetting {
-    SiteSetting();
+struct Appearance {
+    bool show_menu_bar { false };
+    bool show_bookmarks_bar { true };
+};
 
-    bool enabled_globally { false };
+struct ContentSettings {
+    double default_zoom_level_factor { 1.0 };
+    HashMap<String, double> zoom_per_host;
+
+    bool enable_force_dark { false };
+};
+
+enum class VerticalTabsPosition : u8 {
+    Left,
+    Right,
+};
+
+struct TabSettings {
+    bool vertical_tabs_enabled { false };
+    bool vertical_tabs_expanded { true };
+    bool vertical_tabs_expand_on_hover { false };
+    VerticalTabsPosition vertical_tabs_position { VerticalTabsPosition::Left };
+    Optional<u16> vertical_tabs_expanded_width;
+};
+
+struct SearchEngineSettings {
+    Optional<SearchEngine> engine;
+    bool suggestions { false };
+};
+
+struct SiteSetting {
     OrderedHashTable<String> site_filters;
+
+protected:
+    SiteSetting() = default;
+};
+
+struct AutoplaySiteSetting : public SiteSetting {
+    Web::HTML::AutoplayPolicy policy { Web::HTML::AutoplayPolicy::BlockAudio };
+};
+
+struct BrowsingDataSettings {
+    HTTP::DiskCacheSettings disk_cache_settings;
 };
 
 enum class GlobalPrivacyControl {
@@ -30,61 +72,155 @@ enum class GlobalPrivacyControl {
     Yes,
 };
 
+struct ContentBlockerList {
+    String identifier;
+    String name;
+    Optional<URL::URL> url;
+    bool enabled { true };
+    bool built_in { false };
+    bool language_specific { false };
+    String description {};
+};
+
+enum class ConfigVariableID : u8 {
+    ShowWebContentProcessIDInTabTitle,
+    ShowAdvancedDebugMenu,
+    ShowTabPerformanceMonitor,
+    UseClientSideWindowDecorations,
+    MaximumConnectionsPerDownload,
+    SplitDownloadsWithoutValidators,
+    RestartStalledConnections,
+
+    Count,
+};
+
+struct ConfigVariableDefinition {
+    ConfigVariableID id;
+    StringView name;
+    StringView title;
+    StringView description;
+    JsonValue default_value;
+    Optional<JsonValue::Type> array_element_type;
+};
+
+WEBVIEW_API ReadonlySpan<ConfigVariableDefinition const> config_variable_definitions();
+WEBVIEW_API Optional<ConfigVariableID> config_variable_id_from_name(StringView);
+
 class WEBVIEW_API SettingsObserver {
 public:
     explicit SettingsObserver();
     virtual ~SettingsObserver();
 
     virtual void new_tab_page_url_changed() { }
-    virtual void default_zoom_level_factor_changed() { }
     virtual void languages_changed() { }
-    virtual void search_engine_changed() { }
-    virtual void autocomplete_engine_changed() { }
+    virtual void appearance_changed() { }
+    virtual void content_settings_changed() { }
+    virtual void tab_settings_changed() { }
+    virtual void browsing_behavior_changed() { }
+    virtual void search_engine_settings_changed() { }
     virtual void autoplay_settings_changed() { }
+    virtual void browsing_data_settings_changed() { }
     virtual void global_privacy_control_changed() { }
     virtual void dns_settings_changed() { }
+    virtual void config_variable_changed(ConfigVariableID) { }
+    virtual void geolocation_settings_changed() { }
+    virtual void background_networking_settings_changed() { }
+    virtual void content_blocker_settings_changed() { }
 };
 
 class WEBVIEW_API Settings {
 public:
-    static Settings create(Badge<Application>);
+    AK_ALLOC_WITH_KMALLOC;
+
+    static Settings create(ByteString settings_path);
 
     JsonValue serialize_json() const;
 
-    void restore_defaults();
+    bool first_run_complete() const { return m_first_run_complete; }
+    ErrorOr<void> complete_first_run();
 
     URL::URL const& new_tab_page_url() const { return m_new_tab_page_url; }
     void set_new_tab_page_url(URL::URL);
-
-    double default_zoom_level_factor() const { return m_default_zoom_level_factor; }
-    void set_default_zoom_level_factor(double);
 
     static Vector<String> parse_json_languages(JsonValue const&);
     Vector<String> const& languages() const { return m_languages; }
     void set_languages(Vector<String>);
 
-    Optional<SearchEngine> const& search_engine() const { return m_search_engine; }
-    void set_search_engine(Optional<StringView> search_engine_name);
+    static Appearance parse_appearance(JsonValue const&);
+    Appearance const& appearance() const { return m_appearance; }
+    void set_appearance(Appearance);
+
+    static ContentSettings parse_content_settings(JsonValue const&);
+    ContentSettings const& content_settings() const { return m_content_settings; }
+    void set_content_settings(ContentSettings);
+
+    double zoom_for_host(StringView host) const;
+    void set_zoom_for_host(String const& host, double zoom_level);
+
+    static TabSettings parse_tab_settings(JsonValue const&);
+    TabSettings const& tab_settings() const { return m_tab_settings; }
+    void set_tab_settings(TabSettings);
+
+    static BrowsingBehavior parse_browsing_behavior(JsonValue const&);
+    BrowsingBehavior browsing_behavior() const;
+    void set_browsing_behavior(BrowsingBehavior);
+
+    SearchEngineSettings const& search_engine_settings() const { return m_search_engine_settings; }
+    void set_search_engine_settings(SearchEngineSettings);
+    Optional<SearchEngine> find_search_engine_by_name(StringView name) const;
 
     static Optional<SearchEngine> parse_custom_search_engine(JsonValue const&);
     void add_custom_search_engine(SearchEngine);
     void remove_custom_search_engine(SearchEngine const&);
 
-    Optional<AutocompleteEngine> const& autocomplete_engine() const { return m_autocomplete_engine; }
-    void set_autocomplete_engine(Optional<StringView> autocomplete_engine_name);
-
-    SiteSetting const& autoplay_settings() const { return m_autoplay; }
-    void set_autoplay_enabled_globally(bool);
+    AutoplaySiteSetting const& autoplay_settings() const { return m_autoplay; }
+    void set_autoplay_policy(Web::HTML::AutoplayPolicy);
     void add_autoplay_site_filter(String const&);
     void remove_autoplay_site_filter(String const&);
     void remove_all_autoplay_site_filters();
 
+    bool geolocation_enabled() const { return m_geolocation_enabled; }
+    void set_geolocation_enabled(bool);
+
+    static BrowsingDataSettings parse_browsing_data_settings(JsonValue const&);
+    BrowsingDataSettings const& browsing_data_settings() const { return m_browsing_data_settings; }
+    void set_browsing_data_settings(BrowsingDataSettings);
+
     GlobalPrivacyControl global_privacy_control() const { return m_global_privacy_control; }
     void set_global_privacy_control(GlobalPrivacyControl);
+
+    Optional<StringView> user_agent_preset() const { return m_user_agent_preset; }
+    void set_user_agent_preset(Optional<StringView> user_agent_preset_name);
+
+    Web::NavigatorCompatibilityMode navigator_compatibility_mode() const { return m_navigator_compatibility_mode; }
+    void set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode);
+
+    bool background_networking_enabled() const { return m_background_networking_enabled; }
+    void set_background_networking_enabled(bool);
+    bool filter_list_updates_enabled() const { return m_filter_list_updates_enabled; }
+    bool automatic_filter_list_updates_allowed() const { return m_background_networking_enabled && m_filter_list_updates_enabled; }
+    void set_filter_list_updates_enabled(bool);
+
+    bool content_blocker_enabled() const { return m_content_blocker_enabled; }
+    void set_content_blocker_enabled(bool);
+
+    Vector<ContentBlockerList> const& content_blocker_lists() const { return m_content_blocker_lists; }
+    Optional<ContentBlockerList const&> content_blocker_list(StringView identifier) const;
+    String add_content_blocker_list(String name, Optional<URL::URL> = {});
+    void set_content_blocker_list_enabled(StringView identifier, bool);
+    bool remove_content_blocker_list(StringView identifier);
+    String const& custom_content_blocker_filters() const { return m_custom_content_blocker_filters; }
+    void set_custom_content_blocker_filters(String);
 
     static DNSSettings parse_dns_settings(JsonValue const&);
     DNSSettings const& dns_settings() const { return m_dns_settings; }
     void set_dns_settings(DNSSettings const&, bool override_by_command_line = false);
+
+    JsonValue const& config_variable(ConfigVariableID) const;
+    bool config_variable_as_bool(ConfigVariableID) const;
+    u32 config_variable_as_u32(ConfigVariableID) const;
+    void set_config_variable(ConfigVariableID, JsonValue);
+    void set_config_variable(StringView name, JsonValue const&);
 
     static void add_observer(Badge<SettingsObserver>, SettingsObserver&);
     static void remove_observer(Badge<SettingsObserver>, SettingsObserver&);
@@ -94,20 +230,39 @@ private:
 
     void persist_settings();
 
-    Optional<SearchEngine> find_search_engine_by_name(StringView name);
-
     ByteString m_settings_path;
 
+    bool m_first_run_complete { false };
     URL::URL m_new_tab_page_url;
-    double m_default_zoom_level_factor { 0 };
     Vector<String> m_languages;
-    Optional<SearchEngine> m_search_engine;
+
+    Appearance m_appearance;
+    ContentSettings m_content_settings;
+    TabSettings m_tab_settings;
+    BrowsingBehavior m_browsing_behavior;
+
+    SearchEngineSettings m_search_engine_settings;
     Vector<SearchEngine> m_custom_search_engines;
-    Optional<AutocompleteEngine> m_autocomplete_engine;
-    SiteSetting m_autoplay;
+
+    AutoplaySiteSetting m_autoplay;
+    bool m_geolocation_enabled { false };
+
+    BrowsingDataSettings m_browsing_data_settings;
     GlobalPrivacyControl m_global_privacy_control { GlobalPrivacyControl::No };
+
+    Optional<StringView> m_user_agent_preset;
+    Web::NavigatorCompatibilityMode m_navigator_compatibility_mode { Web::default_navigator_compatibility_mode };
+
+    bool m_background_networking_enabled { true };
+    bool m_filter_list_updates_enabled { false };
+    bool m_content_blocker_enabled { false };
+    Vector<ContentBlockerList> m_content_blocker_lists;
+    String m_custom_content_blocker_filters;
+
     DNSSettings m_dns_settings { SystemDNS() };
     bool m_dns_override_by_command_line { false };
+
+    Array<JsonValue, static_cast<size_t>(ConfigVariableID::Count)> m_config_variables {};
 
     Vector<SettingsObserver&> m_observers;
 };

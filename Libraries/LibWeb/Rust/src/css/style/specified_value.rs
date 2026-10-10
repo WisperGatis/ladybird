@@ -1,0 +1,305 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! Canonical specified-value identities retained as an evictable dense table.
+
+use crate::css::style_value::RetainedStyleValueData;
+use crate::css::style_value::StyleValueData;
+use crate::css::style_value::retain_style_value;
+
+use super::capacity::capacity_bytes;
+use super::cascade::SpecifiedValueID;
+use super::fast_hash::FastMap as HashMap;
+use super::memory::MemoryCategory;
+use super::memory::MemoryController;
+use super::memory::MemoryLease;
+use super::partial_view::Lookup;
+
+#[derive(Clone)]
+
+struct SpecifiedValueEntry {
+    id: SpecifiedValueID,
+    value: RetainedStyleValueData,
+}
+
+define_id! { struct SpecifiedValueEntryIndex(); }
+
+impl super::intern_table::InternIdentity for SpecifiedValueEntryIndex {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SpecifiedValueGap {
+    RetiredPayloads { eviction_generation: u64 },
+}
+
+/// An identity is never reused, so evicting the values only makes future equality checks
+/// conservative. Existing rule and winner rows can keep comparing their opaque identities without
+/// retaining old CSSOM values forever.
+#[derive(Clone)]
+pub(super) struct SpecifiedValues {
+    entries: super::intern_table::InternTable<SpecifiedValueEntryIndex, SpecifiedValueEntry>,
+    entries_by_pointer: HashMap<usize, SpecifiedValueID>,
+    entries_by_id: HashMap<SpecifiedValueID, u32>,
+    gap: Option<SpecifiedValueGap>,
+    next_id: u64,
+    residency: MemoryLease,
+}
+
+impl SpecifiedValues {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: super::intern_table::InternTable::default(),
+            entries_by_pointer: HashMap::default(),
+            entries_by_id: HashMap::default(),
+            gap: None,
+            next_id: 1,
+            residency: MemoryLease::new(MemoryCategory::SpecifiedValueTable),
+        }
+    }
+
+    #[must_use]
+    fn lookup(&self, value: &StyleValueData) -> Lookup<SpecifiedValueID, SpecifiedValueGap> {
+        if let Some(id) = self.entries_by_pointer.get(&(std::ptr::from_ref(value) as usize)) {
+            return Lookup::Known(*id);
+        }
+        // Equal URL text can refer to different resources in different declarations. The native
+        // image keeps its stylesheet context outside StyleValueData, so only an existing pointer
+        // identity can prove equality for values containing resource-dependent images.
+        if !crate::css::style_compute::value_may_need_style_sheet_resource_context(value)
+            && let Some(index) = self
+                .entries
+                .find(value.content_hash(), |_index, entry| entry.value.data() == value)
+        {
+            return Lookup::Known(self.entries[index].id);
+        }
+        self.gap.map_or(Lookup::KnownAbsent, Lookup::Missing)
+    }
+
+    fn mark_partial(&mut self) -> SpecifiedValueGap {
+        *self
+            .gap
+            .get_or_insert(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
+    }
+
+    /// Return the retained payload behind one maintained declaration identity.
+    #[must_use]
+    pub(super) fn value(&self, id: SpecifiedValueID) -> Lookup<&StyleValueData, SpecifiedValueGap> {
+        if let Some(index) = self.entries_by_id.get(&id) {
+            return Lookup::Known(self.entries[*index as usize].value.data());
+        }
+        self.gap.map_or(Lookup::KnownAbsent, Lookup::Missing)
+    }
+
+    /// Return an owned reference to one maintained declaration payload.
+    #[must_use]
+    #[cfg(test)]
+    pub(super) fn retained_value(&self, id: SpecifiedValueID) -> Lookup<RetainedStyleValueData, SpecifiedValueGap> {
+        if let Some(index) = self.entries_by_id.get(&id) {
+            return Lookup::Known(self.entries[*index as usize].value.clone_retained());
+        }
+        self.gap.map_or(Lookup::KnownAbsent, Lookup::Missing)
+    }
+
+    /// # Safety
+    /// `value` must point at live `StyleValueData`.
+    pub(super) unsafe fn intern(
+        &mut self,
+        value: *const StyleValueData,
+        memory: &mut MemoryController,
+    ) -> (SpecifiedValueID, Lookup<(), SpecifiedValueGap>) {
+        let lookup = match self.lookup(unsafe { &*value }) {
+            Lookup::Known(id) => return (id, Lookup::Known(())),
+            Lookup::KnownAbsent => Lookup::KnownAbsent,
+            Lookup::Missing(gap) => Lookup::Missing(gap),
+        };
+
+        let id = SpecifiedValueID(self.next_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("specified value identity space exhausted");
+        if !memory.is_tier3_admitting(MemoryCategory::SpecifiedValueTable) {
+            return (id, Lookup::Missing(self.mark_partial()));
+        }
+        let retained = unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) };
+        self.push_entry(id, retained);
+        self.settle_memory(memory);
+        (id, lookup)
+    }
+
+    /// Associate another immutable spelling with an existing canonical identity.
+    ///
+    /// # Safety
+    /// `value` must point at live `StyleValueData`.
+    pub(super) unsafe fn alias(
+        &mut self,
+        value: *const StyleValueData,
+        id: SpecifiedValueID,
+        memory: &mut MemoryController,
+    ) {
+        if let Lookup::Known(existing) = self.lookup(unsafe { &*value }) {
+            debug_assert_eq!(existing, id);
+            return;
+        }
+        if !memory.is_tier3_admitting(MemoryCategory::SpecifiedValueTable) {
+            return;
+        }
+        let retained = unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) };
+        self.push_entry(id, retained);
+        self.settle_memory(memory);
+    }
+
+    fn push_entry(&mut self, id: SpecifiedValueID, value: RetainedStyleValueData) {
+        let pointer = value.pointer() as usize;
+        let index = SpecifiedValueEntryIndex(
+            u32::try_from(self.entries.len()).expect("specified value table exceeds u32 indexing"),
+        );
+        self.entries
+            .insert(value.data().content_hash(), index, SpecifiedValueEntry { id, value });
+        self.entries_by_pointer.insert(pointer, id);
+        self.entries_by_id.entry(id).or_insert(index.0);
+    }
+
+    #[must_use]
+    fn capacity_bytes(&self) -> u64 {
+        capacity_bytes! {
+            shallow [self.entries, self.entries_by_pointer, self.entries_by_id];
+            cached [];
+            nested [];
+            skip [self.gap, self.next_id, self.residency];
+        }
+    }
+
+    fn settle_memory(&mut self, memory: &mut MemoryController) {
+        let current = self.capacity_bytes();
+        self.residency.reconcile_committed(memory, current);
+    }
+
+    pub(super) fn evict(&mut self) {
+        self.residency.release();
+        if !self.entries.is_empty() {
+            let eviction_generation = match self.gap {
+                None => 1,
+                Some(SpecifiedValueGap::RetiredPayloads { eviction_generation }) => eviction_generation
+                    .checked_add(1)
+                    .expect("specified value eviction generation exhausted"),
+            };
+            self.gap = Some(SpecifiedValueGap::RetiredPayloads { eviction_generation });
+        }
+        self.entries = super::intern_table::InternTable::default();
+        self.entries_by_pointer = HashMap::default();
+        self.entries_by_id = HashMap::default();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arc_with_non_send_sync)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicted_specified_values_are_missing_instead_of_absent() {
+        let mut memory = MemoryController::new();
+        let mut values = SpecifiedValues::new();
+        let value = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
+        let equal_value = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
+
+        assert!(matches!(values.lookup(&value), Lookup::KnownAbsent));
+        let (first, first_lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&value), &mut memory) };
+        assert!(matches!(first_lookup, Lookup::KnownAbsent));
+        assert_eq!(values.entries_by_pointer.len(), 1);
+        assert_eq!(
+            memory.bytes_in_category(MemoryCategory::SpecifiedValueTable),
+            values.capacity_bytes()
+        );
+        assert!(matches!(values.lookup(&value), Lookup::Known(id) if id == first));
+        assert!(matches!(values.value(first), Lookup::Known(retained) if retained == value.as_ref()));
+        let (reused, reused_lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&equal_value), &mut memory) };
+        assert_eq!(reused, first);
+        assert!(matches!(reused_lookup, Lookup::Known(())));
+        // A content hit does not retain a one-use duplicate spelling. Looking it up again repeats
+        // the collision-safe content lookup against the canonical table.
+        assert_eq!(values.entries_by_pointer.len(), 1);
+        assert!(matches!(values.lookup(&equal_value), Lookup::Known(id) if id == first));
+
+        values.evict();
+        assert!(matches!(
+            values.value(first),
+            Lookup::Missing(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
+        ));
+        assert!(matches!(
+            values.lookup(&value),
+            Lookup::Missing(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
+        ));
+        let (second, second_lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&value), &mut memory) };
+        assert_ne!(second, first, "retired specified-value identities are never reused");
+        assert!(matches!(
+            second_lookup,
+            Lookup::Missing(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
+        ));
+    }
+
+    #[test]
+    fn equal_content_dedups_across_distinct_spellings() {
+        let mut memory = MemoryController::new();
+        let mut values = SpecifiedValues::new();
+        let originals: Vec<_> = (0..64)
+            .map(|i| std::sync::Arc::new(StyleValueData::Number { value: f64::from(i) }))
+            .collect();
+        let ids: Vec<_> = originals
+            .iter()
+            .map(|value| unsafe { values.intern(std::sync::Arc::as_ptr(value), &mut memory) }.0)
+            .collect();
+        for (left, right) in ids.iter().zip(ids.iter().skip(1)) {
+            assert_ne!(left, right);
+        }
+        let respellings: Vec<_> = (0..64)
+            .map(|i| std::sync::Arc::new(StyleValueData::Number { value: f64::from(i) }))
+            .collect();
+        for (respelling, id) in respellings.iter().zip(ids.iter()) {
+            let (reused, _) = unsafe { values.intern(std::sync::Arc::as_ptr(respelling), &mut memory) };
+            assert_eq!(reused, *id);
+        }
+    }
+
+    #[test]
+    fn committed_specified_values_remain_resolvable_across_quota_boundaries() {
+        let mut memory = MemoryController::new();
+        memory.set_tier3_limit_for_test(0);
+        memory.begin_tier3_quota_period();
+        let mut values = SpecifiedValues::new();
+        let value = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
+
+        let (identity, _) = unsafe { values.intern(std::sync::Arc::as_ptr(&value), &mut memory) };
+
+        assert!(matches!(values.value(identity), Lookup::Known(retained) if retained == value.as_ref()));
+        assert!(!memory.finish_tier3_quota_period()[MemoryCategory::SpecifiedValueTable as usize]);
+        assert!(matches!(values.value(identity), Lookup::Known(retained) if retained == value.as_ref()));
+    }
+
+    #[test]
+    fn authored_spellings_can_alias_a_canonical_identity() {
+        let mut memory = MemoryController::new();
+        let mut values = SpecifiedValues::new();
+        let canonical = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
+        let authored = std::sync::Arc::new(StyleValueData::Number { value: 43.0 });
+
+        let (canonical_id, _) = unsafe { values.intern(std::sync::Arc::as_ptr(&canonical), &mut memory) };
+        unsafe { values.alias(std::sync::Arc::as_ptr(&authored), canonical_id, &mut memory) };
+        assert_eq!(values.entries_by_pointer.len(), 2);
+        assert!(matches!(
+            values.lookup(&authored),
+            Lookup::Known(id) if id == canonical_id
+        ));
+        let (authored_id, lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&authored), &mut memory) };
+
+        assert_eq!(authored_id, canonical_id);
+        assert!(matches!(lookup, Lookup::Known(())));
+    }
+}

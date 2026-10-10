@@ -1,34 +1,76 @@
 name: Lint Code
 
-on: [ push, pull_request ]
+on:
+  push:
+    branches: [master]
+  pull_request:
 
 jobs:
   lint:
-    runs-on: macos-14
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: github.repository == 'LadybirdBrowser/ladybird'
+    container:
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.08
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Set Up Environment
-        shell: bash
-        run: |
-          set -e
-
-          brew install curl llvm@20 ninja optipng ruff shellcheck swift-format unzip
-
-          # Note: gn isn't available in homebrew :(
-          # Corresponds to https://gn.googlesource.com/gn/+/225e90c5025bf74f41dbee60d9cde4512c846fe7
-          curl -L -o gn-mac-arm64.zip "https://chrome-infra-packages.appspot.com/dl/gn/gn/mac-arm64/+/786UV5-XW0Bz6QnRFxKtnzTSVq0ta5AU1KXRJs-ZNwcC"
-          unzip gn-mac-arm64.zip -d ${{ github.workspace }}/bin
-          chmod +x ${{ github.workspace }}/bin/gn
-          echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
-          echo -n "gn version: "
-          ${{ github.workspace}}/bin/gn --version
-
-      - name: Install JS Dependencies
-        shell: bash
-        run: npm install -g prettier@3.3.3
+        uses: ./.github/actions/setup
+        with:
+          os: 'Linux'
+          arch: 'x86_64'
+          type: 'lint'
 
       - name: Lint
-        run: ${{ github.workspace }}/Meta/lint-ci.sh
+        run: "${GITHUB_WORKSPACE}/Meta/lint-ci.sh"
+
+  flap:
+    permissions:
+      contents: read
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: github.repository == 'LadybirdBrowser/ladybird'
+    container:
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.08
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set Up Environment
+        uses: ./.github/actions/setup
+        with:
+          os: 'Linux'
+          arch: 'x86_64'
+          type: 'lint'
+
+      - name: Check Flap
+        run: |
+          cargo fmt --manifest-path Libraries/LibJS/Flap/Cargo.toml -- --check
+          cargo clippy --manifest-path Libraries/LibJS/Flap/Cargo.toml \
+            --all-targets -- -D clippy::all
+
+      - name: Generate and assemble the Flap interpreter
+        run: |
+          cargo build --release --manifest-path Libraries/LibJS/Flap/Cargo.toml
+          mkdir -p "${RUNNER_TEMP}/flap-smoke"
+          for arch in x86_64 aarch64; do
+            Libraries/LibJS/Flap/target/release/flapc \
+              --arch "${arch}" \
+              --object-format elf \
+              --constants Libraries/LibJS/Flap/tests/interpreter-layout.conf \
+              --input Libraries/LibJS/Interpreter/interpreter.flap \
+              --output "${RUNNER_TEMP}/flap-smoke/${arch}.S"
+            clang --target="${arch}-unknown-linux-gnu" \
+              -c "${RUNNER_TEMP}/flap-smoke/${arch}.S" \
+              -o "${RUNNER_TEMP}/flap-smoke/${arch}.o"
+            Libraries/LibJS/Flap/target/release/flapc \
+              --arch "${arch}" \
+              --object-format elf \
+              --constants Libraries/LibJS/Flap/tests/interpreter-layout.conf \
+              --input Libraries/LibJS/Interpreter/interpreter.flap \
+              --output "${RUNNER_TEMP}/flap-smoke/${arch}-repeat.S"
+            cmp "${RUNNER_TEMP}/flap-smoke/${arch}.S" \
+              "${RUNNER_TEMP}/flap-smoke/${arch}-repeat.S"
+          done

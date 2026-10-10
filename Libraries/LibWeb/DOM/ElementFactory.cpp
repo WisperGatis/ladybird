@@ -1,14 +1,20 @@
 /*
  * Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2020-2023, Luke Wilde <lukew@serenityos.org>
+ * Copyright (c) 2025, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashMap.h>
+#include <AK/NeverDestroyed.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
+#include <LibWeb/HTML/CustomElements/CustomElementAlgorithms.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/CustomElements/CustomElementName.h>
+#include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLAudioElement.h>
@@ -60,6 +66,7 @@
 #include <LibWeb/HTML/HTMLQuoteElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
+#include <LibWeb/HTML/HTMLSelectedContentElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLSourceElement.h>
 #include <LibWeb/HTML/HTMLSpanElement.h>
@@ -79,9 +86,9 @@
 #include <LibWeb/HTML/HTMLUListElement.h>
 #include <LibWeb/HTML/HTMLUnknownElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
-#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
-#include <LibWeb/Infra/Strings.h>
+#include <LibWeb/MathML/MathMLAnchorElement.h>
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/MathML/MathMLMiElement.h>
 #include <LibWeb/MathML/MathMLMspaceElement.h>
@@ -95,13 +102,22 @@
 #include <LibWeb/SVG/SVGEllipseElement.h>
 #include <LibWeb/SVG/SVGFEBlendElement.h>
 #include <LibWeb/SVG/SVGFEColorMatrixElement.h>
+#include <LibWeb/SVG/SVGFEComponentTransferElement.h>
 #include <LibWeb/SVG/SVGFECompositeElement.h>
+#include <LibWeb/SVG/SVGFEDisplacementMapElement.h>
+#include <LibWeb/SVG/SVGFEDropShadowElement.h>
 #include <LibWeb/SVG/SVGFEFloodElement.h>
+#include <LibWeb/SVG/SVGFEFuncAElement.h>
+#include <LibWeb/SVG/SVGFEFuncBElement.h>
+#include <LibWeb/SVG/SVGFEFuncGElement.h>
+#include <LibWeb/SVG/SVGFEFuncRElement.h>
 #include <LibWeb/SVG/SVGFEGaussianBlurElement.h>
 #include <LibWeb/SVG/SVGFEImageElement.h>
 #include <LibWeb/SVG/SVGFEMergeElement.h>
 #include <LibWeb/SVG/SVGFEMergeNodeElement.h>
+#include <LibWeb/SVG/SVGFEMorphologyElement.h>
 #include <LibWeb/SVG/SVGFEOffsetElement.h>
+#include <LibWeb/SVG/SVGFETurbulenceElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
 #include <LibWeb/SVG/SVGGElement.h>
@@ -111,6 +127,7 @@
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGMetadataElement.h>
 #include <LibWeb/SVG/SVGPathElement.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGPolygonElement.h>
 #include <LibWeb/SVG/SVGPolylineElement.h>
 #include <LibWeb/SVG/SVGRadialGradientElement.h>
@@ -119,6 +136,7 @@
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStopElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
+#include <LibWeb/SVG/SVGSwitchElement.h>
 #include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/SVG/SVGTSpanElement.h>
 #include <LibWeb/SVG/SVGTextElement.h>
@@ -127,155 +145,165 @@
 #include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/SVG/SVGViewElement.h>
 #include <LibWeb/SVG/TagNames.h>
-#include <LibWeb/WebIDL/AbstractOperations.h>
+#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::DOM {
 
-ErrorOr<FixedArray<FlyString>> valid_local_names_for_given_html_element_interface(StringView html_element_interface_name)
+template<typename ElementType>
+static GC::Ref<ElementType> create_element_on_heap(Document& document, QualifiedName qualified_name)
 {
-    if (html_element_interface_name == "HTMLAnchorElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::a });
-    if (html_element_interface_name == "HTMLAreaElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::area });
-    if (html_element_interface_name == "HTMLAudioElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::audio });
-    if (html_element_interface_name == "HTMLBaseElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::base });
-    if (html_element_interface_name == "HTMLBodyElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::body });
-    if (html_element_interface_name == "HTMLBRElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::br });
-    if (html_element_interface_name == "HTMLButtonElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::button });
-    if (html_element_interface_name == "HTMLCanvasElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::canvas });
-    if (html_element_interface_name == "HTMLDataElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::data });
-    if (html_element_interface_name == "HTMLDataListElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::datalist });
-    if (html_element_interface_name == "HTMLDetailsElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::details });
-    if (html_element_interface_name == "HTMLDialogElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::dialog });
-    if (html_element_interface_name == "HTMLDirectoryElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::dir });
-    if (html_element_interface_name == "HTMLDivElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::div });
-    if (html_element_interface_name == "HTMLDListElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::dl });
-    if (html_element_interface_name == "HTMLEmbedElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::embed });
-    if (html_element_interface_name == "HTMLFieldSetElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::fieldset });
-    if (html_element_interface_name == "HTMLFontElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::font });
-    if (html_element_interface_name == "HTMLFormElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::form });
-    if (html_element_interface_name == "HTMLFrameElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::frame });
-    if (html_element_interface_name == "HTMLFrameSetElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::frameset });
-    if (html_element_interface_name == "HTMLHeadElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::head });
-    if (html_element_interface_name == "HTMLHeadingElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::h1, HTML::TagNames::h2, HTML::TagNames::h3, HTML::TagNames::h4, HTML::TagNames::h5, HTML::TagNames::h6 });
-    if (html_element_interface_name == "HTMLHRElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::hr });
-    if (html_element_interface_name == "HTMLHtmlElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::html });
-    if (html_element_interface_name == "HTMLIFrameElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::iframe });
-    if (html_element_interface_name == "HTMLImageElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::img });
-    if (html_element_interface_name == "HTMLInputElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::input });
-    if (html_element_interface_name == "HTMLLabelElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::label });
-    if (html_element_interface_name == "HTMLLegendElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::legend });
-    if (html_element_interface_name == "HTMLLIElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::li });
-    if (html_element_interface_name == "HTMLLinkElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::link });
-    if (html_element_interface_name == "HTMLMapElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::map });
-    if (html_element_interface_name == "HTMLMarqueeElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::marquee });
-    if (html_element_interface_name == "HTMLMenuElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::menu });
-    if (html_element_interface_name == "HTMLMetaElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::meta });
-    if (html_element_interface_name == "HTMLMeterElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::meter });
-    if (html_element_interface_name == "HTMLModElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::ins, HTML::TagNames::del });
-    if (html_element_interface_name == "HTMLOListElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::ol });
-    if (html_element_interface_name == "HTMLObjectElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::object });
-    if (html_element_interface_name == "HTMLOptGroupElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::optgroup });
-    if (html_element_interface_name == "HTMLOptionElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::option });
-    if (html_element_interface_name == "HTMLOutputElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::output });
-    if (html_element_interface_name == "HTMLParagraphElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::p });
-    if (html_element_interface_name == "HTMLParamElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::param });
-    if (html_element_interface_name == "HTMLPictureElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::picture });
-    if (html_element_interface_name == "HTMLPreElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::pre, HTML::TagNames::listing, HTML::TagNames::xmp });
-    if (html_element_interface_name == "HTMLProgressElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::progress });
-    if (html_element_interface_name == "HTMLQuoteElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::blockquote, HTML::TagNames::q });
-    if (html_element_interface_name == "HTMLScriptElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::script });
-    if (html_element_interface_name == "HTMLSelectElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::select });
-    if (html_element_interface_name == "HTMLSlotElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::slot });
-    if (html_element_interface_name == "HTMLSourceElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::source });
-    if (html_element_interface_name == "HTMLSpanElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::span });
-    if (html_element_interface_name == "HTMLStyleElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::style });
-    if (html_element_interface_name == "HTMLTableCaptionElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::caption });
-    if (html_element_interface_name == "HTMLTableCellElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::td, HTML::TagNames::th });
-    if (html_element_interface_name == "HTMLTableColElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::colgroup, HTML::TagNames::col });
-    if (html_element_interface_name == "HTMLTableRowElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::tr });
-    if (html_element_interface_name == "HTMLTableElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::table });
-    if (html_element_interface_name == "HTMLTableSectionElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::tbody, HTML::TagNames::thead, HTML::TagNames::tfoot });
-    if (html_element_interface_name == "HTMLTemplateElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::template_ });
-    if (html_element_interface_name == "HTMLTextAreaElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::textarea });
-    if (html_element_interface_name == "HTMLTimeElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::time });
-    if (html_element_interface_name == "HTMLTitleElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::title });
-    if (html_element_interface_name == "HTMLTrackElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::track });
-    if (html_element_interface_name == "HTMLUListElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::ul });
-    if (html_element_interface_name == "HTMLVideoElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::video });
-    if (html_element_interface_name == "HTMLElement"sv)
-        return FixedArray<FlyString>::create({ HTML::TagNames::article, HTML::TagNames::search, HTML::TagNames::section, HTML::TagNames::nav, HTML::TagNames::aside, HTML::TagNames::hgroup, HTML::TagNames::header, HTML::TagNames::footer, HTML::TagNames::address, HTML::TagNames::dt, HTML::TagNames::dd, HTML::TagNames::figure, HTML::TagNames::figcaption, HTML::TagNames::main, HTML::TagNames::em, HTML::TagNames::strong, HTML::TagNames::small, HTML::TagNames::s, HTML::TagNames::cite, HTML::TagNames::dfn, HTML::TagNames::abbr, HTML::TagNames::ruby, HTML::TagNames::rt, HTML::TagNames::rp, HTML::TagNames::code, HTML::TagNames::var, HTML::TagNames::samp, HTML::TagNames::kbd, HTML::TagNames::sub, HTML::TagNames::sup, HTML::TagNames::i, HTML::TagNames::b, HTML::TagNames::u, HTML::TagNames::mark, HTML::TagNames::bdi, HTML::TagNames::bdo, HTML::TagNames::wbr, HTML::TagNames::summary, HTML::TagNames::noscript, HTML::TagNames::acronym, HTML::TagNames::basefont, HTML::TagNames::big, HTML::TagNames::center, HTML::TagNames::nobr, HTML::TagNames::noembed, HTML::TagNames::noframes, HTML::TagNames::plaintext, HTML::TagNames::rb, HTML::TagNames::rtc, HTML::TagNames::strike, HTML::TagNames::tt });
-    return FixedArray<FlyString>::create({});
+    auto element = GC::Heap::the().allocate<ElementType>(document, move(qualified_name));
+    static_cast<Element&>(*element).initialize_element();
+    return element;
+}
+
+ErrorOr<FixedArray<Utf16FlyString>> valid_local_names_for_given_html_element_interface(Utf16View html_element_interface_name)
+{
+    if (html_element_interface_name == Utf16View { "HTMLAnchorElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::a });
+    if (html_element_interface_name == Utf16View { "HTMLAreaElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::area });
+    if (html_element_interface_name == Utf16View { "HTMLAudioElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::audio });
+    if (html_element_interface_name == Utf16View { "HTMLBaseElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::base });
+    if (html_element_interface_name == Utf16View { "HTMLBodyElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::body });
+    if (html_element_interface_name == Utf16View { "HTMLBRElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::br });
+    if (html_element_interface_name == Utf16View { "HTMLButtonElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::button });
+    if (html_element_interface_name == Utf16View { "HTMLCanvasElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::canvas });
+    if (html_element_interface_name == Utf16View { "HTMLDataElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::data });
+    if (html_element_interface_name == Utf16View { "HTMLDataListElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::datalist });
+    if (html_element_interface_name == Utf16View { "HTMLDetailsElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::details });
+    if (html_element_interface_name == Utf16View { "HTMLDialogElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::dialog });
+    if (html_element_interface_name == Utf16View { "HTMLDirectoryElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::dir });
+    if (html_element_interface_name == Utf16View { "HTMLDivElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::div });
+    if (html_element_interface_name == Utf16View { "HTMLDListElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::dl });
+    if (html_element_interface_name == Utf16View { "HTMLEmbedElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::embed });
+    if (html_element_interface_name == Utf16View { "HTMLFieldSetElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::fieldset });
+    if (html_element_interface_name == Utf16View { "HTMLFontElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::font });
+    if (html_element_interface_name == Utf16View { "HTMLFormElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::form });
+    if (html_element_interface_name == Utf16View { "HTMLFrameElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::frame });
+    if (html_element_interface_name == Utf16View { "HTMLFrameSetElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::frameset });
+    if (html_element_interface_name == Utf16View { "HTMLHeadElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::head });
+    if (html_element_interface_name == Utf16View { "HTMLHeadingElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::h1, HTML::TagNames::h2, HTML::TagNames::h3, HTML::TagNames::h4, HTML::TagNames::h5, HTML::TagNames::h6 });
+    if (html_element_interface_name == Utf16View { "HTMLHRElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::hr });
+    if (html_element_interface_name == Utf16View { "HTMLHtmlElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::html });
+    if (html_element_interface_name == Utf16View { "HTMLIFrameElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::iframe });
+    if (html_element_interface_name == Utf16View { "HTMLImageElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::img });
+    if (html_element_interface_name == Utf16View { "HTMLInputElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::input });
+    if (html_element_interface_name == Utf16View { "HTMLLabelElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::label });
+    if (html_element_interface_name == Utf16View { "HTMLLegendElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::legend });
+    if (html_element_interface_name == Utf16View { "HTMLLIElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::li });
+    if (html_element_interface_name == Utf16View { "HTMLLinkElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::link });
+    if (html_element_interface_name == Utf16View { "HTMLMapElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::map });
+    if (html_element_interface_name == Utf16View { "HTMLMarqueeElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::marquee });
+    if (html_element_interface_name == Utf16View { "HTMLMenuElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::menu });
+    if (html_element_interface_name == Utf16View { "HTMLMetaElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::meta });
+    if (html_element_interface_name == Utf16View { "HTMLMeterElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::meter });
+    if (html_element_interface_name == Utf16View { "HTMLModElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::ins, HTML::TagNames::del });
+    if (html_element_interface_name == Utf16View { "HTMLOListElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::ol });
+    if (html_element_interface_name == Utf16View { "HTMLObjectElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::object });
+    if (html_element_interface_name == Utf16View { "HTMLOptGroupElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::optgroup });
+    if (html_element_interface_name == Utf16View { "HTMLOptionElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::option });
+    if (html_element_interface_name == Utf16View { "HTMLOutputElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::output });
+    if (html_element_interface_name == Utf16View { "HTMLParagraphElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::p });
+    if (html_element_interface_name == Utf16View { "HTMLParamElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::param });
+    if (html_element_interface_name == Utf16View { "HTMLPictureElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::picture });
+    if (html_element_interface_name == Utf16View { "HTMLPreElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::pre, HTML::TagNames::listing, HTML::TagNames::xmp });
+    if (html_element_interface_name == Utf16View { "HTMLProgressElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::progress });
+    if (html_element_interface_name == Utf16View { "HTMLQuoteElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::blockquote, HTML::TagNames::q });
+    if (html_element_interface_name == Utf16View { "HTMLScriptElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::script });
+    if (html_element_interface_name == Utf16View { "HTMLSelectedContentElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::selectedcontent });
+    if (html_element_interface_name == Utf16View { "HTMLSelectElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::select });
+    if (html_element_interface_name == Utf16View { "HTMLSlotElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::slot });
+    if (html_element_interface_name == Utf16View { "HTMLSourceElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::source });
+    if (html_element_interface_name == Utf16View { "HTMLSpanElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::span });
+    if (html_element_interface_name == Utf16View { "HTMLStyleElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::style });
+    if (html_element_interface_name == Utf16View { "HTMLTableCaptionElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::caption });
+    if (html_element_interface_name == Utf16View { "HTMLTableCellElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::td, HTML::TagNames::th });
+    if (html_element_interface_name == Utf16View { "HTMLTableColElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::colgroup, HTML::TagNames::col });
+    if (html_element_interface_name == Utf16View { "HTMLTableRowElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::tr });
+    if (html_element_interface_name == Utf16View { "HTMLTableElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::table });
+    if (html_element_interface_name == Utf16View { "HTMLTableSectionElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::tbody, HTML::TagNames::thead, HTML::TagNames::tfoot });
+    if (html_element_interface_name == Utf16View { "HTMLTemplateElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::template_ });
+    if (html_element_interface_name == Utf16View { "HTMLTextAreaElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::textarea });
+    if (html_element_interface_name == Utf16View { "HTMLTimeElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::time });
+    if (html_element_interface_name == Utf16View { "HTMLTitleElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::title });
+    if (html_element_interface_name == Utf16View { "HTMLTrackElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::track });
+    if (html_element_interface_name == Utf16View { "HTMLUListElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::ul });
+    if (html_element_interface_name == Utf16View { "HTMLVideoElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::video });
+    if (html_element_interface_name == Utf16View { "HTMLElement"sv })
+        return FixedArray<Utf16FlyString>::create({ HTML::TagNames::article, HTML::TagNames::search, HTML::TagNames::section, HTML::TagNames::nav, HTML::TagNames::aside, HTML::TagNames::hgroup, HTML::TagNames::header, HTML::TagNames::footer, HTML::TagNames::address, HTML::TagNames::dt, HTML::TagNames::dd, HTML::TagNames::figure, HTML::TagNames::figcaption, HTML::TagNames::main, HTML::TagNames::em, HTML::TagNames::strong, HTML::TagNames::small, HTML::TagNames::s, HTML::TagNames::cite, HTML::TagNames::dfn, HTML::TagNames::abbr, HTML::TagNames::ruby, HTML::TagNames::rt, HTML::TagNames::rp, HTML::TagNames::code, HTML::TagNames::var, HTML::TagNames::samp, HTML::TagNames::kbd, HTML::TagNames::sub, HTML::TagNames::sup, HTML::TagNames::i, HTML::TagNames::b, HTML::TagNames::u, HTML::TagNames::mark, HTML::TagNames::bdi, HTML::TagNames::bdo, HTML::TagNames::wbr, HTML::TagNames::summary, HTML::TagNames::noscript, HTML::TagNames::acronym, HTML::TagNames::basefont, HTML::TagNames::big, HTML::TagNames::center, HTML::TagNames::nobr, HTML::TagNames::noembed, HTML::TagNames::noframes, HTML::TagNames::plaintext, HTML::TagNames::rb, HTML::TagNames::rtc, HTML::TagNames::strike, HTML::TagNames::tt });
+    return FixedArray<Utf16FlyString>::create({});
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom%3Aelement-interface
-bool is_unknown_html_element(FlyString const& tag_name)
+bool is_unknown_html_element(Utf16FlyString const& tag_name)
 {
     // NOTE: This is intentionally case-sensitive.
 
@@ -302,257 +330,307 @@ bool is_unknown_html_element(FlyString const& tag_name)
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom%3Aelement-interface
-static GC::Ref<Element> create_html_element(JS::Realm& realm, Document& document, QualifiedName qualified_name)
+using HTMLElementFactory = GC::Ref<Element> (*)(Document&, QualifiedName);
+
+template<typename ElementType>
+static GC::Ref<Element> create_html_element_on_heap(Document& document, QualifiedName qualified_name)
 {
-    FlyString tag_name = qualified_name.local_name();
-
-    if (tag_name == HTML::TagNames::a)
-        return realm.create<HTML::HTMLAnchorElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::area)
-        return realm.create<HTML::HTMLAreaElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::audio)
-        return realm.create<HTML::HTMLAudioElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::base)
-        return realm.create<HTML::HTMLBaseElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::body)
-        return realm.create<HTML::HTMLBodyElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::br)
-        return realm.create<HTML::HTMLBRElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::button)
-        return realm.create<HTML::HTMLButtonElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::canvas)
-        return realm.create<HTML::HTMLCanvasElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::data)
-        return realm.create<HTML::HTMLDataElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::datalist)
-        return realm.create<HTML::HTMLDataListElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::details)
-        return realm.create<HTML::HTMLDetailsElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::dialog)
-        return realm.create<HTML::HTMLDialogElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::dir)
-        return realm.create<HTML::HTMLDirectoryElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::div)
-        return realm.create<HTML::HTMLDivElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::dl)
-        return realm.create<HTML::HTMLDListElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::embed)
-        return realm.create<HTML::HTMLEmbedElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::fieldset)
-        return realm.create<HTML::HTMLFieldSetElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::font)
-        return realm.create<HTML::HTMLFontElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::form)
-        return realm.create<HTML::HTMLFormElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::frame)
-        return realm.create<HTML::HTMLFrameElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::frameset)
-        return realm.create<HTML::HTMLFrameSetElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::head)
-        return realm.create<HTML::HTMLHeadElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(HTML::TagNames::h1, HTML::TagNames::h2, HTML::TagNames::h3, HTML::TagNames::h4, HTML::TagNames::h5, HTML::TagNames::h6))
-        return realm.create<HTML::HTMLHeadingElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::hr)
-        return realm.create<HTML::HTMLHRElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::html)
-        return realm.create<HTML::HTMLHtmlElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::iframe)
-        return realm.create<HTML::HTMLIFrameElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::img)
-        return realm.create<HTML::HTMLImageElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::input)
-        return realm.create<HTML::HTMLInputElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::label)
-        return realm.create<HTML::HTMLLabelElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::legend)
-        return realm.create<HTML::HTMLLegendElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::li)
-        return realm.create<HTML::HTMLLIElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::link)
-        return realm.create<HTML::HTMLLinkElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::map)
-        return realm.create<HTML::HTMLMapElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::marquee)
-        return realm.create<HTML::HTMLMarqueeElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::menu)
-        return realm.create<HTML::HTMLMenuElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::meta)
-        return realm.create<HTML::HTMLMetaElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::meter)
-        return realm.create<HTML::HTMLMeterElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(HTML::TagNames::ins, HTML::TagNames::del))
-        return realm.create<HTML::HTMLModElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::object)
-        return realm.create<HTML::HTMLObjectElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::ol)
-        return realm.create<HTML::HTMLOListElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::optgroup)
-        return realm.create<HTML::HTMLOptGroupElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::option)
-        return realm.create<HTML::HTMLOptionElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::output)
-        return realm.create<HTML::HTMLOutputElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::p)
-        return realm.create<HTML::HTMLParagraphElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::param)
-        return realm.create<HTML::HTMLParamElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::picture)
-        return realm.create<HTML::HTMLPictureElement>(document, move(qualified_name));
-    // NOTE: The obsolete elements "listing" and "xmp" are explicitly mapped to HTMLPreElement in the specification.
-    if (tag_name.is_one_of(HTML::TagNames::pre, HTML::TagNames::listing, HTML::TagNames::xmp))
-        return realm.create<HTML::HTMLPreElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::progress)
-        return realm.create<HTML::HTMLProgressElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(HTML::TagNames::blockquote, HTML::TagNames::q))
-        return realm.create<HTML::HTMLQuoteElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::script)
-        return realm.create<HTML::HTMLScriptElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::select)
-        return realm.create<HTML::HTMLSelectElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::slot)
-        return realm.create<HTML::HTMLSlotElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::source)
-        return realm.create<HTML::HTMLSourceElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::span)
-        return realm.create<HTML::HTMLSpanElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::style)
-        return realm.create<HTML::HTMLStyleElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::summary)
-        return realm.create<HTML::HTMLSummaryElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::caption)
-        return realm.create<HTML::HTMLTableCaptionElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(Web::HTML::TagNames::td, Web::HTML::TagNames::th))
-        return realm.create<HTML::HTMLTableCellElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(HTML::TagNames::colgroup, HTML::TagNames::col))
-        return realm.create<HTML::HTMLTableColElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::table)
-        return realm.create<HTML::HTMLTableElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::tr)
-        return realm.create<HTML::HTMLTableRowElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(HTML::TagNames::tbody, HTML::TagNames::thead, HTML::TagNames::tfoot))
-        return realm.create<HTML::HTMLTableSectionElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::template_)
-        return realm.create<HTML::HTMLTemplateElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::textarea)
-        return realm.create<HTML::HTMLTextAreaElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::time)
-        return realm.create<HTML::HTMLTimeElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::title)
-        return realm.create<HTML::HTMLTitleElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::track)
-        return realm.create<HTML::HTMLTrackElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::ul)
-        return realm.create<HTML::HTMLUListElement>(document, move(qualified_name));
-    if (tag_name == HTML::TagNames::video)
-        return realm.create<HTML::HTMLVideoElement>(document, move(qualified_name));
-    if (tag_name.is_one_of(
-            HTML::TagNames::article, HTML::TagNames::search, HTML::TagNames::section, HTML::TagNames::nav, HTML::TagNames::aside, HTML::TagNames::hgroup, HTML::TagNames::header, HTML::TagNames::footer, HTML::TagNames::address, HTML::TagNames::dt, HTML::TagNames::dd, HTML::TagNames::figure, HTML::TagNames::figcaption, HTML::TagNames::main, HTML::TagNames::em, HTML::TagNames::strong, HTML::TagNames::small, HTML::TagNames::s, HTML::TagNames::cite, HTML::TagNames::dfn, HTML::TagNames::abbr, HTML::TagNames::ruby, HTML::TagNames::rt, HTML::TagNames::rp, HTML::TagNames::code, HTML::TagNames::var, HTML::TagNames::samp, HTML::TagNames::kbd, HTML::TagNames::sub, HTML::TagNames::sup, HTML::TagNames::i, HTML::TagNames::b, HTML::TagNames::u, HTML::TagNames::mark, HTML::TagNames::bdi, HTML::TagNames::bdo, HTML::TagNames::wbr, HTML::TagNames::noscript,
-            // Obsolete
-            HTML::TagNames::acronym, HTML::TagNames::basefont, HTML::TagNames::big, HTML::TagNames::center, HTML::TagNames::nobr, HTML::TagNames::noembed, HTML::TagNames::noframes, HTML::TagNames::plaintext, HTML::TagNames::rb, HTML::TagNames::rtc, HTML::TagNames::strike, HTML::TagNames::tt))
-        return realm.create<HTML::HTMLElement>(document, move(qualified_name));
-    if (HTML::is_valid_custom_element_name(qualified_name.local_name()))
-        return realm.create<HTML::HTMLElement>(document, move(qualified_name));
-
-    return realm.create<HTML::HTMLUnknownElement>(document, move(qualified_name));
+    return create_element_on_heap<ElementType>(document, move(qualified_name));
 }
 
-static GC::Ref<SVG::SVGElement> create_svg_element(JS::Realm& realm, Document& document, QualifiedName qualified_name)
+static HashMap<FlatPtr, HTMLElementFactory> const& html_element_factories()
+{
+    static NeverDestroyed<HashMap<FlatPtr, HTMLElementFactory>> factories = [] {
+        HashMap<FlatPtr, HTMLElementFactory> factories;
+
+#define __ENUMERATE_HTML_TAG(name, tag) factories.set(HTML::TagNames::name.raw_identity(), &create_html_element_on_heap<HTML::HTMLUnknownElement>);
+        ENUMERATE_HTML_TAGS
+#undef __ENUMERATE_HTML_TAG
+
+#define REGISTER_HTML_ELEMENT(tag_name, element_type) factories.set(HTML::TagNames::tag_name.raw_identity(), &create_html_element_on_heap<HTML::element_type>)
+        REGISTER_HTML_ELEMENT(a, HTMLAnchorElement);
+        REGISTER_HTML_ELEMENT(area, HTMLAreaElement);
+        REGISTER_HTML_ELEMENT(audio, HTMLAudioElement);
+        REGISTER_HTML_ELEMENT(base, HTMLBaseElement);
+        REGISTER_HTML_ELEMENT(body, HTMLBodyElement);
+        REGISTER_HTML_ELEMENT(br, HTMLBRElement);
+        REGISTER_HTML_ELEMENT(button, HTMLButtonElement);
+        REGISTER_HTML_ELEMENT(canvas, HTMLCanvasElement);
+        REGISTER_HTML_ELEMENT(data, HTMLDataElement);
+        REGISTER_HTML_ELEMENT(datalist, HTMLDataListElement);
+        REGISTER_HTML_ELEMENT(details, HTMLDetailsElement);
+        REGISTER_HTML_ELEMENT(dialog, HTMLDialogElement);
+        REGISTER_HTML_ELEMENT(dir, HTMLDirectoryElement);
+        REGISTER_HTML_ELEMENT(div, HTMLDivElement);
+        REGISTER_HTML_ELEMENT(dl, HTMLDListElement);
+        REGISTER_HTML_ELEMENT(embed, HTMLEmbedElement);
+        REGISTER_HTML_ELEMENT(fieldset, HTMLFieldSetElement);
+        REGISTER_HTML_ELEMENT(font, HTMLFontElement);
+        REGISTER_HTML_ELEMENT(form, HTMLFormElement);
+        REGISTER_HTML_ELEMENT(frame, HTMLFrameElement);
+        REGISTER_HTML_ELEMENT(frameset, HTMLFrameSetElement);
+        REGISTER_HTML_ELEMENT(head, HTMLHeadElement);
+        REGISTER_HTML_ELEMENT(h1, HTMLHeadingElement);
+        REGISTER_HTML_ELEMENT(h2, HTMLHeadingElement);
+        REGISTER_HTML_ELEMENT(h3, HTMLHeadingElement);
+        REGISTER_HTML_ELEMENT(h4, HTMLHeadingElement);
+        REGISTER_HTML_ELEMENT(h5, HTMLHeadingElement);
+        REGISTER_HTML_ELEMENT(h6, HTMLHeadingElement);
+        REGISTER_HTML_ELEMENT(hr, HTMLHRElement);
+        REGISTER_HTML_ELEMENT(html, HTMLHtmlElement);
+        REGISTER_HTML_ELEMENT(iframe, HTMLIFrameElement);
+        REGISTER_HTML_ELEMENT(img, HTMLImageElement);
+        REGISTER_HTML_ELEMENT(input, HTMLInputElement);
+        REGISTER_HTML_ELEMENT(label, HTMLLabelElement);
+        REGISTER_HTML_ELEMENT(legend, HTMLLegendElement);
+        REGISTER_HTML_ELEMENT(li, HTMLLIElement);
+        REGISTER_HTML_ELEMENT(link, HTMLLinkElement);
+        REGISTER_HTML_ELEMENT(map, HTMLMapElement);
+        REGISTER_HTML_ELEMENT(marquee, HTMLMarqueeElement);
+        REGISTER_HTML_ELEMENT(menu, HTMLMenuElement);
+        REGISTER_HTML_ELEMENT(meta, HTMLMetaElement);
+        REGISTER_HTML_ELEMENT(meter, HTMLMeterElement);
+        REGISTER_HTML_ELEMENT(ins, HTMLModElement);
+        REGISTER_HTML_ELEMENT(del, HTMLModElement);
+        REGISTER_HTML_ELEMENT(object, HTMLObjectElement);
+        REGISTER_HTML_ELEMENT(ol, HTMLOListElement);
+        REGISTER_HTML_ELEMENT(optgroup, HTMLOptGroupElement);
+        REGISTER_HTML_ELEMENT(option, HTMLOptionElement);
+        REGISTER_HTML_ELEMENT(output, HTMLOutputElement);
+        REGISTER_HTML_ELEMENT(p, HTMLParagraphElement);
+        REGISTER_HTML_ELEMENT(param, HTMLParamElement);
+        REGISTER_HTML_ELEMENT(picture, HTMLPictureElement);
+        REGISTER_HTML_ELEMENT(pre, HTMLPreElement);
+        REGISTER_HTML_ELEMENT(listing, HTMLPreElement);
+        REGISTER_HTML_ELEMENT(xmp, HTMLPreElement);
+        REGISTER_HTML_ELEMENT(progress, HTMLProgressElement);
+        REGISTER_HTML_ELEMENT(blockquote, HTMLQuoteElement);
+        REGISTER_HTML_ELEMENT(q, HTMLQuoteElement);
+        REGISTER_HTML_ELEMENT(script, HTMLScriptElement);
+        REGISTER_HTML_ELEMENT(selectedcontent, HTMLSelectedContentElement);
+        REGISTER_HTML_ELEMENT(select, HTMLSelectElement);
+        REGISTER_HTML_ELEMENT(slot, HTMLSlotElement);
+        REGISTER_HTML_ELEMENT(source, HTMLSourceElement);
+        REGISTER_HTML_ELEMENT(span, HTMLSpanElement);
+        REGISTER_HTML_ELEMENT(style, HTMLStyleElement);
+        REGISTER_HTML_ELEMENT(summary, HTMLSummaryElement);
+        REGISTER_HTML_ELEMENT(caption, HTMLTableCaptionElement);
+        REGISTER_HTML_ELEMENT(td, HTMLTableCellElement);
+        REGISTER_HTML_ELEMENT(th, HTMLTableCellElement);
+        REGISTER_HTML_ELEMENT(colgroup, HTMLTableColElement);
+        REGISTER_HTML_ELEMENT(col, HTMLTableColElement);
+        REGISTER_HTML_ELEMENT(table, HTMLTableElement);
+        REGISTER_HTML_ELEMENT(tr, HTMLTableRowElement);
+        REGISTER_HTML_ELEMENT(tbody, HTMLTableSectionElement);
+        REGISTER_HTML_ELEMENT(thead, HTMLTableSectionElement);
+        REGISTER_HTML_ELEMENT(tfoot, HTMLTableSectionElement);
+        REGISTER_HTML_ELEMENT(template_, HTMLTemplateElement);
+        REGISTER_HTML_ELEMENT(textarea, HTMLTextAreaElement);
+        REGISTER_HTML_ELEMENT(time, HTMLTimeElement);
+        REGISTER_HTML_ELEMENT(title, HTMLTitleElement);
+        REGISTER_HTML_ELEMENT(track, HTMLTrackElement);
+        REGISTER_HTML_ELEMENT(ul, HTMLUListElement);
+        REGISTER_HTML_ELEMENT(video, HTMLVideoElement);
+
+#define REGISTER_GENERIC_HTML_ELEMENT(tag_name) REGISTER_HTML_ELEMENT(tag_name, HTMLElement)
+        REGISTER_GENERIC_HTML_ELEMENT(article);
+        REGISTER_GENERIC_HTML_ELEMENT(search);
+        REGISTER_GENERIC_HTML_ELEMENT(section);
+        REGISTER_GENERIC_HTML_ELEMENT(nav);
+        REGISTER_GENERIC_HTML_ELEMENT(aside);
+        REGISTER_GENERIC_HTML_ELEMENT(hgroup);
+        REGISTER_GENERIC_HTML_ELEMENT(header);
+        REGISTER_GENERIC_HTML_ELEMENT(footer);
+        REGISTER_GENERIC_HTML_ELEMENT(address);
+        REGISTER_GENERIC_HTML_ELEMENT(dt);
+        REGISTER_GENERIC_HTML_ELEMENT(dd);
+        REGISTER_GENERIC_HTML_ELEMENT(figure);
+        REGISTER_GENERIC_HTML_ELEMENT(figcaption);
+        REGISTER_GENERIC_HTML_ELEMENT(main);
+        REGISTER_GENERIC_HTML_ELEMENT(em);
+        REGISTER_GENERIC_HTML_ELEMENT(strong);
+        REGISTER_GENERIC_HTML_ELEMENT(small);
+        REGISTER_GENERIC_HTML_ELEMENT(s);
+        REGISTER_GENERIC_HTML_ELEMENT(cite);
+        REGISTER_GENERIC_HTML_ELEMENT(dfn);
+        REGISTER_GENERIC_HTML_ELEMENT(abbr);
+        REGISTER_GENERIC_HTML_ELEMENT(ruby);
+        REGISTER_GENERIC_HTML_ELEMENT(rt);
+        REGISTER_GENERIC_HTML_ELEMENT(rp);
+        REGISTER_GENERIC_HTML_ELEMENT(code);
+        REGISTER_GENERIC_HTML_ELEMENT(var);
+        REGISTER_GENERIC_HTML_ELEMENT(samp);
+        REGISTER_GENERIC_HTML_ELEMENT(kbd);
+        REGISTER_GENERIC_HTML_ELEMENT(sub);
+        REGISTER_GENERIC_HTML_ELEMENT(sup);
+        REGISTER_GENERIC_HTML_ELEMENT(i);
+        REGISTER_GENERIC_HTML_ELEMENT(b);
+        REGISTER_GENERIC_HTML_ELEMENT(u);
+        REGISTER_GENERIC_HTML_ELEMENT(mark);
+        REGISTER_GENERIC_HTML_ELEMENT(bdi);
+        REGISTER_GENERIC_HTML_ELEMENT(bdo);
+        REGISTER_GENERIC_HTML_ELEMENT(wbr);
+        REGISTER_GENERIC_HTML_ELEMENT(noscript);
+        REGISTER_GENERIC_HTML_ELEMENT(acronym);
+        REGISTER_GENERIC_HTML_ELEMENT(basefont);
+        REGISTER_GENERIC_HTML_ELEMENT(big);
+        REGISTER_GENERIC_HTML_ELEMENT(center);
+        REGISTER_GENERIC_HTML_ELEMENT(nobr);
+        REGISTER_GENERIC_HTML_ELEMENT(noembed);
+        REGISTER_GENERIC_HTML_ELEMENT(noframes);
+        REGISTER_GENERIC_HTML_ELEMENT(plaintext);
+        REGISTER_GENERIC_HTML_ELEMENT(rb);
+        REGISTER_GENERIC_HTML_ELEMENT(rtc);
+        REGISTER_GENERIC_HTML_ELEMENT(strike);
+        REGISTER_GENERIC_HTML_ELEMENT(tt);
+#undef REGISTER_GENERIC_HTML_ELEMENT
+#undef REGISTER_HTML_ELEMENT
+
+        return factories;
+    }();
+
+    return *factories;
+}
+
+static GC::Ref<Element> create_html_element(Document& document, QualifiedName qualified_name)
+{
+    auto const& tag_name = qualified_name.local_name();
+
+    if (auto factory = html_element_factories().get(tag_name.raw_identity()); factory.has_value())
+        return factory.value()(document, move(qualified_name));
+
+    if (HTML::is_valid_custom_element_name(qualified_name.local_name()))
+        return create_element_on_heap<HTML::HTMLElement>(document, move(qualified_name));
+
+    return create_element_on_heap<HTML::HTMLUnknownElement>(document, move(qualified_name));
+}
+
+static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, QualifiedName qualified_name)
 {
     auto const& local_name = qualified_name.local_name();
 
     if (local_name == SVG::TagNames::svg)
-        return realm.create<SVG::SVGSVGElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGSVGElement>(document, move(qualified_name));
     // FIXME: Support SVG's mixedCase tag names properly.
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::clipPath))
-        return realm.create<SVG::SVGClipPathElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGClipPathElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::circle)
-        return realm.create<SVG::SVGCircleElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGCircleElement>(document, move(qualified_name));
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::defs))
-        return realm.create<SVG::SVGDefsElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGDefsElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::desc)
-        return realm.create<SVG::SVGDescElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGDescElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::ellipse)
-        return realm.create<SVG::SVGEllipseElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGEllipseElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feBlend)
-        return realm.create<SVG::SVGFEBlendElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feComposite)
-        return realm.create<SVG::SVGFECompositeElement>(document, move(qualified_name));
-    if (local_name == SVG::TagNames::feFlood)
-        return realm.create<SVG::SVGFEFloodElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEBlendElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feColorMatrix)
-        return realm.create<SVG::SVGFEColorMatrixElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEColorMatrixElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feComponentTransfer)
+        return create_element_on_heap<SVG::SVGFEComponentTransferElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feComposite)
+        return create_element_on_heap<SVG::SVGFECompositeElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feDisplacementMap)
+        return create_element_on_heap<SVG::SVGFEDisplacementMapElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feDropShadow)
+        return create_element_on_heap<SVG::SVGFEDropShadowElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feFlood)
+        return create_element_on_heap<SVG::SVGFEFloodElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feFuncA)
+        return create_element_on_heap<SVG::SVGFEFuncAElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feFuncB)
+        return create_element_on_heap<SVG::SVGFEFuncBElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feFuncG)
+        return create_element_on_heap<SVG::SVGFEFuncGElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feFuncR)
+        return create_element_on_heap<SVG::SVGFEFuncRElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feGaussianBlur)
-        return realm.create<SVG::SVGFEGaussianBlurElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEGaussianBlurElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feImage)
-        return realm.create<SVG::SVGFEImageElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEImageElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feMerge)
-        return realm.create<SVG::SVGFEMergeElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEMergeElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feMergeNode)
-        return realm.create<SVG::SVGFEMergeNodeElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEMergeNodeElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feMorphology)
+        return create_element_on_heap<SVG::SVGFEMorphologyElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feOffset)
-        return realm.create<SVG::SVGFEOffsetElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFEOffsetElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feTurbulence)
+        return create_element_on_heap<SVG::SVGFETurbulenceElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::filter)
-        return realm.create<SVG::SVGFilterElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGFilterElement>(document, move(qualified_name));
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::foreignObject))
-        return realm.create<SVG::SVGForeignObjectElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGForeignObjectElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::line)
-        return realm.create<SVG::SVGLineElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGLineElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::linearGradient)
-        return realm.create<SVG::SVGLinearGradientElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGLinearGradientElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::mask)
-        return realm.create<SVG::SVGMaskElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGMaskElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::metadata)
-        return realm.create<SVG::SVGMetadataElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGMetadataElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::path)
-        return realm.create<SVG::SVGPathElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGPathElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::pattern)
+        return create_element_on_heap<SVG::SVGPatternElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::polygon)
-        return realm.create<SVG::SVGPolygonElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGPolygonElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::polyline)
-        return realm.create<SVG::SVGPolylineElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGPolylineElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::radialGradient)
-        return realm.create<SVG::SVGRadialGradientElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGRadialGradientElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::rect)
-        return realm.create<SVG::SVGRectElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGRectElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::g)
-        return realm.create<SVG::SVGGElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGGElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::stop)
-        return realm.create<SVG::SVGStopElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGStopElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::style)
-        return realm.create<SVG::SVGStyleElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGStyleElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::switch_)
+        return create_element_on_heap<SVG::SVGSwitchElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::symbol)
-        return realm.create<SVG::SVGSymbolElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGSymbolElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::text)
-        return realm.create<SVG::SVGTextElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGTextElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::textPath)
-        return realm.create<SVG::SVGTextPathElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGTextPathElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::title)
-        return realm.create<SVG::SVGTitleElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGTitleElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::tspan)
-        return realm.create<SVG::SVGTSpanElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGTSpanElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::use)
-        return realm.create<SVG::SVGUseElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGUseElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::script)
-        return realm.create<SVG::SVGScriptElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGScriptElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::view)
-        return realm.create<SVG::SVGViewElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGViewElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::a)
-        return realm.create<SVG::SVGAElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGAElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::image)
-        return realm.create<SVG::SVGImageElement>(document, move(qualified_name));
+        return create_element_on_heap<SVG::SVGImageElement>(document, move(qualified_name));
 
     // https://svgwg.org/svg2-draft/types.html#ElementsInTheSVGDOM
     // Elements in the SVG namespace whose local name does not match an element defined in any
     // specification supported by the software must nonetheless implement the SVGElement interface.
-    return realm.create<SVG::SVGElement>(document, move(qualified_name));
+    return create_element_on_heap<SVG::SVGElement>(document, move(qualified_name));
 }
 
-static GC::Ref<MathML::MathMLElement> create_mathml_element(JS::Realm& realm, Document& document, QualifiedName qualified_name)
+static GC::Ref<MathML::MathMLElement> create_mathml_element(Document& document, QualifiedName qualified_name)
 {
+
     auto const& local_name = qualified_name.local_name();
+
+    // https://w3c.github.io/mathml-core/#dom-mathmlanchorelement
+    // The <a> element must implement, and expose to scripts, the following MathMLAnchorElement interface.
+    if (local_name == MathML::TagNames::a)
+        return create_element_on_heap<MathML::MathMLAnchorElement>(document, move(qualified_name));
+
     if (local_name == MathML::TagNames::mi)
-        return realm.create<MathML::MathMLMiElement>(document, move(qualified_name));
+        return create_element_on_heap<MathML::MathMLMiElement>(document, move(qualified_name));
     if (local_name == MathML::TagNames::mspace)
-        return realm.create<MathML::MathMLMspaceElement>(document, move(qualified_name));
+        return create_element_on_heap<MathML::MathMLMspaceElement>(document, move(qualified_name));
 
     // https://w3c.github.io/mathml-core/#dom-and-javascript
     // All the nodes representing MathML elements in the DOM must implement, and expose to scripts,
@@ -561,176 +639,152 @@ static GC::Ref<MathML::MathMLElement> create_mathml_element(JS::Realm& realm, Do
     // https://w3c.github.io/mathml-core/#mathml-elements-and-attributes
     // The term MathML element refers to any element in the MathML namespace.
 
-    return realm.create<MathML::MathMLElement>(document, move(qualified_name));
+    return create_element_on_heap<MathML::MathMLElement>(document, move(qualified_name));
 }
-// https://dom.spec.whatwg.org/#concept-create-element
-WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, FlyString local_name, Optional<FlyString> namespace_, Optional<FlyString> prefix, Optional<String> is_value, bool synchronous_custom_elements_flag)
+
+// https://dom.spec.whatwg.org/#create-an-element-internal
+template<typename Interface>
+GC::Ref<Element> create_element_internal(Document& document, Interface interface, Utf16FlyString local_name, Optional<Utf16FlyString> namespace_, Optional<Utf16FlyString> prefix, CustomElementState custom_element_state, Optional<Utf16FlyString> is_value, GC::Ptr<HTML::CustomElementRegistry> registry)
 {
-    auto& realm = document.realm();
+    // 1. Let element be a new element that implements interface, with namespace set to namespace, namespace prefix set
+    //    to prefix, local name set to localName, custom element registry set to registry, custom element state set to
+    //    state, custom element definition set to null, is value set to is, and node document set to document.
+    auto qualified_name = QualifiedName { local_name, prefix, namespace_ };
+    auto element = interface(document, qualified_name);
+    element->set_custom_element_registry(registry);
+    element->set_custom_element_state(custom_element_state);
+    element->set_is_value(move(is_value));
+    // NB: Document is set in the call to `interface()` above. Custom element definition is null by default.
 
+    // 2. Assert: element’s attribute list is empty.
+    VERIFY(!element->has_attributes());
+
+    // 3. Return element.
+    return element;
+}
+
+// https://dom.spec.whatwg.org/#concept-create-element
+WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, Utf16FlyString local_name, Optional<Utf16FlyString> namespace_, Optional<Utf16FlyString> prefix, Optional<Utf16FlyString> is_value, bool synchronous_custom_elements_flag, Variant<GC::Ptr<HTML::CustomElementRegistry>, Default> initial_registry)
+{
     // 1. Let result be null.
-    // NOTE: We collapse this into just returning an element where necessary.
+    GC::Ptr<Element> result;
 
-    // 2. Let definition be the result of looking up a custom element definition given document, namespace, localName, and is.
-    auto definition = document.lookup_custom_element_definition(namespace_, local_name, is_value);
+    // 2. If registry is "default", then set registry to the result of looking up a custom element registry given
+    //    document.
+    GC::Ptr<HTML::CustomElementRegistry> registry = initial_registry.visit(
+        [&document](Default const&) {
+            return HTML::look_up_a_custom_element_registry(document);
+        },
+        [](GC::Ptr<HTML::CustomElementRegistry> pointer) {
+            return pointer;
+        });
 
-    // 3. If definition is non-null, and definition’s name is not equal to its local name (i.e., definition represents a customized built-in element), then:
+    // 3. Let definition be the result of looking up a custom element definition given registry, namespace, localName,
+    //    and is.
+    auto definition = HTML::look_up_a_custom_element_definition(registry, namespace_, local_name, is_value);
+
+    // 4. If definition is non-null, and definition’s name is not equal to its local name (i.e., definition represents
+    //    a customized built-in element):
     if (definition && definition->name() != definition->local_name()) {
         // 1. Let interface be the element interface for localName and the HTML namespace.
-        // 2. Set result to a new element that implements interface, with no attributes, namespace set to the HTML namespace,
-        //    namespace prefix set to prefix, local name set to localName, custom element state set to "undefined", custom element definition set to null,
-        //    is value set to is, and node document set to document.
-        auto element = create_html_element(realm, document, QualifiedName { local_name, prefix, Namespace::HTML });
-        element->set_is_value(is_value);
+        // 2. Set result to the result of creating an element internal given document, interface, localName, the HTML
+        //    namespace, prefix, "undefined", is, and registry.
+        result = create_element_internal(document, create_html_element, local_name, Namespace::HTML, prefix, CustomElementState::Undefined, is_value, registry);
 
-        // 3. If the synchronous custom elements flag is set, then run this step while catching any exceptions:
+        // 3. If synchronousCustomElements is true, then run this step while catching any exceptions:
         if (synchronous_custom_elements_flag) {
-            // 1. Upgrade element using definition.
-            auto upgrade_result = element->upgrade_element(*definition);
+            // 1. Upgrade result using definition.
+            auto upgrade_result = Bindings::upgrade_custom_element(*result, *definition);
 
-            // If this step threw an exception, then:
+            // If this step threw an exception exception:
             if (upgrade_result.is_throw_completion()) {
-                // 1. Report exception for definition’s constructor’s corresponding JavaScript object’s associated realm’s global object.
-                auto& window_or_worker = as<HTML::WindowOrWorkerGlobalScopeMixin>(HTML::relevant_global_object(definition->constructor().callback));
+                // 1. Report exception for definition’s constructor’s corresponding JavaScript object’s associated
+                //    realm’s global object.
+                auto& window_or_worker = HTML::relevant_window_or_worker_global_scope(definition->constructor().callback);
                 window_or_worker.report_an_exception(upgrade_result.error_value());
 
                 // 2. Set result’s custom element state to "failed".
-                element->set_custom_element_state(CustomElementState::Failed);
+                result->set_custom_element_state(CustomElementState::Failed);
             }
         }
 
         // 4. Otherwise, enqueue a custom element upgrade reaction given result and definition.
         else {
-            element->enqueue_a_custom_element_upgrade_reaction(*definition);
+            result->enqueue_a_custom_element_upgrade_reaction(*definition);
         }
-
-        return element;
     }
 
-    // 4. Otherwise, if definition is non-null, then:
-    if (definition) {
-        // 1. If synchronousCustomElements is true, then run these steps while catching any exceptions:
+    // 5. Otherwise, if definition is non-null, then:
+    else if (definition) {
+        // 1. If synchronousCustomElements is true:
         if (synchronous_custom_elements_flag) {
-            auto synchronously_upgrade_custom_element = [&]() -> JS::ThrowCompletionOr<GC::Ref<HTML::HTMLElement>> {
-                // 1. Let C be definition’s constructor.
-                auto& constructor = definition->constructor();
-
-                // 2. Set result to the result of constructing C, with no arguments.
-                auto result = TRY(WebIDL::construct(constructor, {}));
-
-                // NOTE: IDL does not currently convert the object for us, so we will have to do it here.
-                if (!result.is_object() || !is<HTML::HTMLElement>(result.as_object()))
-                    return JS::throw_completion(JS::TypeError::create(realm, "Custom element constructor must return an object that implements HTMLElement"_string));
-
-                GC::Ref<HTML::HTMLElement> element = as<HTML::HTMLElement>(result.as_object());
-
-                // FIXME: 3. Assert: result’s custom element state and custom element definition are initialized.
-
-                // 4. Assert: result’s namespace is the HTML namespace.
-                // Spec Note: IDL enforces that result is an HTMLElement object, which all use the HTML namespace.
-                VERIFY(element->namespace_uri() == Namespace::HTML);
-
-                // 5. If result’s attribute list is not empty, then throw a "NotSupportedError" DOMException.
-                if (element->has_attributes())
-                    return JS::throw_completion(WebIDL::NotSupportedError::create(realm, "Synchronously created custom element cannot have attributes"_utf16));
-
-                // 6. If result has children, then throw a "NotSupportedError" DOMException.
-                if (element->has_children())
-                    return JS::throw_completion(WebIDL::NotSupportedError::create(realm, "Synchronously created custom element cannot have children"_utf16));
-
-                // 7. If result’s parent is not null, then throw a "NotSupportedError" DOMException.
-                if (element->parent())
-                    return JS::throw_completion(WebIDL::NotSupportedError::create(realm, "Synchronously created custom element cannot have a parent"_utf16));
-
-                // 8. If result’s node document is not document, then throw a "NotSupportedError" DOMException.
-                if (&element->document() != &document)
-                    return JS::throw_completion(WebIDL::NotSupportedError::create(realm, "Synchronously created custom element must be in the same document that element creation was invoked in"_utf16));
-
-                // 9. If result’s local name is not equal to localName, then throw a "NotSupportedError" DOMException.
-                if (element->local_name() != local_name)
-                    return JS::throw_completion(WebIDL::NotSupportedError::create(realm, "Synchronously created custom element must have the same local name that element creation was invoked with"_utf16));
-
-                // 10. Set result’s namespace prefix to prefix.
-                element->set_prefix(prefix);
-
-                // 11. Set result’s is value to null.
-                element->set_is_value(Optional<String> {});
-                return element;
-            };
-
-            auto result = synchronously_upgrade_custom_element();
+            // 3. Run these steps while catching any exceptions:
+            auto constructed_element = Bindings::construct_autonomous_custom_element(
+                document,
+                local_name,
+                prefix,
+                registry,
+                *definition);
 
             // If any of these steps threw an exception, then:
-            if (result.is_throw_completion()) {
-                // 1. Report exception for definition’s constructor’s corresponding JavaScript object’s associated realm’s global object.
-                auto& window_or_worker = as<HTML::WindowOrWorkerGlobalScopeMixin>(HTML::relevant_global_object(definition->constructor().callback));
-                window_or_worker.report_an_exception(result.error_value());
+            if (constructed_element.is_throw_completion()) {
+                // 1. Report exception for definition’s constructor’s corresponding JavaScript object’s associated
+                //    realm’s global object.
+                auto& window_or_worker = HTML::relevant_window_or_worker_global_scope(definition->constructor().callback);
+                window_or_worker.report_an_exception(constructed_element.error_value());
 
-                // 2. Set result to a new element that implements the HTMLUnknownElement interface, with no attributes, namespace set to the HTML namespace, namespace prefix set to prefix,
-                //    local name set to localName, custom element state set to "failed", custom element definition set to null, is value set to null, and node document set to document.
-                GC::Ref<Element> element = realm.create<HTML::HTMLUnknownElement>(document, QualifiedName { local_name, prefix, Namespace::HTML });
-                element->set_custom_element_state(CustomElementState::Failed);
-                return element;
+                // 2. Set result to the result of creating an element internal given document, HTMLUnknownElement,
+                //    localName, the HTML namespace, prefix, "failed", null, and registry.
+                result = create_element_internal(document, [](auto& document, auto qualified_name) { return create_element_on_heap<HTML::HTMLUnknownElement>(document, qualified_name); }, local_name, Namespace::HTML, prefix, CustomElementState::Failed, {}, registry);
             }
 
-            return result.release_value();
+            else {
+                result = constructed_element.release_value();
+            }
         }
 
         // 2. Otherwise:
-        // 1. Set result to a new element that implements the HTMLElement interface, with no attributes, namespace set to the HTML namespace, namespace prefix set to prefix,
-        //    local name set to localName, custom element state set to "undefined", custom element definition set to null, is value set to null, and node document set to document.
-        auto element = realm.create<HTML::HTMLElement>(document, QualifiedName { local_name, prefix, Namespace::HTML });
-        element->set_custom_element_state(CustomElementState::Undefined);
+        else {
+            // 1. Set result to the result of creating an element internal given document, HTMLElement, localName, the HTML
+            //    namespace, prefix, "undefined", null, and registry.
+            result = create_element_internal(document, [](auto& document, auto qualified_name) { return create_element_on_heap<HTML::HTMLElement>(document, qualified_name); }, local_name, Namespace::HTML, prefix, CustomElementState::Undefined, {}, registry);
 
-        // 2. Enqueue a custom element upgrade reaction given result and definition.
-        element->enqueue_a_custom_element_upgrade_reaction(*definition);
-        return element;
+            // 2. Enqueue a custom element upgrade reaction given result and definition.
+            result->enqueue_a_custom_element_upgrade_reaction(*definition);
+        }
     }
 
-    // 5. Otherwise:
-    //    1. Let interface be the element interface for localName and namespace.
-    //    2. Set result to a new element that implements interface, with no attributes, namespace set to namespace, namespace prefix set to prefix,
-    //       local name set to localName, custom element state set to "uncustomized", custom element definition set to null, is value set to is,
-    //       and node document set to document.
+    // 6. Otherwise:
+    else {
+        // 1. Let interface be the element interface for localName and namespace.
+        // 2. Set result to the result of creating an element internal given document, interface, localName, namespace,
+        //    prefix, "uncustomized", is, and registry.
+        if (namespace_ == Namespace::HTML) {
+            result = create_element_internal(document, create_html_element, local_name, namespace_, prefix, CustomElementState::Uncustomized, is_value, registry);
 
-    auto qualified_name = QualifiedName { local_name, prefix, namespace_ };
+            // 3. If namespace is the HTML namespace, and either localName is a valid custom element name or is is
+            //    non-null, then set result’s custom element state to "undefined".
+            if (HTML::is_valid_custom_element_name(local_name) || is_value.has_value())
+                result->set_custom_element_state(CustomElementState::Undefined);
+        }
 
-    if (namespace_ == Namespace::HTML) {
-        auto element = create_html_element(realm, document, move(qualified_name));
-        element->set_is_value(is_value);
-        element->set_custom_element_state(CustomElementState::Uncustomized);
+        else if (namespace_ == Namespace::SVG) {
+            result = create_element_internal(document, create_svg_element, local_name, namespace_, prefix, CustomElementState::Uncustomized, is_value, registry);
+        }
 
-        // 3. If namespace is the HTML namespace, and either localName is a valid custom element name or is is non-null,
-        //    then set result’s custom element state to "undefined".
-        if (HTML::is_valid_custom_element_name(local_name) || is_value.has_value())
-            element->set_custom_element_state(CustomElementState::Undefined);
+        else if (namespace_ == Namespace::MathML) {
+            result = create_element_internal(document, create_mathml_element, local_name, namespace_, prefix, CustomElementState::Uncustomized, is_value, registry);
+        }
 
-        return element;
+        else {
+            // https://dom.spec.whatwg.org/#concept-element-interface
+            // The element interface for any name and namespace is Element, unless stated otherwise.
+            result = create_element_internal(document, [](auto& document, auto qualified_name) { return create_element_on_heap<DOM::Element>(document, qualified_name); }, local_name, namespace_, prefix, CustomElementState::Uncustomized, is_value, registry);
+        }
     }
 
-    if (namespace_ == Namespace::SVG) {
-        auto element = create_svg_element(realm, document, qualified_name);
-        element->set_is_value(is_value);
-        element->set_custom_element_state(CustomElementState::Uncustomized);
-        return element;
-    }
-
-    if (namespace_ == Namespace::MathML) {
-        auto element = create_mathml_element(realm, document, qualified_name);
-        element->set_is_value(is_value);
-        element->set_custom_element_state(CustomElementState::Uncustomized);
-        return element;
-    }
-
-    // 6. Return result.
-    // NOTE: See step 1.
-
-    // https://dom.spec.whatwg.org/#concept-element-interface
-    // The element interface for any name and namespace is Element, unless stated otherwise.
-    auto element = realm.create<DOM::Element>(document, move(qualified_name));
-    element->set_is_value(move(is_value));
-    element->set_custom_element_state(CustomElementState::Uncustomized);
-    return element;
+    // 7. Return result.
+    return GC::Ref { *result };
 }
 
 }

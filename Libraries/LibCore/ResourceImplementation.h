@@ -6,14 +6,17 @@
 
 #pragma once
 
-#include <AK/RefPtr.h>
+#include <AK/NonnullRefPtr.h>
 #include <AK/StringView.h>
+#include <LibCore/Export.h>
 #include <LibCore/Resource.h>
 
 namespace Core {
 
-class ResourceImplementation {
+class CORE_API ResourceImplementation {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     ErrorOr<NonnullRefPtr<Resource>> load_from_uri(StringView);
     Vector<String> child_names(Resource const&);
     String filesystem_path(Resource const&);
@@ -29,7 +32,6 @@ protected:
     virtual String filesystem_path_for_resource_scheme(String const&) = 0;
 
     static NonnullRefPtr<Resource> make_resource(String full_path, NonnullOwnPtr<Core::MappedFile>, time_t modified_time);
-    static NonnullRefPtr<Resource> make_resource(String full_path, ByteBuffer, time_t modified_time);
     static NonnullRefPtr<Resource> make_directory_resource(String full_path, time_t modified_time);
 };
 

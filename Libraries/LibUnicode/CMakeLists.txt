@@ -1,18 +1,28 @@
 set(SOURCES
+    Bidi.cpp
+    Calendar.cpp
+    Calendars/AdjustedEraCalendar.cpp
+    Calendars/ChineseDangiCalendar.cpp
+    CaseMapping.cpp
     CharacterTypes.cpp
     Collator.cpp
     CurrencyCode.cpp
     DateTimeFormat.cpp
+    DateTimeFormatExports.cpp
     DisplayNames.cpp
     DurationFormat.cpp
+    FullwidthMapping.cpp
     ICU.cpp
     IDNA.cpp
+    IntlExports.cpp
     ListFormat.cpp
     Locale.cpp
     Normalize.cpp
     NumberFormat.cpp
+    NumberFormatExports.cpp
     PluralRules.cpp
     RelativeTimeFormat.cpp
+    RelativeTimeFormatExports.cpp
     Segmenter.cpp
     String.cpp
     TimeZone.cpp
@@ -24,13 +34,15 @@ set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 
 ladybird_lib(LibUnicode unicode)
 
-find_package(ICU 76 REQUIRED COMPONENTS data i18n uc)
 target_link_libraries(LibUnicode PRIVATE ICU::i18n ICU::uc ICU::data)
+
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libunicode_rust FEATURES allocator idna FFI_HEADER RustFFI.h)
+target_link_libraries(LibUnicode PRIVATE libunicode_rust)
 
 # FIXME: Add support for building LibGfx in sanitize
 #   lld-link: error: /failifmismatch: mismatch detected for 'annotate_string':
 #   >>> lagom-unicode.lib(TimeZone.cpp.obj) has value 1
 #   >>> lagom-gfx.lib(PaintingSurface.cpp.obj) has value 0
-if (WIN32 AND ENABLE_WINDOWS_CI)
+if (WIN32 AND ENABLE_ADDRESS_SANITIZER)
     target_compile_options(LibUnicode PRIVATE -fno-sanitize=address)
 endif()

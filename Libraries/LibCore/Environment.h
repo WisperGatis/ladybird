@@ -7,17 +7,15 @@
 #pragma once
 
 #include <AK/Error.h>
-#include <AK/Function.h>
-#include <AK/IterationDecision.h>
 #include <AK/Optional.h>
 #include <AK/StringView.h>
-#include <AK/Vector.h>
+#include <LibCore/Export.h>
 
 namespace Core::Environment {
 
-char** raw_environ();
+CORE_API char** raw_environ();
 
-struct Entry {
+struct CORE_API Entry {
     StringView full_entry;
     StringView name;
     StringView value;
@@ -61,19 +59,19 @@ EntryIterator entries();
 
 size_t size();
 
-bool has(StringView name);
+CORE_API bool has(StringView name);
 enum class SecureOnly {
     No,
     Yes,
 };
-Optional<StringView> get(StringView name, SecureOnly = SecureOnly::No);
+CORE_API Optional<StringView> get(StringView name, SecureOnly = SecureOnly::No);
 
 enum class Overwrite {
     No,
     Yes,
 };
-ErrorOr<void> set(StringView name, StringView value, Overwrite);
-ErrorOr<void> unset(StringView name);
+CORE_API ErrorOr<void> set(StringView name, StringView value, Overwrite);
+CORE_API ErrorOr<void> unset(StringView name);
 ErrorOr<void> put(StringView env);
 
 ErrorOr<void> clear();

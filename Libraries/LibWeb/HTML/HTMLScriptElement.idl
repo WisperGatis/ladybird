@@ -1,7 +1,3 @@
-#import <Fetch/Request.idl>
-#import <HTML/HTMLElement.idl>
-#import <HTML/Scripting/Fetching.idl>
-
 // https://html.spec.whatwg.org/multipage/scripting.html#htmlscriptelement
 [Exposed=Window]
 interface HTMLScriptElement : HTMLElement {
@@ -17,11 +13,11 @@ interface HTMLScriptElement : HTMLElement {
     [CEReactions, Reflect] attribute DOMString integrity;
     [CEReactions, Enumerated=FetchPriorityAttribute, Reflect=fetchpriority] attribute DOMString fetchPriority;
 
-    // https://www.w3.org/TR/trusted-types/#enforcement-in-scripts
-    [CEReactions] attribute (TrustedScript or Utf16DOMString) text;
-    [CEReactions] attribute (TrustedScriptURL or Utf16USVString) src;
-    [CEReactions] attribute (TrustedScript or Utf16DOMString)? textContent;
-    [CEReactions] attribute (TrustedScript or Utf16DOMString) innerText;
+    // https://w3c.github.io/trusted-types/dist/spec/#enforcement-in-scripts
+    [CEReactions] attribute (TrustedScript or DOMString) text;
+    [CEReactions] attribute (TrustedScriptURL or USVString) src;
+    [CEReactions] attribute (TrustedScript or DOMString)? textContent;
+    [CEReactions] attribute (TrustedScript or DOMString) innerText;
 
     static boolean supports(DOMString type);
 

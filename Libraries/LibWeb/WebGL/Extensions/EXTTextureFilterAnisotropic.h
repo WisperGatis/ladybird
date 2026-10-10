@@ -6,28 +6,25 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
-class EXTTextureFilterAnisotropic : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(EXTTextureFilterAnisotropic, Bindings::PlatformObject);
+class EXTTextureFilterAnisotropic : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(EXTTextureFilterAnisotropic, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(EXTTextureFilterAnisotropic);
 
 public:
-    static JS::ThrowCompletionOr<GC::Ptr<EXTTextureFilterAnisotropic>> create(JS::Realm&, WebGLRenderingContextBase*);
+    static GC::Ref<Bindings::Wrappable> create(GC::Ref<WebGLRenderingContextBase>);
 
 protected:
-    void initialize(JS::Realm&) override;
     void visit_edges(Visitor&) override;
 
 private:
-    EXTTextureFilterAnisotropic(JS::Realm&, WebGLRenderingContextBase*);
+    EXTTextureFilterAnisotropic(JS::Realm&, GC::Ref<WebGLRenderingContextBase>);
 
-    // FIXME: It should be GC::Ptr instead of raw pointer, but we need to make WebGLRenderingContextBase inherit from PlatformObject first.
-    WebGLRenderingContextBase* m_context;
+    GC::Ref<WebGLRenderingContextBase> m_context;
 };
 
 }

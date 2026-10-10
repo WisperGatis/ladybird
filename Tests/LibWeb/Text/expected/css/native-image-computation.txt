@@ -1,0 +1,2 @@
+all image values computed: true
+inline image value computed: true

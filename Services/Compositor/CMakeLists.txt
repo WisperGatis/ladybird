@@ -1,0 +1,77 @@
+set(SOURCES
+    BackingStoreManager.cpp
+    CanvasHost.cpp
+    CompositorState.cpp
+    ContextState.cpp
+    DisplayListPlayer.cpp
+    DisplayListPlayerSkia.cpp
+    DisplayListRasterCache.cpp
+    ConnectionFromClient.cpp
+    ConnectionFromWebContent.cpp
+    FramePacer.cpp
+    HostWebGLContext.cpp
+    OpenGLContext.cpp
+    PausedDebuggerOverlay.cpp
+    RasterizeDisplayList.cpp
+    RenderClockConnection.cpp
+    ScrollSnapController.cpp
+    ScrollbarController.cpp
+    VideoFrameSkia.cpp
+    VSyncScheduler.cpp
+    WebGLObjectMap.cpp
+)
+
+invoke_py_generator(
+    "WebGLCommandReplayer.cpp"
+    "generate_compositor_webgl_replayer.py"
+    "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.json"
+    "WebGLCommandReplayer.h"
+    "WebGLCommandReplayer.cpp"
+    arguments -j "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.json"
+    dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
+)
+
+set(GENERATED_SOURCES
+    CompositorControlClientEndpoint.h
+    CompositorControlServerEndpoint.h
+    CompositorWebContentClientEndpoint.h
+    CompositorWebContentServerEndpoint.h
+    RenderClockClientEndpoint.h
+    RenderClockServerEndpoint.h
+    ${CMAKE_BINARY_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.cpp
+    WebGLCommandReplayer.cpp
+)
+
+add_library(compositorservice STATIC ${SOURCES} ${GENERATED_SOURCES})
+ladybird_generated_sources(compositorservice)
+
+add_executable(Compositor main.cpp)
+
+if (LINUX)
+    target_sources(Compositor PRIVATE SandboxLinux.cpp)
+elseif (APPLE)
+    target_sources(Compositor PRIVATE SandboxMacOS.cpp)
+else()
+    target_sources(Compositor PRIVATE SandboxUnimplemented.cpp)
+endif()
+
+target_include_directories(compositorservice PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/../..)
+target_include_directories(compositorservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Services/)
+
+target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSandbox)
+# ANGLE must precede Skia so macOS GLES symbols bind to ANGLE rather than the
+# OpenGL framework pulled in by Skia.
+target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
+
+if (APPLE)
+    target_sources(compositorservice PRIVATE VideoFrameSkia.mm)
+    target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")
+endif()
+
+if (WIN32)
+    target_include_directories(Compositor PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
+    target_include_directories(compositorservice PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
+    ladybird_windows_bin(Compositor CONSOLE)
+endif()
+
+ladybird_sign_helper_process(Compositor)

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="structural-matrix.js"></script>
+<style>
+    #queried { --state: off }
+    #queried.changed { --state: on }
+    #unqueried.changed { background-color: blue }
+    @container style(--state: on) {
+        #dependent { color: rgb(1, 2, 3) }
+    }
+</style>
+<div id="unqueried"><div><span></span><span></span></div></div>
+<div id="queried"><div><span id="dependent"></span></div></div>
+<script>
+    test(() => {
+        const dependent = document.getElementById("dependent");
+        const queried = document.getElementById("queried");
+        const unqueried = document.getElementById("unqueried");
+
+        // A style change on an element has to reach the descendants whose style container queries
+        // resolved against it. A change on anything else must leave the dependent unaffected.
+        println(`dependent before: ${getComputedStyle(dependent).color}`);
+
+        flushPendingStyleWork();
+        unqueried.classList.add("changed");
+        internals.updateStyle();
+        println(`dependent after unrelated change: ${getComputedStyle(dependent).color}`);
+
+        flushPendingStyleWork();
+        queried.classList.add("changed");
+        internals.updateStyle();
+        println(`dependent after: ${getComputedStyle(dependent).color}`);
+    });
+</script>

@@ -8,6 +8,7 @@
 #include <AK/Checked.h>
 #include <AK/DateConstants.h>
 #include <AK/GenericLexer.h>
+#include <AK/SaturatingMath.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -15,11 +16,22 @@
 
 #ifdef AK_OS_WINDOWS
 #    include <AK/Windows.h>
-#    define localtime_r(time, tm) localtime_s(tm, time)
-#    define gmtime_r(time, tm) gmtime_s(tm, time)
 #    define tzname _tzname
 #    define timegm _mkgmtime
 #endif
+
+static bool fill_tm(time_t& timestamp, struct tm& tm, UnixDateTime::LocalTime& local_time)
+{
+#ifdef AK_OS_WINDOWS
+    if (local_time == UnixDateTime::LocalTime::Yes)
+        return localtime_s(&tm, &timestamp) == 0;
+    return gmtime_s(&tm, &timestamp) == 0;
+#else
+    if (local_time == UnixDateTime::LocalTime::Yes)
+        return localtime_r(&timestamp, &tm) != nullptr;
+    return gmtime_r(&timestamp, &tm) != nullptr;
+#endif
+}
 
 namespace AK {
 
@@ -67,6 +79,72 @@ Duration Duration::from_timeval(const struct timeval& tv)
     return Duration::from_half_sanitized(tv.tv_sec, extra_secs, usecs * 1'000);
 }
 
+Duration Duration::from_time_units(i64 time_units, u32 numerator, u32 denominator)
+{
+    VERIFY(numerator != 0);
+    VERIFY(denominator != 0);
+
+    if (Checked<i64>::multiplication_would_overflow(time_units, numerator))
+        return Duration(time_units >= 0 ? NumericLimits<i64>::max() : NumericLimits<i64>::min(), 0);
+    auto time_units_product = time_units * numerator;
+    auto seconds = time_units_product / denominator;
+    auto time_units_remainder = time_units_product % denominator;
+    if (time_units_remainder < 0) {
+        if (seconds == NumericLimits<i64>::min())
+            return Duration(NumericLimits<i64>::min(), 0);
+        seconds--;
+        time_units_remainder += denominator;
+    }
+
+    auto nanoseconds = ((time_units_remainder * 1'000'000'000) + (denominator / 2)) / denominator;
+    if (nanoseconds == 1'000'000'000) {
+        seconds++;
+        nanoseconds = 0;
+    }
+    VERIFY(nanoseconds >= 0);
+    VERIFY(nanoseconds < 1'000'000'000);
+    return Duration(seconds, static_cast<u32>(nanoseconds));
+}
+
+Duration Duration::scaled_by(u32 numerator, u32 denominator) const
+{
+    VERIFY(denominator != 0);
+
+    if (numerator == 0)
+        return Duration::zero();
+    if (numerator == denominator)
+        return *this;
+
+    if (Checked<i64>::multiplication_would_overflow(m_seconds, numerator))
+        return Duration(m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max(), 0);
+    auto seconds_product = m_seconds * static_cast<i64>(numerator);
+    auto seconds = seconds_product / static_cast<i64>(denominator);
+    auto seconds_remainder = seconds_product % static_cast<i64>(denominator);
+    if (seconds_remainder < 0) {
+        if (seconds == NumericLimits<i64>::min())
+            return Duration(NumericLimits<i64>::min(), 0);
+        seconds--;
+        seconds_remainder += denominator;
+    }
+
+    auto numerator_ns = seconds_remainder * 1'000'000'000;
+    numerator_ns += m_nanoseconds * static_cast<i64>(numerator);
+    auto total_ns = (numerator_ns + denominator / 2) / static_cast<i64>(denominator);
+
+    auto extra_seconds = total_ns / 1'000'000'000;
+    auto nanoseconds = total_ns % 1'000'000'000;
+    if (extra_seconds > 0) {
+        Checked<i64> total_seconds = seconds;
+        total_seconds += extra_seconds;
+        if (total_seconds.has_overflow())
+            return Duration(NumericLimits<i64>::max(), 999'999'999);
+        seconds = total_seconds.value();
+    }
+    VERIFY(nanoseconds >= 0);
+    VERIFY(nanoseconds < 1'000'000'000);
+    return Duration(seconds, static_cast<u32>(nanoseconds));
+}
+
 i64 Duration::to_truncated_seconds() const
 {
     VERIFY(m_nanoseconds < 1'000'000'000);
@@ -93,7 +171,7 @@ i64 Duration::to_truncated_milliseconds() const
     }
     if (!milliseconds.has_overflow())
         return milliseconds.value();
-    return m_seconds < 0 ? -0x8000'0000'0000'0000LL : 0x7fff'ffff'ffff'ffffLL;
+    return m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max();
 }
 
 i64 Duration::to_truncated_microseconds() const
@@ -112,7 +190,7 @@ i64 Duration::to_truncated_microseconds() const
     }
     if (!microseconds.has_overflow())
         return microseconds.value();
-    return m_seconds < 0 ? -0x8000'0000'0000'0000LL : 0x7fff'ffff'ffff'ffffLL;
+    return m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max();
 }
 
 i64 Duration::to_seconds() const
@@ -121,7 +199,7 @@ i64 Duration::to_seconds() const
     if (m_seconds >= 0 && m_nanoseconds) {
         Checked<i64> seconds(m_seconds);
         seconds++;
-        return seconds.has_overflow() ? 0x7fff'ffff'ffff'ffffLL : seconds.value();
+        return seconds.has_overflow() ? NumericLimits<i64>::max() : seconds.value();
     }
     return m_seconds;
 }
@@ -146,7 +224,7 @@ i64 Duration::to_milliseconds() const
     }
     if (!milliseconds.has_overflow())
         return milliseconds.value();
-    return m_seconds < 0 ? -0x8000'0000'0000'0000LL : 0x7fff'ffff'ffff'ffffLL;
+    return m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max();
 }
 
 i64 Duration::to_microseconds() const
@@ -163,7 +241,7 @@ i64 Duration::to_microseconds() const
     }
     if (!microseconds.has_overflow())
         return microseconds.value();
-    return m_seconds < 0 ? -0x8000'0000'0000'0000LL : 0x7fff'ffff'ffff'ffffLL;
+    return m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max();
 }
 
 i64 Duration::to_nanoseconds() const
@@ -178,7 +256,7 @@ i64 Duration::to_nanoseconds() const
     }
     if (!nanoseconds.has_overflow())
         return nanoseconds.value();
-    return m_seconds < 0 ? -0x8000'0000'0000'0000LL : 0x7fff'ffff'ffff'ffffLL;
+    return m_seconds < 0 ? NumericLimits<i64>::min() : NumericLimits<i64>::max();
 }
 
 timespec Duration::to_timespec() const
@@ -194,6 +272,28 @@ timeval Duration::to_timeval() const
     using sec_type = decltype(declval<timeval>().tv_sec);
     using usec_type = decltype(declval<timeval>().tv_usec);
     return { static_cast<sec_type>(m_seconds), static_cast<usec_type>(m_nanoseconds) / 1000 };
+}
+
+i64 Duration::to_time_units(u32 numerator, u32 denominator) const
+{
+    VERIFY(numerator != 0);
+    VERIFY(denominator != 0);
+
+    auto seconds_product = saturating_mul(m_seconds, static_cast<i64>(denominator));
+    auto time_units = seconds_product / numerator;
+    auto seconds_remainder_dividend = seconds_product % numerator;
+
+    auto seconds_remainder_nanosecond_dividend = seconds_remainder_dividend * 1'000'000'000;
+    auto rounding_half_nanosecond_dividend = static_cast<i64>(numerator) * 500'000'000;
+    auto sub_seconds_nanosecond_dividend = (static_cast<i64>(m_nanoseconds) * denominator) + seconds_remainder_nanosecond_dividend;
+
+    auto sub_seconds_nanosecond_units = sub_seconds_nanosecond_dividend / numerator;
+    auto sub_seconds_units_remainder_nanosecond_dividend = sub_seconds_nanosecond_dividend % numerator;
+    auto rounding_adjustment_nanosecond_units = (rounding_half_nanosecond_dividend + sub_seconds_units_remainder_nanosecond_dividend) / numerator;
+
+    time_units = saturating_add(time_units, (sub_seconds_nanosecond_units + rounding_adjustment_nanosecond_units) / 1'000'000'000);
+
+    return time_units;
 }
 
 Duration Duration::from_half_sanitized(i64 seconds, i32 extra_seconds, u32 nanoseconds)
@@ -216,6 +316,113 @@ Duration Duration::from_half_sanitized(i64 seconds, i32 extra_seconds, u32 nanos
     }
 
     return Duration { seconds + extra_seconds, nanoseconds };
+}
+
+ErrorOr<void> Formatter<Duration>::format(FormatBuilder& builder, Duration value)
+{
+    if (value.m_nanoseconds >= 1'000'000'000)
+        return builder.put_string("{ INVALID }"sv);
+
+    auto align = m_align;
+    if (align == FormatBuilder::Align::Default)
+        align = FormatBuilder::Align::Right;
+
+    auto sign_mode = m_sign_mode;
+    if (sign_mode == FormatBuilder::SignMode::Default)
+        sign_mode = FormatBuilder::SignMode::OnlyIfNeeded;
+
+    auto align_width = m_width.value_or(0);
+
+    u8 base;
+    bool upper_case = false;
+    if (m_mode == Mode::Default || m_mode == Mode::FixedPoint) {
+        base = 10;
+    } else if (m_mode == Mode::Hexfloat) {
+        base = 16;
+    } else if (m_mode == Mode::HexfloatUppercase) {
+        base = 16;
+        upper_case = true;
+    } else if (m_mode == Mode::Binary) {
+        base = 2;
+    } else if (m_mode == Mode::BinaryUppercase) {
+        base = 2;
+        upper_case = true;
+    } else if (m_mode == Mode::Octal) {
+        base = 8;
+    } else {
+        VERIFY_NOT_REACHED();
+    }
+
+    auto is_negative = value.m_seconds < 0;
+    auto seconds = is_negative ? 0 - static_cast<u64>(value.m_seconds) : static_cast<u64>(value.m_seconds);
+    auto nanoseconds = value.m_nanoseconds;
+    if (is_negative && nanoseconds > 0) {
+        seconds--;
+        nanoseconds = 1'000'000'000 - nanoseconds;
+    }
+
+    VERIFY(nanoseconds < 1'000'000'000);
+
+    size_t integer_width = 1;
+    if (seconds != 0) {
+        auto remaining_seconds = seconds / 10;
+        while (remaining_seconds != 0) {
+            remaining_seconds /= base;
+            integer_width++;
+        }
+    }
+    if (sign_mode != FormatBuilder::SignMode::OnlyIfNeeded)
+        integer_width++;
+
+    constexpr size_t nanoseconds_length = 9;
+    size_t precision = 0;
+    u64 nanoseconds_to_precision = nanoseconds;
+    if (m_precision.has_value()) {
+        precision = min(m_precision.value(), nanoseconds_length);
+        for (size_t i = nanoseconds_length; i > precision; i--)
+            nanoseconds_to_precision /= base;
+    } else if (nanoseconds_to_precision != 0) {
+        auto trailing_zeroes = 0;
+        while ((nanoseconds_to_precision % base) == 0) {
+            nanoseconds_to_precision /= base;
+            trailing_zeroes++;
+        }
+        precision = nanoseconds_length - trailing_zeroes;
+    }
+
+    size_t non_integer_width = 0;
+    if (precision != 0)
+        non_integer_width = precision + 1;
+    if (m_alternative_form)
+        non_integer_width++;
+
+    auto total_width = integer_width + non_integer_width;
+
+    size_t integer_align_width = 0;
+    if (align == FormatBuilder::Align::Right)
+        integer_align_width = saturating_sub(align_width, non_integer_width);
+    else if (align == FormatBuilder::Align::Center)
+        integer_align_width = integer_width + saturating_sub(align_width, total_width) / 2;
+    TRY(builder.put_u64(seconds, base, false, upper_case, m_zero_pad, m_use_separator, FormatBuilder::Align::Right, integer_align_width, m_fill, m_sign_mode, is_negative));
+
+    if (nanoseconds_to_precision != 0) {
+        TRY(builder.builder().try_append('.'));
+        TRY(builder.put_u64(nanoseconds_to_precision, base, false, upper_case, true, m_use_separator, FormatBuilder::Align::Right, precision));
+        if (m_precision.has_value() && m_precision.value() > nanoseconds_length) {
+            auto zeroes = m_precision.value() - nanoseconds_length;
+            TRY(builder.put_padding('0', zeroes));
+        }
+    }
+
+    if (m_alternative_form)
+        TRY(builder.builder().try_append('s'));
+
+    if (align_width > 0 && align != FormatBuilder::Align::Right) {
+        auto padding_width = saturating_sub(align_width, max(integer_width, integer_align_width) + non_integer_width);
+        TRY(builder.builder().try_append_repeated(m_fill, padding_width));
+    }
+
+    return {};
 }
 
 namespace {
@@ -248,17 +455,16 @@ Duration now_time_from_filetime()
 Duration now_time_from_query_performance_counter()
 {
     static LARGE_INTEGER ticks_per_second;
-    // FIXME: Limit to microseconds for now, but could probably use nanos?
-    static float ticks_per_microsecond;
+    static f64 ticks_per_nanosecond;
     if (ticks_per_second.QuadPart == 0) {
         QueryPerformanceFrequency(&ticks_per_second);
         VERIFY(ticks_per_second.QuadPart != 0);
-        ticks_per_microsecond = static_cast<float>(ticks_per_second.QuadPart) / 1'000'000.0F;
+        ticks_per_nanosecond = static_cast<f64>(ticks_per_second.QuadPart) / 1'000'000'000.0;
     }
 
     LARGE_INTEGER now_time {};
     QueryPerformanceCounter(&now_time);
-    return Duration::from_microseconds(static_cast<i64>(now_time.QuadPart / ticks_per_microsecond));
+    return Duration::from_nanoseconds(static_cast<i64>(now_time.QuadPart / ticks_per_nanosecond));
 }
 
 Duration now_time_from_clock(int clock_id)
@@ -332,13 +538,11 @@ UnixDateTime UnixDateTime::now_coarse()
 
 ErrorOr<void> UnixDateTime::to_string_impl(StringBuilder& builder, StringView format, LocalTime local_time) const
 {
-    struct tm tm;
-
+    struct tm tm {};
     auto timestamp = m_offset.to_timespec().tv_sec;
-    if (local_time == LocalTime::Yes)
-        (void)localtime_r(&timestamp, &tm);
-    else
-        (void)gmtime_r(&timestamp, &tm);
+
+    if (!fill_tm(timestamp, tm, local_time))
+        VERIFY_NOT_REACHED();
 
     size_t const format_len = format.length();
 
@@ -499,9 +703,9 @@ ErrorOr<String> UnixDateTime::to_string(StringView format, LocalTime local_time)
 
 Utf16String UnixDateTime::to_utf16_string(StringView format, LocalTime local_time) const
 {
-    StringBuilder builder(StringBuilder::Mode::UTF16);
+    StringBuilder builder;
     MUST(to_string_impl(builder, format, local_time));
-    return builder.to_utf16_string();
+    return Utf16String::from_utf8_without_validation(MUST(builder.to_string()));
 }
 
 ByteString UnixDateTime::to_byte_string(StringView format, LocalTime local_time) const

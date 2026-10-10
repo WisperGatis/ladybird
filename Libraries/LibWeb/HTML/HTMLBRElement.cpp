@@ -4,12 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLBRElementPrototype.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
+#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/Layout/BreakNode.h>
+#include <LibWeb/Layout/Box.h>
+#include <LibWeb/VisualLines.h>
 
 namespace Web::HTML {
 
@@ -22,22 +26,80 @@ HTMLBRElement::HTMLBRElement(DOM::Document& document, DOM::QualifiedName qualifi
 
 HTMLBRElement::~HTMLBRElement() = default;
 
-void HTMLBRElement::initialize(JS::Realm& realm)
+CSS::ElementBoxKind HTMLBRElement::box_kind() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLBRElement);
-    Base::initialize(realm);
+    return CSS::ElementBoxKind::Break;
 }
 
-GC::Ptr<Layout::Node> HTMLBRElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+bool HTMLBRElement::is_presentational_hint(Utf16FlyString const& name) const
 {
-    return heap().allocate<Layout::BreakNode>(document(), *this, move(style));
+    if (Base::is_presentational_hint(name))
+        return true;
+
+    return name == HTML::AttributeNames::clear;
 }
 
-void HTMLBRElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLBRElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
+    Base::apply_presentational_hints(properties);
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
+        // https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3
+        if (name == HTML::AttributeNames::clear) {
+            if (value.equals_ignoring_ascii_case(u"left"sv))
+                properties.append({ .property_id = CSS::PropertyID::Clear, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Left) });
+            else if (value.equals_ignoring_ascii_case(u"right"sv))
+                properties.append({ .property_id = CSS::PropertyID::Clear, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Right) });
+            else if (value.equals_ignoring_ascii_case(u"all"sv) || value.equals_ignoring_ascii_case(u"both"sv))
+                properties.append({ .property_id = CSS::PropertyID::Clear, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Both) });
+        }
+    });
+}
+
+// Rendered inline content that would appear before a <br> on its line.
+static bool is_rendered_inline_content(Layout::BegunRead const& read, DOM::Node const& node)
+{
+    if (auto const* text = as_if<DOM::Text>(node)) {
+        for (auto const& line : collect_visual_lines(read, *text)) {
+            if (line.has_fragments)
+                return true;
+        }
+        return false;
+    }
+    if (auto const* element = as_if<DOM::Element>(node)) {
+        auto const* layout_node = element->layout_node(read);
+        if (!layout_node)
+            return false;
+        if (layout_node->is_replaced_box())
+            return true;
+        if (layout_node->display().is_inline_outside() && !layout_node->display().is_flow_inside())
+            return true;
+    }
+    return false;
+}
+
+// NB: Layout produces no fragments for <br>, so this walks the DOM back to the start of the containing block or a
+//     previous <br>, whichever comes first.
+bool HTMLBRElement::represents_empty_line(Layout::BegunRead const& read) const
+{
+    if (!layout_node(read))
+        return false;
+
+    auto const* containing_block = layout_node(read)->containing_block();
+    if (!containing_block)
+        return false;
+    auto const* containing_block_dom_node = containing_block->dom_node();
+    if (!containing_block_dom_node)
+        return false;
+
+    for (auto const* previous = previous_in_pre_order(); previous && previous != containing_block_dom_node; previous = previous->previous_in_pre_order()) {
+        if (!containing_block_dom_node->is_inclusive_ancestor_of(*previous))
+            break;
+        if (is<HTMLBRElement>(*previous))
+            return true;
+        if (is_rendered_inline_content(read, *previous))
+            return false;
+    }
+    return true;
 }
 
 }

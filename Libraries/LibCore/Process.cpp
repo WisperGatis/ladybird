@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
+#include <AK/Assertions.h>
 #include <AK/ByteString.h>
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
@@ -16,8 +18,10 @@
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #if defined(AK_OS_SERENITY)
@@ -30,6 +34,11 @@
 extern "C" {
 #    include <hurd.h>
 }
+#endif
+#if defined(AK_OS_LINUX)
+#    include <AK/QuickSort.h>
+#    include <sys/prctl.h>
+#    include <sys/syscall.h>
 #endif
 #if defined(AK_OS_FREEBSD)
 #    include <sys/user.h>
@@ -61,33 +70,308 @@ struct ArgvList {
     }
 };
 
+static Vector<char const*> environment_for_child(ProcessSpawnOptions const& options)
+{
+    Vector<char const*> environment;
+    if (!options.environment.has_value())
+        return environment;
+    environment.ensure_capacity(options.environment->size() + 1);
+    for (auto const& variable : *options.environment)
+        environment.append(variable.characters());
+    environment.append(nullptr);
+    return environment;
+}
+
+static char** environment_pointer(Vector<char const*>& environment)
+{
+    if (environment.is_empty())
+        return Environment::raw_environ();
+    return const_cast<char**>(environment.data());
+}
+
 Process::Process(Process&& other)
     : m_pid(exchange(other.m_pid, 0))
-    , m_should_disown(exchange(other.m_should_disown, false))
 {
 }
 
 Process& Process::operator=(Process&& other)
 {
     m_pid = exchange(other.m_pid, 0);
-    m_should_disown = exchange(other.m_should_disown, false);
     return *this;
 }
 
 Process::~Process()
 {
-    (void)disown();
 }
 
 Process Process::current()
 {
     auto p = Process { getpid() };
-    p.m_should_disown = false;
     return p;
 }
 
+#if defined(AK_OS_LINUX)
+static Optional<int> run_file_actions_in_child(Vector<ProcessSpawnOptions::FileActionType> const& file_actions)
+{
+    for (auto const& file_action : file_actions) {
+        auto error = file_action.visit(
+            [&](FileAction::OpenFile const& action) {
+                auto fd = open(
+                    action.path.characters(),
+                    File::open_mode_to_options(action.mode | Core::File::OpenMode::KeepOnExec),
+                    action.permissions);
+                if (fd < 0)
+                    return Optional<int> { errno };
+
+                if (fd != action.fd) {
+                    if (dup2(fd, action.fd) < 0) {
+                        auto saved_errno = errno;
+                        close(fd);
+                        return Optional<int> { saved_errno };
+                    }
+                    close(fd);
+                }
+                return Optional<int> {};
+            },
+            [&](FileAction::CloseFile const& action) {
+                close(action.fd);
+                return Optional<int> {};
+            },
+            [&](FileAction::DupFd const& action) {
+                // NB: Like posix_spawn(), a descriptor duplicated onto itself is one that the child keeps.
+                if (action.write_fd == action.fd) {
+                    auto flags = fcntl(action.fd, F_GETFD);
+                    if (flags < 0 || fcntl(action.fd, F_SETFD, flags & ~FD_CLOEXEC) < 0)
+                        return Optional<int> { errno };
+                    return Optional<int> {};
+                }
+                if (dup2(action.write_fd, action.fd) < 0)
+                    return Optional<int> { errno };
+                return Optional<int> {};
+            });
+        if (error.has_value())
+            return error;
+    }
+    return {};
+}
+
+static int file_action_target(ProcessSpawnOptions::FileActionType const& file_action)
+{
+    return file_action.visit(
+        [](FileAction::OpenFile const& action) { return action.fd; },
+        [](FileAction::CloseFile const& action) { return action.fd; },
+        [](FileAction::DupFd const& action) { return action.fd; });
+}
+
+// The descriptors above stderr that the child gets on purpose, in ascending order.
+static Vector<int> declared_descriptors(Vector<ProcessSpawnOptions::FileActionType> const& file_actions)
+{
+    Vector<int> descriptors;
+    for (auto const& file_action : file_actions) {
+        if (file_action.has<FileAction::CloseFile>())
+            continue;
+        auto fd = file_action_target(file_action);
+        if (fd > STDERR_FILENO && !descriptors.contains_slow(fd))
+            descriptors.append(fd);
+    }
+    quick_sort(descriptors);
+    return descriptors;
+}
+
+static bool is_declared(ReadonlySpan<int> declared_descriptors, int fd)
+{
+    for (auto declared_fd : declared_descriptors) {
+        if (declared_fd == fd)
+            return true;
+    }
+    return false;
+}
+
+// Linux before 5.9 has no close_range(), and some container seccomp profiles refuse it, so walk /proc/self/fd there.
+// This runs between fork() and exec(), so it reads the directory with getdents64() into the stack instead of
+// allocating.
+static Optional<int> close_undeclared_descriptors_one_by_one(ReadonlySpan<int> declared_descriptors)
+{
+    struct LinuxDirectoryEntry {
+        u64 inode;
+        i64 offset;
+        u16 record_length;
+        u8 type;
+        char name[];
+    };
+
+    auto directory_fd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0)
+        return errno;
+
+    alignas(LinuxDirectoryEntry) char buffer[4096];
+    while (true) {
+        auto bytes_read = syscall(SYS_getdents64, directory_fd, buffer, sizeof(buffer));
+        if (bytes_read < 0) {
+            auto saved_errno = errno;
+            close(directory_fd);
+            return saved_errno;
+        }
+        if (bytes_read == 0)
+            break;
+
+        // NB: The offsets in this directory are descriptor numbers, so closing one does not make us skip another.
+        for (long position = 0; position < bytes_read;) {
+            auto const* entry = reinterpret_cast<LinuxDirectoryEntry const*>(buffer + position);
+            position += entry->record_length;
+
+            int fd = 0;
+            bool is_number = entry->name[0] != '\0';
+            for (auto const* character = entry->name; *character != '\0'; ++character) {
+                if (*character < '0' || *character > '9') {
+                    is_number = false;
+                    break;
+                }
+                fd = fd * 10 + (*character - '0');
+            }
+            if (is_number && fd > STDERR_FILENO && fd != directory_fd && !is_declared(declared_descriptors, fd))
+                close(fd);
+        }
+    }
+    close(directory_fd);
+    return {};
+}
+
+// Closes every descriptor above stderr that was not declared. Anything the parent forgot to mark close-on-exec would
+// otherwise reach the child, including descriptors that other threads opened while we were spawning.
+static Optional<int> close_undeclared_descriptors(ReadonlySpan<int> declared_descriptors)
+{
+    auto close_range = [](unsigned first, unsigned last) -> Optional<int> {
+        if (first <= last && syscall(__NR_close_range, first, last, 0) < 0)
+            return errno;
+        return {};
+    };
+
+    unsigned next = STDERR_FILENO + 1;
+    for (auto fd : declared_descriptors) {
+        if (static_cast<unsigned>(fd) > next) {
+            if (auto error = close_range(next, fd - 1); error.has_value()) {
+                if (error.value() == ENOSYS || error.value() == EPERM)
+                    return close_undeclared_descriptors_one_by_one(declared_descriptors);
+                return error;
+            }
+        }
+        next = fd + 1;
+    }
+    if (auto error = close_range(next, ~0U); error.has_value()) {
+        if (error.value() == ENOSYS || error.value() == EPERM)
+            return close_undeclared_descriptors_one_by_one(declared_descriptors);
+        return error;
+    }
+    return {};
+}
+
+static ErrorOr<pid_t> fork_and_exec(ProcessSpawnOptions const& options, Span<char const*> arguments)
+{
+    auto environment = environment_for_child(options);
+
+    auto error_pipe = TRY(System::pipe2(O_CLOEXEC));
+
+    // The child reports a failed exec() through the pipe, so no file action may replace, close or duplicate it. A number
+    // that a file action names but that is not open here, such as stdin when we were started without one, could
+    // otherwise be the number the pipe got.
+    auto is_named_by_file_action = [&](int fd) {
+        return any_of(options.file_actions, [&](auto const& file_action) {
+            if (auto const* dup = file_action.template get_pointer<FileAction::DupFd>(); dup && dup->write_fd == fd)
+                return true;
+            return file_action_target(file_action) == fd;
+        });
+    };
+    for (int lowest_candidate = STDERR_FILENO + 1; is_named_by_file_action(error_pipe[1]);) {
+        auto moved_fd = fcntl(error_pipe[1], F_DUPFD_CLOEXEC, lowest_candidate);
+        if (moved_fd < 0) {
+            auto saved_errno = errno;
+            MUST(System::close(error_pipe[0]));
+            MUST(System::close(error_pipe[1]));
+            return Error::from_syscall("fcntl(F_DUPFD_CLOEXEC)"sv, saved_errno);
+        }
+        if (is_named_by_file_action(moved_fd)) {
+            MUST(System::close(moved_fd));
+            lowest_candidate = moved_fd + 1;
+            continue;
+        }
+        MUST(System::close(error_pipe[1]));
+        error_pipe[1] = moved_fd;
+    }
+
+    // Close-on-exec, but it has to stay open until exec() to report a failure.
+    auto descriptors_to_keep = declared_descriptors(options.file_actions);
+    descriptors_to_keep.append(error_pipe[1]);
+    quick_sort(descriptors_to_keep);
+
+    auto parent_pid = getpid();
+    auto pid = fork();
+    if (pid < 0) {
+        auto saved_errno = errno;
+        MUST(System::close(error_pipe[0]));
+        MUST(System::close(error_pipe[1]));
+        return Error::from_syscall("fork"sv, saved_errno);
+    }
+
+    if (pid == 0) {
+        close(error_pipe[0]);
+
+        auto report_errno_and_exit = [&](int error) {
+            auto bytes_written = write(error_pipe[1], &error, sizeof(error));
+            (void)bytes_written;
+            _exit(127);
+        };
+
+        if (options.die_with_parent) {
+            if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
+                report_errno_and_exit(errno);
+            if (getppid() != parent_pid)
+                _exit(127);
+        }
+
+        if (auto error = run_file_actions_in_child(options.file_actions); error.has_value())
+            report_errno_and_exit(error.value());
+        if (auto error = close_undeclared_descriptors(descriptors_to_keep); error.has_value())
+            report_errno_and_exit(error.value());
+
+        if (options.search_for_executable_in_path)
+            execvpe(options.executable.characters(), const_cast<char* const*>(arguments.data()), environment_pointer(environment));
+        else
+            execve(options.executable.characters(), const_cast<char* const*>(arguments.data()), environment_pointer(environment));
+
+        report_errno_and_exit(errno);
+    }
+
+    MUST(System::close(error_pipe[1]));
+
+    int child_errno = 0;
+    // A signal about another process, such as SIGCHLD, can interrupt the wait for this child's exec.
+    auto bytes_read = System::read(error_pipe[0], { &child_errno, sizeof(child_errno) });
+    while (bytes_read.is_error() && bytes_read.error().code() == EINTR)
+        bytes_read = System::read(error_pipe[0], { &child_errno, sizeof(child_errno) });
+    MUST(System::close(error_pipe[0]));
+
+    if (TRY(bytes_read) > 0) {
+        int status = 0;
+        (void)waitpid(pid, &status, 0);
+        return Error::from_errno(child_errno);
+    }
+
+    return pid;
+}
+#endif
+
 ErrorOr<Process> Process::spawn(ProcessSpawnOptions const& options)
 {
+    ArgvList argv_list(options.executable, options.arguments.size());
+    for (auto const& argument : options.arguments)
+        argv_list.append(argument.characters());
+
+#if defined(AK_OS_LINUX)
+    // NB: posix_spawn() cannot ask for the parent death signal, and it cannot close the descriptors that nobody declared.
+    return Process { TRY(fork_and_exec(options, argv_list.get())) };
+#endif
+
 #define CHECK(invocation)                  \
     if (int returned_errno = (invocation)) \
         return Error::from_errno(returned_errno);
@@ -98,14 +382,26 @@ ErrorOr<Process> Process::spawn(ProcessSpawnOptions const& options)
         posix_spawn_file_actions_destroy(&spawn_actions);
     };
 
-    if (options.working_directory.has_value()) {
-#ifdef AK_OS_SERENITY
-        CHECK(posix_spawn_file_actions_addchdir(&spawn_actions, options.working_directory->characters()));
-#else
-        // FIXME: Support ProcessSpawnOptions::working_directory n platforms that support it.
-        TODO();
-#endif
+    posix_spawnattr_t* spawn_attributes_pointer = nullptr;
+#if defined(AK_OS_MACOS)
+    // A descriptor that is not close-on-exec at the moment of the spawn would otherwise reach the child, including one
+    // that another thread has just received or duplicated. Only pass the standard streams and the descriptors that the
+    // file actions name.
+    posix_spawnattr_t spawn_attributes;
+    CHECK(posix_spawnattr_init(&spawn_attributes));
+    ScopeGuard cleanup_spawn_attributes = [&] {
+        posix_spawnattr_destroy(&spawn_attributes);
+    };
+    CHECK(posix_spawnattr_setflags(&spawn_attributes, POSIX_SPAWN_CLOEXEC_DEFAULT));
+    spawn_attributes_pointer = &spawn_attributes;
+
+    // The inherit actions must come before the file actions, which may replace the same descriptors.
+    for (int fd : { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO }) {
+        // Inheriting a closed descriptor would make the spawn fail.
+        if (fcntl(fd, F_GETFD) != -1)
+            CHECK(posix_spawn_file_actions_addinherit_np(&spawn_actions, fd));
     }
+#endif
 
     for (auto const& file_action : options.file_actions) {
         TRY(file_action.visit(
@@ -130,34 +426,27 @@ ErrorOr<Process> Process::spawn(ProcessSpawnOptions const& options)
 
 #undef CHECK
 
-    ArgvList argv_list(options.executable, options.arguments.size());
-    for (auto const& argument : options.arguments)
-        argv_list.append(argument.characters());
-
+    auto environment = environment_for_child(options);
     pid_t pid;
     if (options.search_for_executable_in_path) {
-        pid = TRY(System::posix_spawnp(options.executable.view(), &spawn_actions, nullptr, const_cast<char**>(argv_list.get().data()), Core::Environment::raw_environ()));
+        pid = TRY(System::posix_spawnp(options.executable.view(), &spawn_actions, spawn_attributes_pointer, const_cast<char**>(argv_list.get().data()), environment_pointer(environment)));
     } else {
-        pid = TRY(System::posix_spawn(options.executable.view(), &spawn_actions, nullptr, const_cast<char**>(argv_list.get().data()), Core::Environment::raw_environ()));
+        pid = TRY(System::posix_spawn(options.executable.view(), &spawn_actions, spawn_attributes_pointer, const_cast<char**>(argv_list.get().data()), environment_pointer(environment)));
     }
     return Process { pid };
 }
 
-ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<ByteString> arguments, ByteString working_directory, KeepAsChild keep_as_child)
+ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<ByteString> arguments)
 {
     auto process = TRY(spawn({
         .executable = path,
         .arguments = Vector<ByteString> { arguments },
-        .working_directory = working_directory.is_empty() ? Optional<ByteString> {} : Optional<ByteString> { working_directory },
     }));
-
-    if (keep_as_child == KeepAsChild::No)
-        TRY(process.disown());
 
     return process;
 }
 
-ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<StringView> arguments, ByteString working_directory, KeepAsChild keep_as_child)
+ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<StringView> arguments)
 {
     Vector<ByteString> backing_strings;
     backing_strings.ensure_capacity(arguments.size());
@@ -167,13 +456,20 @@ ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<StringView> argume
     auto process = TRY(spawn({
         .executable = path,
         .arguments = backing_strings,
-        .working_directory = working_directory.is_empty() ? Optional<ByteString> {} : Optional<ByteString> { working_directory },
     }));
 
-    if (keep_as_child == KeepAsChild::No)
-        TRY(process.disown());
-
     return process;
+}
+
+void Process::terminate_immediately(int status)
+{
+    _exit(status);
+    VERIFY_NOT_REACHED();
+}
+
+ErrorOr<void> Process::terminate_process(pid_t pid, TerminationMode mode)
+{
+    return System::kill(pid, mode == TerminationMode::Graceful ? SIGTERM : SIGKILL);
 }
 
 ErrorOr<String> Process::get_name()
@@ -192,25 +488,6 @@ ErrorOr<String> Process::get_name()
 #else
     // FIXME: Implement Process::get_name() for other platforms.
     return "???"_string;
-#endif
-}
-
-ErrorOr<void> Process::set_name([[maybe_unused]] StringView name, [[maybe_unused]] SetThreadName set_thread_name)
-{
-#if defined(AK_OS_SERENITY)
-    int rc = set_process_name(name.characters_without_null_termination(), name.length());
-    if (rc != 0)
-        return Error::from_syscall("set_process_name"sv, rc);
-    if (set_thread_name == SetThreadName::No)
-        return {};
-
-    rc = prctl(PR_SET_THREAD_NAME, gettid(), name.characters_without_null_termination(), name.length());
-    if (rc != 0)
-        return Error::from_syscall("set_thread_name"sv, rc);
-    return {};
-#else
-    // FIXME: Implement Process::set_name() for other platforms.
-    return {};
 #endif
 }
 
@@ -323,22 +600,7 @@ pid_t Process::pid() const
     return m_pid;
 }
 
-ErrorOr<void> Process::disown()
-{
-    if (m_pid != 0 && m_should_disown) {
-#ifdef AK_OS_SERENITY
-        TRY(System::disown(m_pid));
-#else
-        // FIXME: Support disown outside Serenity.
-#endif
-        m_should_disown = false;
-        return {};
-    } else {
-        return Error::from_errno(EINVAL);
-    }
-}
-
-ErrorOr<int> Process::wait_for_termination()
+ErrorOr<int> Process::wait_for_termination() const
 {
     VERIFY(m_pid > 0);
 
@@ -358,7 +620,6 @@ ErrorOr<int> Process::wait_for_termination()
         VERIFY_NOT_REACHED();
     }
 
-    m_should_disown = false;
     return exit_code;
 }
 

@@ -1,0 +1,2 @@
+PASS: quiet empty mask (work + checks)
+PASS: expand mask area (work + checks)

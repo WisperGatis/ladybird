@@ -6,10 +6,10 @@
 
 #include <AK/Optional.h>
 #include <LibGfx/Path.h>
-#include <LibWeb/Bindings/SVGPathElementPrototype.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
-#include <LibWeb/Layout/SVGGeometryBox.h>
+#include <LibWeb/Layout/Box.h>
+#include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGPathElement.h>
 
 namespace Web::SVG {
@@ -21,23 +21,25 @@ SVGPathElement::SVGPathElement(DOM::Document& document, DOM::QualifiedName quali
 {
 }
 
-void SVGPathElement::initialize(JS::Realm& realm)
+Gfx::Path SVGPathElement::get_path(CSSPixelSize, CSS::ComputedValues const& computed_values)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGPathElement);
-    Base::initialize(realm);
-}
+    auto computed_d = computed_values.d();
 
-void SVGPathElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
-{
-    Base::attribute_changed(name, old_value, value, namespace_);
+    if (computed_d->is_keyword()) {
+        VERIFY(computed_d->as_keyword().keyword() == CSS::Keyword::None);
+        return {};
+    }
 
-    if (name == "d")
-        m_path = AttributeParser::parse_path_data(value.value_or(String {}));
-}
-
-Gfx::Path SVGPathElement::get_path(CSSPixelSize)
-{
-    return m_path.to_gfx_path();
+    VERIFY(computed_d->is_basic_shape());
+    auto const& shape = *computed_d->rust_style_value_data()->basic_shape.shape.pointer;
+    VERIFY(shape.kind == 6);
+    auto* native_path = static_cast<Gfx::Path*>(CSS::StyleValueFFI::rust_css_path_to_gfx_path(&shape.path));
+    auto path = move(*native_path);
+    delete native_path;
+    static_assert(to_underlying(Gfx::WindingRule::Nonzero) == 0);
+    static_assert(to_underlying(Gfx::WindingRule::EvenOdd) == 1);
+    path.set_fill_type(static_cast<Gfx::WindingRule>(shape.fill_rule));
+    return path;
 }
 
 }

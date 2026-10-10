@@ -1,0 +1,4 @@
+PASS: quiet without overlays (work)
+PASS: enable overlays (work)
+PASS: disable overlays (work)
+PASS: quiet without overlays again (work)

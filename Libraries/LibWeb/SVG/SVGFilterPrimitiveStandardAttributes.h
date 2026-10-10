@@ -16,33 +16,19 @@ class SVGFilterPrimitiveStandardAttributes {
 public:
     virtual ~SVGFilterPrimitiveStandardAttributes() = default;
 
-    GC::Ref<SVGAnimatedLength> x()
-    {
-        return this_svg_element()->svg_animated_length_for_property(CSS::PropertyID::X);
-    }
+    // https://drafts.csswg.org/filter-effects-1#dom-svgfilterprimitivestandardattributes-x
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::percentage(0));
 
-    GC::Ref<SVGAnimatedLength> y()
-    {
-        return this_svg_element()->svg_animated_length_for_property(CSS::PropertyID::Y);
-    }
+    // https://drafts.csswg.org/filter-effects-1#dom-svgfilterprimitivestandardattributes-y
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::percentage(0));
 
-    GC::Ref<SVGAnimatedLength> width()
-    {
-        return this_svg_element()->svg_animated_length_for_property(CSS::PropertyID::Width);
-    }
+    // https://drafts.csswg.org/filter-effects-1#dom-svgfilterprimitivestandardattributes-width
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::percentage(100));
 
-    GC::Ref<SVGAnimatedLength> height()
-    {
-        return this_svg_element()->svg_animated_length_for_property(CSS::PropertyID::Height);
-    }
+    // https://drafts.csswg.org/filter-effects-1#dom-svgfilterprimitivestandardattributes-height
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::percentage(100));
 
-    GC::Ref<SVGAnimatedString> result()
-    {
-        if (!m_result_animated_string)
-            m_result_animated_string = SVGAnimatedString::create(this_svg_element()->realm(), *this_svg_element(), AttributeNames::result);
-
-        return *m_result_animated_string;
-    }
+    GC::Ref<SVGAnimatedString> result();
 
 protected:
     void visit_edges(JS::Cell::Visitor& visitor)
@@ -52,6 +38,11 @@ protected:
 
 private:
     SVGElement* this_svg_element() { return static_cast<IncludingClass*>(this); }
+
+    GC::Ref<SVGAnimatedLength> svg_animated_length_for_attribute(Utf16FlyString const& attribute_name, SVGLength::Directionality directionality, SVGLengthValue default_value)
+    {
+        return this_svg_element()->svg_animated_length_for_attribute(attribute_name, directionality, default_value);
+    }
 
     GC::Ptr<SVGAnimatedString> m_result_animated_string;
 };

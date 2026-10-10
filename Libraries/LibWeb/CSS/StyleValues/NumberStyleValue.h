@@ -10,38 +10,43 @@
 #pragma once
 
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
-class NumberStyleValue final : public StyleValue {
+class WEB_API NumberStyleValue final : public StyleValue {
 public:
     static ValueComparingNonnullRefPtr<NumberStyleValue const> create(double value)
     {
+        // Zero and one dominate real-world number values (opacity, alpha, flex factors), so
+        // those two are interned.
+        if (value == 0 && !signbit(value)) {
+            static auto const& zero_instance = adopt_ref(*new (nothrow) NumberStyleValue(0.0)).leak_ref();
+            return zero_instance;
+        }
+        if (value == 1) {
+            static auto const& one_instance = adopt_ref(*new (nothrow) NumberStyleValue(1)).leak_ref();
+            return one_instance;
+        }
         return adopt_ref(*new (nothrow) NumberStyleValue(value));
     }
 
-    double number() const { return m_value; }
+    double number() const { return m_value->number.value; }
 
-    virtual String to_string(SerializationMode) const override;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, FlyString const& associated_property) const override;
-
-    bool equals(StyleValue const& other) const override
-    {
-        if (type() != other.type())
-            return false;
-        auto const& other_number = other.as_number();
-        return m_value == other_number.m_value;
-    }
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
-    explicit NumberStyleValue(double value)
-        : StyleValue(Type::Number)
-        , m_value(value)
+    friend class StyleValue;
+
+    explicit NumberStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValue(Type::Number, data)
     {
     }
 
-    double m_value { 0 };
+    explicit NumberStyleValue(double value)
+        : StyleValue(Type::Number, StyleValueFFI::rust_style_value_create_number(value))
+    {
+    }
 };
 
 }

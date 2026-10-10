@@ -7,50 +7,94 @@
 #pragma once
 
 #include <AK/TypeCasts.h>
+#include <AK/Utf16String.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/PixelUnits.h>
-#include <LibWeb/UIEvents/EventModifier.h>
 #include <LibWeb/UIEvents/UIEvent.h>
+#include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
+#include <LibWebCommon/PixelUnits.h>
+
+namespace Web::HTML {
+
+class Window;
+
+}
+
+namespace Web::Bindings {
+
+struct MouseEventInit;
+
+}
 
 namespace Web::UIEvents {
 
-struct MouseEventInit : public EventModifierInit {
-    double screen_x = 0;
-    double screen_y = 0;
-    double client_x = 0;
-    double client_y = 0;
-    double movement_x = 0;
-    double movement_y = 0;
-    i16 button = 0;
-    u16 buttons = 0;
-    GC::Ptr<DOM::EventTarget> related_target = nullptr;
+struct MouseEventOptions {
+    bool bubbles { false };
+    bool cancelable { false };
+    bool composed { false };
+    GC::Ptr<HTML::WindowProxy> view {};
+    int detail { 0 };
+    bool ctrl_key { false };
+    bool shift_key { false };
+    bool alt_key { false };
+    bool meta_key { false };
+    bool modifier_alt_graph { false };
+    bool modifier_caps_lock { false };
+    bool modifier_fn { false };
+    bool modifier_fn_lock { false };
+    bool modifier_hyper { false };
+    bool modifier_num_lock { false };
+    bool modifier_scroll_lock { false };
+    bool modifier_super { false };
+    bool modifier_symbol { false };
+    bool modifier_symbol_lock { false };
+    double screen_x { 0 };
+    double screen_y { 0 };
+    double client_x { 0 };
+    double client_y { 0 };
+    double movement_x { 0 };
+    double movement_y { 0 };
+    i16 button { 0 };
+    u16 buttons { 0 };
+    GC::Ptr<DOM::EventTarget> related_target {};
 };
 
+WEB_API MouseEventOptions mouse_event_options_from_bindings(Bindings::MouseEventInit const&);
+
 class WEB_API MouseEvent : public UIEvent {
-    WEB_PLATFORM_OBJECT(MouseEvent, UIEvent);
+    WEB_WRAPPABLE(MouseEvent, UIEvent);
     GC_DECLARE_ALLOCATOR(MouseEvent);
 
 public:
-    [[nodiscard]] static GC::Ref<MouseEvent> create(JS::Realm&, FlyString const& event_name, MouseEventInit const& = {}, double page_x = 0, double page_y = 0, double offset_x = 0, double offset_y = 0);
-    static WebIDL::ExceptionOr<GC::Ref<MouseEvent>> create_from_platform_event(JS::Realm&, GC::Ptr<HTML::WindowProxy>, FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers);
-    static WebIDL::ExceptionOr<GC::Ref<MouseEvent>> construct_impl(JS::Realm&, FlyString const& event_name, MouseEventInit const&);
+    [[nodiscard]] static GC::Ref<MouseEvent> create(
+        FlyString const& event_name, MouseEventOptions const&,
+        double page_x, double page_y, double offset_x, double offset_y,
+        HighResolutionTime::DOMHighResTimeStamp);
+    [[nodiscard]] static GC::Ref<MouseEvent> create(
+        Utf16FlyString const& event_name, MouseEventOptions const&,
+        double page_x, double page_y, double offset_x, double offset_y,
+        HighResolutionTime::DOMHighResTimeStamp);
+    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<MouseEvent>> create_for_constructor(FlyString const&, Bindings::MouseEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
+    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<MouseEvent>> create_for_constructor(Utf16String const&, Bindings::MouseEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
+    [[nodiscard]] static GC::Ref<MouseEvent> create_from_mouse_event(MouseEvent const&, HighResolutionTime::DOMHighResTimeStamp);
+    static WebIDL::ExceptionOr<GC::Ref<MouseEvent>> create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy>, FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers, int detail = 0);
+    static WebIDL::ExceptionOr<GC::Ref<MouseEvent>> create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy>, Utf16FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers, int detail = 0);
 
     virtual ~MouseEvent() override;
 
-    double screen_x() const { return m_screen_x; }
-    double screen_y() const { return m_screen_y; }
+    virtual double screen_x() const { return is_trusted() ? m_screen_x : AK::floor(m_screen_x); }
+    virtual double screen_y() const { return is_trusted() ? m_screen_y : AK::floor(m_screen_y); }
 
-    double page_x() const { return m_page_x; }
-    double page_y() const { return m_page_y; }
+    virtual double page_x() const { return is_trusted() ? m_page_x : AK::floor(m_page_x); }
+    virtual double page_y() const { return is_trusted() ? m_page_y : AK::floor(m_page_y); }
 
-    double client_x() const { return m_client_x; }
-    double client_y() const { return m_client_y; }
+    virtual double client_x() const { return is_trusted() ? m_client_x : AK::floor(m_client_x); }
+    virtual double client_y() const { return is_trusted() ? m_client_y : AK::floor(m_client_y); }
 
     double x() const { return client_x(); }
     double y() const { return client_y(); }
 
-    double offset_x() const { return m_offset_x; }
-    double offset_y() const { return m_offset_y; }
+    virtual double offset_x() const { return is_trusted() ? m_offset_x : AK::floor(m_offset_x); }
+    virtual double offset_y() const { return is_trusted() ? m_offset_y : AK::floor(m_offset_y); }
 
     bool ctrl_key() const { return m_ctrl_key; }
     bool shift_key() const { return m_shift_key; }
@@ -72,22 +116,20 @@ public:
     i16 button() const { return m_button; }
     u16 buttons() const { return m_buttons; }
 
-    GC::Ptr<DOM::EventTarget> related_target() const { return m_related_target; }
-
-    bool get_modifier_state(String const& key_arg) const;
+    bool get_modifier_state(Utf16FlyString const& key_arg) const;
 
     virtual u32 which() const override { return m_button + 1; }
 
-    void init_mouse_event(String const& type, bool bubbles, bool cancelable, GC::Ptr<HTML::WindowProxy> view, WebIDL::Long detail, WebIDL::Long screen_x, WebIDL::Long screen_y, WebIDL::Long client_x, WebIDL::Long client_y, bool ctrl_key, bool alt_key, bool shift_key, bool meta_key, WebIDL::Short button, DOM::EventTarget* related_target);
+    void init_mouse_event(Utf16FlyString const& type, bool bubbles, bool cancelable, GC::Ptr<HTML::WindowProxy> view, WebIDL::Long detail, WebIDL::Long screen_x, WebIDL::Long screen_y, WebIDL::Long client_x, WebIDL::Long client_y, bool ctrl_key, bool alt_key, bool shift_key, bool meta_key, WebIDL::Short button, GC::Ptr<DOM::EventTarget> related_target);
+
+    void set_offset_x(double offset_x) { m_offset_x = offset_x; }
+    void set_offset_y(double offset_y) { m_offset_y = offset_y; }
 
 protected:
-    MouseEvent(JS::Realm&, FlyString const& event_name, MouseEventInit const& event_init, double page_x, double page_y, double offset_x, double offset_y);
+    MouseEvent(FlyString const& event_name, MouseEventOptions const&, double page_x, double page_y, double offset_x, double offset_y, HighResolutionTime::DOMHighResTimeStamp);
+    MouseEvent(Utf16FlyString const& event_name, MouseEventOptions const&, double page_x, double page_y, double offset_x, double offset_y, HighResolutionTime::DOMHighResTimeStamp);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
-
-private:
-    virtual bool is_mouse_event() const override { return true; }
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     double m_screen_x { 0 };
     double m_screen_y { 0 };
@@ -97,6 +139,10 @@ private:
     double m_client_y { 0 };
     double m_offset_x { 0 };
     double m_offset_y { 0 };
+
+private:
+    virtual bool is_mouse_event() const override { return true; }
+
     bool m_ctrl_key { false };
     bool m_shift_key { false };
     bool m_alt_key { false };
@@ -115,7 +161,6 @@ private:
     double m_movement_y { 0 };
     i16 m_button { 0 };
     u16 m_buttons { 0 };
-    GC::Ptr<DOM::EventTarget> m_related_target { nullptr };
 };
 
 }

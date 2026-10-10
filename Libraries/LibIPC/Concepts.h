@@ -4,14 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#pragma once
+
+#include <AK/DistinctNumeric.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/Span.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibCore/SharedCircularQueue.h>
-
-#pragma once
 
 // These concepts are used to help the compiler distinguish between specializations that would be
 // ambiguous otherwise. For example, if the specializations for int and Vector<T> were declared as
@@ -72,5 +73,8 @@ concept Optional = SpecializationOf<T, AK::Optional>;
 
 template<typename T>
 concept Variant = SpecializationOf<T, AK::Variant>;
+
+template<typename T>
+concept DistinctNumeric = SpecializationOf<T, AK::DistinctNumeric>;
 
 }

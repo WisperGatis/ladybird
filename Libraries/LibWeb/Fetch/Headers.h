@@ -7,13 +7,14 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/IterationDecision.h>
 #include <AK/String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibGC/Ptr.h>
-#include <LibJS/Forward.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Headers.h>
+#include <LibHTTP/HeaderList.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Fetch {
@@ -21,8 +22,8 @@ namespace Web::Fetch {
 using HeadersInit = Variant<Vector<Vector<String>>, OrderedHashMap<String, String>>;
 
 // https://fetch.spec.whatwg.org/#headers-class
-class Headers final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(Headers, Bindings::PlatformObject);
+class Headers final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(Headers, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(Headers);
 
 public:
@@ -34,18 +35,19 @@ public:
         None,
     };
 
-    static WebIDL::ExceptionOr<GC::Ref<Headers>> construct_impl(JS::Realm& realm, Optional<HeadersInit> const& init);
+    [[nodiscard]] static GC::Ref<Headers> create(NonnullRefPtr<HTTP::HeaderList>);
+    static WebIDL::ExceptionOr<GC::Ref<Headers>> create_from_init(Optional<HeadersInit> const& init);
 
     virtual ~Headers() override;
 
-    [[nodiscard]] GC::Ref<Infrastructure::HeaderList> header_list() const { return m_header_list; }
-    void set_header_list(GC::Ref<Infrastructure::HeaderList> header_list) { m_header_list = header_list; }
+    [[nodiscard]] NonnullRefPtr<HTTP::HeaderList> const& header_list() const { return m_header_list; }
+    void set_header_list(NonnullRefPtr<HTTP::HeaderList> header_list) { m_header_list = move(header_list); }
 
     [[nodiscard]] Guard guard() const { return m_guard; }
     void set_guard(Guard guard) { m_guard = guard; }
 
     WebIDL::ExceptionOr<void> fill(HeadersInit const&);
-    WebIDL::ExceptionOr<void> append(Infrastructure::Header);
+    WebIDL::ExceptionOr<void> append(HTTP::Header);
 
     // JS API functions
     WebIDL::ExceptionOr<void> append(String const& name, String const& value);
@@ -55,23 +57,20 @@ public:
     WebIDL::ExceptionOr<bool> has(String const& name);
     WebIDL::ExceptionOr<void> set(String const& name, String const& value);
 
-    using ForEachCallback = Function<JS::ThrowCompletionOr<void>(String const&, String const&)>;
-    JS::ThrowCompletionOr<void> for_each(ForEachCallback);
+    using ForEachCallback = Function<IterationDecision(String const&, String const&)>;
+    void for_each(ForEachCallback);
 
 private:
     friend class HeadersIterator;
 
-    Headers(JS::Realm&, GC::Ref<Infrastructure::HeaderList>);
+    explicit Headers(NonnullRefPtr<HTTP::HeaderList>);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(JS::Cell::Visitor&) override;
-
-    WebIDL::ExceptionOr<bool> validate(Infrastructure::Header const&) const;
+    WebIDL::ExceptionOr<bool> validate(HTTP::Header const&) const;
     void remove_privileged_no_cors_request_headers();
 
     // https://fetch.spec.whatwg.org/#concept-headers-header-list
     // A Headers object has an associated header list (a header list), which is initially empty.
-    GC::Ref<Infrastructure::HeaderList> m_header_list;
+    NonnullRefPtr<HTTP::HeaderList> m_header_list;
 
     // https://fetch.spec.whatwg.org/#concept-headers-guard
     // A Headers object also has an associated guard, which is a headers guard. A headers guard is "immutable", "request", "request-no-cors", "response" or "none".

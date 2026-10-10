@@ -8,16 +8,24 @@
 
 #include <AK/Badge.h>
 #include <AK/HashMap.h>
+#include <AK/WeakPtr.h>
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibRequests/Forward.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
+
+namespace Web::Fetch::Fetching {
+
+class PendingResponse;
+
+}
 
 namespace Web::Fetch::Infrastructure {
 
@@ -27,30 +35,49 @@ class WEB_API FetchController : public JS::Cell {
     GC_DECLARE_ALLOCATOR(FetchController);
 
 public:
-    enum class State {
+    enum class State : u8 {
         Ongoing,
         Terminated,
         Aborted,
+        Stopped,
     };
 
-    [[nodiscard]] static GC::Ref<FetchController> create(JS::VM&);
+    [[nodiscard]] static GC::Ref<FetchController> create();
 
-    void set_full_timing_info(GC::Ref<FetchTimingInfo> full_timing_info) { m_full_timing_info = full_timing_info; }
+    void set_full_timing_info(NonnullRefPtr<FetchTimingInfo> full_timing_info) { m_full_timing_info = move(full_timing_info); }
     void set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps);
     void set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps);
 
     [[nodiscard]] State state() const { return m_state; }
+    [[nodiscard]] RefPtr<FetchTimingInfo> timing_info() const;
 
     void report_timing(JS::Object&) const;
     void process_next_manual_redirect() const;
-    [[nodiscard]] GC::Ref<FetchTimingInfo> extract_full_timing_info() const;
+    [[nodiscard]] NonnullRefPtr<FetchTimingInfo> extract_full_timing_info() const;
     void abort(JS::Realm&, Optional<JS::Value>);
-    JS::Value deserialize_a_serialized_abort_reason(JS::Realm&);
+    Optional<HTML::IPCSerializationRecord> const& serialized_abort_reason() const { return m_serialized_abort_reason; }
     void terminate();
 
     void set_fetch_params(Badge<FetchParams>, GC::Ref<FetchParams> fetch_params) { m_fetch_params = fetch_params; }
+    [[nodiscard]] GC::Ptr<FetchParams> fetch_params() const { return m_fetch_params; }
+
+    // AD-HOC: Whether this fetch's response has arrived: as headers from the network, or at main fetch. From then on,
+    //         its body delivery is queued as event-loop tasks, and its response processing captures its task
+    //         destination as it was then — so re-targeting the fetch no longer reaches either.
+    //         consume_a_preloaded_resource() checks this before re-targeting an in-flight preload's fetch.
+    void set_response_arrived() { m_response_arrived = true; }
+    [[nodiscard]] bool response_arrived() const { return m_response_arrived; }
+    [[nodiscard]] GC::Ptr<Fetching::PendingResponse> pending_preloaded_response() const { return m_pending_preloaded_response; }
+    void set_pending_preloaded_response(GC::Ptr<Fetching::PendingResponse> pending_preloaded_response) { m_pending_preloaded_response = pending_preloaded_response; }
+
+    void set_pending_request(RefPtr<Requests::Request> const&);
+    bool requires_network() const { return m_requires_network; }
+    bool has_started_request() const { return m_has_started_request; }
+    void set_inner_fetch_controller(GC::Ref<FetchController>);
 
     void stop_fetch();
+    void stop_request();
+    void set_stop_steps(GC::Ref<GC::Function<void()>> stop_steps) { m_stop_steps = stop_steps; }
 
     u64 next_fetch_task_id() { return m_next_fetch_task_id++; }
     void fetch_task_queued(u64 fetch_task_id, HTML::TaskID event_id);
@@ -69,7 +96,7 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-controller-full-timing-info
     // full timing info (default null)
     //    Null or a fetch timing info.
-    GC::Ptr<FetchTimingInfo> m_full_timing_info;
+    RefPtr<FetchTimingInfo> m_full_timing_info;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // report timing steps (default null)
@@ -79,7 +106,7 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // serialized abort reason (default null)
     //     Null or a Record (result of StructuredSerialize).
-    Optional<HTML::SerializationRecord> m_serialized_abort_reason;
+    Optional<HTML::IPCSerializationRecord> m_serialized_abort_reason;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-next-manual-redirect-steps
     // next manual redirect steps (default null)
@@ -87,9 +114,20 @@ private:
     GC::Ptr<GC::Function<void()>> m_next_manual_redirect_steps;
 
     GC::Ptr<FetchParams> m_fetch_params;
+    bool m_response_arrived { false };
+    // NB: Assumes one waiting consumer for a pending preloaded response.
+    // Widen this if preload handoff ever supports multiple consumers.
+    GC::Ptr<Fetching::PendingResponse> m_pending_preloaded_response;
+
+    WeakPtr<Requests::Request> m_pending_request;
+    bool m_requires_network { false };
+    bool m_has_started_request { false };
 
     HashMap<u64, HTML::TaskID> m_ongoing_fetch_tasks;
     u64 m_next_fetch_task_id { 0 };
+
+    // AD-HOC: Run when the fetch is stopped, for whatever was waiting on its response.
+    GC::Ptr<GC::Function<void()>> m_stop_steps;
 };
 
 class FetchControllerHolder : public JS::Cell {
@@ -97,7 +135,7 @@ class FetchControllerHolder : public JS::Cell {
     GC_DECLARE_ALLOCATOR(FetchControllerHolder);
 
 public:
-    static GC::Ref<FetchControllerHolder> create(JS::VM&);
+    static GC::Ref<FetchControllerHolder> create();
 
     [[nodiscard]] GC::Ptr<FetchController> const& controller() const { return m_controller; }
     void set_controller(GC::Ref<FetchController> controller) { m_controller = controller; }

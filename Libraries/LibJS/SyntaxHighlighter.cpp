@@ -5,17 +5,20 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Debug.h>
+#include <AK/UnicodeUtils.h>
 #include <LibGfx/Palette.h>
-#include <LibJS/Lexer.h>
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/SyntaxHighlighter.h>
 #include <LibJS/Token.h>
+#include <LibTextCodec/Decoder.h>
 
 namespace JS {
 
-static Gfx::TextAttributes style_for_token_type(Gfx::Palette const& palette, TokenType type)
+using namespace EmbeddingABI;
+
+static Gfx::TextAttributes style_for_token_category(Gfx::Palette const& palette, TokenCategory category)
 {
-    switch (Token::category(type)) {
+    switch (category) {
     case TokenCategory::Invalid:
         return { palette.syntax_comment() };
     case TokenCategory::Number:
@@ -37,115 +40,83 @@ static Gfx::TextAttributes style_for_token_type(Gfx::Palette const& palette, Tok
     }
 }
 
-bool SyntaxHighlighter::is_identifier(u64 token) const
+struct RehighlightState {
+    Gfx::Palette const& palette;
+    Vector<Syntax::TextDocumentSpan>& spans;
+    Utf16View source;
+    Syntax::TextPosition position { 0, 0 };
+};
+
+static void advance_position(Syntax::TextPosition& position, Utf16View const& source, u32 start, u32 length)
 {
-    auto js_token = static_cast<TokenType>(static_cast<size_t>(token));
-    return js_token == TokenType::Identifier;
+    for (u32 i = 0; i < length; ++i) {
+        if (auto code_unit = source.code_unit_at(start + i); code_unit == '\n') {
+            position.set_line(position.line() + 1);
+            position.set_column(0);
+        } else {
+            position.set_column(position.column() + 1);
+
+            if (AK::UnicodeUtils::is_utf16_high_surrogate(code_unit)
+                && i + 1 < length
+                && AK::UnicodeUtils::is_utf16_low_surrogate(source.code_unit_at(start + i + 1))) {
+                ++i;
+            }
+        }
+    }
 }
 
-bool SyntaxHighlighter::is_navigatable([[maybe_unused]] u64 token) const
+static void on_token(void* context, JSToken const* token)
 {
-    return false;
+    auto& state = *static_cast<RehighlightState*>(context);
+    auto token_type = static_cast<TokenType>(token->token_type);
+    auto category = static_cast<TokenCategory>(token->category);
+
+    if (token->trivia_length > 0) {
+        auto trivia_start = state.position;
+        advance_position(state.position, state.source, token->trivia_offset, token->trivia_length);
+        Syntax::TextDocumentSpan span;
+        span.range.set_start(trivia_start);
+        span.range.set_end({ state.position.line(), state.position.column() });
+        span.attributes = style_for_token_category(state.palette, TokenCategory::Trivia);
+        span.is_skippable = true;
+        span.data = pack_token_data(TokenType::Trivia, TokenCategory::Trivia);
+        state.spans.append(span);
+    }
+
+    auto token_start = state.position;
+    if (token->length > 0) {
+        advance_position(state.position, state.source, token->offset, token->length);
+        Syntax::TextDocumentSpan span;
+        span.range.set_start(token_start);
+        span.range.set_end({ state.position.line(), state.position.column() });
+        span.attributes = style_for_token_category(state.palette, category);
+        span.is_skippable = false;
+        span.data = pack_token_data(token_type, category);
+        state.spans.append(span);
+    }
 }
 
 void SyntaxHighlighter::rehighlight(Palette const& palette)
 {
     auto text = m_client->get_text();
-
-    Lexer lexer(text);
+    auto decoder = TextCodec::decoder_for("UTF-8"sv);
+    VERIFY(decoder.has_value());
+    auto source = TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, text)
+                      .release_value_but_fixme_should_propagate_errors();
 
     Vector<Syntax::TextDocumentSpan> spans;
-    Vector<Syntax::TextDocumentFoldingRegion> folding_regions;
-    Syntax::TextPosition position { 0, 0 };
-    Syntax::TextPosition start { 0, 0 };
 
-    auto advance_position = [&position](u32 code_point) {
-        if (code_point == '\n') {
-            position.set_line(position.line() + 1);
-            position.set_column(0);
-        } else
-            position.set_column(position.column() + 1);
+    RehighlightState state {
+        .palette = palette,
+        .spans = spans,
+        .source = source.utf16_view(),
+        .position = { 0, 0 },
     };
 
-    auto append_token = [&](Utf16View const& str, Token const& token, bool is_trivia) {
-        if (str.is_empty())
-            return;
-
-        start = position;
-        for (auto code_point : str)
-            advance_position(code_point);
-
-        Syntax::TextDocumentSpan span;
-        span.range.set_start(start);
-        span.range.set_end({ position.line(), position.column() });
-        auto type = is_trivia ? TokenType::Trivia : token.type();
-        span.attributes = style_for_token_type(palette, type);
-        span.is_skippable = is_trivia;
-        span.data = static_cast<u64>(type);
-        spans.append(span);
-
-        dbgln_if(SYNTAX_HIGHLIGHTING_DEBUG, "{}{} @ '{}' {}:{} - {}:{}",
-            token.name(),
-            is_trivia ? " (trivia)" : "",
-            token.value(),
-            span.range.start().line(), span.range.start().column(),
-            span.range.end().line(), span.range.end().column());
-    };
-
-    struct TokenData {
-        Token token;
-        Syntax::TextRange range;
-    };
-    Vector<TokenData> folding_region_start_tokens;
-
-    bool was_eof = false;
-    for (auto token = lexer.next(); !was_eof; token = lexer.next()) {
-        append_token(token.trivia(), token, true);
-
-        auto token_start_position = position;
-        append_token(token.value(), token, false);
-
-        if (token.type() == TokenType::Eof)
-            was_eof = true;
-
-        // Create folding regions for {} blocks
-        if (token.type() == TokenType::CurlyOpen) {
-            folding_region_start_tokens.append({ .token = token,
-                .range = { token_start_position, position } });
-        } else if (token.type() == TokenType::CurlyClose) {
-            if (!folding_region_start_tokens.is_empty()) {
-                auto curly_open = folding_region_start_tokens.take_last();
-                Syntax::TextDocumentFoldingRegion region;
-                region.range.set_start(curly_open.range.end());
-                region.range.set_end(token_start_position);
-                folding_regions.append(region);
-            }
-        }
-    }
+    JSTokenSink token_sink { .context = &state, .append = on_token };
+    js_compile_tokenize(utf16_view_to_abi(source.utf16_view()), &token_sink);
 
     m_client->do_set_spans(move(spans));
-    m_client->do_set_folding_regions(move(folding_regions));
-
-    m_has_brace_buddies = false;
-    highlight_matching_token_pair();
-
-    m_client->do_update();
-}
-
-Vector<Syntax::Highlighter::MatchingTokenPair> SyntaxHighlighter::matching_token_pairs_impl() const
-{
-    static Vector<Syntax::Highlighter::MatchingTokenPair> pairs;
-    if (pairs.is_empty()) {
-        pairs.append({ static_cast<u64>(TokenType::CurlyOpen), static_cast<u64>(TokenType::CurlyClose) });
-        pairs.append({ static_cast<u64>(TokenType::ParenOpen), static_cast<u64>(TokenType::ParenClose) });
-        pairs.append({ static_cast<u64>(TokenType::BracketOpen), static_cast<u64>(TokenType::BracketClose) });
-    }
-    return pairs;
-}
-
-bool SyntaxHighlighter::token_types_equal(u64 token1, u64 token2) const
-{
-    return static_cast<TokenType>(token1) == static_cast<TokenType>(token2);
 }
 
 }

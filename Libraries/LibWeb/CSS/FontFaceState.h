@@ -1,0 +1,193 @@
+/*
+ * Copyright (c) 2024, Andrew Kaster <akaster@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/HashTable.h>
+#include <AK/RefCounted.h>
+#include <AK/Time.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
+#include <AK/Weakable.h>
+#include <LibGC/HeapVector.h>
+#include <LibGC/Weak.h>
+#include <LibGfx/Font/Typeface.h>
+#include <LibGfx/FontCascadeList.h>
+#include <LibURL/URL.h>
+#include <LibWeb/Bindings/FontFace.h>
+#include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontFaceSnapshot.h>
+#include <LibWeb/CSS/RustDescriptorBlock.h>
+#include <LibWeb/CSS/StyleValues/ComputationContext.h>
+#include <LibWeb/WebIDL/Buffers.h>
+
+namespace Web::CSS {
+
+class FontLoader;
+using FontFaceLoadStatus = Bindings::FontFaceLoadStatus;
+using FontFaceDescriptors = Bindings::FontFaceDescriptors;
+
+class FontFaceState final : public RefCounted<FontFaceState>
+    , public Weakable<FontFaceState> {
+
+public:
+    using FontFaceSource = FlattenVariant<Variant<Utf16String>, WebIDL::BufferSourceVariant>;
+
+    [[nodiscard]] static GC::Ref<FontFace> create_for_constructor(JS::Object&, Utf16String family, FontFaceSource source, Bindings::FontFaceDescriptors const& descriptors);
+    [[nodiscard]] static NonnullRefPtr<FontFaceState> create_css_connected(JS::Realm&, u64 rule_identity, StyleSheetState&);
+    ~FontFaceState();
+    FontFace& cssom_font_face() const;
+    void visit_edges(GC::Cell::Visitor&);
+    GC::Ref<GC::HeapVector<NonnullRefPtr<FontFaceState>>> keep_alive_during_load();
+    void load_for_style();
+
+    Utf16FlyString const& family_name() const { return m_family; }
+
+    // The serialization of the @font-face descriptor a FontFace attribute reflects.
+    Utf16String const& descriptor_text(DescriptorID) const;
+    WebIDL::ExceptionOr<void> set_descriptor(DescriptorID, Utf16View);
+    static constexpr size_t attribute_count = 11;
+
+    bool is_css_connected() const { return m_css_font_face_rule_identity.has_value(); }
+    Optional<u64> css_rule_identity() const
+    {
+        return m_css_font_face_rule_identity;
+    }
+    void disconnect_from_css_rule();
+    void reparse_connected_css_font_face_rule_descriptors();
+
+    RefPtr<Gfx::Typeface const> typeface() const { return m_parsed_font; }
+
+    // The number this face is known by in the process. A style update that must not mutate the face names it by this
+    // number and leaves the mutation for the drain below.
+    [[nodiscard]] u64 id() const { return m_id; }
+    [[nodiscard]] static RefPtr<FontFaceState> with_id(u64);
+
+    // The key the font computer files this face under, and matching selects it by.
+    [[nodiscard]] FontFaceKey matching_key() const
+    {
+        return {
+            .family_name = m_family,
+            .weight = m_cached_weight_range,
+            .slope = m_cached_slope,
+            .width = m_cached_width,
+        };
+    }
+
+    bool should_be_registered_with_font_computer() const;
+
+    // What the face renders with right now, published for a cascade on any thread: its typeface while its font-display
+    // period has not failed.
+    NonnullRefPtr<FontFaceRenderingTypeface const> rendering_typeface() const { return m_rendering_typeface; }
+
+    Vector<Gfx::UnicodeRange> const& unicode_ranges() const { return m_unicode_ranges; }
+    bool has_urls() const { return !m_urls.is_empty(); }
+    // Its font-display period failed or its load errored, so it contributes nothing to a cascade.
+    bool is_unusable_for_rendering() const { return m_font_display_failed || m_status == FontFaceLoadStatus::Error; }
+    bool is_pending_rendering_from_cache() const;
+    bool has_pending_rendering() const;
+    void set_font_display_time_for_testing(u32 milliseconds);
+    Gfx::PendingFontState resolve_for_rendering();
+    Gfx::PendingFontState rendering_state_without_requesting() const;
+
+    bool has_non_default_unicode_range() const
+    {
+        if (m_unicode_ranges.size() != 1)
+            return true;
+        auto const& range = m_unicode_ranges.first();
+        return range.min_code_point() != 0 || range.max_code_point() != 0x10FFFF;
+    }
+
+    FontFaceLoadStatus status() const { return m_status; }
+
+    GC::Ref<WebIDL::Promise> load();
+    GC::Ref<WebIDL::Promise> loaded() const;
+
+    GC::Ref<WebIDL::Promise> font_status_promise() { return loaded(); }
+
+    void add_to_set(FontFaceSet&);
+    void remove_from_set(FontFaceSet&);
+
+private:
+    explicit FontFaceState(GC::Ref<HTML::EnvironmentSettingsObject>);
+
+    JS::Object& task_global_object() const;
+    void reject_status_promise(WebIDL::Exception);
+    void did_load(RefPtr<Gfx::Typeface const>);
+    void set_parsed_font(RefPtr<Gfx::Typeface const>);
+
+    Optional<FontComputer&> font_computer() const;
+    void update_font_display_period();
+    i64 font_download_elapsed_time() const;
+    void invalidate_font_display();
+    CSSFontFaceRule& cssom_rule() const;
+    RustDescriptorBlock connected_descriptors() const;
+
+    [[nodiscard]] Optional<ComputationContext> computation_context() const;
+    void apply_descriptor(DescriptorID, StyleValue const&);
+
+    u64 m_id { 0 };
+
+    Utf16FlyString m_family;
+    Array<Utf16String, attribute_count> m_descriptor_texts;
+    Vector<Gfx::UnicodeRange> m_unicode_ranges;
+
+    FontWeightRange m_cached_weight_range { 400, 400 };
+    int m_cached_slope { 0 };
+    int m_cached_width { 100 };
+    GC::Ptr<FontLoader> m_font_loader;
+    GC::Ref<HTML::EnvironmentSettingsObject> m_environment;
+
+    // https://drafts.csswg.org/css-fonts-4/#font-display-timeline
+    enum class FontDisplayPeriod : u8 {
+        Block,
+        Swap,
+        Failure,
+    };
+    FontDisplay m_font_display { FontDisplay::Auto };
+    FontDisplayPeriod m_font_display_period { FontDisplayPeriod::Block };
+    Optional<MonotonicTime> m_font_download_timer_start;
+    GC::Ptr<Platform::Timer> m_font_download_timer;
+    Optional<u32> m_font_display_time_for_testing;
+    bool m_font_display_failed { false };
+    bool m_font_download_completed { false };
+
+    // https://drafts.csswg.org/css-font-loading/#dom-fontface-status
+    FontFaceLoadStatus m_status;
+
+    mutable GC::Ptr<WebIDL::Promise> m_font_status_promise; // [[FontStatusPromise]]
+    Vector<FontLoader::Source> m_urls;                      // [[Urls]]
+    ByteBuffer m_binary_data {};                            // [[Data]]
+
+    RefPtr<Gfx::Typeface const> m_parsed_font;
+    NonnullRefPtr<FontFaceRenderingTypeface> m_rendering_typeface { FontFaceRenderingTypeface::create() };
+    RefPtr<Core::Promise<NonnullRefPtr<Gfx::Typeface const>>> m_font_load_promise;
+
+    Optional<u64> m_css_font_face_rule_identity;
+    RefPtr<StyleSheetState> m_source_style_sheet;
+    HashTable<GC::Ref<FontFaceSet>> m_containing_sets;
+    mutable GC::Weak<FontFace> m_cssom_font_face;
+    GC::Ptr<WebIDL::DOMException> m_load_error;
+    bool m_visiting_edges { false };
+};
+
+bool font_format_is_supported(Utf16View name);
+
+// Record that a style update wanted a web face loaded, on any thread. Loading a face changes its status, appends it to
+// every FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of
+// which may happen while a style update runs, nor anywhere but the main thread.
+void note_wanted_web_face(u64 face_id);
+
+// Load every face wanted since the last call, unless a style update is running: that one drains them at its end.
+void request_wanted_web_faces();
+
+// A style update defers every load its cascades want to its own end.
+void begin_deferred_web_face_loads();
+void end_deferred_web_face_loads();
+
+}

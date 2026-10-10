@@ -1,742 +1,795 @@
 /*
- * Copyright (c) 2022, Gregory Bertilson <zaggy1024@gmail.com>
+ * Copyright (c) 2022-2026, Gregory Bertilson <gregory@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Format.h>
-#include <LibCore/MappedFile.h>
-#include <LibCore/Timer.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
-#include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
+#include <AK/Debug.h>
+#include <AK/HashMap.h>
+#include <AK/NeverDestroyed.h>
+#include <LibMedia/Demuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
+#include <LibMedia/MonotonicMediaClock.h>
+#include <LibMedia/PlaybackStates/EndedStateHandler.h>
+#include <LibMedia/PlaybackStates/StartingStateHandler.h>
+#include <LibMedia/Processors/AudioMixer.h>
+#include <LibMedia/Processors/AudioTimeStretchProcessor.h>
+#include <LibMedia/Producers/DecodedAudioProducer.h>
+#include <LibMedia/Producers/DecodedVideoProducer.h>
+#include <LibMedia/Sinks/AudioPlaybackSink.h>
+#include <LibMedia/Sinks/DisplayingVideoSink.h>
+#include <LibMedia/Sinks/VideoSink.h>
+#include <LibMedia/Track.h>
 #include <LibMedia/VideoFrame.h>
+#include <LibThreading/Thread.h>
+#include <LibThreading/ThreadPool.h>
 
 #include "PlaybackManager.h"
 
 namespace Media {
 
-#define TRY_OR_FATAL_ERROR(expression)                                                               \
-    ({                                                                                               \
-        auto&& _fatal_expression = (expression);                                                     \
-        if (_fatal_expression.is_error()) {                                                          \
-            dispatch_fatal_error(_fatal_expression.release_error());                                 \
-            return;                                                                                  \
-        }                                                                                            \
-        static_assert(!::AK::Detail::IsLvalueReference<decltype(_fatal_expression.release_value())>, \
-            "Do not return a reference from a fallible expression");                                 \
-        _fatal_expression.release_value();                                                           \
-    })
+namespace {
 
-DecoderErrorOr<NonnullOwnPtr<PlaybackManager>> PlaybackManager::from_data(ReadonlyBytes data)
+HashMap<VideoSinkHandle, PlaybackManager*>& video_sink_registrations()
 {
-    auto stream = make<FixedMemoryStream>(data);
-    return from_stream(move(stream));
+    static NeverDestroyed<HashMap<VideoSinkHandle, PlaybackManager*>> registrations;
+    return *registrations;
 }
 
-DecoderErrorOr<NonnullOwnPtr<PlaybackManager>> PlaybackManager::from_stream(NonnullOwnPtr<SeekableStream> stream)
-{
-    auto demuxer_or_error = FFmpeg::FFmpegDemuxer::create(move(stream));
-    if (demuxer_or_error.is_error())
-        return DecoderError::format(DecoderErrorCategory::Unknown, "{}", demuxer_or_error.error());
-    return create(demuxer_or_error.release_value());
 }
 
-DecoderErrorOr<NonnullOwnPtr<PlaybackManager>> PlaybackManager::from_url(StringView url)
+DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlaybackManager const& self, NonnullRefPtr<Demuxer> const& demuxer, Core::EventLoop& main_thread_event_loop, NonnullRefPtr<AddMediaSourcePromise>& promise)
 {
-    auto demuxer_or_error = FFmpeg::FFmpegDemuxer::create_from_url(url);
-    if (demuxer_or_error.is_error())
-        return DecoderError::format(DecoderErrorCategory::Unknown, "{}", demuxer_or_error.error());
-    return create(demuxer_or_error.release_value());
+    // Create the video tracks and their producers.
+    auto all_video_tracks = TRY(demuxer->get_tracks_for_type(TrackType::Video));
+
+    auto supported_video_tracks = VideoTracks();
+    auto supported_video_track_datas = VideoTrackDatas();
+    supported_video_tracks.ensure_capacity(all_video_tracks.size());
+    supported_video_track_datas.ensure_capacity(all_video_tracks.size());
+    for (auto const& track : all_video_tracks) {
+        auto video_producer_result = DecodedVideoProducer::try_create(main_thread_event_loop, demuxer, track);
+        if (video_producer_result.is_error())
+            continue;
+        supported_video_tracks.append(track);
+        supported_video_track_datas.empend(VideoTrackData(track, demuxer, video_producer_result.release_value()));
+    }
+    supported_video_tracks.shrink_to_fit();
+    supported_video_track_datas.shrink_to_fit();
+
+    // Create all the audio tracks, their producers, and the audio output.
+    auto all_audio_tracks = TRY(demuxer->get_tracks_for_type(TrackType::Audio));
+
+    auto supported_audio_tracks = AudioTracks();
+    auto supported_audio_track_datas = AudioTrackDatas();
+    supported_audio_tracks.ensure_capacity(all_audio_tracks.size());
+    supported_audio_track_datas.ensure_capacity(all_audio_tracks.size());
+    for (auto const& track : all_audio_tracks) {
+        auto audio_producer_result = DecodedAudioProducer::try_create(main_thread_event_loop, demuxer, track);
+        if (audio_producer_result.is_error())
+            continue;
+        auto audio_producer = audio_producer_result.release_value();
+        supported_audio_tracks.append(track);
+        supported_audio_track_datas.empend(AudioTrackData(track, demuxer, move(audio_producer)));
+    }
+    supported_audio_tracks.shrink_to_fit();
+    supported_audio_track_datas.shrink_to_fit();
+
+    if (supported_video_tracks.is_empty() && supported_audio_tracks.is_empty())
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "No supported video or audio tracks found"sv);
+
+    auto preferred_video_track = demuxer->get_preferred_track_for_type(TrackType::Video).value_or({});
+    if (preferred_video_track.has_value() && !supported_video_tracks.contains_slow(*preferred_video_track))
+        preferred_video_track = {};
+    auto preferred_audio_track = demuxer->get_preferred_track_for_type(TrackType::Audio).value_or({});
+    if (preferred_audio_track.has_value() && !supported_audio_tracks.contains_slow(*preferred_audio_track))
+        preferred_audio_track = {};
+
+    auto duration = demuxer->total_duration().value_or(AK::Duration::zero());
+    auto start_time_realtime = demuxer->start_time_realtime();
+
+    main_thread_event_loop.deferred_invoke([self, demuxer, video_tracks = move(supported_video_tracks), video_track_datas = move(supported_video_track_datas), preferred_video_track, audio_tracks = move(supported_audio_tracks), audio_track_datas = move(supported_audio_track_datas), preferred_audio_track, duration, start_time_realtime, promise = move(promise)] mutable {
+        if (!self)
+            return;
+
+        for (auto const& existing_track : self->m_video_tracks) {
+            if (video_tracks.contains_slow(existing_track)) {
+                promise->reject(DecoderError::with_description(DecoderErrorCategory::Invalid, "Duplicate video track found"sv));
+                return;
+            }
+        }
+        for (auto const& existing_track : self->m_audio_tracks) {
+            if (audio_tracks.contains_slow(existing_track)) {
+                promise->reject(DecoderError::with_description(DecoderErrorCategory::Invalid, "Duplicate audio track found"sv));
+                return;
+            }
+        }
+
+        auto first_new_video_index = self->m_video_tracks.size();
+        auto first_new_audio_index = self->m_audio_tracks.size();
+
+        self->m_video_tracks.extend(move(video_tracks));
+        self->m_video_track_datas.extend(move(video_track_datas));
+        self->m_audio_tracks.extend(move(audio_tracks));
+        self->m_audio_track_datas.extend(move(audio_track_datas));
+
+        if (!self->m_preferred_video_track.has_value())
+            self->m_preferred_video_track = preferred_video_track;
+        if (!self->m_preferred_audio_track.has_value())
+            self->m_preferred_audio_track = preferred_audio_track;
+
+        self->m_start_time_realtime = start_time_realtime;
+        self->check_for_demuxed_duration_change(duration);
+
+        self->m_demuxers.append(demuxer);
+        demuxer->set_scan_state_change_handler([self, &demuxer = *demuxer](TimeRanges const& invalidated_ranges) {
+            if (!self)
+                return;
+            self->update_duration_from_scan_states();
+            self->seek_tracks_with_invalidated_data(demuxer, invalidated_ranges);
+            self->update_pipeline_state();
+            self->dispatch_buffered_ranges_change();
+        });
+        self->update_duration_from_scan_states();
+
+        self->set_up_producers();
+
+        if (!self->m_audio_sink && !self->m_audio_tracks.is_empty()) {
+            self->m_audio_mixer = MUST(AudioMixer::try_create());
+            self->m_audio_time_stretch_processor = MUST(AudioTimeStretchProcessor::try_create());
+            self->m_audio_sink = MUST(AudioPlaybackSink::try_create(
+                [self](PipelineStatus status) {
+                    if (!self)
+                        return;
+                    self->on_audio_sink_state_changed(status);
+                },
+                self->m_audio_output));
+            MUST(self->m_audio_time_stretch_processor->connect_input(*self->m_audio_mixer));
+            MUST(self->m_audio_sink->connect_input(*self->m_audio_time_stretch_processor));
+            self->set_clock(*self->m_audio_sink);
+            self->m_audio_sink->on_audio_output_error = [self](Error&& error) {
+                if (!self)
+                    return;
+                dbgln("Audio output initialization failed with error: {}", error);
+                self->disable_audio();
+            };
+            if (self->m_started)
+                self->m_audio_sink->start();
+        }
+
+        AddedTracks added_tracks { .demuxer = demuxer, .audio_tracks = {}, .video_tracks = {} };
+        for (size_t i = first_new_audio_index; i < self->m_audio_tracks.size(); i++)
+            added_tracks.audio_tracks.append(self->m_audio_tracks[i]);
+        for (size_t i = first_new_video_index; i < self->m_video_tracks.size(); i++)
+            added_tracks.video_tracks.append(self->m_video_tracks[i]);
+        promise->resolve(move(added_tracks));
+    });
+
+    return {};
 }
 
-PlaybackManager::PlaybackManager(NonnullOwnPtr<Demuxer>& demuxer, Track video_track, NonnullOwnPtr<VideoDecoder>&& decoder, VideoFrameQueue&& frame_queue)
-    : m_demuxer(move(demuxer))
-    , m_selected_video_track(video_track)
-    , m_frame_queue(move(frame_queue))
-    , m_decoder(move(decoder))
-    , m_decode_wait_condition(m_decode_wait_mutex)
+NonnullOwnPtr<PlaybackManager> PlaybackManager::create()
+{
+    auto playback_manager = adopt_own(*new (nothrow) PlaybackManager());
+    playback_manager->m_handler = make<StartingStateHandler>(*playback_manager);
+    playback_manager->m_handler->on_enter();
+    return playback_manager;
+}
+
+PlaybackManager::PlaybackManager()
+    : m_weak_link(make_ref_counted<WeakPlaybackManagerLink>(*this))
+    , m_clock(MUST(MonotonicMediaClock::try_create()))
+    , m_time_reader(m_clock->time_reader())
 {
 }
 
 PlaybackManager::~PlaybackManager()
 {
-    terminate_playback();
-}
-
-void PlaybackManager::resume_playback()
-{
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "Resuming playback.");
-    TRY_OR_FATAL_ERROR(m_playback_handler->play());
-}
-
-void PlaybackManager::pause_playback()
-{
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "Pausing playback.");
-    if (!m_playback_handler->is_playing())
-        warnln("Cannot pause.");
-    TRY_OR_FATAL_ERROR(m_playback_handler->pause());
-}
-
-void PlaybackManager::terminate_playback()
-{
-    m_stop_decoding.exchange(true);
-    m_decode_wait_condition.broadcast();
-
-    if (m_decode_thread->needs_to_be_joined()) {
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Waiting for decode thread to end...");
-        (void)m_decode_thread->join();
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Successfully destroyed PlaybackManager.");
+    m_clock->pause();
+    for (auto& track_data : m_video_track_datas) {
+        if (track_data.handle.has_value())
+            video_sink_registrations().remove(*track_data.handle);
     }
+    m_weak_link->revoke({});
 }
 
-AK::Duration PlaybackManager::current_playback_time()
+void PlaybackManager::reject_media_source(WeakPlaybackManager self, NonnullRefPtr<AddMediaSourcePromise>&& promise, Core::EventLoop& main_thread_event_loop, DecoderError error)
 {
-    return m_playback_handler->current_time();
-}
-
-AK::Duration PlaybackManager::duration()
-{
-    auto duration_result = ({
-        auto demuxer_locker = Threading::MutexLocker(m_decoder_mutex);
-        m_demuxer->duration_of_track(m_selected_video_track);
+    if (error.category() == DecoderErrorCategory::EndOfStream)
+        error = DecoderError::with_description(DecoderErrorCategory::Corrupted, "The media ended before its metadata could be read"sv);
+    main_thread_event_loop.deferred_invoke([self = move(self), promise = move(promise), error = move(error)] mutable {
+        if (!self)
+            return;
+        promise->reject(move(error));
     });
-    if (duration_result.is_error()) {
-        dispatch_decoder_error(duration_result.release_error());
-        // FIXME: We should determine the last sample that the demuxer knows is available and
-        //        use that as the current duration. The duration may change if the demuxer doesn't
-        //        know there is a fixed duration.
-        return AK::Duration::zero();
-    }
-    return duration_result.release_value();
 }
 
-void PlaybackManager::dispatch_fatal_error(Error error)
+NonnullRefPtr<PlaybackManager::AddMediaSourcePromise> PlaybackManager::add_media_source(NonnullRefPtr<MediaStream> const& stream)
 {
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "Encountered fatal error: {}", error.string_literal());
-    // FIXME: For threading, this will have to use a pre-allocated event to send to the main loop
-    //        to be able to gracefully handle OOM.
-    if (on_fatal_playback_error)
-        on_fatal_playback_error(move(error));
-}
+    auto self = weak();
+    auto& main_thread_event_loop = Core::EventLoop::current();
+    auto promise = AddMediaSourcePromise::construct();
 
-void PlaybackManager::dispatch_decoder_error(DecoderError error)
-{
-    switch (error.category()) {
-    case DecoderErrorCategory::EndOfStream:
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "{}", error.string_literal());
-        TRY_OR_FATAL_ERROR(m_playback_handler->stop());
-        break;
-    default:
-        dbgln("Playback error encountered: {}", error.string_literal());
-        TRY_OR_FATAL_ERROR(m_playback_handler->stop());
-
-        if (on_decoder_error)
-            on_decoder_error(move(error));
-
-        break;
-    }
-}
-
-void PlaybackManager::dispatch_new_frame(RefPtr<Gfx::Bitmap> frame)
-{
-    if (on_video_frame)
-        on_video_frame(move(frame));
-}
-
-bool PlaybackManager::dispatch_frame_queue_item(FrameQueueItem&& item)
-{
-    if (item.is_error()) {
-        dispatch_decoder_error(item.release_error());
-        return true;
-    }
-
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "Sent frame for presentation with timestamp {}ms, late by {}ms", item.timestamp().to_milliseconds(), (current_playback_time() - item.timestamp()).to_milliseconds());
-    dispatch_new_frame(item.bitmap());
-    return false;
-}
-
-void PlaybackManager::dispatch_state_change()
-{
-    if (on_playback_state_change)
-        on_playback_state_change();
-}
-
-void PlaybackManager::timer_callback()
-{
-    TRY_OR_FATAL_ERROR(m_playback_handler->do_timed_state_update());
-}
-
-void PlaybackManager::seek_to_timestamp(AK::Duration target_timestamp, SeekMode seek_mode)
-{
-    TRY_OR_FATAL_ERROR(m_playback_handler->seek(target_timestamp, seek_mode));
-}
-
-DecoderErrorOr<Optional<AK::Duration>> PlaybackManager::seek_demuxer_to_most_recent_keyframe(AK::Duration timestamp, Optional<AK::Duration> earliest_available_sample)
-{
-    auto seeked_timestamp = TRY(m_demuxer->seek_to_most_recent_keyframe(m_selected_video_track, timestamp, move(earliest_available_sample)));
-    if (seeked_timestamp.has_value())
-        m_decoder->flush();
-    return seeked_timestamp;
-}
-
-Optional<FrameQueueItem> PlaybackManager::dequeue_one_frame()
-{
-    auto result = m_frame_queue.dequeue();
-    m_decode_wait_condition.broadcast();
-    if (result.is_error()) {
-        if (result.error() != VideoFrameQueue::QueueStatus::Empty)
-            dispatch_fatal_error(Error::from_string_literal("Dequeue failed with an unexpected error"));
-        return {};
-    }
-    return result.release_value();
-}
-
-void PlaybackManager::set_state_update_timer(int delay_ms)
-{
-    m_state_update_timer->start(delay_ms);
-}
-
-void PlaybackManager::restart_playback()
-{
-    seek_to_timestamp(AK::Duration::zero());
-}
-
-void PlaybackManager::decode_and_queue_one_sample()
-{
-#if PLAYBACK_MANAGER_DEBUG
-    auto start_time = MonotonicTime::now();
-#endif
-
-    FrameQueueItem item_to_enqueue;
-
-    while (item_to_enqueue.is_empty()) {
-        OwnPtr<VideoFrame> decoded_frame = nullptr;
-        CodingIndependentCodePoints container_cicp;
-
-        {
-            Threading::MutexLocker decoder_locker(m_decoder_mutex);
-
-            // Get a sample to decode.
-            auto sample_result = m_demuxer->get_next_sample_for_track(m_selected_video_track);
-            if (sample_result.is_error()) {
-                item_to_enqueue = FrameQueueItem::error_marker(sample_result.release_error(), FrameQueueItem::no_timestamp);
-                break;
-            }
-            auto sample = sample_result.release_value();
-            container_cicp = sample.auxiliary_data().get<CodedVideoFrameData>().container_cicp();
-
-            // Submit the sample to the decoder.
-            auto decode_result = m_decoder->receive_coded_data(sample.timestamp(), sample.data());
-            if (decode_result.is_error()) {
-                item_to_enqueue = FrameQueueItem::error_marker(decode_result.release_error(), sample.timestamp());
-                break;
-            }
-
-            // Retrieve the last available frame to present.
-            while (true) {
-                auto frame_result = m_decoder->get_decoded_frame();
-
-                if (frame_result.is_error()) {
-                    if (frame_result.error().category() == DecoderErrorCategory::NeedsMoreInput) {
-                        break;
-                    }
-
-                    item_to_enqueue = FrameQueueItem::error_marker(frame_result.release_error(), sample.timestamp());
-                    break;
-                }
-
-                decoded_frame = frame_result.release_value();
-            }
-        }
-
-        // Convert the frame for display.
-        if (decoded_frame != nullptr) {
-            auto& cicp = decoded_frame->cicp();
-            cicp.adopt_specified_values(container_cicp);
-            cicp.default_code_points_if_unspecified({ ColorPrimaries::BT709, TransferCharacteristics::BT709, MatrixCoefficients::BT709, VideoFullRangeFlag::Studio });
-
-            // BT.470 M, B/G, BT.601, BT.709 and BT.2020 have a similar transfer function to sRGB, so other applications
-            // (Chromium, VLC) forgo transfer characteristics conversion. We will emulate that behavior by
-            // handling those as sRGB instead, which causes no transfer function change in the output,
-            // unless display color management is later implemented.
-            switch (cicp.transfer_characteristics()) {
-            case TransferCharacteristics::BT470BG:
-            case TransferCharacteristics::BT470M:
-            case TransferCharacteristics::BT601:
-            case TransferCharacteristics::BT709:
-            case TransferCharacteristics::BT2020BitDepth10:
-            case TransferCharacteristics::BT2020BitDepth12:
-                cicp.set_transfer_characteristics(TransferCharacteristics::SRGB);
-                break;
-            default:
-                break;
-            }
-
-            auto bitmap_result = decoded_frame->to_bitmap();
-
-            if (bitmap_result.is_error())
-                item_to_enqueue = FrameQueueItem::error_marker(bitmap_result.release_error(), decoded_frame->timestamp());
-            else
-                item_to_enqueue = FrameQueueItem::frame(bitmap_result.release_value(), decoded_frame->timestamp());
-            break;
-        }
-    }
-
-    VERIFY(!item_to_enqueue.is_empty());
-#if PLAYBACK_MANAGER_DEBUG
-    dbgln("Media Decoder: Sample at {}ms took {}ms to decode, queue contains ~{} items", item_to_enqueue.timestamp().to_milliseconds(), (MonotonicTime::now() - start_time).to_milliseconds(), m_frame_queue.weak_used());
-#endif
-
-    auto wait = [&] {
-        auto wait_locker = Threading::MutexLocker(m_decode_wait_mutex);
-        m_decode_wait_condition.wait();
-    };
-
-    bool had_error = item_to_enqueue.is_error();
-    while (true) {
-        if (m_frame_queue.can_enqueue()) {
-            MUST(m_frame_queue.enqueue(move(item_to_enqueue)));
-            break;
-        }
-
-        if (m_stop_decoding.load()) {
-            dbgln_if(PLAYBACK_MANAGER_DEBUG, "Media Decoder: Received signal to stop, exiting decode function...");
+    // The promise's reference count is not atomic, so the thread pool task must only ever move it.
+    Threading::ThreadPool::the().submit([self = move(self), stream, &main_thread_event_loop, promise = promise] mutable {
+        auto demuxer_or_error = create_demuxer(stream);
+        if (demuxer_or_error.is_error()) {
+            reject_media_source(move(self), move(promise), main_thread_event_loop, demuxer_or_error.release_error());
             return;
         }
 
-        m_buffer_is_full.exchange(true);
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Media Decoder: Waiting for a frame to be dequeued...");
-        wait();
+        auto maybe_error = prepare_playback_from_demuxer(self, demuxer_or_error.release_value(), main_thread_event_loop, promise);
+        if (maybe_error.is_error())
+            reject_media_source(move(self), move(promise), main_thread_event_loop, maybe_error.release_error());
+    });
+    return promise;
+}
+
+NonnullRefPtr<PlaybackManager::AddMediaSourcePromise> PlaybackManager::add_media_source(NonnullRefPtr<Demuxer> const& demuxer)
+{
+    auto self = weak();
+    auto& main_thread_event_loop = Core::EventLoop::current();
+    auto promise = AddMediaSourcePromise::construct();
+
+    // The promise's reference count is not atomic, so the thread pool task must only ever move it.
+    Threading::ThreadPool::the().submit([self = move(self), demuxer, &main_thread_event_loop, promise = promise] mutable {
+        auto maybe_error = prepare_playback_from_demuxer(self, demuxer, main_thread_event_loop, promise);
+        if (maybe_error.is_error())
+            reject_media_source(move(self), move(promise), main_thread_event_loop, maybe_error.release_error());
+    });
+    return promise;
+}
+
+WeakPlaybackManager PlaybackManager::weak()
+{
+    return WeakPlaybackManager(m_weak_link);
+}
+
+void PlaybackManager::set_up_producers()
+{
+    for (auto const& video_track_data : m_video_track_datas) {
+        video_track_data.producer->set_error_handler([self = weak()](DecoderError&& error) {
+            if (!self)
+                return;
+            self->dispatch_error(move(error));
+        });
+        video_track_data.producer->set_read_blocked_change_handler([self = weak(), track = video_track_data.track](ReadBlocked read_blocked) {
+            if (!self)
+                return;
+            self->get_video_data_for_track(track).read_blocked = read_blocked == ReadBlocked::Yes;
+            self->update_pipeline_state();
+        });
     }
 
-    if (had_error) {
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Media Decoder: Encountered {}, waiting...", item_to_enqueue.error().category() == DecoderErrorCategory::EndOfStream ? "end of stream"sv : "error"sv);
-        m_buffer_is_full.exchange(true);
-        wait();
+    for (auto const& audio_track_data : m_audio_track_datas) {
+        audio_track_data.producer->set_error_handler([self = weak()](DecoderError&& error) {
+            if (!self)
+                return;
+            self->dispatch_error(move(error));
+        });
+        audio_track_data.producer->set_read_blocked_change_handler([self = weak(), track = audio_track_data.track](ReadBlocked read_blocked) {
+            if (!self)
+                return;
+            self->get_audio_data_for_track(track).read_blocked = read_blocked == ReadBlocked::Yes;
+            self->update_pipeline_state();
+        });
     }
-
-    m_buffer_is_full.exchange(false);
 }
 
-AK::Duration PlaybackManager::PlaybackStateHandler::current_time() const
+AK::Duration PlaybackManager::current_time() const
 {
-    return m_manager.m_last_present_in_media_time;
+    auto time = m_handler->current_time();
+    return min(time, duration());
 }
 
-ErrorOr<void> PlaybackManager::PlaybackStateHandler::seek(AK::Duration target_timestamp, SeekMode seek_mode)
+void PlaybackManager::on_audio_sink_state_changed(PipelineStatus status)
 {
-    return replace_handler_and_delete_this<SeekingStateHandler>(is_playing(), target_timestamp, seek_mode);
+    dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackManager({:p}): Audio sink reports {}", this, status);
+    m_audio_sink_status = status;
+    update_pipeline_state();
 }
 
-ErrorOr<void> PlaybackManager::PlaybackStateHandler::stop()
+void PlaybackManager::on_video_sink_state_changed(Track const& track, PipelineStatus status)
 {
-    return replace_handler_and_delete_this<StoppedStateHandler>();
+    auto& track_data = get_video_data_for_track(track);
+    dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackManager({:p}): Video sink for track {} reports {}", this, track.identifier(), status);
+    track_data.sink_status = status;
+    update_pipeline_state();
 }
 
-template<class T, class... Args>
-ErrorOr<void> PlaybackManager::PlaybackStateHandler::replace_handler_and_delete_this(Args... args)
+Optional<AK::Duration> PlaybackManager::verified_end_time_for_source(Demuxer const& demuxer)
 {
-    OwnPtr<PlaybackStateHandler> temp_handler = TRY(try_make<T>(m_manager, args...));
-    m_manager.m_playback_handler.swap(temp_handler);
-#if PLAYBACK_MANAGER_DEBUG
-    m_has_exited = true;
-    dbgln("Changing state from {} to {}", temp_handler->name(), m_manager.m_playback_handler->name());
-#endif
-    TRY(m_manager.m_playback_handler->on_enter());
-    m_manager.dispatch_state_change();
-    return {};
-}
-
-PlaybackManager& PlaybackManager::PlaybackStateHandler::manager() const
-{
-#if PLAYBACK_MANAGER_DEBUG
-    VERIFY(!m_has_exited);
-#endif
-    return m_manager;
-}
-
-class PlaybackManager::ResumingStateHandler : public PlaybackManager::PlaybackStateHandler {
-public:
-    ResumingStateHandler(PlaybackManager& manager, bool playing)
-        : PlaybackStateHandler(manager)
-        , m_playing(playing)
-    {
-    }
-    ~ResumingStateHandler() override = default;
-
-protected:
-    ErrorOr<void> assume_next_state()
-    {
-        if (!m_playing)
-            return replace_handler_and_delete_this<PausedStateHandler>();
-        return replace_handler_and_delete_this<PlayingStateHandler>();
-    }
-
-    ErrorOr<void> play() override
-    {
-        m_playing = true;
-        manager().dispatch_state_change();
+    auto const& scan_state = demuxer.scan_state();
+    if (!scan_state.reached_end_of_stream)
         return {};
-    }
-    bool is_playing() const override { return m_playing; }
-    ErrorOr<void> pause() override
-    {
-        m_playing = false;
-        manager().dispatch_state_change();
+    auto ranges = scan_state.buffered_ranges();
+    if (ranges.is_empty())
         return {};
-    }
+    return ranges.highest_end_time();
+}
 
-    bool m_playing { false };
-};
+PipelineStatus PlaybackManager::combined_pipeline_status() const
+{
+    auto status = PipelineStatus::EndOfStream;
 
-class PlaybackManager::PlayingStateHandler : public PlaybackManager::PlaybackStateHandler {
-public:
-    PlayingStateHandler(PlaybackManager& manager)
-        : PlaybackStateHandler(manager)
-    {
-    }
-    ~PlayingStateHandler() override = default;
-
-private:
-    ErrorOr<void> on_enter() override
-    {
-        m_last_present_in_real_time = MonotonicTime::now();
-        return do_timed_state_update();
-    }
-
-    StringView name() override { return "Playing"sv; }
-
-    bool is_playing() const override { return true; }
-    PlaybackState get_state() const override { return PlaybackState::Playing; }
-    ErrorOr<void> pause() override
-    {
-        manager().m_last_present_in_media_time = current_time();
-        return replace_handler_and_delete_this<PausedStateHandler>();
-    }
-    ErrorOr<void> buffer() override
-    {
-        manager().m_last_present_in_media_time = current_time();
-        return replace_handler_and_delete_this<BufferingStateHandler>(true);
-    }
-
-    AK::Duration current_time() const override
-    {
-        return manager().m_last_present_in_media_time + (MonotonicTime::now() - m_last_present_in_real_time);
-    }
-
-    ErrorOr<void> do_timed_state_update() override
-    {
-        auto set_presentation_timer = [&]() {
-            auto frame_time_ms = (manager().m_next_frame->timestamp() - current_time()).to_milliseconds();
-            VERIFY(frame_time_ms <= NumericLimits<int>::max());
-            dbgln_if(PLAYBACK_MANAGER_DEBUG, "Time until next frame is {}ms", frame_time_ms);
-            manager().set_state_update_timer(max(static_cast<int>(frame_time_ms), 0));
-        };
-
-        if (manager().m_next_frame.has_value() && current_time() < manager().m_next_frame->timestamp()) {
-            dbgln_if(PLAYBACK_MANAGER_DEBUG, "Current time {}ms is too early to present the next frame at {}ms, delaying", current_time().to_milliseconds(), manager().m_next_frame->timestamp().to_milliseconds());
-            set_presentation_timer();
-            return {};
-        }
-
-        Optional<FrameQueueItem> future_frame_item;
-        bool should_present_frame = false;
-
-        // Skip frames until we find a frame past the current playback time, and keep the one that precedes it to display.
-        while (true) {
-            future_frame_item = manager().dequeue_one_frame();
-            if (!future_frame_item.has_value())
-                break;
-
-            if (future_frame_item->timestamp() >= current_time() || future_frame_item->timestamp() == FrameQueueItem::no_timestamp) {
-                dbgln_if(PLAYBACK_MANAGER_DEBUG, "Should present frame, future {} is error or after {}ms", future_frame_item->debug_string(), current_time().to_milliseconds());
-                should_present_frame = true;
+    if (m_audio_sink != nullptr) {
+        auto audio_status = m_audio_sink_status;
+        if (audio_status == PipelineStatus::Pending) {
+            for (auto const& track_data : m_audio_track_datas) {
+                if (!track_data.enabled)
+                    continue;
+                if (!track_data.read_blocked)
+                    continue;
+                audio_status = PipelineStatus::Blocked;
                 break;
             }
-
-            if (manager().m_next_frame.has_value()) {
-                dbgln_if(PLAYBACK_MANAGER_DEBUG, "At {}ms: Dropped {} in favor of {}", current_time().to_milliseconds(), manager().m_next_frame->debug_string(), future_frame_item->debug_string());
-                manager().m_skipped_frames++;
-            }
-            manager().m_next_frame.emplace(future_frame_item.release_value());
         }
-
-        // If we don't have both of these items, we can't present, since we need to set a timer for
-        // the next frame. Check if we need to buffer based on the current state.
-        if (!manager().m_next_frame.has_value() || !future_frame_item.has_value()) {
-#if PLAYBACK_MANAGER_DEBUG
-            StringBuilder debug_string_builder;
-            debug_string_builder.append("We don't have "sv);
-            if (!manager().m_next_frame.has_value()) {
-                debug_string_builder.append("a frame to present"sv);
-                if (!future_frame_item.has_value())
-                    debug_string_builder.append(" or a future frame"sv);
-            } else {
-                debug_string_builder.append("a future frame"sv);
-            }
-            debug_string_builder.append(", checking for error and buffering"sv);
-            dbgln_if(PLAYBACK_MANAGER_DEBUG, debug_string_builder.to_byte_string());
-#endif
-            if (future_frame_item.has_value()) {
-                if (future_frame_item->is_error()) {
-                    manager().dispatch_decoder_error(future_frame_item.release_value().release_error());
-                    return {};
-                }
-                manager().m_next_frame.emplace(future_frame_item.release_value());
-            }
-            TRY(buffer());
-            return {};
+        status = select_combined_pipeline_status(status, audio_status);
+    } else {
+        for (auto const& track_data : m_audio_track_datas) {
+            if (!track_data.enabled)
+                continue;
+            auto track_status = PipelineStatus::HaveData;
+            auto verified_end_time = verified_end_time_for_source(track_data.demuxer);
+            if (verified_end_time.has_value() && current_time() >= *verified_end_time)
+                track_status = PipelineStatus::EndOfStream;
+            status = select_combined_pipeline_status(status, track_status);
         }
+    }
 
-        // If we have a frame, send it for presentation.
-        if (should_present_frame) {
-            auto now = MonotonicTime::now();
-            manager().m_last_present_in_media_time += now - m_last_present_in_real_time;
-            m_last_present_in_real_time = now;
-
-            if (manager().dispatch_frame_queue_item(manager().m_next_frame.release_value()))
-                return {};
+    for (auto const& track_data : m_video_track_datas) {
+        if (!track_data.handle.has_value())
+            continue;
+        auto track_status = track_data.sink_status;
+        if (!track_data.ticking && track_status != PipelineStatus::Error) {
+            auto verified_end_time = verified_end_time_for_source(track_data.demuxer);
+            if (verified_end_time.has_value() && current_time() >= *verified_end_time)
+                track_status = PipelineStatus::EndOfStream;
         }
-
-        // Now that we've presented the current frame, we can throw whatever error is next in queue.
-        // This way, we always display a frame before the stream ends, and should also show any frames
-        // we already had when a real error occurs.
-        if (future_frame_item->is_error()) {
-            manager().dispatch_decoder_error(future_frame_item.release_value().release_error());
-            return {};
-        }
-
-        // The future frame item becomes the next one to present.
-        manager().m_next_frame.emplace(future_frame_item.release_value());
-        set_presentation_timer();
-        return {};
+        if (track_status == PipelineStatus::Pending && track_data.read_blocked)
+            track_status = PipelineStatus::Blocked;
+        status = select_combined_pipeline_status(status, track_status);
     }
 
-    MonotonicTime m_last_present_in_real_time = MonotonicTime::now_coarse();
-};
+    return status;
+}
 
-class PlaybackManager::PausedStateHandler : public PlaybackManager::PlaybackStateHandler {
-public:
-    PausedStateHandler(PlaybackManager& manager)
-        : PlaybackStateHandler(manager)
-    {
-    }
-    ~PausedStateHandler() override = default;
-
-private:
-    StringView name() override { return "Paused"sv; }
-
-    ErrorOr<void> play() override
-    {
-        return replace_handler_and_delete_this<PlayingStateHandler>();
-    }
-    bool is_playing() const override { return false; }
-    PlaybackState get_state() const override { return PlaybackState::Paused; }
-};
-
-// FIXME: This is a placeholder variable that could be scaled based on how long each frame decode takes to
-//        avoid triggering the timer to check the queue constantly. However, doing so may reduce the speed
-//        of seeking due to the decode thread having to wait for a signal to continue decoding.
-constexpr int buffering_or_seeking_decode_wait_time = 1;
-
-class PlaybackManager::BufferingStateHandler : public PlaybackManager::ResumingStateHandler {
-    using PlaybackManager::ResumingStateHandler::ResumingStateHandler;
-
-    ErrorOr<void> on_enter() override
-    {
-        manager().set_state_update_timer(buffering_or_seeking_decode_wait_time);
-        return {};
-    }
-
-    StringView name() override { return "Buffering"sv; }
-
-    ErrorOr<void> do_timed_state_update() override
-    {
-        auto buffer_is_full = manager().m_buffer_is_full.load();
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Buffering timer callback has been called. Buffer is {}.", buffer_is_full ? "full, exiting"sv : "not full, waiting"sv);
-        if (buffer_is_full)
-            return assume_next_state();
-
-        manager().set_state_update_timer(buffering_or_seeking_decode_wait_time);
-        return {};
-    }
-
-    PlaybackState get_state() const override { return PlaybackState::Buffering; }
-};
-
-class PlaybackManager::SeekingStateHandler : public PlaybackManager::ResumingStateHandler {
-public:
-    SeekingStateHandler(PlaybackManager& manager, bool playing, AK::Duration target_timestamp, SeekMode seek_mode)
-        : ResumingStateHandler(manager, playing)
-        , m_target_timestamp(target_timestamp)
-        , m_seek_mode(seek_mode)
-    {
-    }
-    ~SeekingStateHandler() override = default;
-
-private:
-    ErrorOr<void> on_enter() override
-    {
-        auto earliest_available_sample = manager().m_last_present_in_media_time;
-        if (manager().m_next_frame.has_value() && manager().m_next_frame->timestamp() != FrameQueueItem::no_timestamp) {
-            earliest_available_sample = min(earliest_available_sample, manager().m_next_frame->timestamp());
-        }
-
-        {
-            Threading::MutexLocker demuxer_locker(manager().m_decoder_mutex);
-
-            auto demuxer_seek_result = manager().seek_demuxer_to_most_recent_keyframe(m_target_timestamp, earliest_available_sample);
-            if (demuxer_seek_result.is_error()) {
-                manager().dispatch_decoder_error(demuxer_seek_result.release_error());
-                return {};
-            }
-            auto keyframe_timestamp = demuxer_seek_result.release_value();
-
-#if PLAYBACK_MANAGER_DEBUG
-            auto seek_mode_name = m_seek_mode == SeekMode::Accurate ? "Accurate"sv : "Fast"sv;
-            if (keyframe_timestamp.has_value())
-                dbgln("{} seeking to timestamp target {}ms, selected keyframe at {}ms", seek_mode_name, m_target_timestamp.to_milliseconds(), keyframe_timestamp->to_milliseconds());
-            else
-                dbgln("{} seeking to timestamp target {}ms, demuxer kept its iterator position after {}ms", seek_mode_name, m_target_timestamp.to_milliseconds(), earliest_available_sample.to_milliseconds());
-#endif
-
-            if (m_seek_mode == SeekMode::Fast)
-                m_target_timestamp = keyframe_timestamp.value_or(manager().m_last_present_in_media_time);
-
-            if (keyframe_timestamp.has_value()) {
-                dbgln_if(PLAYBACK_MANAGER_DEBUG, "Keyframe is nearer to the target than the current frames, emptying queue");
-                while (manager().dequeue_one_frame().has_value()) { }
-                manager().m_next_frame.clear();
-                manager().m_last_present_in_media_time = keyframe_timestamp.value();
-            } else if (m_target_timestamp >= manager().m_last_present_in_media_time && manager().m_next_frame.has_value() && manager().m_next_frame.value().timestamp() > m_target_timestamp) {
-                dbgln_if(PLAYBACK_MANAGER_DEBUG, "Target timestamp is between the last presented frame and the next frame, exiting seek at {}ms", m_target_timestamp.to_milliseconds());
-                manager().m_last_present_in_media_time = m_target_timestamp;
-                return assume_next_state();
-            }
-        }
-
-        return skip_samples_until_timestamp();
-    }
-
-    ErrorOr<void> skip_samples_until_timestamp()
-    {
-        while (true) {
-            auto optional_item = manager().dequeue_one_frame();
-            if (!optional_item.has_value())
-                break;
-            auto item = optional_item.release_value();
-
-            dbgln_if(PLAYBACK_MANAGER_DEBUG, "Dequeuing frame at {}ms and comparing to seek target {}ms", item.timestamp().to_milliseconds(), m_target_timestamp.to_milliseconds());
-            if (manager().m_next_frame.has_value() && (item.timestamp() > m_target_timestamp || item.timestamp() == FrameQueueItem::no_timestamp)) {
-                // If the frame we're presenting is later than the target timestamp, skip the timestamp forward to it.
-                if (manager().m_next_frame->timestamp() > m_target_timestamp) {
-                    manager().m_last_present_in_media_time = manager().m_next_frame->timestamp();
-                } else {
-                    manager().m_last_present_in_media_time = m_target_timestamp;
-                }
-
-                if (manager().dispatch_frame_queue_item(manager().m_next_frame.release_value()))
-                    return {};
-
-                manager().m_next_frame.emplace(item);
-
-                dbgln_if(PLAYBACK_MANAGER_DEBUG, "Exiting seek to {} state at {}ms", m_playing ? "Playing" : "Paused", manager().m_last_present_in_media_time.to_milliseconds());
-                return assume_next_state();
-            }
-            manager().m_next_frame.emplace(item);
-        }
-
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Frame queue is empty while seeking, waiting for buffer to fill.");
-        manager().set_state_update_timer(buffering_or_seeking_decode_wait_time);
-        return {};
-    }
-
-    StringView name() override { return "Seeking"sv; }
-
-    ErrorOr<void> seek(AK::Duration target_timestamp, SeekMode seek_mode) override
-    {
-        m_target_timestamp = target_timestamp;
-        m_seek_mode = seek_mode;
-        return on_enter();
-    }
-
-    AK::Duration current_time() const override
-    {
-        return m_target_timestamp;
-    }
-
-    // We won't need this override when threaded, the queue can pause us in on_enter().
-    ErrorOr<void> do_timed_state_update() override
-    {
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Seeking wait finished, attempting to dequeue until timestamp.");
-        return skip_samples_until_timestamp();
-    }
-
-    PlaybackState get_state() const override { return PlaybackState::Seeking; }
-
-    AK::Duration m_target_timestamp { AK::Duration::zero() };
-    SeekMode m_seek_mode { SeekMode::Accurate };
-};
-
-class PlaybackManager::StoppedStateHandler : public PlaybackManager::PlaybackStateHandler {
-public:
-    StoppedStateHandler(PlaybackManager& manager)
-        : PlaybackStateHandler(manager)
-    {
-    }
-    ~StoppedStateHandler() override = default;
-
-private:
-    ErrorOr<void> on_enter() override
-    {
-        return {};
-    }
-
-    StringView name() override { return "Stopped"sv; }
-
-    ErrorOr<void> play() override
-    {
-        // When Stopped, the decoder thread will be waiting for a signal to start its loop going again.
-        manager().m_decode_wait_condition.broadcast();
-        return replace_handler_and_delete_this<SeekingStateHandler>(true, AK::Duration::zero(), SeekMode::Fast);
-    }
-    bool is_playing() const override { return false; }
-    PlaybackState get_state() const override { return PlaybackState::Stopped; }
-};
-
-DecoderErrorOr<NonnullOwnPtr<PlaybackManager>> PlaybackManager::create(NonnullOwnPtr<Demuxer> demuxer)
+void PlaybackManager::update_pipeline_state()
 {
-    auto optional_track = TRY(demuxer->get_preferred_track_for_type(TrackType::Video));
-    if (!optional_track.has_value()) {
-        return DecoderError::with_description(DecoderErrorCategory::Invalid, "No video track is present"sv);
+    auto status = combined_pipeline_status();
+    if constexpr (PLAYBACK_MANAGER_DEBUG) {
+        if (status != m_last_traced_combined_status) {
+            m_last_traced_combined_status = status;
+            StringBuilder breakdown;
+            breakdown.appendff("audio sink {}{}", m_audio_sink_status, m_audio_sink ? "" : " (none)");
+            for (auto const& track_data : m_audio_track_datas)
+                breakdown.appendff(", audio track {} {}{}", track_data.track.identifier(), track_data.enabled ? "enabled" : "disabled", track_data.read_blocked ? " read blocked" : "");
+            for (auto const& track_data : m_video_track_datas)
+                breakdown.appendff(", video track {} sink {}{}{}", track_data.track.identifier(), track_data.sink_status, track_data.ticking ? "" : " unticked", track_data.read_blocked ? " read blocked" : "");
+            dbgln("PlaybackManager({:p}): Combined status {} in {} ({})", this, status, m_handler->state(), breakdown.string_view());
+        }
+    }
+    m_handler->on_pipeline_status_changed(status);
+}
+
+void PlaybackManager::reset_pipeline_state()
+{
+    for (auto& track_data : m_video_track_datas) {
+        if (track_data.video_sink == nullptr)
+            continue;
+        track_data.sink_status = PipelineStatus::Pending;
+    }
+    m_audio_sink_status = m_audio_sink != nullptr ? PipelineStatus::Pending : PipelineStatus::HaveData;
+}
+
+void PlaybackManager::update_duration_from_scan_states()
+{
+    auto duration = AK::Duration::zero();
+    for (auto const& demuxer : m_demuxers)
+        duration = max(duration, demuxer->scan_state().duration);
+    check_for_demuxed_duration_change(duration);
+}
+
+void PlaybackManager::check_for_demuxed_duration_change(AK::Duration duration)
+{
+    if (m_duration_was_provided)
+        return;
+    if (m_duration == duration)
+        return;
+    m_duration = duration;
+    if (on_duration_change)
+        on_duration_change(m_duration);
+}
+
+void PlaybackManager::set_duration(AK::Duration duration)
+{
+    m_duration_was_provided = true;
+    if (m_duration == duration)
+        return;
+    m_duration = duration;
+    dispatch_buffered_ranges_change();
+}
+
+void PlaybackManager::dispatch_error(DecoderError&& error)
+{
+    VERIFY(error.category() != DecoderErrorCategory::EndOfStream);
+
+    if (m_is_in_error_state)
+        return;
+    m_is_in_error_state = true;
+    if (on_error)
+        on_error(move(error));
+}
+
+void PlaybackManager::dispatch_buffered_ranges_change()
+{
+    if (on_buffered_ranges_change)
+        on_buffered_ranges_change();
+}
+
+void PlaybackManager::set_clock(NonnullRefPtr<MediaClock> const& clock)
+{
+    auto time = current_time();
+    clock->seek(time);
+    m_clock = clock;
+    m_time_reader = clock->time_reader();
+    if (m_host_hooks.on_clock_changed)
+        m_host_hooks.on_clock_changed(m_time_reader);
+    for (auto& track_data : m_video_track_datas) {
+        if (!track_data.video_sink)
+            continue;
+        track_data.video_sink->set_time_reader(m_time_reader);
+    }
+    clock->set_playback_rate(m_playback_rate);
+    if (is_playing())
+        clock->resume();
+}
+
+void PlaybackManager::disable_audio()
+{
+    m_audio_mixer = nullptr;
+    m_audio_time_stretch_processor = nullptr;
+    m_audio_sink = nullptr;
+    set_clock(MUST(MonotonicMediaClock::try_create()));
+    on_audio_sink_state_changed(PipelineStatus::EndOfStream);
+}
+
+void PlaybackManager::attach_video_sink(VideoTrackData& track_data, NonnullRefPtr<VideoSink> video_sink)
+{
+    VERIFY(track_data.video_sink == nullptr);
+    auto track = track_data.track;
+    video_sink->set_state_change_handler([self = weak(), track](PipelineStatus status) {
+        if (!self)
+            return;
+        self->on_video_sink_state_changed(track, status);
+    });
+    video_sink->set_resize_handler([self = weak(), track](Gfx::Size<u32> size) {
+        if (!self)
+            return;
+        auto& track_data = self->get_video_data_for_track(track);
+        if (track_data.on_resize)
+            track_data.on_resize(size);
+    });
+    MUST(video_sink->connect_input(track_data.producer));
+    track_data.video_sink = move(video_sink);
+    update_pipeline_state();
+    dispatch_buffered_ranges_change();
+}
+
+VideoSinkHandle PlaybackManager::reserve_video_sink_handle(Track const& track)
+{
+    auto handle = allocate_video_sink_handle();
+    reserve_video_sink_handle(track, handle, ResumeEndedPlayback::No);
+    return handle;
+}
+
+void PlaybackManager::reserve_video_sink_handle(Track const& track, VideoSinkHandle handle, ResumeEndedPlayback resume_ended_playback)
+{
+    auto& track_data = get_video_data_for_track(track);
+    if (track_data.handle.has_value())
+        disable_video_sink_by_handle(*track_data.handle);
+    track_data.handle = handle;
+    track_data.ticking = true;
+    video_sink_registrations().set(handle, this);
+    apply_track_change_to_ended_state(resume_ended_playback);
+    update_pipeline_state();
+}
+
+void PlaybackManager::set_host_hooks(HostHooks hooks)
+{
+    m_host_hooks = move(hooks);
+}
+
+void PlaybackManager::set_video_resize_handler(VideoSinkHandle handle, Function<void(Gfx::Size<u32>)> handler)
+{
+    if (auto* track_data = find_video_data_for_handle(handle))
+        track_data->on_resize = move(handler);
+}
+
+void PlaybackManager::disable_video_sink_by_handle(VideoSinkHandle handle)
+{
+    video_sink_registrations().remove(handle);
+    auto* track_data = find_video_data_for_handle(handle);
+    if (!track_data)
+        return;
+    if (track_data->video_sink) {
+        disconnect_video_sink(*track_data);
+        track_data->sink_status = PipelineStatus::HaveData;
+    }
+    track_data->handle = {};
+    update_pipeline_state();
+    dispatch_buffered_ranges_change();
+}
+
+void PlaybackManager::disconnect_video_sink(VideoTrackData& track_data)
+{
+    track_data.video_sink->set_state_change_handler(nullptr);
+    track_data.video_sink->set_resize_handler(nullptr);
+    track_data.video_sink->disconnect_input(track_data.producer);
+    track_data.video_sink = nullptr;
+    track_data.video_edge_sink = nullptr;
+}
+
+void PlaybackManager::set_video_sink_ticking(VideoSinkHandle handle, bool ticking)
+{
+    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
+    if (!manager)
+        return;
+    auto& track_data = manager->get_video_data_for_handle(handle);
+    if (track_data.ticking == ticking)
+        return;
+    track_data.ticking = ticking;
+    manager->update_pipeline_state();
+}
+
+void PlaybackManager::detach_video_sink(VideoSinkHandle handle)
+{
+    auto* track_data = find_video_data_for_handle(handle);
+    if (!track_data)
+        return;
+    if (track_data->video_sink)
+        disconnect_video_sink(*track_data);
+    track_data->sink_status = PipelineStatus::Pending;
+    update_pipeline_state();
+    dispatch_buffered_ranges_change();
+}
+
+bool PlaybackManager::has_video_sink_handle(Badge<VideoPresentationServerConnection>, VideoSinkHandle handle)
+{
+    return video_sink_registrations().contains(handle);
+}
+
+ErrorOr<PlaybackManager::RemoteVideoEdge> PlaybackManager::create_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle handle, RemoteVideoSink::Delegates delegates)
+{
+    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
+    if (!manager)
+        return Error::from_string_literal("No playback manager registered for video sink handle");
+
+    auto pump = TRY(RemoteVideoSink::create(move(delegates)));
+    return RemoteVideoEdge {
+        .sink = pump,
+        .time_reader = manager->m_time_reader,
+    };
+}
+
+void PlaybackManager::attach_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle handle, NonnullRefPtr<RemoteVideoSink> const& pump)
+{
+    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
+    if (!manager)
+        return;
+    auto& track_data = manager->get_video_data_for_handle(handle);
+    // The replaced sink's last status stands until the new one reports, so replacing does not interrupt buffering.
+    if (track_data.video_sink != nullptr)
+        disconnect_video_sink(track_data);
+    pump->set_pool_retired_observer([self = manager->weak(), handle](VideoFramePoolID pool_id) {
+        if (!self)
+            return;
+        if (self->m_host_hooks.on_video_frame_pool_retired)
+            self->m_host_hooks.on_video_frame_pool_retired(handle, pool_id);
+    });
+    manager->attach_video_sink(track_data, pump);
+    track_data.video_edge_sink = pump;
+    if (manager->m_host_hooks.on_video_edge_attached)
+        manager->m_host_hooks.on_video_edge_attached(handle, pump->presented_frame_page());
+}
+
+Optional<RemoteVideoSink::SlotStorage> PlaybackManager::presented_frame_slot_storage(VideoSinkHandle handle, VideoFramePoolID pool_id, u32 slot_index)
+{
+    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
+    if (!manager)
+        return {};
+    auto* track_data = manager->find_video_data_for_handle(handle);
+    if (!track_data || !track_data->video_edge_sink)
+        return {};
+    return track_data->video_edge_sink->lent_slot_storage(pool_id, slot_index);
+}
+
+RefPtr<VideoFrame> PlaybackManager::current_presented_frame(VideoSinkHandle handle)
+{
+    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
+    if (!manager)
+        return nullptr;
+    auto& track_data = manager->get_video_data_for_handle(handle);
+    if (!track_data.video_sink)
+        return nullptr;
+    return track_data.video_sink->current_frame();
+}
+
+void PlaybackManager::release_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle handle, VideoSink const& released_sink)
+{
+    auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
+    if (!manager)
+        return;
+    auto* track_data = manager->find_video_data_for_handle(handle);
+    if (!track_data || track_data->video_sink != &released_sink)
+        return;
+    manager->detach_video_sink(handle);
+}
+
+void PlaybackManager::enable_an_audio_track(Track const& track, ResumeEndedPlayback resume_ended_playback)
+{
+    auto& track_data = get_audio_data_for_track(track);
+    VERIFY(!track_data.enabled);
+    m_audio_sink_status = PipelineStatus::HaveData;
+    if (m_audio_mixer) {
+        MUST(m_audio_mixer->connect_input(track_data.producer));
+        m_audio_sink->reseek_input_keeping_clock();
+    }
+    track_data.enabled = true;
+    apply_track_change_to_ended_state(resume_ended_playback);
+    update_pipeline_state();
+    dispatch_buffered_ranges_change();
+}
+
+void PlaybackManager::disable_an_audio_track(Track const& track)
+{
+    auto& track_data = get_audio_data_for_track(track);
+    VERIFY(track_data.enabled);
+    m_audio_sink_status = PipelineStatus::HaveData;
+    if (m_audio_mixer) {
+        m_audio_mixer->disconnect_input(track_data.producer);
+        m_audio_sink->reseek_input_keeping_clock();
+    }
+    track_data.enabled = false;
+    update_pipeline_state();
+    dispatch_buffered_ranges_change();
+}
+
+void PlaybackManager::apply_track_change_to_ended_state(ResumeEndedPlayback resume_ended_playback)
+{
+    if (m_handler->state() != PlaybackState::Ended)
+        return;
+    auto& ended_state_handler = static_cast<EndedStateHandler&>(*m_handler);
+    if (resume_ended_playback == ResumeEndedPlayback::Yes)
+        ended_state_handler.resume_from_position_before_end();
+    else
+        ended_state_handler.move_pipeline_to_end();
+}
+
+void PlaybackManager::seek_tracks_with_invalidated_data(Demuxer const& demuxer, TimeRanges const& invalidated_ranges)
+{
+    auto current_timestamp = current_time();
+    auto pipeline_may_hold_invalidated_data = invalidated_ranges.highest_end_time() > current_timestamp;
+    if (!pipeline_may_hold_invalidated_data)
+        return;
+
+    for (auto& track_data : m_video_track_datas) {
+        if (track_data.demuxer.ptr() != &demuxer || track_data.video_sink == nullptr)
+            continue;
+        track_data.video_sink->seek(current_timestamp, InvalidateHeldData::Yes);
     }
 
-    auto track = optional_track.release_value();
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "Selecting video track number {}", track.identifier());
+    auto has_enabled_audio_track = any_of(m_audio_track_datas, [&](auto const& track_data) {
+        return track_data.demuxer.ptr() == &demuxer && track_data.enabled;
+    });
+    if (has_enabled_audio_track && m_audio_sink != nullptr)
+        m_audio_sink->reseek_input_keeping_clock();
+}
 
-    auto codec_id = TRY(demuxer->get_codec_id_for_track(track));
-    auto codec_initialization_data = TRY(demuxer->get_codec_initialization_data_for_track(track));
-    NonnullOwnPtr<VideoDecoder> decoder = TRY(FFmpeg::FFmpegVideoDecoder::try_create(codec_id, codec_initialization_data));
-    auto frame_queue = DECODER_TRY_ALLOC(VideoFrameQueue::create());
-    auto playback_manager = DECODER_TRY_ALLOC(try_make<PlaybackManager>(demuxer, track, move(decoder), move(frame_queue)));
+void PlaybackManager::seek_clock_and_video_sinks(AK::Duration timestamp)
+{
+    m_clock->seek(timestamp);
 
-    playback_manager->m_state_update_timer = Core::Timer::create_single_shot(0, [&self = *playback_manager] { self.timer_callback(); });
+    for (auto& track_data : m_video_track_datas) {
+        if (track_data.video_sink == nullptr)
+            continue;
+        track_data.video_sink->seek(timestamp);
+    }
+}
 
-    playback_manager->m_decode_thread = DECODER_TRY_ALLOC(Threading::Thread::try_create([&self = *playback_manager] {
-        while (!self.m_stop_decoding.load())
-            self.decode_and_queue_one_sample();
+bool PlaybackManager::track_is_enabled(Track const& track) const
+{
+    if (track.type() == TrackType::Video) {
+        auto const& track_data = get_video_data_for_track(track);
+        return track_data.video_sink != nullptr;
+    }
 
-        dbgln_if(PLAYBACK_MANAGER_DEBUG, "Media Decoder thread ended.");
-        return 0;
-    },
-        "Media Decoder"sv));
+    VERIFY(track.type() == TrackType::Audio);
+    auto const& track_data = get_audio_data_for_track(track);
+    return track_data.enabled;
+}
 
-    playback_manager->m_playback_handler = make<SeekingStateHandler>(*playback_manager, false, AK::Duration::zero(), SeekMode::Fast);
-    DECODER_TRY_ALLOC(playback_manager->m_playback_handler->on_enter());
+void PlaybackManager::start()
+{
+    m_started = true;
+    if (m_audio_sink)
+        m_audio_sink->start();
+    m_handler->start();
+}
 
-    playback_manager->m_decode_thread->start();
+void PlaybackManager::play()
+{
+    m_handler->play();
+}
 
-    return playback_manager;
+void PlaybackManager::pause()
+{
+    m_handler->pause();
+}
+
+void PlaybackManager::seek(AK::Duration timestamp, SeekMode mode)
+{
+    dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackManager({:p}): Seek to {} ({}) from {}", this, timestamp, mode, m_handler->state());
+    m_handler->seek(timestamp, mode);
+    m_is_in_error_state = false;
+
+    // Defer the pipeline update so that we don't synchronously resolve seeks.
+    Core::deferred_invoke([self = weak()] {
+        if (!self)
+            return;
+        self->update_pipeline_state();
+    });
+}
+
+bool PlaybackManager::is_playing()
+{
+    return m_handler->is_playing();
+}
+
+PlaybackState PlaybackManager::state()
+{
+    return m_handler->state();
+}
+
+AvailableData PlaybackManager::available_data()
+{
+    return m_handler->available_data();
+}
+
+TimeRanges PlaybackManager::buffered_time_ranges() const
+{
+    Vector<DemuxerScanState> active_sources;
+    for (auto const& demuxer : m_demuxers) {
+        if (source_has_enabled_track(demuxer))
+            active_sources.append(demuxer->scan_state());
+    }
+    return DemuxerScanState::buffered_ranges_of_sources(active_sources);
+}
+
+bool PlaybackManager::source_has_enabled_track(Demuxer const& demuxer) const
+{
+    for (auto const& track_data : m_video_track_datas) {
+        if (track_data.demuxer.ptr() == &demuxer && track_data.video_sink != nullptr)
+            return true;
+    }
+    for (auto const& track_data : m_audio_track_datas) {
+        if (track_data.demuxer.ptr() == &demuxer && track_data.enabled)
+            return true;
+    }
+    return false;
+}
+
+void PlaybackManager::set_volume(double volume)
+{
+    if (m_audio_sink)
+        m_audio_sink->set_volume(volume);
+}
+
+void PlaybackManager::set_playback_rate(float rate)
+{
+    m_playback_rate = rate;
+    m_clock->set_playback_rate(rate);
+    update_pipeline_state();
 }
 
 }

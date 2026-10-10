@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<div id="target"></div>
+<script>
+    promiseTest(async () => {
+        const styleElement = document.createElement('style');
+        styleElement.textContent = '@import url("../data/import-1.css");';
+        await new Promise(resolve => {
+            styleElement.onload = resolve;
+            styleElement.onerror = resolve;
+            document.head.append(styleElement);
+        });
+        println(`Target's background color: ${getComputedStyle(target).backgroundColor}`);
+    });
+</script>

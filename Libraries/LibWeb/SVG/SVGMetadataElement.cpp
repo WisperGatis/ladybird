@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGMetadataElementPrototype.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/SVG/SVGMetadataElement.h>
@@ -19,15 +18,9 @@ SVGMetadataElement::SVGMetadataElement(DOM::Document& document, DOM::QualifiedNa
 {
 }
 
-void SVGMetadataElement::initialize(JS::Realm& realm)
+CSS::ElementBoxKind SVGMetadataElement::box_kind() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGMetadataElement);
-    Base::initialize(realm);
-}
-
-GC::Ptr<Layout::Node> SVGMetadataElement::create_layout_node(GC::Ref<CSS::ComputedProperties>)
-{
-    return nullptr;
+    return CSS::ElementBoxKind::NoBox;
 }
 
 }

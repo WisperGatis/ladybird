@@ -6,23 +6,25 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/SVG/SVGTransformList.h>
 
 namespace Web::SVG {
 
 // https://svgwg.org/svg2-draft/single-page.html#coords-InterfaceSVGTransformList
-class SVGAnimatedTransformList final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(SVGAnimatedTransformList, Bindings::PlatformObject);
+class SVGAnimatedTransformList final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(SVGAnimatedTransformList, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(SVGAnimatedTransformList);
 
 public:
-    [[nodiscard]] static GC::Ref<SVGAnimatedTransformList> create(JS::Realm& realm, GC::Ref<SVGTransformList> base_val, GC::Ref<SVGTransformList> anim_val);
-    virtual ~SVGAnimatedTransformList() override;
+    static constexpr size_t base_val_offset() { return offsetof(SVGAnimatedTransformList, m_base_val); }
+    static constexpr size_t anim_val_offset() { return offsetof(SVGAnimatedTransformList, m_anim_val); }
+    [[nodiscard]] static GC::Ref<SVGAnimatedTransformList> create(GC::Ref<SVGTransformList> base_val, GC::Ref<SVGTransformList> anim_val);
+    virtual ~SVGAnimatedTransformList() override = default;
 
     GC::Ref<SVGTransformList> base_val() const
     {
-        return m_anim_val;
+        return m_base_val;
     }
 
     GC::Ref<SVGTransformList> anim_val() const
@@ -31,9 +33,8 @@ public:
     }
 
 private:
-    SVGAnimatedTransformList(JS::Realm& realm, GC::Ref<SVGTransformList> base_val, GC::Ref<SVGTransformList> anim_val);
+    SVGAnimatedTransformList(GC::Ref<SVGTransformList> base_val, GC::Ref<SVGTransformList> anim_val);
 
-    virtual void initialize(JS::Realm& realm) override;
     virtual void visit_edges(Cell::Visitor& visitor) override;
 
     GC::Ref<SVGTransformList> m_base_val;

@@ -10,7 +10,9 @@
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/String.h>
+#include <AK/Weakable.h>
 #include <LibCore/Socket.h>
 #include <LibDevTools/Actors/RootActor.h>
 #include <LibDevTools/Forward.h>
@@ -19,14 +21,19 @@ namespace DevTools {
 
 using ActorRegistry = HashMap<String, NonnullRefPtr<Actor>>;
 
-class DEVTOOLS_API DevToolsServer {
+class DEVTOOLS_API DevToolsServer : public Weakable<DevToolsServer> {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     static ErrorOr<NonnullOwnPtr<DevToolsServer>> create(DevToolsDelegate&, u16 port);
     ~DevToolsServer();
 
     RefPtr<Connection>& connection() { return m_connection; }
+    bool has_active_connection() const { return m_connection; }
     DevToolsDelegate const& delegate() const { return m_delegate; }
     ActorRegistry const& actor_registry() const { return m_actor_registry; }
+    Optional<u16> local_port() const;
+    void unregister_actor(String const& name);
 
     template<typename ActorType, typename... Args>
     ActorType& register_actor(Args&&... args)
@@ -55,6 +62,7 @@ private:
     void on_message_received(JsonObject);
 
     void close_connection();
+    void notify_actors_connection_closed();
 
     NonnullRefPtr<Core::TCPServer> m_server;
     RefPtr<Connection> m_connection;
@@ -66,6 +74,9 @@ private:
 
     u64 m_server_id { 0 };
     u64 m_actor_count { 0 };
+    bool m_did_notify_actors_connection_closed { false };
+    bool m_is_closing_connection { false };
+    bool m_is_shutting_down { false };
 };
 
 }

@@ -6,9 +6,18 @@
 
 #pragma once
 
-#include <LibWeb/DOM/Document.h>
+#include <AK/Optional.h>
+#include <LibCompositing/DisplayList/DisplayList.h>
+#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCore/Promise.h>
+#include <LibGC/Heap.h>
+#include <LibGC/WeakHashSet.h>
+#include <LibGfx/DecodedImageFrame.h>
+#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebCommon/Page/QueuedInputEvent.h>
 
 namespace Web::SVG {
 
@@ -18,47 +27,101 @@ class SVGDecodedImageData final : public HTML::DecodedImageData {
 
 public:
     class SVGPageClient;
-    static ErrorOr<GC::Ref<SVGDecodedImageData>> create(JS::Realm&, GC::Ref<Page>, URL::URL const&, ReadonlyBytes encoded_svg);
+    using DecodePromise = Core::Promise<GC::Root<SVGDecodedImageData>>;
+    static NonnullRefPtr<DecodePromise> decode(GC::Ref<Page>, URL::URL const&, ReadonlyBytes encoded_svg);
     virtual ~SVGDecodedImageData() override;
 
-    virtual RefPtr<Gfx::ImmutableBitmap> bitmap(size_t frame_index, Gfx::IntSize) const override;
+    virtual Optional<Gfx::DecodedImageFrame> default_frame(Gfx::IntSize = {}) const override;
+    virtual Optional<Gfx::DecodedImageFrame> current_frame(Gfx::IntSize = {}) const override;
 
     virtual Optional<CSSPixels> intrinsic_width() const override;
     virtual Optional<CSSPixels> intrinsic_height() const override;
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
+    u64 vector_content_identity() const { return m_vector_content_identity; }
+
+    virtual Optional<Compositing::DisplayListResource> record_display_list(Gfx::IntSize, CSS::PreferredColorScheme, Compositing::DisplayListResourceStorage&) const override;
+    // Lays the inner document out at the CSS size and records at css × raster_scale resolution.
+    Optional<Compositing::DisplayListResource> record_display_list_at_scale(CSSPixelSize css_size, float raster_scale, CSS::PreferredColorScheme, Compositing::DisplayListResourceStorage&) const;
 
     // FIXME: Support SVG animations. :^)
-    virtual int frame_duration(size_t) const override { return 0; }
-    virtual size_t frame_count() const override { return 1; }
-    virtual size_t loop_count() const override { return 0; }
-    virtual bool is_animated() const override { return false; }
-
     DOM::Document const& svg_document() const { return *m_document; }
 
     virtual void visit_edges(Cell::Visitor& visitor) override;
+    virtual void finalize() override;
+    virtual size_t external_memory_size() const override;
+
+    virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
+    bool has_active_view_box() const;
+
+    // The scheme the SVG document currently answers `prefers-color-scheme` with. Held on the image
+    // rather than on the page, because the page is shared with every other image.
+    CSS::PreferredColorScheme color_scheme() const { return m_color_scheme; }
 
 private:
+    static GC::Ref<SVGDecodedImageData> create(GC::Ref<Page>, GC::Ref<SVGPageClient>, GC::Ref<DOM::Document>, GC::Ref<SVG::SVGSVGElement>);
     SVGDecodedImageData(GC::Ref<Page>, GC::Ref<SVGPageClient>, GC::Ref<DOM::Document>, GC::Ref<SVG::SVGSVGElement>);
 
-    RefPtr<Gfx::Bitmap> render(Gfx::IntSize) const;
+    CSS::SizeWithAspectRatio const& natural_size() const;
+    Compositor::CompositorHost* host_compositor() const;
+    RefPtr<Gfx::Bitmap> render_frame(Gfx::IntSize) const;
+    void prune_cached_display_list_resources() const;
+    void append_cached_display_list_resources(Compositing::DisplayListResourceSet&) const;
+    void append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet&) const;
+    void did_request_frame();
+    void invalidate_cached_rendering();
+    static u64 next_vector_content_identity();
 
-    mutable HashMap<Gfx::IntSize, NonnullRefPtr<Gfx::ImmutableBitmap>> m_cached_rendered_bitmaps;
+    mutable HashMap<Gfx::IntSize, Gfx::DecodedImageFrame> m_cached_rendered_frames;
+
+    mutable CSS::PreferredColorScheme m_color_scheme { CSS::PreferredColorScheme::Auto };
+
+    struct CachedDisplayList {
+        NonnullRefPtr<Compositing::DisplayList> display_list;
+        Compositing::AccumulatedVisualContextTree visual_context_tree;
+        // Precomputed by collect_referenced_resources(); the display list is immutable, so this never changes.
+        Compositing::DisplayListResourceSet referenced_resources;
+    };
+    // An SVG used as an image resolves `prefers-color-scheme` from the used `color-scheme` of the
+    // element referencing it, so one image can render two ways on one page and the recording is
+    // keyed by both.
+    struct RenderKey {
+        CSSPixelSize css_size;
+        float raster_scale { 1 };
+        CSS::PreferredColorScheme color_scheme;
+        bool operator==(RenderKey const&) const = default;
+    };
+    struct RenderKeyTraits : public Traits<RenderKey> {
+        static unsigned hash(RenderKey const& key)
+        {
+            auto size_hash = pair_int_hash(key.css_size.width().raw_value(), key.css_size.height().raw_value());
+            return pair_int_hash(pair_int_hash(size_hash, bit_cast<u32>(key.raster_scale)), to_underlying(key.color_scheme));
+        }
+        static bool equals(RenderKey const& a, RenderKey const& b) { return a == b; }
+    };
+    mutable HashMap<RenderKey, CachedDisplayList, RenderKeyTraits> m_cached_display_lists;
+    mutable Optional<CSS::SizeWithAspectRatio> m_natural_size;
 
     GC::Ref<Page> m_page;
     GC::Ref<SVGPageClient> m_page_client;
 
     GC::Ref<DOM::Document> m_document;
     GC::Ref<SVG::SVGSVGElement> m_root_element;
+    u64 m_vector_content_identity { 0 };
+
+    mutable bool m_is_recording_display_list { false };
+    bool m_has_pending_client_notification { false };
 };
 
 class SVGDecodedImageData::SVGPageClient final : public PageClient {
     GC_CELL(SVGDecodedImageData::SVGPageClient, PageClient);
     GC_DECLARE_ALLOCATOR(SVGDecodedImageData::SVGPageClient);
 
+    friend class ScopedSVGImageDocument;
+
 public:
-    static GC::Ref<SVGPageClient> create(JS::VM& vm, Page& page)
+    static GC::Ref<SVGPageClient> create(Page& page)
     {
-        return vm.heap().allocate<SVGPageClient>(page);
+        return GC::Heap::the().allocate<SVGPageClient>(page);
     }
 
     virtual ~SVGPageClient() override = default;
@@ -66,22 +129,43 @@ public:
     GC::Ref<Page> m_host_page;
     GC::Ptr<Page> m_svg_page;
 
-    virtual u64 id() const override { VERIFY_NOT_REACHED(); }
+    virtual Web::PageId id() const override { return m_host_page->client().id(); }
+    virtual HTML::CrossProcessId allocate_cross_process_id() override { return m_host_page->client().allocate_cross_process_id(); }
+    virtual HTML::CrossProcessId allocate_navigable_id() override { return m_host_page->client().allocate_navigable_id(); }
     virtual Page& page() override { return *m_svg_page; }
     virtual Page const& page() const override { return *m_svg_page; }
     virtual bool is_connection_open() const override { return false; }
     virtual Gfx::Palette palette() const override { return m_host_page->client().palette(); }
     virtual DevicePixelRect screen_rect() const override { return {}; }
-    virtual double device_pixels_per_css_pixel() const override { return 1.0; }
+    virtual double zoom_level() const override { return 1.0; }
+    virtual double device_pixel_ratio() const override { return 1.0; }
+    virtual double device_pixels_per_css_pixel() const override { return m_device_pixels_per_css_pixel; }
+    void set_device_pixels_per_css_pixel(double value) { m_device_pixels_per_css_pixel = value; }
     virtual CSS::PreferredColorScheme preferred_color_scheme() const override { return m_host_page->client().preferred_color_scheme(); }
     virtual CSS::PreferredContrast preferred_contrast() const override { return m_host_page->client().preferred_contrast(); }
     virtual CSS::PreferredMotion preferred_motion() const override { return m_host_page->client().preferred_motion(); }
+    virtual size_t screen_count() const override { return 1; }
     virtual void request_file(FileRequest) override { }
     virtual Queue<QueuedInputEvent>& input_event_queue() override { VERIFY_NOT_REACHED(); }
-    virtual void report_finished_handling_input_event([[maybe_unused]] u64 page_id, [[maybe_unused]] EventResult event_was_handled) override { }
+    virtual void report_finished_handling_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] u64 event_id, [[maybe_unused]] EventResult event_was_handled) override { }
+    virtual void request_frame() override;
 
-    virtual DisplayListPlayerType display_list_player_type() const override { return m_host_page->client().display_list_player_type(); }
     virtual bool is_headless() const override { return m_host_page->client().is_headless(); }
+
+    void register_svg_image_data(SVGDecodedImageData&);
+    void prune_cached_display_list_resources() const;
+    HTML::Window& window() const;
+    void begin_recording_display_list() { ++m_display_list_recording_count; }
+    void end_recording_display_list();
+
+    GC::Ptr<SVGDecodedImageData> current_svg_image_data() const { return m_current_svg_image_data.ptr(); }
+    void set_current_svg_image_data(GC::Ptr<SVGDecodedImageData>);
+    void suppress_frame_requests() { ++m_frame_request_suppression_count; }
+    void unsuppress_frame_requests()
+    {
+        VERIFY(m_frame_request_suppression_count > 0);
+        --m_frame_request_suppression_count;
+    }
 
 private:
     explicit SVGPageClient(Page& host_page)
@@ -92,6 +176,39 @@ private:
     virtual bool is_svg_page_client() const override { return true; }
 
     virtual void visit_edges(Visitor&) override;
+    void prune_cached_display_list_resources_now() const;
+
+    double m_device_pixels_per_css_pixel { 1.0 };
+    GC::WeakHashSet<SVGDecodedImageData> m_svg_image_data;
+    GC::Weak<SVGDecodedImageData> m_current_svg_image_data;
+    size_t m_frame_request_suppression_count { 0 };
+    size_t m_display_list_recording_count { 0 };
+    mutable bool m_has_pending_display_list_resource_prune { false };
+};
+
+class WEB_API ScopedSVGImageDocument {
+    AK_MAKE_NONCOPYABLE(ScopedSVGImageDocument);
+
+public:
+    enum class FrameRequests : u8 {
+        Suppress,
+        RouteToCurrentImage
+    };
+
+    ScopedSVGImageDocument(DOM::Document&, FrameRequests);
+    ScopedSVGImageDocument(ScopedSVGImageDocument&&);
+    ~ScopedSVGImageDocument();
+
+    [[nodiscard]] static Optional<ScopedSVGImageDocument> create_if_needed(GC::Ptr<DOM::Document const>, FrameRequests);
+
+private:
+    GC::Ref<SVGDecodedImageData::SVGPageClient> m_page_client;
+    GC::Ref<HTML::LocalNavigable> m_navigable;
+    GC::Ref<HTML::Window> m_window;
+    GC::Ref<DOM::Document> m_previous_document;
+    GC::Weak<SVGDecodedImageData> m_previous_current_image_data;
+    bool m_should_unsuppress_frame_requests { false };
+    bool m_is_active { true };
 };
 
 }

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/String.h>
+#include <AK/StringBuilder.h>
 #include <LibWeb/CSS/SerializationMode.h>
 #include <LibWeb/CSS/Units.h>
 #include <LibWeb/Forward.h>
@@ -19,14 +20,12 @@ public:
     static Angle make_degrees(double);
     Angle percentage_of(Percentage const&) const;
 
-    String to_string(SerializationMode = SerializationMode::Normal) const;
-
     double to_degrees() const;
     double to_radians() const;
 
     double raw_value() const { return m_value; }
     AngleUnit unit() const { return m_unit; }
-    FlyString unit_name() const { return CSS::to_string(m_unit); }
+    Utf16FlyString unit_name() const { return CSS::to_string(m_unit); }
 
     bool operator==(Angle const& other) const
     {
@@ -45,7 +44,7 @@ public:
         return 0;
     }
 
-    static Angle resolve_calculated(NonnullRefPtr<CalculatedStyleValue const> const&, Layout::Node const&, Angle const& reference_value);
+    static Angle from_style_value(NonnullRefPtr<StyleValue const> const&, Optional<Angle> percentage_basis);
 
 private:
     AngleUnit m_unit;
@@ -53,11 +52,3 @@ private:
 };
 
 }
-
-template<>
-struct AK::Formatter<Web::CSS::Angle> : Formatter<StringView> {
-    ErrorOr<void> format(FormatBuilder& builder, Web::CSS::Angle const& angle)
-    {
-        return Formatter<StringView>::format(builder, angle.to_string());
-    }
-};

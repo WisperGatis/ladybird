@@ -7,449 +7,572 @@
 #pragma once
 
 #include <AK/ByteBuffer.h>
-#include <AK/Function.h>
+#include <AK/Optional.h>
+#include <AK/Span.h>
 #include <AK/Variant.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/BigInt.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/GlobalObject.h>
 #include <LibJS/Runtime/Object.h>
 
+struct JSArrayBufferStorage;
+
 namespace JS {
 
 struct ClampedU8 {
 };
 
-// 25.1.1 Notation (read-modify-write modification function), https://tc39.es/ecma262/#sec-arraybuffer-notation
-using ReadWriteModifyFunction = Function<ByteBuffer(ByteBuffer, ByteBuffer)>;
-
-enum class PreserveResizability {
-    FixedLength,
-    PreserveResizability
-};
-
 // 6.2.9 Data Blocks, https://tc39.es/ecma262/#sec-data-blocks
+// The bytes of an ArrayBuffer live in the runtime's data block, so a DataBlock of LibJS's users describes storage: the
+// storage of LibGC's primitive storage that it owns, storage that a GC cell owns, or a shared memory object, as
+// ArrayBuffer::data_block() describes the storage of a buffer and ArrayBuffer::create(Realm&, DataBlock) hands it to
+// a new one.
 struct DataBlock {
     enum class Shared {
         No,
         Yes,
     };
 
-    struct UnownedFixedLengthByteBuffer {
-        explicit UnownedFixedLengthByteBuffer(ByteBuffer* buffer)
-            : buffer(buffer)
-            , size(buffer ? buffer->size() : 0)
+    enum class ZeroFillNewBytes {
+        No,
+        Yes,
+    };
+
+    class OwnedBackingStore {
+    public:
+        OwnedBackingStore() = default;
+        ~OwnedBackingStore()
+        {
+            if (m_owns_storage && m_handle.is_valid())
+                GC::PrimitiveStorage::the().free(m_handle);
+        }
+
+        OwnedBackingStore(OwnedBackingStore&& other)
+        {
+            move_from(move(other));
+        }
+
+        OwnedBackingStore& operator=(OwnedBackingStore&& other)
+        {
+            if (this != &other) {
+                if (m_owns_storage && m_handle.is_valid())
+                    GC::PrimitiveStorage::the().free(m_handle);
+                move_from(move(other));
+            }
+            return *this;
+        }
+
+        OwnedBackingStore(OwnedBackingStore const&) = delete;
+        OwnedBackingStore& operator=(OwnedBackingStore const&) = delete;
+
+        static ErrorOr<OwnedBackingStore> create_zeroed(size_t size)
+        {
+            OwnedBackingStore buffer;
+            if (size > 0)
+                buffer.m_handle = TRY(GC::PrimitiveStorage::the().try_allocate(size, GC::PrimitiveStorage::ZeroFillNewBytes::Yes));
+            return buffer;
+        }
+
+        static ErrorOr<OwnedBackingStore> create_uninitialized(size_t size)
+        {
+            OwnedBackingStore buffer;
+            if (size > 0)
+                buffer.m_handle = TRY(GC::PrimitiveStorage::the().try_allocate(size, GC::PrimitiveStorage::ZeroFillNewBytes::No));
+            return buffer;
+        }
+
+        static ErrorOr<OwnedBackingStore> create_zeroed_with_capacity(size_t size, size_t capacity)
+        {
+            OwnedBackingStore buffer;
+            if (capacity > 0)
+                buffer.m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(size, capacity, GC::PrimitiveStorage::ZeroFillNewBytes::Yes));
+            return buffer;
+        }
+
+        u8* data() { return GC::PrimitiveStorage::the().data(m_handle); }
+        u8 const* data() const { return GC::PrimitiveStorage::the().data(m_handle); }
+        size_t size() const { return GC::PrimitiveStorage::the().size(m_handle); }
+        size_t capacity() const { return GC::PrimitiveStorage::the().capacity(m_handle); }
+        size_t offset() const { return GC::PrimitiveStorage::the().offset(m_handle); }
+        GC::PrimitiveStorageHandle handle() const { return m_handle; }
+
+    private:
+        friend class ArrayBuffer;
+
+        // The storage of a buffer, which ArrayBuffer::data_block() describes without taking it over.
+        static OwnedBackingStore describing_storage_of_an_array_buffer(GC::PrimitiveStorageHandle handle)
+        {
+            OwnedBackingStore buffer;
+            buffer.m_handle = handle;
+            buffer.m_owns_storage = false;
+            return buffer;
+        }
+
+        static OwnedBackingStore taking_over(GC::PrimitiveStorageHandle handle)
+        {
+            OwnedBackingStore buffer;
+            buffer.m_handle = handle;
+            return buffer;
+        }
+
+        GC::PrimitiveStorageHandle give_up_storage()
+        {
+            VERIFY(m_owns_storage);
+            return exchange(m_handle, {});
+        }
+
+        void move_from(OwnedBackingStore&& other)
+        {
+            m_handle = exchange(other.m_handle, {});
+            m_owns_storage = exchange(other.m_owns_storage, true);
+        }
+
+        GC::PrimitiveStorageHandle m_handle;
+        bool m_owns_storage { true };
+    };
+
+    struct DynamicPrimitiveStorageSize {
+    };
+
+    // AD-HOC: ECMA-262 models ArrayBuffer backing storage as a Data Block. We additionally allow
+    //         host code to provide an external caged primitive store, so engine-independent
+    //         consumers like LibWeb can project spec-defined host objects onto ArrayBuffer without
+    //         teaching LibJS about those hosts.
+    struct ExternalPrimitiveStorage {
+        explicit ExternalPrimitiveStorage(GC::Ref<GC::Cell> owner, GC::PrimitiveStorageHandle handle)
+            : handle(handle)
+            , size(DynamicPrimitiveStorageSize {})
+            , owner(owner)
         {
         }
 
-        ByteBuffer* buffer = nullptr;
-        size_t size = 0;
+        explicit ExternalPrimitiveStorage(GC::Ref<GC::Cell> owner, GC::PrimitiveStorageHandle handle, size_t fixed_size)
+            : handle(handle)
+            , size(fixed_size)
+            , owner(owner)
+        {
+        }
+
+        u8* data() { return GC::PrimitiveStorage::the().data(handle); }
+        u8 const* data() const { return GC::PrimitiveStorage::the().data(handle); }
+        size_t byte_length() const
+        {
+            return size.visit(
+                [&](DynamicPrimitiveStorageSize) { return GC::PrimitiveStorage::the().size(handle); },
+                [](size_t fixed_size) { return fixed_size; });
+        }
+        size_t capacity() const { return GC::PrimitiveStorage::the().capacity(handle); }
+        size_t offset() const { return GC::PrimitiveStorage::the().offset(handle); }
+
+        GC::PrimitiveStorageHandle handle;
+        Variant<DynamicPrimitiveStorageSize, size_t> size;
+        GC::Ref<GC::Cell> owner;
     };
 
-    ByteBuffer& buffer()
+    // AD-HOC: Backs a shared, fixed-length Data Block with cross-process shared memory, so a SharedArrayBuffer can be
+    //         genuinely shared (not copied) across agents in different processes. object_id names the shared object
+    //         in every agent that maps it, and is 0 for an object without one. The runtime maps the object into the
+    //         primitive storage cage when a buffer is created over it.
+    struct SharedBackingStore {
+        explicit SharedBackingStore(Core::AnonymousBuffer buffer, u64 object_id = 0)
+            : buffer(move(buffer))
+            , object_id(object_id)
+        {
+        }
+
+        SharedBackingStore(SharedBackingStore&& other)
+            : buffer(move(other.buffer))
+            , object_id(exchange(other.object_id, 0))
+        {
+        }
+
+        SharedBackingStore& operator=(SharedBackingStore&& other)
+        {
+            if (this != &other) {
+                buffer = move(other.buffer);
+                object_id = exchange(other.object_id, 0);
+            }
+            return *this;
+        }
+
+        SharedBackingStore(SharedBackingStore const&) = delete;
+        SharedBackingStore& operator=(SharedBackingStore const&) = delete;
+
+        u8* data() { return buffer.data<u8>(); }
+        u8 const* data() const { return buffer.data<u8>(); }
+        size_t size() const { return buffer.size(); }
+
+        Core::AnonymousBuffer buffer;
+        u64 object_id { 0 };
+    };
+
+    u8* data_at(size_t byte_offset)
     {
         return byte_buffer.visit(
-            [&](Empty) -> ByteBuffer& { VERIFY_NOT_REACHED(); },
-            [&](ByteBuffer& value) -> ByteBuffer& { return value; },
-            [&](UnownedFixedLengthByteBuffer& value) -> ByteBuffer& { return *value.buffer; });
+            [](Empty) -> u8* { VERIFY_NOT_REACHED(); },
+            [byte_offset](OwnedBackingStore& value) -> u8* {
+                if (!value.handle().is_valid()) {
+                    VERIFY(byte_offset == 0);
+                    return nullptr;
+                }
+                return GC::PrimitiveStorage::the().data(value.handle(), byte_offset);
+            },
+            [byte_offset](ExternalPrimitiveStorage& value) -> u8* { return GC::PrimitiveStorage::the().data(value.handle, byte_offset); },
+            [byte_offset](SharedBackingStore& value) -> u8* { return value.data() + byte_offset; });
     }
-    ByteBuffer const& buffer() const { return const_cast<DataBlock*>(this)->buffer(); }
+    u8 const* data_at(size_t byte_offset) const { return const_cast<DataBlock*>(this)->data_at(byte_offset); }
+
+    void copy_to(size_t offset, Bytes destination) const
+    {
+        VERIFY(offset <= size());
+        VERIFY(destination.size() <= size() - offset);
+        if (!destination.is_empty())
+            __builtin_memcpy(destination.data(), data_at(offset), destination.size());
+    }
+
+    ErrorOr<ByteBuffer> copy_to_byte_buffer(size_t offset, size_t count) const
+    {
+        VERIFY(offset <= size());
+        VERIFY(count <= size() - offset);
+
+        auto destination = TRY(ByteBuffer::create_uninitialized(count));
+        copy_to(offset, destination);
+        return destination;
+    }
+
+    ErrorOr<ByteBuffer> copy_to_byte_buffer() const
+    {
+        return copy_to_byte_buffer(0, size());
+    }
+
+    template<typename Callback>
+    decltype(auto) with_readonly_bytes(size_t offset, size_t count, Callback callback) const
+    {
+        VERIFY(offset <= size());
+        VERIFY(count <= size() - offset);
+
+        if (count == 0)
+            return callback({});
+
+        // AD-HOC: Never hand out a pointer into a Shared Data Block. Another agent may write to those bytes at any
+        //         time, so the consumer gets a snapshot of them instead.
+        if (is_shared == Shared::No)
+            return callback({ data_at(offset), count });
+
+        auto storage = MUST(copy_to_byte_buffer(offset, count));
+        return callback(storage.bytes());
+    }
+
+    void overwrite(size_t offset, void const* source, size_t count)
+    {
+        VERIFY(offset <= size());
+        VERIFY(count <= size() - offset);
+        if (count > 0)
+            __builtin_memcpy(data_at(offset), source, count);
+    }
 
     size_t size() const
     {
         return byte_buffer.visit(
             [](Empty) -> size_t { return 0u; },
-            [](ByteBuffer const& buffer) { return buffer.size(); },
-            [](UnownedFixedLengthByteBuffer const& value) { return value.size; });
+            [](OwnedBackingStore const& buffer) { return buffer.size(); },
+            [](ExternalPrimitiveStorage const& value) { return value.byte_length(); },
+            [](SharedBackingStore const& value) { return value.size(); });
     }
 
-    Variant<Empty, ByteBuffer, UnownedFixedLengthByteBuffer> byte_buffer;
+    bool is_external() const { return byte_buffer.has<ExternalPrimitiveStorage>(); }
+    bool is_cross_process_shared() const { return byte_buffer.has<SharedBackingStore>(); }
+
+    Optional<Core::AnonymousBuffer> shared_anonymous_buffer() const
+    {
+        if (auto const* shared = byte_buffer.get_pointer<SharedBackingStore>())
+            return shared->buffer;
+        return {};
+    }
+
+    u64 shared_object_id() const
+    {
+        if (auto const* shared = byte_buffer.get_pointer<SharedBackingStore>())
+            return shared->object_id;
+        return 0;
+    }
+
+    Variant<Empty, OwnedBackingStore, ExternalPrimitiveStorage, SharedBackingStore> byte_buffer;
     Shared is_shared = { Shared::No };
 };
 
-class JS_API ArrayBuffer : public Object {
-    JS_OBJECT(ArrayBuffer, Object);
-    GC_DECLARE_ALLOCATOR(ArrayBuffer);
-
+// An ArrayBuffer or a SharedArrayBuffer of the Rust runtime, whose data block the runtime keeps.
+//
+// The members that make or take a DataBlock are defined in this header, over out-of-line members that describe the
+// storage in plain values, because a DataBlock can hold a Core::AnonymousBuffer, and LibJS links LibCore privately.
+class JS_API ArrayBuffer final : public Object {
 public:
+    static bool is_engine_class_of(Object const& object) { return object.engine_class_id() == JS_LAYOUT_CLASS_ID_ARRAY_BUFFER; }
+
     static ThrowCompletionOr<GC::Ref<ArrayBuffer>> create(Realm&, size_t, DataBlock::Shared = DataBlock::Shared::No);
     static GC::Ref<ArrayBuffer> create(Realm&, ByteBuffer, DataBlock::Shared = DataBlock::Shared::No);
-    static GC::Ref<ArrayBuffer> create(Realm&, ByteBuffer*, DataBlock::Shared = DataBlock::Shared::No);
+    static GC::Ref<ArrayBuffer> create(Realm&, DataBlock);
+    static GC::Ref<ArrayBuffer> create(Realm&, Core::AnonymousBuffer, u64 shared_object_id);
 
-    virtual ~ArrayBuffer() override = default;
-
-    size_t byte_length() const { return m_data_block.size(); }
+    size_t byte_length() const;
 
     // [[ArrayBufferData]]
-    ByteBuffer& buffer() { return m_data_block.buffer(); }
-    ByteBuffer const& buffer() const { return m_data_block.buffer(); }
+    u8* data_at(size_t byte_index) { return bytes_from(byte_index).data(); }
+    u8 const* data_at(size_t byte_index) const { return bytes_from(byte_index).data(); }
+    void copy_to(size_t offset, Bytes destination) const;
+    ErrorOr<ByteBuffer> copy_to_byte_buffer(size_t offset, size_t count) const;
+    ErrorOr<ByteBuffer> copy_to_byte_buffer() const;
+    Optional<Core::AnonymousBuffer> shared_buffer() const;
+    u64 shared_object_id() const;
+    template<typename Callback>
+    decltype(auto) with_readonly_bytes(size_t offset, size_t count, Callback callback) const;
+    void copy_data_to(ArrayBuffer& destination, size_t source_offset, size_t destination_offset, size_t count) const;
+    void copy_data_to(DataBlock& destination, size_t source_offset, size_t destination_offset, size_t count) const;
+    void overwrite(size_t offset, void const* source, size_t count);
+
+    // A description of the storage of the buffer's data block, which stays the buffer's. It is const so that it cannot
+    // be moved into another buffer.
+    DataBlock const data_block() const;
+
+    // Detaches this ArrayBuffer and returns its underlying DataBlock for use in a TransferArrayBuffer-like operation.
+    // If detach fails, the underlying storage is left untouched.
+    ThrowCompletionOr<DataBlock> detach_and_take_data_block(VM&);
 
     // [[ArrayBufferMaxByteLength]]
-    size_t max_byte_length() const { return m_max_byte_length.value(); }
-    void set_max_byte_length(size_t max_byte_length) { m_max_byte_length = max_byte_length; }
+    size_t max_byte_length() const;
+    void set_max_byte_length(size_t max_byte_length);
 
-    // Used by allocate_array_buffer() to attach the data block after construction
-    void set_data_block(DataBlock block) { m_data_block = move(block); }
+    // Only to storage that a GC cell owns, as WebAssembly.Memory refreshes its buffers.
+    void set_data_block(DataBlock);
 
-    Value detach_key() const { return m_detach_key; }
-    void set_detach_key(Value detach_key) { m_detach_key = detach_key; }
-
-    void detach_buffer() { m_data_block.byte_buffer = Empty {}; }
+    Value detach_key() const;
+    void set_detach_key(Value detach_key);
 
     // 25.1.3.4 IsDetachedBuffer ( arrayBuffer ), https://tc39.es/ecma262/#sec-isdetachedbuffer
-    bool is_detached() const
-    {
-        // 1. If arrayBuffer.[[ArrayBufferData]] is null, return true.
-        if (m_data_block.byte_buffer.has<Empty>())
-            return true;
-        // 2. Return false.
-        return false;
-    }
+    bool is_detached() const;
 
     // 25.1.3.9 IsFixedLengthArrayBuffer ( arrayBuffer ), https://tc39.es/ecma262/#sec-isfixedlengtharraybuffer
-    bool is_fixed_length() const
-    {
-        // 1. If arrayBuffer has an [[ArrayBufferMaxByteLength]] internal slot, return false.
-        if (m_max_byte_length.has_value())
-            return false;
-
-        // 2. Return true.
-        return true;
-    }
+    bool is_fixed_length() const;
 
     // 25.2.2.2 IsSharedArrayBuffer ( obj ), https://tc39.es/ecma262/#sec-issharedarraybuffer
-    bool is_shared_array_buffer() const
-    {
-        // 1. Let bufferData be obj.[[ArrayBufferData]].
-        // 2. If bufferData is null, return false.
-        if (m_data_block.byte_buffer.has<Empty>())
-            return false;
-        // 3. If bufferData is a Data Block, return false.
-        if (m_data_block.is_shared == DataBlock::Shared::No)
-            return false;
-        // 4. Assert: bufferData is a Shared Data Block.
-        VERIFY(m_data_block.is_shared == DataBlock::Shared::Yes);
-        // 5. Return true.
-        return true;
-    }
+    bool is_shared_array_buffer() const;
 
     enum Order {
         SeqCst,
         Unordered
     };
+
+    // 25.1.3.16 GetValueFromBuffer ( arrayBuffer, byteIndex, type, isTypedArray, order [ , isLittleEndian ] ), https://tc39.es/ecma262/#sec-getvaluefrombuffer
     template<typename type>
-    Value get_value(size_t byte_index, bool is_typed_array, Order, bool is_little_endian = true);
-    template<typename type>
-    void set_value(size_t byte_index, Value value, bool is_typed_array, Order, bool is_little_endian = true);
-    template<typename T>
-    Value get_modify_set_value(size_t byte_index, Value value, ReadWriteModifyFunction operation, bool is_little_endian = true);
+    Value get_value(size_t byte_index, bool is_typed_array, Order order, bool is_little_endian = true)
+    {
+        return get_value_of_element_type(element_type_of<type>(), byte_index, is_typed_array, order, is_little_endian);
+    }
 
 private:
-    ArrayBuffer(ByteBuffer buffer, DataBlock::Shared, Object& prototype);
-    ArrayBuffer(ByteBuffer* buffer, DataBlock::Shared, Object& prototype);
+    // The element types of Table 71, in the order of JS_ENUMERATE_TYPED_ARRAYS.
+    enum class ElementType : u8 {
+        Uint8,
+        Uint8Clamped,
+        Uint16,
+        Uint32,
+        BigUint64,
+        Int8,
+        Int16,
+        Int32,
+        BigInt64,
+        Float16,
+        Float32,
+        Float64,
+    };
 
-    virtual void visit_edges(Visitor&) override;
+    template<typename T>
+    static constexpr ElementType element_type_of()
+    {
+        if constexpr (IsSame<T, ClampedU8>)
+            return ElementType::Uint8Clamped;
+        else if constexpr (IsSame<T, u8>)
+            return ElementType::Uint8;
+        else if constexpr (IsSame<T, u16>)
+            return ElementType::Uint16;
+        else if constexpr (IsSame<T, u32>)
+            return ElementType::Uint32;
+        else if constexpr (IsSame<T, u64>)
+            return ElementType::BigUint64;
+        else if constexpr (IsSame<T, i8>)
+            return ElementType::Int8;
+        else if constexpr (IsSame<T, i16>)
+            return ElementType::Int16;
+        else if constexpr (IsSame<T, i32>)
+            return ElementType::Int32;
+        else if constexpr (IsSame<T, i64>)
+            return ElementType::BigInt64;
+        else if constexpr (IsSame<T, f16>)
+            return ElementType::Float16;
+        else if constexpr (IsSame<T, float>)
+            return ElementType::Float32;
+        else if constexpr (IsSame<T, double>)
+            return ElementType::Float64;
+        else
+            static_assert(DependentFalse<T>, "Not an element type of a buffer");
+    }
 
-    DataBlock m_data_block;
-    Optional<size_t> m_max_byte_length;
+    Value get_value_of_element_type(ElementType, size_t byte_index, bool is_typed_array, Order, bool is_little_endian);
 
-    // The various detach related members of ArrayBuffer are not used by any ECMA262 functionality,
-    // but are required to be available for the use of various harnesses like the Test262 test runner.
-    Value m_detach_key;
+    // The bytes of the data block from `byte_index` on, with a null pointer for a block without bytes.
+    Bytes bytes_from(size_t byte_index) const;
+
+    enum class StorageKind : u8 {
+        Detached,
+        Owned,
+        External,
+        SharedMemory,
+    };
+
+    // The storage of a data block in plain values. A description of the storage of a buffer comes with a duplicate of
+    // the descriptor of its shared memory object, which the receiver owns.
+    struct StorageDescription {
+        StorageKind kind { StorageKind::Detached };
+        DataBlock::Shared is_shared { DataBlock::Shared::No };
+        GC::PrimitiveStorageHandle handle;
+        GC::Ptr<GC::Cell> external_owner;
+        Optional<size_t> external_fixed_byte_length;
+        int shared_memory_fd { -1 };
+        size_t shared_memory_byte_length { 0 };
+        u64 shared_memory_object_id { 0 };
+    };
+
+    enum class OwnedStorageGoesToTheBlock {
+        No,
+        Yes,
+    };
+    static DataBlock data_block_from(StorageDescription const&, OwnedStorageGoesToTheBlock);
+
+    static StorageDescription storage_description_from_abi(JSArrayBufferStorage const&);
+    StorageDescription describe_storage() const;
+    ThrowCompletionOr<StorageDescription> detach_and_take_storage(VM&);
+
+    static GC::Ref<ArrayBuffer> create_taking_over_storage(Realm&, GC::PrimitiveStorageHandle, DataBlock::Shared);
+    static GC::Ref<ArrayBuffer> create_over_external_storage(Realm&, DataBlock::ExternalPrimitiveStorage const&, DataBlock::Shared);
+    static GC::Ptr<ArrayBuffer> create_over_shared_memory(Realm&, int shared_memory_fd, size_t byte_length, u64 shared_object_id);
+    static GC::Ref<ArrayBuffer> create_detached(Realm&);
+    void set_external_storage(DataBlock::ExternalPrimitiveStorage const&, DataBlock::Shared);
 };
 
-JS_API ThrowCompletionOr<DataBlock> create_byte_data_block(VM& vm, size_t size);
-JS_API void copy_data_block_bytes(ByteBuffer& to_block, u64 to_index, ByteBuffer const& from_block, u64 from_index, u64 count);
-ThrowCompletionOr<ArrayBuffer*> allocate_array_buffer(VM&, FunctionObject& constructor, size_t byte_length, Optional<size_t> const& max_byte_length = {});
-ThrowCompletionOr<ArrayBuffer*> array_buffer_copy_and_detach(VM&, ArrayBuffer& array_buffer, Value new_length, PreserveResizability preserve_resizability);
+inline DataBlock ArrayBuffer::data_block_from(StorageDescription const& storage, OwnedStorageGoesToTheBlock owned_storage_goes_to_the_block)
+{
+    switch (storage.kind) {
+    case StorageKind::Detached:
+        return DataBlock { Empty {}, storage.is_shared };
+    case StorageKind::Owned:
+        if (owned_storage_goes_to_the_block == OwnedStorageGoesToTheBlock::Yes)
+            return DataBlock { DataBlock::OwnedBackingStore::taking_over(storage.handle), storage.is_shared };
+        return DataBlock { DataBlock::OwnedBackingStore::describing_storage_of_an_array_buffer(storage.handle), storage.is_shared };
+    case StorageKind::External:
+        if (storage.external_fixed_byte_length.has_value())
+            return DataBlock { DataBlock::ExternalPrimitiveStorage { *storage.external_owner, storage.handle, *storage.external_fixed_byte_length }, storage.is_shared };
+        return DataBlock { DataBlock::ExternalPrimitiveStorage { *storage.external_owner, storage.handle }, storage.is_shared };
+    case StorageKind::SharedMemory: {
+        auto shared_memory = MUST(Core::AnonymousBuffer::create_from_anon_fd(storage.shared_memory_fd, storage.shared_memory_byte_length));
+        return DataBlock { DataBlock::SharedBackingStore { move(shared_memory), storage.shared_memory_object_id }, DataBlock::Shared::Yes };
+    }
+    }
+    VERIFY_NOT_REACHED();
+}
+
+inline GC::Ref<ArrayBuffer> ArrayBuffer::create(Realm& realm, DataBlock block)
+{
+    return block.byte_buffer.visit(
+        [&](Empty) {
+            VERIFY(block.is_shared == DataBlock::Shared::No);
+            return create_detached(realm);
+        },
+        [&](DataBlock::OwnedBackingStore& owned) {
+            return create_taking_over_storage(realm, owned.give_up_storage(), block.is_shared);
+        },
+        [&](DataBlock::ExternalPrimitiveStorage const& external) {
+            return create_over_external_storage(realm, external, block.is_shared);
+        },
+        [&](DataBlock::SharedBackingStore const& shared) {
+            VERIFY(block.is_shared == DataBlock::Shared::Yes);
+            return create(realm, shared.buffer, shared.object_id);
+        });
+}
+
+inline GC::Ref<ArrayBuffer> ArrayBuffer::create(Realm& realm, Core::AnonymousBuffer shared_memory, u64 shared_object_id)
+{
+    if (auto buffer = create_over_shared_memory(realm, shared_memory.fd(), shared_memory.size(), shared_object_id))
+        return *buffer;
+
+    // The runtime cannot map the object into the primitive storage cage, where the bytes of every buffer live, so the
+    // buffer gets a copy of its bytes instead. A buffer of no bytes has none to share.
+    auto bytes = shared_memory.size() > 0 ? MUST(ByteBuffer::copy(shared_memory.data<u8>(), shared_memory.size())) : ByteBuffer {};
+    return create(realm, move(bytes), DataBlock::Shared::Yes);
+}
+
+inline Optional<Core::AnonymousBuffer> ArrayBuffer::shared_buffer() const
+{
+    auto storage = describe_storage();
+    if (storage.kind != StorageKind::SharedMemory)
+        return {};
+    return MUST(Core::AnonymousBuffer::create_from_anon_fd(storage.shared_memory_fd, storage.shared_memory_byte_length));
+}
+
+inline DataBlock const ArrayBuffer::data_block() const
+{
+    return data_block_from(describe_storage(), OwnedStorageGoesToTheBlock::No);
+}
+
+inline ThrowCompletionOr<DataBlock> ArrayBuffer::detach_and_take_data_block(VM& vm)
+{
+    auto storage = TRY(detach_and_take_storage(vm));
+    return data_block_from(storage, OwnedStorageGoesToTheBlock::Yes);
+}
+
+inline void ArrayBuffer::set_data_block(DataBlock block)
+{
+    auto const* external = block.byte_buffer.get_pointer<DataBlock::ExternalPrimitiveStorage>();
+    VERIFY(external);
+    set_external_storage(*external, block.is_shared);
+}
+
+template<typename Callback>
+decltype(auto) ArrayBuffer::with_readonly_bytes(size_t offset, size_t count, Callback callback) const
+{
+    auto bytes = bytes_from(0);
+    VERIFY(offset <= bytes.size());
+    VERIFY(count <= bytes.size() - offset);
+
+    if (count == 0)
+        return callback({});
+
+    // AD-HOC: Never hand out a pointer into a Shared Data Block. Another agent may write to those bytes at any time, so
+    //         the consumer gets a snapshot of them instead.
+    if (!is_shared_array_buffer())
+        return callback(ReadonlyBytes { bytes.slice(offset, count) });
+
+    auto storage = MUST(ByteBuffer::copy(bytes.slice(offset, count)));
+    return callback(storage.bytes());
+}
+
+namespace Detail {
+
+// The zeroed bytes of CreateByteDataBlock, or the RangeError it throws.
+JS_API ThrowCompletionOr<DataBlock::OwnedBackingStore> allocate_zeroed_storage_for_byte_data_block(VM&, size_t size, Optional<size_t> capacity);
+
+}
+
+// 6.2.9.1 CreateByteDataBlock ( size ), https://tc39.es/ecma262/#sec-createbytedatablock
+inline ThrowCompletionOr<DataBlock> create_byte_data_block(VM& vm, size_t size, Optional<size_t> capacity = {})
+{
+    auto owned_backing_store = TRY(Detail::allocate_zeroed_storage_for_byte_data_block(vm, size, capacity));
+    return DataBlock { move(owned_backing_store), DataBlock::Shared::No };
+}
+
 JS_API ThrowCompletionOr<void> detach_array_buffer(VM&, ArrayBuffer& array_buffer, Optional<Value> key = {});
-ThrowCompletionOr<Optional<size_t>> get_array_buffer_max_byte_length_option(VM&, Value options);
 JS_API ThrowCompletionOr<ArrayBuffer*> clone_array_buffer(VM&, ArrayBuffer& source_buffer, size_t source_byte_offset, size_t source_length);
-JS_API ThrowCompletionOr<GC::Ref<ArrayBuffer>> allocate_shared_array_buffer(VM&, FunctionObject& constructor, size_t byte_length);
-
-// 25.1.3.2 ArrayBufferByteLength ( arrayBuffer, order ), https://tc39.es/ecma262/#sec-arraybufferbytelength
-inline size_t array_buffer_byte_length(ArrayBuffer const& array_buffer, ArrayBuffer::Order)
-{
-    // FIXME: 1. If IsSharedArrayBuffer(arrayBuffer) is true and arrayBuffer has an [[ArrayBufferByteLengthData]] internal slot, then
-    // FIXME:     a. Let bufferByteLengthBlock be arrayBuffer.[[ArrayBufferByteLengthData]].
-    // FIXME:     b. Let rawLength be GetRawBytesFromSharedBlock(bufferByteLengthBlock, 0, biguint64, true, order).
-    // FIXME:     c. Let isLittleEndian be the value of the [[LittleEndian]] field of the surrounding agent's Agent Record.
-    // FIXME:     d. Return ℝ(RawBytesToNumeric(biguint64, rawLength, isLittleEndian)).
-
-    // 2. Assert: IsDetachedBuffer(arrayBuffer) is false.
-    VERIFY(!array_buffer.is_detached());
-
-    // 3. Return arrayBuffer.[[ArrayBufferByteLength]].
-    return array_buffer.byte_length();
-}
-
-// 25.1.3.14 RawBytesToNumeric ( type, rawBytes, isLittleEndian ), https://tc39.es/ecma262/#sec-rawbytestonumeric
-template<typename T>
-static Value raw_bytes_to_numeric(VM& vm, Bytes raw_value, bool is_little_endian)
-{
-    // 1. Let elementSize be the Element Size value specified in Table 70 for Element Type type.
-    //    NOTE: Used in step 7, but not needed with our implementation of that step.
-
-    // 2. If isLittleEndian is false, reverse the order of the elements of rawBytes.
-    if (!is_little_endian) {
-        VERIFY(raw_value.size() % 2 == 0);
-        for (size_t i = 0; i < raw_value.size() / 2; ++i)
-            swap(raw_value[i], raw_value[raw_value.size() - 1 - i]);
-    }
-
-    using UnderlyingBufferDataType = Conditional<IsSame<ClampedU8, T>, u8, T>;
-
-    // 3. If type is Float16, then
-    if constexpr (IsSame<UnderlyingBufferDataType, f16>) {
-        // a. Let value be the byte elements of rawBytes concatenated and interpreted as a little-endian bit string encoding of an IEEE 754-2019 binary16 value.
-        f16 value;
-        raw_value.copy_to({ &value, sizeof(f16) });
-
-        // b. If value is an IEEE 754-2019 binary16 NaN value, return the NaN Number value.
-        if (isnan(static_cast<double>(value)))
-            return js_nan();
-
-        // c. Return the Number value that corresponds to value.
-        return Value(value);
-    }
-
-    // 4. If type is Float32, then
-    if constexpr (IsSame<UnderlyingBufferDataType, float>) {
-        // a. Let value be the byte elements of rawBytes concatenated and interpreted as a little-endian bit string encoding of an IEEE 754-2019 binary32 value.
-        float value;
-        raw_value.copy_to({ &value, sizeof(float) });
-
-        // b. If value is an IEEE 754-2019 binary32 NaN value, return the NaN Number value.
-        if (isnan(value))
-            return js_nan();
-
-        // c. Return the Number value that corresponds to value.
-        return Value(value);
-    }
-
-    // 5. If type is Float64, then
-    if constexpr (IsSame<UnderlyingBufferDataType, double>) {
-        // a. Let value be the byte elements of rawBytes concatenated and interpreted as a little-endian bit string encoding of an IEEE 754-2019 binary64 value.
-        double value;
-        raw_value.copy_to({ &value, sizeof(double) });
-
-        // b. If value is an IEEE 754-2019 binary64 NaN value, return the NaN Number value.
-        if (isnan(value))
-            return js_nan();
-
-        // c. Return the Number value that corresponds to value.
-        return Value(value);
-    }
-
-    // NOTE: Not in spec, sanity check for steps below.
-    if constexpr (!IsIntegral<UnderlyingBufferDataType>)
-        VERIFY_NOT_REACHED();
-
-    // 6. If IsUnsignedElementType(type) is true, then
-    //     a. Let intValue be the byte elements of rawBytes concatenated and interpreted as a bit string encoding of an unsigned little-endian binary number.
-    // 7. Else,
-    //     a. Let intValue be the byte elements of rawBytes concatenated and interpreted as a bit string encoding of a binary little-endian two's complement number of bit length elementSize × 8.
-    //
-    // NOTE: The signed/unsigned logic above is implemented in step 7 by the IsSigned<> check, and in step 8 by JS::Value constructor overloads.
-    UnderlyingBufferDataType int_value = 0;
-    raw_value.copy_to({ &int_value, sizeof(UnderlyingBufferDataType) });
-
-    // 8. If IsBigIntElementType(type) is true, return the BigInt value that corresponds to intValue.
-    if constexpr (sizeof(UnderlyingBufferDataType) == 8) {
-        if constexpr (IsSigned<UnderlyingBufferDataType>) {
-            static_assert(IsSame<UnderlyingBufferDataType, i64>);
-            return BigInt::create(vm, Crypto::SignedBigInteger { int_value });
-        } else {
-            static_assert(IsOneOf<UnderlyingBufferDataType, u64, double>);
-            return BigInt::create(vm, Crypto::SignedBigInteger { Crypto::UnsignedBigInteger { int_value } });
-        }
-    }
-    // 9. Otherwise, return the Number value that corresponds to intValue.
-    else {
-        return Value(int_value);
-    }
-}
-
-// 25.1.3.16 GetValueFromBuffer ( arrayBuffer, byteIndex, type, isTypedArray, order [ , isLittleEndian ] ), https://tc39.es/ecma262/#sec-getvaluefrombuffer
-template<typename T>
-Value ArrayBuffer::get_value(size_t byte_index, [[maybe_unused]] bool is_typed_array, Order, bool is_little_endian)
-{
-    auto& vm = this->vm();
-    // 1. Assert: IsDetachedBuffer(arrayBuffer) is false.
-    VERIFY(!is_detached());
-
-    // 2. Assert: There are sufficient bytes in arrayBuffer starting at byteIndex to represent a value of type.
-    VERIFY(m_data_block.buffer().bytes().slice(byte_index).size() >= sizeof(T));
-
-    // 3. Let block be arrayBuffer.[[ArrayBufferData]].
-    auto& block = m_data_block.buffer();
-
-    // 4. Let elementSize be the Element Size value specified in Table 70 for Element Type type.
-    auto element_size = sizeof(T);
-
-    AK::Array<u8, sizeof(T)> raw_value {};
-
-    // FIXME: 5. If IsSharedArrayBuffer(arrayBuffer) is true, then
-    if (false) {
-        // FIXME: a. Let execution be the [[CandidateExecution]] field of the surrounding agent's Agent Record.
-        // FIXME: b. Let eventsRecord be the Agent Events Record of execution.[[EventsRecords]] whose [[AgentSignifier]] is AgentSignifier().
-        // FIXME: c. If isTypedArray is true and IsNoTearConfiguration(type, order) is true, let noTear be true; otherwise let noTear be false.
-        // FIXME: d. Let rawValue be a List of length elementSize whose elements are nondeterministically chosen byte values.
-        // FIXME: e. NOTE: In implementations, rawValue is the result of a non-atomic or atomic read instruction on the underlying hardware. The nondeterminism is a semantic prescription of the memory model to describe observable behaviour of hardware with weak consistency.
-        // FIXME: f. Let readEvent be ReadSharedMemory { [[Order]]: order, [[NoTear]]: noTear, [[Block]]: block, [[ByteIndex]]: byteIndex, [[ElementSize]]: elementSize }.
-        // FIXME: g. Append readEvent to eventsRecord.[[EventList]].
-        // FIXME: h. Append Chosen Value Record { [[Event]]: readEvent, [[ChosenValue]]: rawValue } to execution.[[ChosenValues]].
-    }
-    // 6. Else,
-    else {
-        // a. Let rawValue be a List whose elements are bytes from block at indices in the interval from byteIndex (inclusive) to byteIndex + elementSize (exclusive).
-        block.bytes().slice(byte_index, element_size).copy_to(raw_value);
-    }
-
-    // 7. Assert: The number of elements in rawValue is elementSize.
-    VERIFY(raw_value.size() == element_size);
-
-    // 8. If isLittleEndian is not present, set isLittleEndian to the value of the [[LittleEndian]] field of the surrounding agent's Agent Record.
-    //    NOTE: Done by default parameter at declaration of this function.
-
-    // 9. Return RawBytesToNumeric(type, rawValue, isLittleEndian).
-    return raw_bytes_to_numeric<T>(vm, raw_value, is_little_endian);
-}
-
-// 25.1.3.17 NumericToRawBytes ( type, value, isLittleEndian ), https://tc39.es/ecma262/#sec-numerictorawbytes
-template<typename T>
-static void numeric_to_raw_bytes(VM& vm, Value value, bool is_little_endian, Bytes raw_bytes)
-{
-    VERIFY(value.is_number() || value.is_bigint());
-    using UnderlyingBufferDataType = Conditional<IsSame<ClampedU8, T>, u8, T>;
-    VERIFY(raw_bytes.size() == sizeof(UnderlyingBufferDataType));
-    auto flip_if_needed = [&]() {
-        if (is_little_endian)
-            return;
-        VERIFY(sizeof(UnderlyingBufferDataType) % 2 == 0);
-        for (size_t i = 0; i < sizeof(UnderlyingBufferDataType) / 2; ++i)
-            swap(raw_bytes[i], raw_bytes[sizeof(UnderlyingBufferDataType) - 1 - i]);
-    };
-    if constexpr (IsSame<UnderlyingBufferDataType, f16>) {
-        auto raw_value = static_cast<f16>(MUST(value.to_double(vm)));
-        ReadonlyBytes { &raw_value, sizeof(f16) }.copy_to(raw_bytes);
-        flip_if_needed();
-        return;
-    }
-    if constexpr (IsSame<UnderlyingBufferDataType, float>) {
-        float raw_value = MUST(value.to_double(vm));
-        ReadonlyBytes { &raw_value, sizeof(float) }.copy_to(raw_bytes);
-        flip_if_needed();
-        return;
-    }
-    if constexpr (IsSame<UnderlyingBufferDataType, double>) {
-        double raw_value = MUST(value.to_double(vm));
-        ReadonlyBytes { &raw_value, sizeof(double) }.copy_to(raw_bytes);
-        flip_if_needed();
-        return;
-    }
-    if constexpr (!IsIntegral<UnderlyingBufferDataType>)
-        VERIFY_NOT_REACHED();
-    if constexpr (sizeof(UnderlyingBufferDataType) == 8) {
-        UnderlyingBufferDataType int_value;
-
-        if constexpr (IsSigned<UnderlyingBufferDataType>)
-            int_value = MUST(value.to_bigint_int64(vm));
-        else
-            int_value = MUST(value.to_bigint_uint64(vm));
-
-        ReadonlyBytes { &int_value, sizeof(UnderlyingBufferDataType) }.copy_to(raw_bytes);
-        flip_if_needed();
-        return;
-    } else {
-        UnderlyingBufferDataType int_value;
-        if constexpr (IsSigned<UnderlyingBufferDataType>) {
-            if constexpr (sizeof(UnderlyingBufferDataType) == 4)
-                int_value = MUST(value.to_i32(vm));
-            else if constexpr (sizeof(UnderlyingBufferDataType) == 2)
-                int_value = MUST(value.to_i16(vm));
-            else
-                int_value = MUST(value.to_i8(vm));
-        } else {
-            if constexpr (sizeof(UnderlyingBufferDataType) == 4)
-                int_value = MUST(value.to_u32(vm));
-            else if constexpr (sizeof(UnderlyingBufferDataType) == 2)
-                int_value = MUST(value.to_u16(vm));
-            else if constexpr (!IsSame<T, ClampedU8>)
-                int_value = MUST(value.to_u8(vm));
-            else
-                int_value = MUST(value.to_u8_clamp(vm));
-        }
-        ReadonlyBytes { &int_value, sizeof(UnderlyingBufferDataType) }.copy_to(raw_bytes);
-        if constexpr (sizeof(UnderlyingBufferDataType) % 2 == 0)
-            flip_if_needed();
-        return;
-    }
-}
-
-// 25.1.3.18 SetValueInBuffer ( arrayBuffer, byteIndex, type, value, isTypedArray, order [ , isLittleEndian ] ), https://tc39.es/ecma262/#sec-setvalueinbuffer
-template<typename T>
-void ArrayBuffer::set_value(size_t byte_index, Value value, [[maybe_unused]] bool is_typed_array, Order, bool is_little_endian)
-{
-    auto& vm = this->vm();
-
-    // 1. Assert: IsDetachedBuffer(arrayBuffer) is false.
-    VERIFY(!is_detached());
-
-    // 2. Assert: There are sufficient bytes in arrayBuffer starting at byteIndex to represent a value of type.
-    VERIFY(m_data_block.buffer().bytes().slice(byte_index).size() >= sizeof(T));
-
-    // 3. Assert: value is a BigInt if IsBigIntElementType(type) is true; otherwise, value is a Number.
-    if constexpr (IsIntegral<T> && sizeof(T) == 8)
-        VERIFY(value.is_bigint());
-    else
-        VERIFY(value.is_number());
-
-    // 4. Let block be arrayBuffer.[[ArrayBufferData]].
-    auto& block = m_data_block.buffer();
-
-    // FIXME: 5. Let elementSize be the Element Size value specified in Table 70 for Element Type type.
-
-    // 6. If isLittleEndian is not present, set isLittleEndian to the value of the [[LittleEndian]] field of the surrounding agent's Agent Record.
-    //    NOTE: Done by default parameter at declaration of this function.
-
-    // 7. Let rawBytes be NumericToRawBytes(type, value, isLittleEndian).
-    AK::Array<u8, sizeof(T)> raw_bytes;
-    numeric_to_raw_bytes<T>(vm, value, is_little_endian, raw_bytes);
-
-    // FIXME 8. If IsSharedArrayBuffer(arrayBuffer) is true, then
-    if (false) {
-        // FIXME: a. Let execution be the [[CandidateExecution]] field of the surrounding agent's Agent Record.
-        // FIXME: b. Let eventsRecord be the Agent Events Record of execution.[[EventsRecords]] whose [[AgentSignifier]] is AgentSignifier().
-        // FIXME: c. If isTypedArray is true and IsNoTearConfiguration(type, order) is true, let noTear be true; otherwise let noTear be false.
-        // FIXME: d. Append WriteSharedMemory { [[Order]]: order, [[NoTear]]: noTear, [[Block]]: block, [[ByteIndex]]: byteIndex, [[ElementSize]]: elementSize, [[Payload]]: rawBytes } to eventsRecord.[[EventList]].
-    }
-    // 9. Else,
-    else {
-        // a. Store the individual bytes of rawBytes into block, starting at block[byteIndex].
-        raw_bytes.span().copy_to(block.span().slice(byte_index));
-    }
-
-    // 10. Return unused.
-}
-
-// 25.1.3.19 GetModifySetValueInBuffer ( arrayBuffer, byteIndex, type, value, op [ , isLittleEndian ] ), https://tc39.es/ecma262/#sec-getmodifysetvalueinbuffer
-template<typename T>
-Value ArrayBuffer::get_modify_set_value(size_t byte_index, Value value, ReadWriteModifyFunction operation, bool is_little_endian)
-{
-    auto& vm = this->vm();
-
-    auto raw_bytes = MUST(ByteBuffer::create_uninitialized(sizeof(T)));
-    numeric_to_raw_bytes<T>(vm, value, is_little_endian, raw_bytes);
-
-    // FIXME: Check for shared buffer
-
-    auto raw_bytes_read = MUST(ByteBuffer::create_uninitialized(sizeof(T)));
-    m_data_block.buffer().bytes().slice(byte_index, sizeof(T)).copy_to(raw_bytes_read);
-    auto raw_bytes_modified = operation(raw_bytes_read, raw_bytes);
-    raw_bytes_modified.span().copy_to(m_data_block.buffer().span().slice(byte_index));
-
-    return raw_bytes_to_numeric<T>(vm, raw_bytes_read, is_little_endian);
-}
 
 }

@@ -1,6 +1,9 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [master]
+  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || format('{0}-{1}', github.ref, github.run_number) }}
@@ -17,10 +20,11 @@ jobs:
       matrix:
         os_name: ['Linux']
         arch: ['x86_64']
-        build_preset: ['Sanitizer']
+        build_preset: ['Release']
         toolchain: ['GNU']
         clang_plugins: [false]
         runner_labels: ['["blacksmith-16vcpu-ubuntu-2404"]']
+        container: [&ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.08"}']
 
         include:
           - os_name: 'Linux'
@@ -29,13 +33,15 @@ jobs:
             toolchain: 'Clang'
             clang_plugins: true
             runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
+            container: *ci_container
 
-          - os_name: 'macOS'
+          - os_name: 'Linux'
             arch: 'arm64'
             build_preset: 'Sanitizer'
             toolchain: 'Clang'
             clang_plugins: false
-            runner_labels: '["macos-15", "self-hosted"]'
+            runner_labels: '["blacksmith-16vcpu-ubuntu-2404-arm"]'
+            container: *ci_container
 
           - os_name: 'Linux'
             arch: 'x86_64'
@@ -43,6 +49,31 @@ jobs:
             toolchain: 'Clang'
             clang_plugins: false
             runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
+            container: *ci_container
+
+          - os_name: 'Linux'
+            arch: 'x86_64'
+            build_preset: 'All_Debug'
+            toolchain: 'Clang'
+            clang_plugins: false
+            runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
+            container: *ci_container
+
+          - os_name: 'Linux'
+            arch: 'x86_64'
+            build_preset: 'Release'
+            toolchain: 'Clang'
+            clang_plugins: false
+            runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
+            container: *ci_container
+
+          - os_name: 'Windows'
+            arch: 'x86_64'
+            build_preset: 'Sanitizer'
+            toolchain: 'ClangCL'
+            clang_plugins: false
+            runner_labels: '["blacksmith-16vcpu-windows-2025"]'
+            container: 'null'
 
     secrets: inherit
     uses: ./.github/workflows/lagom-template.yml
@@ -53,3 +84,33 @@ jobs:
       arch: ${{ matrix.arch }}
       build_preset: ${{ matrix.build_preset }}
       clang_plugins: ${{ matrix.clang_plugins }}
+      container: ${{ matrix.container }}
+
+  # The macOS Sanitizer build has a 2nd consumer: the macOS AX tests run against the app bundle the Sanitizer build
+  # packages. We put it outside the matrix to make those tests wait for this build alone, not for the slowest job in it.
+  macOS-Sanitizer:
+    if: github.repository == 'LadybirdBrowser/ladybird'
+    name: 'macOS, arm64, Sanitizer, Clang'
+    secrets: inherit
+    uses: ./.github/workflows/lagom-template.yml
+    with:
+      toolchain: 'Clang'
+      os_name: 'macOS'
+      runner_labels: '["blacksmith-12vcpu-macos-26"]'
+      arch: 'arm64'
+      build_preset: 'Sanitizer'
+      clang_plugins: false
+
+  # The macOS AX tests need an unlocked GUI session that Accessibility can be granted in. Blacksmith's macOS runners
+  # boot screen-locked — so we can't run the tests there. Thus, we instead run the tests on a GH-hosted runner.
+  macOS-Accessibility:
+    needs: macOS-Sanitizer
+    name: macOS, arm64, AX testing, ${{ fromJSON(matrix.runner_labels)[0] }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_labels: ['["macos-26"]']
+    uses: ./.github/workflows/macos-accessibility-tests.yml
+    with:
+      runner_labels: ${{ matrix.runner_labels }}
+      artifact_name: ladybird-app-bundle-macOS-arm64-Sanitizer

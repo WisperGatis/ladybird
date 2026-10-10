@@ -1,0 +1,6 @@
+holder color: rgb(0, 0, 0)
+holder border-top-color: rgb(0, 0, 0)
+holder::before background-color: rgb(7, 8, 9)
+first outline-color: rgb(0, 0, 0)
+div.holder: .holder::before[pseudo 2] .holder::before[pseudo 2]
+

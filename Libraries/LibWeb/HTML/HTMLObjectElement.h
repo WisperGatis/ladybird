@@ -6,10 +6,10 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
-#include <LibWeb/HTML/FormAssociatedElement.h>
-#include <LibWeb/HTML/HTMLElement.h>
+#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/ImageProvider.h>
 
@@ -17,11 +17,9 @@ namespace Web::HTML {
 
 class HTMLObjectElement final
     : public NavigableContainer
-    , public FormAssociatedElement
     , public Layout::ImageProvider {
-    WEB_PLATFORM_OBJECT(HTMLObjectElement, NavigableContainer)
+    WEB_WRAPPABLE(HTMLObjectElement, NavigableContainer)
     GC_DECLARE_ALLOCATOR(HTMLObjectElement);
-    FORM_ASSOCIATED_ELEMENT(NavigableContainer, HTMLObjectElement)
 
     enum class Representation {
         Unknown,
@@ -33,32 +31,45 @@ class HTMLObjectElement final
 public:
     virtual ~HTMLObjectElement() override;
 
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual void form_associated_element_was_removed(DOM::Node*) override;
 
-    String data() const;
-    void set_data(String const& data) { MUST(set_attribute(HTML::AttributeNames::data, data)); }
+    Utf16String type() const { return get_attribute_value(HTML::AttributeNames::type); }
 
-    String type() const { return get_attribute_value(HTML::AttributeNames::type); }
+    bool represents_its_content_navigable() const { return m_representation == Representation::ContentNavigable; }
+
+    // The natural size of the <svg> document element of the document the element shows as its content navigable's,
+    // which that document's layout works out and hands over here. Nothing if that document element is no <svg>.
+    CSS::SizeWithAspectRatio const& natural_size_of_content_document() const { return m_natural_size_of_content_document; }
+    void set_natural_size_of_content_document(CSS::SizeWithAspectRatio const&);
+
+    // ^FormAssociatedElement
+    virtual bool is_form_associated_element() const override { return true; }
 
     // ^FormAssociatedElement
     // https://html.spec.whatwg.org/multipage/forms.html#category-listed
     virtual bool is_listed() const override { return true; }
 
+    // ^EventTarget
+    virtual bool is_focusable() const override
+    {
+        return meets_focusable_area_rendering_requirements();
+    }
+
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void adopted_from(DOM::Document&) override;
 
 private:
     HTMLObjectElement(DOM::Document&, DOM::QualifiedName);
 
     virtual bool is_html_object_element() const override { return true; }
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(GC::Ref<CSS::CascadedProperties>) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     bool has_ancestor_media_element_or_object_element_not_showing_fallback_content() const;
 
@@ -77,17 +88,12 @@ private:
     virtual i32 default_tab_index_value() const override;
 
     // ^Layout::ImageProvider
-    virtual bool is_image_available() const override;
-    virtual Optional<CSSPixels> intrinsic_width() const override;
-    virtual Optional<CSSPixels> intrinsic_height() const override;
-    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
-    virtual RefPtr<Gfx::ImmutableBitmap> current_image_bitmap_sized(Gfx::IntSize) const override;
-    virtual void set_visible_in_viewport(bool) override;
-    virtual GC::Ptr<DOM::Element const> to_html_element() const override { return *this; }
+    virtual GC::Ptr<DecodedImageData> decoded_image_data() const override { return image_data(); }
 
     GC::Ptr<DecodedImageData> image_data() const;
 
     Representation m_representation { Representation::Unknown };
+    CSS::SizeWithAspectRatio m_natural_size_of_content_document;
 
     GC::Ptr<SharedResourceRequest> m_resource_request;
 

@@ -9,32 +9,39 @@
 
 #include <LibWeb/CSS/CSSFontFaceDescriptors.h>
 #include <LibWeb/CSS/CSSRule.h>
-#include <LibWeb/CSS/ParsedFontFace.h>
 
 namespace Web::CSS {
 
+class FontFaceState;
+
 class CSSFontFaceRule final : public CSSRule {
-    WEB_PLATFORM_OBJECT(CSSFontFaceRule, CSSRule);
+    WEB_WRAPPABLE(CSSFontFaceRule, CSSRule);
     GC_DECLARE_ALLOCATOR(CSSFontFaceRule);
 
 public:
-    [[nodiscard]] static GC::Ref<CSSFontFaceRule> create(JS::Realm&, GC::Ref<CSSFontFaceDescriptors>);
+    [[nodiscard]] static GC::Ref<CSSFontFaceRule> create(RustRule);
 
     virtual ~CSSFontFaceRule() override = default;
 
     bool is_valid() const;
-    ParsedFontFace font_face() const;
-    GC::Ref<CSSStyleDeclaration> style() { return m_style; }
-    GC::Ref<CSSFontFaceDescriptors const> descriptors() const { return m_style; }
+    GC::Ref<CSSFontFaceDescriptors> descriptors() const;
+
+    RefPtr<FontFaceState> css_connected_font_face() const;
+    void handle_descriptor_change(Utf16FlyString const& property);
+    void disconnect_font_face();
 
 private:
-    CSSFontFaceRule(JS::Realm&, GC::Ref<CSSFontFaceDescriptors>);
+    CSSFontFaceRule(RustRule);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual String serialized() const override;
+    virtual size_t external_memory_size() const override;
+    virtual Utf16String serialized() const override;
     virtual void visit_edges(Visitor&) override;
+    virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    GC::Ref<CSSFontFaceDescriptors> m_style;
+    void handle_src_descriptor_change();
+
+    RustDescriptorBlock m_descriptors;
+    mutable GC::Ptr<CSSFontFaceDescriptors> m_style;
 };
 
 template<>

@@ -7,7 +7,9 @@
 #pragma once
 
 #include <AK/Assertions.h>
+#include <AK/IterationDecision.h>
 #include <AK/TypeCasts.h>
+#include <AK/Vector.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Forward.h>
@@ -62,6 +64,17 @@ public:
     T const* first_child() const { return m_first_child; }
     T const* last_child() const { return m_last_child; }
 
+    template<typename Derived>
+    static constexpr size_t parent_offset() { return offsetof(Derived, m_parent); }
+    template<typename Derived>
+    static constexpr size_t first_child_offset() { return offsetof(Derived, m_first_child); }
+    template<typename Derived>
+    static constexpr size_t last_child_offset() { return offsetof(Derived, m_last_child); }
+    template<typename Derived>
+    static constexpr size_t previous_sibling_offset() { return offsetof(Derived, m_previous_sibling); }
+    template<typename Derived>
+    static constexpr size_t next_sibling_offset() { return offsetof(Derived, m_next_sibling); }
+
     // https://dom.spec.whatwg.org/#concept-tree-index
     size_t index() const
     {
@@ -72,7 +85,7 @@ public:
         return index;
     }
 
-    // // https://dom.spec.whatwg.org/#concept-tree-root
+    // https://dom.spec.whatwg.org/#concept-tree-root
     T& root()
     {
         // The root of an object is itself, if its parent is null, or else it is the root of its parent.
@@ -438,6 +451,23 @@ public:
         }
     }
 
+    template<typename U, typename Callback>
+    void for_each_inclusive_ancestor_of_type(Callback callback) const
+    {
+        return const_cast<TreeNode*>(this)->for_each_inclusive_ancestor_of_type<U>(move(callback));
+    }
+
+    template<typename U, typename Callback>
+    void for_each_inclusive_ancestor_of_type(Callback callback)
+    {
+        for (auto* ancestor = static_cast<T*>(this); ancestor; ancestor = ancestor->parent()) {
+            if (auto* ancestor_of_type = as_if<U>(*ancestor)) {
+                if (callback(*ancestor_of_type) == IterationDecision::Break)
+                    return;
+            }
+        }
+    }
+
     ~TreeNode() = default;
 
 protected:
@@ -465,10 +495,10 @@ inline void TreeNode<T>::remove_child(GC::Ref<T> node)
 {
     VERIFY(node->m_parent == this);
 
-    if (m_first_child == node)
+    if (m_first_child == node.ptr())
         m_first_child = node->m_next_sibling;
 
-    if (m_last_child == node)
+    if (m_last_child == node.ptr())
         m_last_child = node->m_previous_sibling;
 
     if (node->m_next_sibling)
@@ -528,15 +558,15 @@ inline void TreeNode<T>::insert_before(GC::Ref<T> node, GC::Ptr<T> child)
     VERIFY(child->parent() == this);
 
     node->m_previous_sibling = child->m_previous_sibling;
-    node->m_next_sibling = child;
+    node->m_next_sibling = child.ptr();
 
     if (child->m_previous_sibling)
-        child->m_previous_sibling->m_next_sibling = node;
+        child->m_previous_sibling->m_next_sibling = node.ptr();
 
-    if (m_first_child == child)
-        m_first_child = node;
+    if (m_first_child == child.ptr())
+        m_first_child = node.ptr();
 
-    child->m_previous_sibling = node;
+    child->m_previous_sibling = node.ptr();
 
     node->m_parent = static_cast<T*>(this);
 }
@@ -598,13 +628,10 @@ inline bool TreeNode<T>::is_inclusive_descendant_of(TreeNode<T> const& other) co
 template<typename T>
 inline bool TreeNode<T>::is_following(TreeNode const& other) const
 {
-    // An object A is following an object B if A and B are in the same tree and A comes after B in tree order.
-    for (auto* node = previous_in_pre_order(); node; node = node->previous_in_pre_order()) {
-        if (node == &other)
-            return true;
-    }
-
-    return false;
+    // An object A is following an object B if A and B are in the same tree, and A comes after B in tree order. That's
+    // exactly the order is_before() decides. So, ask is_before() — rather than scan the preorder all the way back to
+    // the start of the tree: The ancestor chains is_before() walks are depth-bounded — while the scan's document-sized.
+    return other.is_before(*this);
 }
 
 template<typename T>
@@ -612,8 +639,32 @@ inline bool TreeNode<T>::is_before(TreeNode const& other) const
 {
     if (this == &other)
         return false;
-    for (auto* node = this; node; node = node->next_in_pre_order()) {
-        if (node == &other)
+    // Compare tree order through the ancestor chains rather than scanning the preorder between the
+    // two nodes: the chains are depth-bounded, while the preorder distance is document-sized and a
+    // negative answer used to scan all the way to the end of the tree.
+    Vector<TreeNode const*, 32> my_chain;
+    for (auto* node = this; node; node = node->parent())
+        my_chain.append(node);
+    Vector<TreeNode const*, 32> other_chain;
+    for (auto* node = &other; node; node = node->parent())
+        other_chain.append(node);
+    // Nodes in different trees have no order, exactly as the preorder scan answered.
+    if (my_chain.last() != other_chain.last())
+        return false;
+    size_t my_depth = my_chain.size();
+    size_t other_depth = other_chain.size();
+    while (my_depth > 0 && other_depth > 0 && my_chain[my_depth - 1] == other_chain[other_depth - 1]) {
+        --my_depth;
+        --other_depth;
+    }
+    // An inclusive ancestor precedes its descendants; otherwise the divergent children of the
+    // deepest common ancestor decide by their sibling order.
+    if (my_depth == 0)
+        return true;
+    if (other_depth == 0)
+        return false;
+    for (auto* sibling = my_chain[my_depth - 1]->next_sibling(); sibling; sibling = sibling->next_sibling()) {
+        if (sibling == other_chain[other_depth - 1])
             return true;
     }
     return false;

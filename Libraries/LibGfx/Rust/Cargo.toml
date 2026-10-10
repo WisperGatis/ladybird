@@ -1,0 +1,20 @@
+[package]
+name = "libgfx_rust"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+allocator = ["dep:ladybird_allocator"]
+
+[dependencies]
+foldhash = "0.1"
+ladybird_allocator = { path = "../../RustAllocator", optional = true }
+rustc-demangle = "0.1"
+yuv = "0.8.17"
+
+[build-dependencies]
+cbindgen = "0.29"

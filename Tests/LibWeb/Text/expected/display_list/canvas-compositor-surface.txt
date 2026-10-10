@@ -1,0 +1,10 @@
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+
+DisplayList:
+DrawCanvas@s1/e0 dst_rect=[8,8 32x32] content_generation=0
+

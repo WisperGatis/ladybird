@@ -5,8 +5,7 @@
  */
 
 #include "CSSMathMax.h"
-#include <LibWeb/Bindings/CSSMathMaxPrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSMathNegate.h>
 #include <LibWeb/CSS/CSSNumericArray.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
@@ -17,33 +16,16 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSMathMax);
 
-GC::Ref<CSSMathMax> CSSMathMax::create(JS::Realm& realm, NumericType type, GC::Ref<CSSNumericArray> values)
+GC::Ref<CSSMathMax> CSSMathMax::create(NumericType type, GC::Ref<CSSNumericArray> values)
 {
-    return realm.create<CSSMathMax>(realm, move(type), move(values));
+    return GC::Heap::the().allocate<CSSMathMax>(move(type), move(values));
 }
 
-// https://drafts.css-houdini.org/css-typed-om-1/#dom-cssmathmin-cssmathmin
-WebIDL::ExceptionOr<GC::Ref<CSSMathMax>> CSSMathMax::construct_impl(JS::Realm& realm, Vector<CSSNumberish> values)
+WebIDL::ExceptionOr<GC::Ref<CSSMathMax>> CSSMathMax::add_all_types_into_math_max(GC::RootVector<GC::Ref<CSSNumericValue>> const& values)
 {
-    // The CSSMathMin(...args) and CSSMathMax(...args) constructors are defined identically to the above, except that
-    // in the last step they return a new CSSMathMin or CSSMathMax object, respectively.
-    // NB: So, the steps below are a modification of the CSSMathSum steps.
-
-    // 1. Replace each item of args with the result of rectifying a numberish value for the item.
-    GC::RootVector<GC::Ref<CSSNumericValue>> converted_values { realm.heap() };
-    converted_values.ensure_capacity(values.size());
-    for (auto const& value : values) {
-        converted_values.append(rectify_a_numberish_value(realm, value));
-    }
-
-    // 2. If args is empty, throw a SyntaxError.
-    if (converted_values.is_empty())
-        return WebIDL::SyntaxError::create(realm, "Cannot create an empty CSSMathMax"_utf16);
-
-    // 3. Let type be the result of adding the types of all the items of args. If type is failure, throw a TypeError.
-    auto type = converted_values.first()->type();
+    auto type = values.first()->type();
     bool first = true;
-    for (auto const& value : converted_values) {
+    for (auto const& value : values) {
         if (first) {
             first = false;
             continue;
@@ -51,46 +33,61 @@ WebIDL::ExceptionOr<GC::Ref<CSSMathMax>> CSSMathMax::construct_impl(JS::Realm& r
         if (auto added_types = type.added_to(value->type()); added_types.has_value()) {
             type = added_types.release_value();
         } else {
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Cannot create a CSSMathMax with values of incompatible types"sv };
+            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Cannot create a CSSMathMax with values of incompatible types"_utf16 };
         }
     }
 
-    // 4. Return a new CSSMathMax whose values internal slot is set to args.
-    auto values_array = CSSNumericArray::create(realm, { converted_values });
-    return CSSMathMax::create(realm, move(type), move(values_array));
+    auto values_array = CSSNumericArray::create({ values });
+    return CSSMathMax::create(type, values_array);
 }
 
-CSSMathMax::CSSMathMax(JS::Realm& realm, NumericType type, GC::Ref<CSSNumericArray> values)
-    : CSSMathValue(realm, Bindings::CSSMathOperator::Max, move(type))
+// https://drafts.css-houdini.org/css-typed-om-1/#dom-cssmathmin-cssmathmin
+WebIDL::ExceptionOr<GC::Ref<CSSMathMax>> CSSMathMax::create_for_constructor(ReadonlySpan<CSSNumberish> values)
+{
+    // The CSSMathMin(...args) and CSSMathMax(...args) constructors are defined identically to the above, except that
+    // in the last step they return a new CSSMathMin or CSSMathMax object, respectively.
+    // NB: So, the steps below are a modification of the CSSMathSum steps.
+
+    // 1. Replace each item of args with the result of rectifying a numberish value for the item.
+    GC::RootVector<GC::Ref<CSSNumericValue>> converted_values;
+    converted_values.ensure_capacity(values.size());
+    for (auto const& value : values) {
+        converted_values.append(rectify_a_numberish_value(value));
+    }
+
+    // 2. If args is empty, throw a SyntaxError.
+    if (converted_values.is_empty())
+        return WebIDL::SyntaxError::create("Cannot create an empty CSSMathMax"_utf16);
+
+    // 3. Let type be the result of adding the types of all the items of args. If type is failure, throw a TypeError.
+    // 4. Return a new CSSMathMax whose values internal slot is set to args.
+    return add_all_types_into_math_max(converted_values);
+}
+
+CSSMathMax::CSSMathMax(NumericType type, GC::Ref<CSSNumericArray> values)
+    : CSSMathValue(CSSMathOperator::Max, move(type))
     , m_values(move(values))
 {
 }
 
 CSSMathMax::~CSSMathMax() = default;
 
-void CSSMathMax::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSMathMax);
-    Base::initialize(realm);
-}
-
-void CSSMathMax::visit_edges(Visitor& visitor)
+void CSSMathMax::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_values);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#serialize-a-cssmathvalue
-String CSSMathMax::serialize_math_value(Nested, Parens) const
+void CSSMathMax::serialize_math_value(Utf16StringBuilder& s, Nested, Parens) const
 {
     // NB: Only steps 1 and 2 apply here.
     // 1. Let s initially be the empty string.
-    StringBuilder s;
 
     // 2. If this is a CSSMathMin or CSSMathMax:
     {
         // 1. Append "min(" or "max(" to s, as appropriate.
-        s.append("max("sv);
+        s.append_ascii("max("sv);
 
         // 2. For each arg in this’s values internal slot, serialize arg with nested and paren-less both true, and
         //    append the result to s, appending a ", " between successive values.
@@ -99,14 +96,13 @@ String CSSMathMax::serialize_math_value(Nested, Parens) const
             if (first) {
                 first = false;
             } else {
-                s.append(", "sv);
+                s.append_ascii(", "sv);
             }
-            s.append(arg->to_string({ .nested = true, .parenless = true }));
+            arg->serialize(s, { .nested = true, .parenless = true });
         }
 
         // 3. Append ")" to s and return s.
-        s.append(")"sv);
-        return s.to_string_without_validation();
+        s.append_ascii(')');
     }
 }
 
@@ -158,14 +154,14 @@ Optional<SumValue> CSSMathMax::create_a_sum_value() const
     return item_with_largest_value;
 }
 
-WebIDL::ExceptionOr<NonnullRefPtr<CalculationNode const>> CSSMathMax::create_calculation_node(CalculationContext const& context) const
+WebIDL::ExceptionOr<CalcNodeRef> CSSMathMax::create_calculation_node(CalculationContext const& context) const
 {
-    Vector<NonnullRefPtr<CalculationNode const>> child_nodes;
+    Vector<CalcNodeRef> child_nodes;
     for (auto const& child_value : m_values->values()) {
         child_nodes.append(TRY(child_value->create_calculation_node(context)));
     }
 
-    return MaxCalculationNode::create(move(child_nodes));
+    return CalcNodeRef::max(move(child_nodes));
 }
 
 }

@@ -8,9 +8,11 @@
 
 #include <AK/HashMap.h>
 #include <AK/String.h>
+#include <LibGC/Heap.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/StorageAPI/StorageBottle.h>
-#include <LibWeb/StorageAPI/StorageType.h>
+#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
+#include <LibWebCommon/StorageAPI/StorageType.h>
 
 namespace Web::StorageAPI {
 
@@ -23,17 +25,24 @@ class StorageShelf : public GC::Cell {
     GC_DECLARE_ALLOCATOR(StorageShelf);
 
 public:
-    static GC::Ref<StorageShelf> create(GC::Heap& heap, GC::Ref<Page> page, StorageKey key, StorageType type) { return heap.allocate<StorageShelf>(page, key, type); }
+    static GC::Ref<StorageShelf> create(GC::Ref<Page> page, HTML::EnvironmentId environment_id, StorageType type) { return GC::Heap::the().allocate<StorageShelf>(page, move(environment_id), type); }
 
     BucketMap& bucket_map() { return m_bucket_map; }
     BucketMap const& bucket_map() const { return m_bucket_map; }
 
+    u64 storage_usage() const;
+    u64 storage_quota() const;
+
     virtual void visit_edges(GC::Cell::Visitor& visitor) override;
 
 private:
-    explicit StorageShelf(GC::Ref<Page>, StorageKey, StorageType);
+    explicit StorageShelf(GC::Ref<Page>, HTML::EnvironmentId, StorageType);
 
+    GC::Ref<Page> m_page;
+    HTML::EnvironmentId m_environment_id;
     BucketMap m_bucket_map;
 };
+
+GC::Ptr<StorageShelf> obtain_a_local_storage_shelf(HTML::EnvironmentSettingsObject&);
 
 }

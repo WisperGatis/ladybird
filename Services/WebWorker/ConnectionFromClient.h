@@ -7,15 +7,19 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/Utf16String.h>
 #include <LibGC/Root.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Loader/FileRequest.h>
-#include <LibWeb/Worker/WebWorkerClientEndpoint.h>
-#include <LibWeb/Worker/WebWorkerServerEndpoint.h>
+#include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/BroadcastChannelMessage.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <WebWorker/Forward.h>
 #include <WebWorker/PageHost.h>
+#include <WebWorker/WebWorkerClientEndpoint.h>
+#include <WebWorker/WebWorkerServerEndpoint.h>
 
 namespace WebWorker {
 
@@ -28,6 +32,8 @@ public:
 
     virtual void die() override;
 
+    virtual Messages::WebWorkerServer::InitTransportResponse init_transport(int peer_pid) override;
+    virtual void set_font_service(IPC::TransportHandle, IPC::File catalog, u64 catalog_size, u64 generation) override;
     virtual void close_worker() override;
 
     void request_file(Web::FileRequest);
@@ -35,16 +41,43 @@ public:
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
 
+    Web::Compositor::CompositorConnection* compositor_process_connection() const;
+
+    Function<void(IPC::TransportHandle const&)> on_request_server_connection;
+    Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
+
+    // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
+#if defined(HAVE_WASM_COMPILER_SERVICE)
+    Function<void(IPC::TransportHandle)> on_wasm_compiler_connection;
+#endif
+
 private:
-    explicit ConnectionFromClient(NonnullOwnPtr<IPC::Transport>);
+    ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, bool enable_test_mode);
 
     Web::Page& page();
     Web::Page const& page() const;
 
-    virtual void start_worker(URL::URL url, Web::Bindings::WorkerType type, Web::Bindings::RequestCredentials credentials, String name, Web::HTML::TransferDataEncoder, Web::HTML::SerializedEnvironmentSettingsObject, Web::Bindings::AgentType) override;
+    virtual void connect_to_request_server(IPC::TransportHandle handle) override;
+    virtual void simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle) override;
+    virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void connect_to_wasm_compiler(IPC::TransportHandle handle) override;
+    virtual void connect_to_compositor(IPC::TransportHandle handle) override;
+    virtual void set_site_compatibility_data(JsonValue data) override;
+    virtual void set_system_font_family(String family) override;
+    virtual void start_worker(URL::URL url, Web::HTML::WorkerType type, Web::HTML::RequestCredentials credentials, String name, Web::HTML::TransferDataEncoder, Web::HTML::SerializedEnvironmentSettingsObject, Web::HTML::AgentType, URL::Origin origin, Web::HTML::EnvironmentId environment_id) override;
+    virtual void connect_shared_worker(Web::HTML::TransferDataEncoder, Web::HTML::SerializedEnvironmentSettingsObject) override;
     virtual void handle_file_return(i32 error, Optional<IPC::File> file, i32 request_id) override;
+    virtual void blob_url_entry_removed(Utf16String url) override;
+    virtual void did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) override;
+    virtual void did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
+    virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
+    virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;
+    virtual void broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) override;
 
     GC::Root<PageHost> m_page_host;
+
+    RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;
 
     // FIXME: Route console messages to the Browser UI using a ConsoleClient
 
@@ -52,6 +85,8 @@ private:
     int last_id { 0 };
 
     RefPtr<WorkerHost> m_worker_host;
+    Function<void()> m_request_server_died_callback_for_testing;
+    bool m_enable_test_mode { false };
 };
 
 }

@@ -15,18 +15,19 @@ set(AK_TEST_SOURCES
     TestByteString.cpp
     TestCharacterTypes.cpp
     TestChecked.cpp
+    TestSaturatingMath.cpp
     TestCircularBuffer.cpp
     TestCircularQueue.cpp
     TestDemangle.cpp
-    TestDisjointChunks.cpp
     TestDistinctNumeric.cpp
     TestDoublyLinkedList.cpp
     TestEndian.cpp
     TestEnumBits.cpp
     TestEnumerate.cpp
+    TestFFIHelpers.cpp
     TestFind.cpp
     TestFixedArray.cpp
-    TestFixedPoint.cpp
+    TestFunction.cpp
     TestFlyString.cpp
     TestFormat.cpp
     TestGenericLexer.cpp
@@ -34,6 +35,7 @@ set(AK_TEST_SOURCES
     TestHashFunctions.cpp
     TestHashMap.cpp
     TestHashTable.cpp
+    TestHeapPartition.cpp
     TestHex.cpp
     TestIPv4Address.cpp
     TestIPv6Address.cpp
@@ -41,7 +43,6 @@ set(AK_TEST_SOURCES
     TestInsertionSort.cpp
     TestIntegerMath.cpp
     TestIntrusiveList.cpp
-    TestIntrusiveRedBlackTree.cpp
     TestJSON.cpp
     TestLEB128.cpp
     TestMemory.cpp
@@ -55,21 +56,23 @@ set(AK_TEST_SOURCES
     TestOwnPtr.cpp
     TestQueue.cpp
     TestQuickSort.cpp
+    TestRandom.cpp
     TestRedBlackTree.cpp
     TestRefPtr.cpp
-    TestSegmentedVector.cpp
-    TestSIMD.cpp
+    TestSeqLock.cpp
+    TestSetUnion.cpp
+    TestSingleProducerCircularQueue.cpp
     TestSinglyLinkedList.cpp
     TestSourceGenerator.cpp
     TestSourceLocation.cpp
     TestSpan.cpp
-    TestStack.cpp
     TestStdLibExtras.cpp
     TestString.cpp
     TestStringConversions.cpp
-    TestStringFloatingPointConversions.cpp
     TestStringUtils.cpp
     TestStringView.cpp
+    TestTearableAtomic.cpp
+    TestThreadSafeWeakable.cpp
     TestTime.cpp
     TestTrie.cpp
     TestTuple.cpp
@@ -78,6 +81,7 @@ set(AK_TEST_SOURCES
     TestUFixedBigInt.cpp
     TestUtf16FlyString.cpp
     TestUtf16String.cpp
+    TestUtf16StringBuilder.cpp
     TestUtf16View.cpp
     TestUtf8View.cpp
     TestVariant.cpp
@@ -102,24 +106,19 @@ if (WIN32)
     target_link_libraries(TestUFixedBigInt PRIVATE clang_rt.builtins-x86_64.lib)
 endif()
 
-if (CXX_COMPILER_SUPPORTS_BLOCKS)
-    ladybird_test(TestFunction.mm AK NAME TestFunction)
-    target_link_libraries(TestFunction PRIVATE ${BLOCKS_REQUIRED_LIBRARIES})
-endif()
-if (CXX_COMPILER_SUPPORTS_OBJC_ARC)
-    ladybird_test(TestFunction.mm AK NAME TestFunctionArc)
-    target_compile_options(TestFunctionArc PRIVATE -fobjc-arc)
-    target_link_libraries(TestFunction PRIVATE ${BLOCKS_REQUIRED_LIBRARIES})
+if (APPLE)
+    ladybird_test(TestFunctionObjC.mm AK NAME TestFunctionObjC)
+
+    ladybird_test(TestFunctionObjC.mm AK NAME TestFunctionObjCArc)
+    target_compile_options(TestFunctionObjCArc PRIVATE -fobjc-arc)
 endif()
 
-target_link_libraries(TestString PRIVATE LibUnicode)
+target_link_libraries(TestByteString PRIVATE LibThreading)
+target_link_libraries(TestFFIHelpers PRIVATE LibThreading)
+target_link_libraries(TestFlyString PRIVATE LibThreading)
+target_link_libraries(TestSeqLock PRIVATE LibThreading)
+target_link_libraries(TestString PRIVATE LibThreading LibUnicode)
+target_link_libraries(TestTearableAtomic PRIVATE LibThreading)
+target_link_libraries(TestThreadSafeWeakable PRIVATE LibThreading)
+target_link_libraries(TestUtf16FlyString PRIVATE LibThreading)
 target_link_libraries(TestUtf16String PRIVATE LibUnicode)
-
-if (ENABLE_SWIFT)
-
-    # FIXME: Convert to use swift-testing after resolving https://github.com/LadybirdBrowser/ladybird/issues/1201
-    add_executable(TestAKBindings TestAKBindings.swift)
-    target_link_libraries(TestAKBindings PRIVATE AK)
-    target_compile_options(TestAKBindings PRIVATE -parse-as-library)
-    add_test(NAME TestAKBindings COMMAND TestAKBindings)
-endif()

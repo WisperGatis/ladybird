@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
 #include <LibJS/Script.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Scripting/Script.h>
@@ -25,10 +27,13 @@ public:
         No,
         Yes,
     };
-    static GC::Ref<ClassicScript> create(ByteString filename, StringView source, JS::Realm&, URL::URL base_url, size_t source_line_number = 1, MutedErrors = MutedErrors::No);
+    static GC::Ref<ClassicScript> create(ByteString filename, Utf16View source, EnvironmentSettingsObject&, URL::URL base_url, size_t source_line_number = 1, MutedErrors = MutedErrors::No, ScriptRegistry::IsInlineSource = ScriptRegistry::IsInlineSource::No);
+    static GC::Ref<ClassicScript> create_from_pre_parsed(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject&, URL::URL base_url, JS::ParsedProgram, MutedErrors = MutedErrors::No);
+    static GC::Ref<ClassicScript> create_from_pre_compiled(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject&, URL::URL base_url, JS::CompiledProgram, MutedErrors = MutedErrors::No);
+    static GC::Ref<ClassicScript> create_from_bytecode_cache(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject&, URL::URL base_url, NonnullRefPtr<JS::DecodedBytecodeCache>, MutedErrors = MutedErrors::No);
 
-    JS::Script* script_record() { return m_script_record; }
-    JS::Script const* script_record() const { return m_script_record; }
+    GC::Ptr<JS::Script> script_record() { return m_script_record; }
+    GC::Ptr<JS::Script const> script_record() const { return m_script_record; }
 
     enum class RethrowErrors {
         No,
@@ -39,7 +44,8 @@ public:
     MutedErrors muted_errors() const { return m_muted_errors; }
 
 private:
-    ClassicScript(URL::URL base_url, ByteString filename, JS::Realm&);
+    ClassicScript(URL::URL base_url, ByteString filename, EnvironmentSettingsObject&);
+    ClassicScript(URL::URL base_url, ByteString filename, Utf16String display_filename, EnvironmentSettingsObject&);
 
     virtual bool is_classic_script() const final { return true; }
 
@@ -52,4 +58,4 @@ private:
 }
 
 template<>
-inline bool JS::Script::HostDefined::fast_is<Web::HTML::ClassicScript>() const { return is_classic_script(); }
+inline bool Web::HTML::Script::fast_is<Web::HTML::ClassicScript>() const { return is_classic_script(); }

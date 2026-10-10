@@ -1,0 +1,77 @@
+#include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
+#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
+#include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
+#include <LibCompositing/DisplayList/DisplayList.h>
+#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCompositing/Forward.h>
+#include <LibCompositing/Scrolling/ScrollState.h>
+#include <LibCompositing/Types.h>
+#include <LibCompositing/WebGL/Types.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibGfx/CanvasCommandList.h>
+#include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/Point.h>
+#include <LibGfx/Rect.h>
+#include <LibGfx/ShareableBitmap.h>
+#include <LibGfx/Size.h>
+#include <LibIPC/TransportHandle.h>
+#include <LibMedia/VideoSinkHandle.h>
+#include <LibWebCommon/Page/InputEvent.h>
+
+endpoint CompositorWebContentServer
+{
+    init_transport(int peer_pid) => (int compositor_pid)
+
+    offer_video_presentation_channel(IPC::TransportHandle handle) =|
+    offer_render_clock_channel(IPC::TransportHandle handle) =|
+
+    add_video_sink(Media::VideoSinkHandle video_sink_handle) =|
+    remove_video_sink(Media::VideoSinkHandle video_sink_handle) =|
+    set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick) =|
+
+    set_parent_context(Web::CompositorContextId context_id, Optional<Web::CompositorContextId> parent_context_id) =|
+    stop_presenting_to_client(Web::CompositorContextId context_id) =|
+    destroy_context(Web::CompositorContextId context_id) =|
+
+    update_display_list(Web::CompositorContextId context_id, Core::AnonymousBuffer display_list_buffer, u64 tape_size, u64 run_count, Compositing::DisplayList::Properties display_list_properties, Compositing::AccumulatedVisualContextTree visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction, Compositing::ScrollStateSnapshot scroll_state_snapshot) =|
+    update_display_list_resources(Web::CompositorContextId context_id, Compositing::DisplayListResourceTransaction resource_transaction) =|
+    update_visual_context_tree(Web::CompositorContextId context_id, Compositing::AccumulatedVisualContextTree visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction) =|
+    update_scroll_state(Web::CompositorContextId context_id, Compositing::ScrollStateSnapshot scroll_state_snapshot, Compositing::KeyboardScrollState keyboard_scroll_state) =|
+
+    create_canvas_2d_context(Gfx::IntSize size, bool alpha) => (bool success, Compositing::CanvasId canvas_id)
+    update_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> segments, Vector<Compositing::DisplayListFontResource> fonts) =|
+    destroy_canvas_context(Compositing::CanvasId canvas_id) =|
+    get_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect, Gfx::AlphaType alpha_type) => (Gfx::ShareableBitmap pixels)
+
+    allocate_placeholder_canvas() => (Compositing::CanvasId canvas_id, u64 secret)
+    release_placeholder_canvas(Compositing::CanvasId canvas_id) =|
+    commit_placeholder_canvas(Compositing::CanvasId canvas_id, u64 secret, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize size, bool origin_clean) =|
+    get_placeholder_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect) => (Gfx::ShareableBitmap pixels, bool origin_clean)
+
+    rasterize_display_list(Core::AnonymousBuffer display_list_buffer, u64 tape_size, u64 run_count, Compositing::DisplayList::Properties display_list_properties, Compositing::AccumulatedVisualContextTree visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction, Gfx::ShareableBitmap target_bitmap) => (bool success)
+
+    create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias) => (bool success, Compositing::CanvasId canvas_id, Vector<String> supported_extensions)
+    webgl_set_command_buffer(Compositing::CanvasId canvas_id, Core::AnonymousBuffer command_buffer) =|
+    webgl_commands_from_shared_buffer(Compositing::CanvasId canvas_id, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Gfx::DecodedImageFrame> bitmaps) =|
+    webgl_drain_command_buffer(Compositing::CanvasId canvas_id) => ()
+    webgl_commands(Compositing::CanvasId canvas_id, Core::AnonymousBuffer commands, Vector<Gfx::DecodedImageFrame> bitmaps) =|
+    webgl_present_canvas(Compositing::CanvasId canvas_id, bool preserve_drawing_buffer) =|
+    webgl_clear_drawing_buffer(Compositing::CanvasId canvas_id) =|
+    webgl_sync_call(Compositing::CanvasId canvas_id, ByteBuffer request) => (ByteBuffer reply)
+    webgl_read_pixels(Compositing::CanvasId canvas_id, i32 x, i32 y, i32 width, i32 height, u32 format, u32 type, i32 buf_size, Core::AnonymousBuffer pixels) => (i32 length, i32 columns, i32 rows)
+    webgl_read_buffer_sub_data(Compositing::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data) => (bool success)
+
+    invalidate_wheel_event_listener_state(Web::CompositorContextId context_id, u64 generation) =|
+    invalidate_keyboard_scroll_state(Web::CompositorContextId context_id, u64 generation) => ()
+    async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking) => (Compositing::AsyncScrollEnqueueResult result)
+    smooth_scroll_to(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator) => (Compositing::AsyncScrollEnqueueResult result)
+    cancel_smooth_scroll(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id) =|
+
+    take_pending_async_scroll_updates(Web::CompositorContextId context_id) => (Compositing::PendingAsyncScrollUpdates updates)
+    viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress) =|
+    request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second) =|
+    hurry_rendering_opportunity(Web::CompositorContextId context_id) =|
+    present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect) =|
+    request_screenshot(Web::CompositorContextId context_id, Compositing::ScreenshotRequestId request_id, Gfx::ShareableBitmap target_bitmap) =|
+}

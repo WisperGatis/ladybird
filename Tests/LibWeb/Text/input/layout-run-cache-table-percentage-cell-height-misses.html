@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #container { width: 300px; height: 100px; }
+    table { border-spacing: 0; width: 100px; }
+    td { padding: 0; }
+    #percentage-cell { height: 50%; }
+    #fixed-cell { height: 20px; }
+</style>
+<div id="container">
+    <table id="percentage-table"><tr><td id="percentage-cell">x</td></tr></table>
+    <table id="fixed-table"><tr><td id="fixed-cell">x</td></tr></table>
+</div>
+<script>
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "only the fixed-height table is reused",
+                mutate: () => {
+                    heightBefore = document.getElementById("percentage-table").getBoundingClientRect().height;
+                    // The percentage-height cell observes the basis forwarded by its table.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          TableWrapper(anonymous)/block RUN (cache=miss)
+                            Box<TABLE>#percentage-table/table RUN (cache=miss)
+                              BlockContainer<TD>#percentage-cell/block (measurement) RUN (cache=bypass)
+                              BlockContainer<TD>#percentage-cell/block RUN (cache=miss)
+                          TableWrapper(anonymous)/block REUSE SUBTREE
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "percentage table height before");
+                    equal(document.getElementById("percentage-table").getBoundingClientRect().height, 100, "percentage table height after");
+                    equal(document.getElementById("fixed-table").getBoundingClientRect().height, 20, "fixed table height");
+                },
+            },
+        ],
+    });
+</script>

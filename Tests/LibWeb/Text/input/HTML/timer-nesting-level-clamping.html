@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    asyncTest(done => {
+        // Once its callback has run 5 times, a setInterval(..., 0) is past nesting level 5, so every later firing is
+        // clamped to at least 4ms after the previous one. A slow machine only makes the callbacks further apart.
+        const unclampedCallbacks = 6;
+        const clampedCallbacks = 20;
+        const times = [];
+
+        const id = setInterval(() => {
+            times.push(performance.now());
+            if (times.length < unclampedCallbacks + clampedCallbacks)
+                return;
+            clearInterval(id);
+
+            // 1ms of slack covers the timer rounding its deadline to whole milliseconds and timestamp coarsening.
+            const start = times[unclampedCallbacks - 1];
+            let clamped = true;
+            for (let i = 1; i <= clampedCallbacks; ++i) {
+                const elapsed = times[unclampedCallbacks - 1 + i] - start;
+                if (elapsed < 4 * i - 1) {
+                    println(`Callback ${unclampedCallbacks + i} ran ${elapsed}ms after callback ${unclampedCallbacks}`);
+                    clamped = false;
+                    break;
+                }
+            }
+            println(`Callbacks past nesting level 5 are clamped to 4ms: ${clamped}`);
+            done();
+        }, 0);
+    });
+</script>

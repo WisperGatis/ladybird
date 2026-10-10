@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; font: 16px/1 monospace; }
+    #spacer { height: 20px; }
+    #cached {
+        display: flex;
+        align-items: baseline;
+        width: 300px;
+    }
+    #cached > .item { width: 80px; }
+    #big { font-size: 32px; }
+    #line { display: inline-block; vertical-align: baseline; }
+</style>
+<div id="spacer"></div>
+<div>x<div id="cached" style="display: inline-flex;"><div class="item" id="big">A</div><div class="item">b</div></div></div>
+<script>
+    let before;
+    layoutTest({
+        steps: [
+            {
+                name: "reused inline-flex retains its baseline",
+                mutate: () => {
+                    before = big.getBoundingClientRect();
+                    spacer.style.height = "50px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          Box<DIV>#cached/flex REUSE SUBTREE
+                `,
+                check: equal => {
+                    const after = big.getBoundingClientRect();
+                    equal(after.top - before.top, 30, "baseline movement");
+                    equal(after.left, 9.703125, "big left");
+                    equal(after.width, 80, "big width");
+                    equal(after.height, 32, "big height");
+                },
+            },
+        ],
+    });
+</script>

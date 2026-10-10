@@ -4,12 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGLinearGradientElementPrototype.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Painting/PaintStyle.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/SVG/AttributeNames.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGLinearGradientElement.h>
 #include <LibWeb/SVG/SVGStopElement.h>
 
@@ -22,36 +20,30 @@ SVGLinearGradientElement::SVGLinearGradientElement(DOM::Document& document, DOM:
 {
 }
 
-void SVGLinearGradientElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGLinearGradientElement);
-    Base::initialize(realm);
-}
-
-void SVGLinearGradientElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGLinearGradientElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     // FIXME: Should allow for `<number-percentage> | <length>` for x1, x2, y1, y2
     if (name == SVG::AttributeNames::x1) {
-        m_x1 = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_x1 = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::y1) {
-        m_y1 = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_y1 = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::x2) {
-        m_x2 = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_x2 = parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::y2) {
-        m_y2 = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_y2 = parse_number_percentage(value.value_or({}));
     }
 }
 
 // https://www.w3.org/TR/SVG11/pservers.html#LinearGradientElementX1Attribute
 NumberPercentage SVGLinearGradientElement::start_x() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return start_x_impl(seen_gradients);
 }
 
-NumberPercentage SVGLinearGradientElement::start_x_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGLinearGradientElement::start_x_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_x1.has_value())
         return *m_x1;
@@ -64,11 +56,11 @@ NumberPercentage SVGLinearGradientElement::start_x_impl(HashTable<SVGGradientEle
 // https://www.w3.org/TR/SVG11/pservers.html#LinearGradientElementY1Attribute
 NumberPercentage SVGLinearGradientElement::start_y() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return start_y_impl(seen_gradients);
 }
 
-NumberPercentage SVGLinearGradientElement::start_y_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGLinearGradientElement::start_y_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_y1.has_value())
         return *m_y1;
@@ -81,11 +73,11 @@ NumberPercentage SVGLinearGradientElement::start_y_impl(HashTable<SVGGradientEle
 // https://www.w3.org/TR/SVG11/pservers.html#LinearGradientElementX2Attribute
 NumberPercentage SVGLinearGradientElement::end_x() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return end_x_impl(seen_gradients);
 }
 
-NumberPercentage SVGLinearGradientElement::end_x_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGLinearGradientElement::end_x_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_x2.has_value())
         return *m_x2;
@@ -98,11 +90,11 @@ NumberPercentage SVGLinearGradientElement::end_x_impl(HashTable<SVGGradientEleme
 // https://www.w3.org/TR/SVG11/pservers.html#LinearGradientElementY2Attribute
 NumberPercentage SVGLinearGradientElement::end_y() const
 {
-    HashTable<SVGGradientElement const*> seen_gradients;
+    GC::RootHashTable<SVGGradientElement const*> seen_gradients;
     return end_y_impl(seen_gradients);
 }
 
-NumberPercentage SVGLinearGradientElement::end_y_impl(HashTable<SVGGradientElement const*>& seen_gradients) const
+NumberPercentage SVGLinearGradientElement::end_y_impl(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
 {
     if (m_y2.has_value())
         return *m_y2;
@@ -112,72 +104,15 @@ NumberPercentage SVGLinearGradientElement::end_y_impl(HashTable<SVGGradientEleme
     return NumberPercentage::create_percentage(0);
 }
 
-Optional<Painting::PaintStyle> SVGLinearGradientElement::to_gfx_paint_style(SVGPaintContext const& paint_context) const
+void SVGLinearGradientElement::push_paint_server_description(void* sink) const
 {
-    auto units = gradient_units();
-    // FIXME: Resolve percentages properly
-    Gfx::FloatPoint start_point {};
-    Gfx::FloatPoint end_point {};
-
-    // https://svgwg.org/svg2-draft/pservers.html#LinearGradientElementGradientUnitsAttribute
-    if (units == GradientUnits::ObjectBoundingBox) {
-        // If gradientUnits="objectBoundingBox", the user coordinate system for attributes ‘x1’, ‘y1’, ‘x2’ and ‘y2’
-        // is established using the bounding box of the element to which the gradient is applied (see Object bounding
-        // box units) and then applying the transform specified by attribute ‘gradientTransform’. Percentages represent
-        // values relative to the bounding box for the object.
-        // Note: For gradientUnits="objectBoundingBox" both "100%" and "1" are treated the same.
-        start_point = { start_x().value(), start_y().value() };
-        end_point = { end_x().value(), end_y().value() };
-    } else {
-        // GradientUnits::UserSpaceOnUse
-        // If gradientUnits="userSpaceOnUse", ‘x1’, ‘y1’, ‘x2’, and ‘y2’ represent values in the coordinate system
-        // that results from taking the current user coordinate system in place at the time when the gradient element
-        // is referenced (i.e., the user coordinate system for the element referencing the gradient element via a
-        // fill or stroke property) and then applying the transform specified by attribute ‘gradientTransform’.
-        // Percentages represent values relative to the current SVG viewport.
-        start_point = {
-            start_x().resolve_relative_to(paint_context.viewport.width()),
-            start_y().resolve_relative_to(paint_context.viewport.height()),
-        };
-        end_point = {
-            end_x().resolve_relative_to(paint_context.viewport.width()),
-            end_y().resolve_relative_to(paint_context.viewport.height()),
-        };
-    }
-
-    if (!m_paint_style) {
-        m_paint_style = Painting::SVGLinearGradientPaintStyle::create(start_point, end_point);
-        // FIXME: Update stops in DOM changes:
-        add_color_stops(*m_paint_style);
-    } else {
-        m_paint_style->set_start_point(start_point);
-        m_paint_style->set_end_point(end_point);
-    }
-
-    m_paint_style->set_gradient_transform(gradient_paint_transform(paint_context));
-    m_paint_style->set_spread_method(to_painting_spread_method(spread_method()));
-    m_paint_style->set_color_space(color_space());
-    return *m_paint_style;
-}
-
-GC::Ref<SVGAnimatedLength> SVGLinearGradientElement::x1() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGLinearGradientElement::y1() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGLinearGradientElement::x2() const
-{
-    return fake_animated_length_fixme();
-}
-
-GC::Ref<SVGAnimatedLength> SVGLinearGradientElement::y2() const
-{
-    return fake_animated_length_fixme();
+    auto description = base_paint_server_description(Layout::RustFFI::FfiSvgGradientKind::Linear);
+    description.x1 = Layout::to_ffi_number_percentage(start_x());
+    description.y1 = Layout::to_ffi_number_percentage(start_y());
+    description.x2 = Layout::to_ffi_number_percentage(end_x());
+    description.y2 = Layout::to_ffi_number_percentage(end_y());
+    Layout::RustFFI::layout_arena_svg_paint_resources_push_gradient(sink, &description);
+    push_color_stops(sink);
 }
 
 }

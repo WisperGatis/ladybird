@@ -1,22 +1,30 @@
 /*
- * Copyright (c) 2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2025-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #pragma once
 
+#include <AK/Utf16String.h>
 #include <LibGC/Cell.h>
 #include <LibWeb/CSS/PseudoElement.h>
-#include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/Forward.h>
+
+namespace Web::CSS {
+
+class InstalledStyle;
+
+}
 
 namespace Web::DOM {
 
 // Either an Element or a PseudoElement
+// FIXME: Figure out const-correctness for the Element.
 class WEB_API AbstractElement {
 public:
     AbstractElement(GC::Ref<Element>, Optional<CSS::PseudoElement> = {});
+    AbstractElement(Element const&, Optional<CSS::PseudoElement> = {});
 
     Document& document() const;
 
@@ -24,8 +32,11 @@ public:
     Element const& element() const { return m_element; }
     Optional<CSS::PseudoElement> pseudo_element() const { return m_pseudo_element; }
 
-    GC::Ptr<Layout::NodeWithStyle> layout_node();
-    GC::Ptr<Layout::NodeWithStyle const> layout_node() const { return const_cast<AbstractElement*>(this)->layout_node(); }
+    Layout::NodeWithStyle* layout_node(Layout::BegunRead const& read);
+    Layout::NodeWithStyle const* layout_node(Layout::BegunRead const& read) const { return const_cast<AbstractElement*>(this)->layout_node(read); }
+
+    Layout::NodeWithStyle* unsafe_layout_node(Layout::BegunRead const& read);
+    Layout::NodeWithStyle const* unsafe_layout_node(Layout::BegunRead const& read) const { return const_cast<AbstractElement*>(this)->unsafe_layout_node(read); }
 
     struct TreeCountingFunctionResolutionContext {
         size_t sibling_count;
@@ -34,43 +45,46 @@ public:
     TreeCountingFunctionResolutionContext tree_counting_function_resolution_context() const;
 
     GC::Ptr<Element const> parent_element() const;
+    Element* flat_tree_parent_element() const;
     Optional<AbstractElement> element_to_inherit_style_from() const;
-    Optional<AbstractElement> previous_in_tree_order() { return walk_layout_tree(WalkMethod::Previous); }
-    Optional<AbstractElement> previous_sibling_in_tree_order() { return walk_layout_tree(WalkMethod::PreviousSibling); }
-    bool is_before(AbstractElement const&) const;
+    Optional<AbstractElement> highlight_inheritance_parent() const;
+    GC::Ptr<Node> root();
 
-    void set_inheritance_override(GC::Ref<Element> element) { m_inheritance_override = element; }
+    [[nodiscard]] CSS::ComputedStyleRecordView computed_style() const;
+    [[nodiscard]] CSS::StyleRecordID style_record_identity() const;
+    [[nodiscard]] CSS::InstalledStyle const& installed_style() const;
+    [[nodiscard]] bool has_style() const { return !!style_record_identity(); }
+    [[nodiscard]] void const* style_record_payloads() const;
+    template<typename StyleGroup>
+    StyleGroup const* style_group() const
+    {
+        auto const* payloads = static_cast<void const* const*>(style_record_payloads());
+        if (!payloads)
+            return nullptr;
+        auto const* payload = payloads[StyleGroup::style_group_index];
+        VERIFY(payload);
+        return static_cast<StyleGroup const*>(payload);
+    }
+    GC::Ptr<CSS::CSSStyleProperties const> inline_style() const;
 
-    GC::Ptr<CSS::ComputedProperties const> computed_properties() const;
+    void set_custom_property_data(RefPtr<CSS::CustomPropertyData const>);
+    void replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const>);
+    [[nodiscard]] RefPtr<CSS::CustomPropertyData const> custom_property_data() const;
+    RefPtr<CSS::StyleValue const> get_custom_property(Utf16FlyString const& name) const;
 
-    void set_custom_properties(OrderedHashMap<FlyString, CSS::StyleProperty>&& custom_properties);
-    [[nodiscard]] OrderedHashMap<FlyString, CSS::StyleProperty> const& custom_properties() const;
-    RefPtr<CSS::StyleValue const> get_custom_property(FlyString const& name) const;
-
-    GC::Ptr<CSS::CascadedProperties> cascaded_properties() const;
-    void set_cascaded_properties(GC::Ptr<CSS::CascadedProperties>);
-
-    bool has_non_empty_counters_set() const;
-    Optional<CSS::CountersSet const&> counters_set() const;
-    CSS::CountersSet& ensure_counters_set();
-    void set_counters_set(OwnPtr<CSS::CountersSet>&&);
+    Vector<GC::Ref<CSS::CSSAnimation>> const* css_defined_animations() const;
+    void set_css_defined_animations(Vector<GC::Ref<CSS::CSSAnimation>>&&);
 
     void visit(GC::Cell::Visitor& visitor) const;
 
-    String debug_description() const;
+    Utf16String debug_description() const;
     bool operator==(AbstractElement const&) const = default;
 
-private:
-    enum class WalkMethod : u8 {
-        Previous,
-        PreviousSibling,
-    };
-    Optional<AbstractElement> walk_layout_tree(WalkMethod);
+    CSS::StyleScope const& style_scope() const;
 
+private:
     GC::Ref<Element> m_element;
     Optional<CSS::PseudoElement> m_pseudo_element;
-
-    GC::Ptr<Element> m_inheritance_override;
 };
 
 }

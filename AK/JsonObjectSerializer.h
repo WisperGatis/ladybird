@@ -72,16 +72,46 @@ public:
         return {};
     }
 
+    ErrorOr<void> add(StringView key, Utf16View const& value)
+    {
+        TRY(begin_item(key));
+        if constexpr (IsLegacyBuilder<Builder>) {
+            TRY(m_builder.try_append('"'));
+            TRY(m_builder.try_append_escaped_for_json(value));
+            TRY(m_builder.try_append('"'));
+        } else {
+            TRY(m_builder.append('"'));
+            TRY(m_builder.append_escaped_for_json(value));
+            TRY(m_builder.append('"'));
+        }
+        return {};
+    }
+
+    ErrorOr<void> add(Utf16View const& key, Utf16View const& value)
+    {
+        TRY(begin_item(key));
+        if constexpr (IsLegacyBuilder<Builder>) {
+            TRY(m_builder.try_append('"'));
+            TRY(m_builder.try_append_escaped_for_json(value));
+            TRY(m_builder.try_append('"'));
+        } else {
+            TRY(m_builder.append('"'));
+            TRY(m_builder.append_escaped_for_json(value));
+            TRY(m_builder.append('"'));
+        }
+        return {};
+    }
+
     ErrorOr<void> add(StringView key, char const* value)
     {
         TRY(begin_item(key));
         if constexpr (IsLegacyBuilder<Builder>) {
             TRY(m_builder.try_append('"'));
-            TRY(m_builder.try_append_escaped_for_json({ value, __builtin_strlen(value) }));
+            TRY(m_builder.try_append_escaped_for_json(StringView { value, __builtin_strlen(value) }));
             TRY(m_builder.try_append('"'));
         } else {
             TRY(m_builder.append('"'));
-            TRY(m_builder.append_escaped_for_json({ value, __builtin_strlen(value) }));
+            TRY(m_builder.append_escaped_for_json(StringView { value, __builtin_strlen(value) }));
             TRY(m_builder.append('"'));
         }
         return {};
@@ -157,25 +187,8 @@ public:
         return {};
     }
 
-    ErrorOr<void> add(StringView key, float value)
-    {
-        TRY(begin_item(key));
-        if constexpr (IsLegacyBuilder<Builder>)
-            TRY(m_builder.try_appendff("{}", value));
-        else
-            TRY(m_builder.appendff("{}", value));
-        return {};
-    }
-
-    ErrorOr<void> add(StringView key, double value)
-    {
-        TRY(begin_item(key));
-        if constexpr (IsLegacyBuilder<Builder>)
-            TRY(m_builder.try_appendff("{}", value));
-        else
-            TRY(m_builder.appendff("{}", value));
-        return {};
-    }
+    ErrorOr<void> add(StringView key, float value) { return add_floating_point(key, value); }
+    ErrorOr<void> add(StringView key, double value) { return add_floating_point(key, value); }
 
     ErrorOr<JsonArraySerializer<Builder>> add_array(StringView key)
     {
@@ -183,7 +196,19 @@ public:
         return JsonArraySerializer<Builder>::try_create(m_builder);
     }
 
+    ErrorOr<JsonArraySerializer<Builder>> add_array(Utf16View const& key)
+    {
+        TRY(begin_item(key));
+        return JsonArraySerializer<Builder>::try_create(m_builder);
+    }
+
     ErrorOr<JsonObjectSerializer<Builder>> add_object(StringView key)
+    {
+        TRY(begin_item(key));
+        return JsonObjectSerializer::try_create(m_builder);
+    }
+
+    ErrorOr<JsonObjectSerializer<Builder>> add_object(Utf16View const& key)
     {
         TRY(begin_item(key));
         return JsonObjectSerializer::try_create(m_builder);
@@ -206,7 +231,49 @@ private:
     {
     }
 
+    template<FloatingPoint T>
+    ErrorOr<void> add_floating_point(StringView key, T value)
+    {
+        TRY(begin_item(key));
+        // JSON cannot represent infinities or NaN, so they serialize as null, as in JSON.stringify().
+        if constexpr (IsLegacyBuilder<Builder>) {
+            if (__builtin_isfinite(value))
+                TRY(m_builder.try_appendff("{}", value));
+            else
+                TRY(m_builder.try_append("null"sv));
+        } else {
+            if (__builtin_isfinite(value))
+                TRY(m_builder.appendff("{}", value));
+            else
+                TRY(m_builder.append("null"sv));
+        }
+        return {};
+    }
+
     ErrorOr<void> begin_item(StringView key)
+    {
+        VERIFY(!m_finished);
+        if (!m_empty) {
+            if constexpr (IsLegacyBuilder<Builder>)
+                TRY(m_builder.try_append(','));
+            else
+                TRY(m_builder.append(','));
+        }
+        m_empty = false;
+
+        if constexpr (IsLegacyBuilder<Builder>) {
+            TRY(m_builder.try_append('"'));
+            TRY(m_builder.try_append_escaped_for_json(key));
+            TRY(m_builder.try_append("\":"sv));
+        } else {
+            TRY(m_builder.append('"'));
+            TRY(m_builder.append_escaped_for_json(key));
+            TRY(m_builder.append("\":"sv));
+        }
+        return {};
+    }
+
+    ErrorOr<void> begin_item(Utf16View const& key)
     {
         VERIFY(!m_finished);
         if (!m_empty) {

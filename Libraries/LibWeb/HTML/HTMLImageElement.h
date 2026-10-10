@@ -9,14 +9,15 @@
 
 #include <AK/ByteBuffer.h>
 #include <AK/OwnPtr.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibGC/Function.h>
 #include <LibGfx/Forward.h>
-#include <LibGfx/ImmutableBitmap.h>
-#include <LibWeb/DOM/Document.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
-#include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/DOM/ViewportClient.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
-#include <LibWeb/HTML/FormAssociatedElement.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/LazyLoadingElement.h>
 #include <LibWeb/HTML/SourceSet.h>
@@ -26,49 +27,55 @@ namespace Web::HTML {
 
 class HTMLImageElement final
     : public HTMLElement
-    , public FormAssociatedElement
     , public LazyLoadingElement<HTMLImageElement>
     , public Layout::ImageProvider
-    , public DOM::Document::ViewportClient {
-    WEB_PLATFORM_OBJECT(HTMLImageElement, HTMLElement);
+    , public DOM::ViewportClient
+    , public DecodedImageData::Client {
+    WEB_WRAPPABLE(HTMLImageElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLImageElement);
-    FORM_ASSOCIATED_ELEMENT(HTMLElement, HTMLImageElement);
     LAZY_LOADING_ELEMENT(HTMLImageElement);
 
 public:
     virtual ~HTMLImageElement() override;
 
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    // ^FormAssociatedElement
+    virtual bool is_form_associated_element() const override { return true; }
 
-    Optional<String> alternative_text() const override
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
+
+    Optional<Utf16String> alternative_text() const override
     {
         if (auto alt = get_attribute(HTML::AttributeNames::alt); alt.has_value())
             return alt.release_value();
         return {};
     }
 
-    String alt() const { return get_attribute_value(HTML::AttributeNames::alt); }
-
-    RefPtr<Gfx::ImmutableBitmap> immutable_bitmap() const;
-    virtual RefPtr<Gfx::ImmutableBitmap> default_image_bitmap_sized(Gfx::IntSize) const override;
+    Utf16String alt() const { return get_attribute_value(HTML::AttributeNames::alt); }
+    void set_alt(Utf16View alt) { set_attribute_value(HTML::AttributeNames::alt, alt); }
 
     WebIDL::UnsignedLong width() const;
-    WebIDL::ExceptionOr<void> set_width(WebIDL::UnsignedLong);
+    void set_width(WebIDL::UnsignedLong);
 
     WebIDL::UnsignedLong height() const;
-    WebIDL::ExceptionOr<void> set_height(WebIDL::UnsignedLong);
+    void set_height(WebIDL::UnsignedLong);
 
     unsigned natural_width() const;
     unsigned natural_height() const;
+
+    int x() const;
+    int y() const;
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
     bool complete() const;
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
-    String current_src() const;
+    Utf16String current_src() const;
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode
-    [[nodiscard]] WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> decode() const;
+    GC::Ref<WebIDL::Promise> decode() const;
+    void decode(GC::Ref<WebIDL::Promise>) const;
+
+    GC::Ptr<HTMLMapElement> associated_map_element();
 
     virtual Optional<ARIA::Role> default_role() const override;
 
@@ -89,10 +96,12 @@ public:
 
     void set_source_set(SourceSet);
 
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
+    DOM::Element const& dimension_attribute_source() const;
+    void set_dimension_attribute_source(DOM::Element const*);
+
     ImageRequest& current_request() { return *m_current_request; }
     ImageRequest const& current_request() const { return *m_current_request; }
-
-    size_t current_frame_index() const { return m_current_frame_index; }
 
     // https://html.spec.whatwg.org/multipage/images.html#upgrade-the-pending-request-to-the-current-request
     void upgrade_pending_request_to_current_request();
@@ -101,48 +110,47 @@ public:
     bool allows_auto_sizes() const;
 
     // ^Layout::ImageProvider
-    virtual bool is_image_available() const override;
+    virtual bool is_image_pending() const override;
+
+    virtual GC::Ptr<DecodedImageData> decoded_image_data() const override;
     virtual Optional<CSSPixels> intrinsic_width() const override;
     virtual Optional<CSSPixels> intrinsic_height() const override;
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
-    virtual RefPtr<Gfx::ImmutableBitmap> current_image_bitmap_sized(Gfx::IntSize) const override;
-    virtual void set_visible_in_viewport(bool) override;
-    virtual GC::Ptr<DOM::Element const> to_html_element() const override { return *this; }
 
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:
     HTMLImageElement(DOM::Document&, DOM::QualifiedName);
 
-    void update_the_image_data_impl(bool restart_the_animations = false, bool maybe_omit_events = false);
+    void update_the_image_data_impl(bool restart_the_animations, bool maybe_omit_events, u64 update_the_image_data_count);
 
     virtual bool is_html_image_element() const override { return true; }
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void finalize() override;
 
     virtual void adopted_from(DOM::Document&) override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(GC::Ref<CSS::CascadedProperties>) const override;
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attributes
     virtual bool supports_dimension_attributes() const override { return true; }
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     virtual void did_set_viewport_rect(CSSPixelRect const&) override;
 
-    void handle_successful_fetch(URL::URL const&, StringView mime_type, ImageRequest&, ByteBuffer, bool maybe_omit_events, URL::URL const& previous_url);
     void handle_failed_fetch();
-    void add_callbacks_to_image_request(GC::Ref<ImageRequest>, bool maybe_omit_events, String const& url_string, String const& previous_url);
+    void add_callbacks_to_image_request(GC::Ref<ImageRequest>, bool maybe_omit_events, Utf16View url_string, Utf16View previous_url);
 
-    void animate();
+    void create_alt_text_shadow_tree();
+    void remove_alt_text_shadow_tree();
+    void update_alt_text_shadow_tree();
+    void set_needs_layout_update_or_repaint_after_image_data_change();
+    void record_box_kind();
 
-    RefPtr<Core::Timer> m_animation_timer;
-    size_t m_current_frame_index { 0 };
-    size_t m_loops_completed { 0 };
+    virtual void decoded_image_data_did_update() override;
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 
@@ -152,7 +160,7 @@ private:
 
     // https://html.spec.whatwg.org/multipage/images.html#last-selected-source
     // Each img element has a last selected source, which must initially be null.
-    Optional<String> m_last_selected_source;
+    Optional<Utf16String> m_last_selected_source;
 
     // https://html.spec.whatwg.org/multipage/images.html#current-request
     GC::Ptr<ImageRequest> m_current_request;
@@ -160,9 +168,24 @@ private:
     // https://html.spec.whatwg.org/multipage/images.html#pending-request
     GC::Ptr<ImageRequest> m_pending_request;
 
+    GC::Ptr<DOM::Text> m_alt_text_node;
+    // The box kind last published for the image, which its box was built with unless it is marked to be built again.
+    CSS::ElementBoxKind m_recorded_box_kind { CSS::ElementBoxKind::Image };
+
     SourceSet m_source_set;
 
     CSSPixelSize m_last_seen_viewport_size;
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
+    // Each img element has a dimension attribute source, which must initially be the img element itself.
+    GC::Ptr<DOM::Element const> m_dimension_attribute_source;
+
+    u64 m_update_the_image_data_count { 0 };
+
+    bool m_has_resumed_lazy_loading { false };
+
+    GC::Ptr<HTMLMapElement> m_cached_associated_map_element;
+    Optional<u64> m_cached_associated_map_element_dom_tree_version;
 };
 
 }

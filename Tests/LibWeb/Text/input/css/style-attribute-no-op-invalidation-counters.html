@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    #custom-property-target {
+        height: var(--vh);
+    }
+</style>
+<div id="target">target</div>
+<div id="custom-property-target"></div>
+<script>
+    function settleAndReset() {
+        internals.updateStyle();
+        internals.resetStyleInvalidationCounters();
+    }
+
+    function report(label) {
+        internals.updateStyle();
+        const counters = internals.getStyleInvalidationCounters();
+        println(`${label}: ${counters.elementStyleRecomputations} recomputations, ${counters.engineComputedStyleRecords} engine records`);
+    }
+
+    test(() => {
+        const target = document.getElementById("target");
+
+        target.setAttribute("style", "color: red");
+        settleAndReset();
+
+        target.setAttribute("style", "color: red");
+        report("setting identical style text");
+
+        settleAndReset();
+        target.setAttribute("style", "color: green");
+        report("setting changed style text");
+
+        document.documentElement.style.setProperty("--vh", "9px");
+        settleAndReset();
+
+        document.documentElement.style.setProperty("--vh", "9px");
+        report("setting identical custom property");
+
+        settleAndReset();
+        document.documentElement.style.setProperty("--vh", "10px");
+        report("setting changed custom property");
+    });
+</script>

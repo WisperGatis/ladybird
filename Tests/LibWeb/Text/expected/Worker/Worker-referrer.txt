@@ -1,0 +1,1 @@
+Got referrer: the worker's URL

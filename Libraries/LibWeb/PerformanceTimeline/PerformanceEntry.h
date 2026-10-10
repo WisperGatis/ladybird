@@ -6,10 +6,15 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
+#include <AK/Optional.h>
+#include <AK/String.h>
+#include <LibWeb/Bindings/PerformanceObserver.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
 
 namespace Web::PerformanceTimeline {
+
+using PerformanceObserverInit = Bindings::PerformanceObserverInit;
 
 enum class AvailableFromTimeline {
     No,
@@ -22,29 +27,29 @@ enum class ShouldAddEntry {
 };
 
 // https://www.w3.org/TR/performance-timeline/#dom-performanceentry
-class PerformanceEntry : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(PerformanceEntry, Bindings::PlatformObject);
+class PerformanceEntry : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(PerformanceEntry, Bindings::GCAllocatedWrappable);
 
 public:
     virtual ~PerformanceEntry();
 
     // https://www.w3.org/TR/performance-timeline/#dom-performanceentry-entrytype
-    virtual FlyString const& entry_type() const = 0;
+    virtual Utf16FlyString const& entry_type() const = 0;
 
-    String const& name() const { return m_name; }
+    Utf16String const& name() const { return m_name; }
     HighResolutionTime::DOMHighResTimeStamp start_time() const { return m_start_time; }
-    HighResolutionTime::DOMHighResTimeStamp duration() const { return m_duration; }
+    virtual HighResolutionTime::DOMHighResTimeStamp duration() const { return m_duration; }
 
     // https://w3c.github.io/timing-entrytypes-registry/#dfn-should-add-entry
     virtual PerformanceTimeline::ShouldAddEntry should_add_entry(Optional<PerformanceObserverInit const&> = {}) const = 0;
 
 protected:
-    PerformanceEntry(JS::Realm&, String const& name, HighResolutionTime::DOMHighResTimeStamp start_time, HighResolutionTime::DOMHighResTimeStamp duration);
-    virtual void initialize(JS::Realm&) override;
+    PerformanceEntry(String const& name, HighResolutionTime::DOMHighResTimeStamp start_time, HighResolutionTime::DOMHighResTimeStamp duration);
+    PerformanceEntry(Utf16String const& name, HighResolutionTime::DOMHighResTimeStamp start_time, HighResolutionTime::DOMHighResTimeStamp duration);
 
 private:
     // https://www.w3.org/TR/performance-timeline/#dom-performanceentry-name
-    String m_name;
+    Utf16String m_name;
 
     // https://www.w3.org/TR/performance-timeline/#dom-performanceentry-starttime
     HighResolutionTime::DOMHighResTimeStamp m_start_time { 0.0 };

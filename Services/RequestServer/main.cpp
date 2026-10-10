@@ -10,23 +10,35 @@
 #include <AK/StringView.h>
 #include <AK/Vector.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Platform/TaskRole.h>
+#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
+#include <LibCore/System.h>
+#include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
-#include <RequestServer/Cache/DiskCache.h>
+#include <RequestServer/CURL.h>
 #include <RequestServer/ConnectionFromClient.h>
-
-#if defined(AK_OS_MACOS)
-#    include <LibCore/Platform/ProcessStatisticsMach.h>
-#endif
+#include <RequestServer/ControlConnectionFromClient.h>
+#include <RequestServer/Resolver.h>
+#include <RequestServer/ResourceSubstitutionMap.h>
+#include <RequestServer/Sandbox.h>
 
 namespace RequestServer {
 
-extern ByteString g_default_certificate_path;
-extern Optional<DiskCache> g_disk_cache;
+OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 }
+
+#ifndef AK_OS_WINDOWS
+static void handle_signal(int signal)
+{
+    VERIFY(signal == SIGINT || signal == SIGTERM);
+    Core::EventLoop::current().quit(0);
+}
+#endif
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
@@ -34,38 +46,93 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Vector<ByteString> certificates;
     StringView mach_server_name;
-    bool enable_http_disk_cache = false;
+    StringView http_disk_cache_mode;
+    StringView resource_map_path;
+    StringView cache_path;
     bool wait_for_debugger = false;
+    bool disable_sandbox = false;
 
+    int crash_report_fd = -1;
     Core::ArgsParser args_parser;
+    args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
-    args_parser.add_option(enable_http_disk_cache, "Enable HTTP disk cache", "enable-http-disk-cache");
+    args_parser.add_option(http_disk_cache_mode, "HTTP disk cache mode", "http-disk-cache-mode", 0, "mode");
+    args_parser.add_option(resource_map_path, "Path to JSON file mapping URLs to local files", "resource-map", 0, "path");
+    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
+    args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.parse(arguments);
+
+    if (crash_report_fd >= 0) {
+        if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
+            warnln("Could not install crash report handler: {}", result.error());
+    }
 
     if (wait_for_debugger)
         Core::Process::wait_for_debugger_and_break();
 
+    if (auto result = Core::Platform::adopt_foreground_application_task_role(); result.is_error())
+        warnln("Could not adopt the foreground application task role: {}", result.error());
+    if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInitiated); result.is_error())
+        warnln("Could not set main thread QoS: {}", result.error());
+
     // FIXME: Update RequestServer to support multiple custom root certificates.
     if (!certificates.is_empty())
-        RequestServer::g_default_certificate_path = certificates.first();
+        RequestServer::set_default_certificate_path(certificates.first());
 
-    Core::EventLoop event_loop;
-
-#if defined(AK_OS_MACOS)
-    if (!mach_server_name.is_empty())
-        Core::Platform::register_with_mach_server(mach_server_name);
-#endif
-
-    if (enable_http_disk_cache) {
-        if (auto cache = RequestServer::DiskCache::create(); cache.is_error())
-            warnln("Unable to create disk cache: {}", cache.error());
+    if (!resource_map_path.is_empty()) {
+        auto map = RequestServer::ResourceSubstitutionMap::load_from_file(resource_map_path);
+        if (map.is_error())
+            warnln("Unable to load resource substitution map from '{}': {}", resource_map_path, map.error());
         else
-            RequestServer::g_disk_cache = cache.release_value();
+            RequestServer::g_resource_substitution_map = map.release_value();
     }
 
-    auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ConnectionFromClient>());
+#if !defined(AK_OS_WINDOWS)
+    MUST(Core::System::signal(SIGPIPE, SIG_IGN));
+#endif
+
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
+    // FIXME: Have another way to signal the event loop to gracefully quit on windows.
+#ifndef AK_OS_WINDOWS
+    Core::EventLoop::register_signal(SIGINT, handle_signal);
+    Core::EventLoop::register_signal(SIGTERM, handle_signal);
+#endif
+
+    Optional<HTTP::DiskCache> disk_cache;
+
+    if (http_disk_cache_mode != "disabled"sv) {
+        auto mode = TRY([&]() -> ErrorOr<HTTP::DiskCache::Mode> {
+            if (http_disk_cache_mode == "enabled"sv)
+                return HTTP::DiskCache::Mode::Normal;
+            if (http_disk_cache_mode == "testing"sv)
+                return HTTP::DiskCache::Mode::Testing;
+            return Error::from_string_literal("Unrecognized disk cache mode");
+        }());
+
+        if (auto cache = HTTP::DiskCache::create(mode, LexicalPath { cache_path }); cache.is_error())
+            warnln("Unable to create disk cache: {}", cache.error());
+        else
+            disk_cache = cache.release_value();
+    }
+
+    TRY(RequestServer::initialize_libcurl());
+
+    if (!disable_sandbox)
+        TRY(RequestServer::apply_sandbox(mach_server_name, certificates, cache_path));
+
+    // Connections are stored on the stack to ensure they are destroyed before static destruction begins. This prevents
+    // crashes from notifiers trying to unregister from already-destroyed thread data during process exit.
+    RequestServer::ConnectionFromClient::ConnectionMap connections;
+    RequestServer::ConnectionFromClient::RequestTransferLeaseMap request_transfer_leases;
+
+    auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ControlConnectionFromClient>(
+        mach_server_name,
+        connections,
+        request_transfer_leases,
+        disk_cache,
+        LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string()));
 
     return event_loop.exec();
 }

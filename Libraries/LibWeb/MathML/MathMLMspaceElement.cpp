@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/MathML/AttributeNames.h>
 #include <LibWeb/MathML/MathMLMspaceElement.h>
@@ -18,23 +20,23 @@ MathMLMspaceElement::MathMLMspaceElement(DOM::Document& document, DOM::Qualified
 {
 }
 
-bool MathMLMspaceElement::is_presentational_hint(FlyString const& name) const
+bool MathMLMspaceElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
     return first_is_one_of(name, AttributeNames::width, AttributeNames::height, AttributeNames::depth);
 }
 
-void MathMLMspaceElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void MathMLMspaceElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    Base::apply_presentational_hints(cascaded_properties);
+    Base::apply_presentational_hints(properties);
     // https://w3c.github.io/mathml-core/#attribute-mspace-width
     // The width, height, depth, if present, must have a value that is a valid <length-percentage>.
-    auto parse_non_percentage_value = [&](FlyString const& attribute_name) -> RefPtr<CSS::StyleValue const> {
+    CSS::Parser::ParsingParams parsing_params { document() };
+    auto parse_non_percentage_value = [&](Utf16FlyString const& attribute_name) -> RefPtr<CSS::StyleValue const> {
         if (auto attribute = this->attribute(attribute_name); attribute.has_value()) {
-            if (auto value = HTML::parse_dimension_value(attribute.value()); value && !value->is_percentage()) {
+            if (auto value = parse_css_type(parsing_params, attribute.value(), CSS::ValueType::Length))
                 return value;
-            }
         }
         return nullptr;
     };
@@ -42,14 +44,14 @@ void MathMLMspaceElement::apply_presentational_hints(GC::Ref<CSS::CascadedProper
     // If the width attribute is present, valid and not a percentage then that attribute is used as a presentational hint
     // setting the element's width property to the corresponding value.
     if (auto width_value = parse_non_percentage_value(AttributeNames::width)) {
-        cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Width, width_value.release_nonnull());
+        properties.append({ .property_id = CSS::PropertyID::Width, .value = width_value.release_nonnull() });
     }
 
     // https://w3c.github.io/mathml-core/#attribute-mspace-height
     // If the height attribute is absent, invalid or a percentage then the requested line-ascent is 0. Otherwise the
     // requested line-ascent is the resolved value of the height attribute, clamping negative values to 0.
     auto height_value = parse_non_percentage_value(AttributeNames::height);
-    // FIXME set the line-ascent
+    // FIXME: set the line-ascent
 
     // If both the height and depth attributes are present, valid and not a percentage then they are used as a
     // presentational hint setting the element's height property to the concatenation of the
@@ -59,11 +61,19 @@ void MathMLMspaceElement::apply_presentational_hints(GC::Ref<CSS::CascadedProper
     auto depth_value = parse_non_percentage_value(AttributeNames::depth);
 
     if (height_value && depth_value) {
-        // FIXME set the presentational hint to calculate height + depth
+        Utf16StringBuilder builder;
+        builder.append("calc("sv);
+        builder.append(attribute(AttributeNames::height).value());
+        builder.append(" + "sv);
+        builder.append(attribute(AttributeNames::depth).value());
+        builder.append(")"sv);
+        auto height_string = builder.to_string();
+        if (auto height_value = parse_css_type(parsing_params, height_string, CSS::ValueType::Length))
+            properties.append({ .property_id = CSS::PropertyID::Height, .value = height_value.release_nonnull() });
     } else if (height_value) {
-        cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Height, height_value.release_nonnull());
+        properties.append({ .property_id = CSS::PropertyID::Height, .value = height_value.release_nonnull() });
     } else if (depth_value) {
-        cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::Height, depth_value.release_nonnull());
+        properties.append({ .property_id = CSS::PropertyID::Height, .value = depth_value.release_nonnull() });
     }
 }
 

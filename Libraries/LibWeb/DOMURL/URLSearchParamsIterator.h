@@ -6,27 +6,32 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibWeb/DOMURL/URLSearchParams.h>
 
 namespace Web::DOMURL {
 
-class URLSearchParamsIterator : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(URLSearchParamsIterator, Bindings::PlatformObject);
+// The state of a URLSearchParams iterator. The iterator's JS object is a host object that carries this cell as its
+// host data.
+class URLSearchParamsIterator final : public JS::Cell {
+    GC_CELL(URLSearchParamsIterator, JS::Cell);
     GC_DECLARE_ALLOCATOR(URLSearchParamsIterator);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<URLSearchParamsIterator>> create(URLSearchParams const&, JS::Object::PropertyKind iteration_kind);
+    using JSValueConversionIsForbidden = void;
+
+    static WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> create(JS::Realm&, URLSearchParams const&, JS::Object::PropertyKind iteration_kind);
 
     virtual ~URLSearchParamsIterator() override;
 
-    JS::Object* next();
+    JS::Object* next(JS::Realm&);
 
 private:
     URLSearchParamsIterator(URLSearchParams const&, JS::Object::PropertyKind iteration_kind);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     GC::Ref<URLSearchParams const> m_url_search_params;
     JS::Object::PropertyKind m_iteration_kind;

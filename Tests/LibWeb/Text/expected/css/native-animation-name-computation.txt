@@ -1,0 +1,1 @@
+animation-name: something, "none", "initial", foo, multi\ word\ string

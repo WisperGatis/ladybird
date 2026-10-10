@@ -9,6 +9,7 @@
 
 #include <AK/Span.h>
 #include <LibCore/EventReceiver.h>
+#include <LibCore/Forward.h>
 #include <LibWebSocket/ConnectionInfo.h>
 #include <LibWebSocket/Impl/WebSocketImpl.h>
 #include <LibWebSocket/Message.h>
@@ -28,6 +29,7 @@ enum class CloseStatusCode : u16 {
     GoingAway = 1001,
     ProtocolError = 1002,
     UnsupportedData = 1003,
+    NoStatusReceived = 1005,
     AbnormalClosure = 1006,
     InvalidPayload = 1007,
     PolicyViolation = 1008,
@@ -39,7 +41,7 @@ enum class CloseStatusCode : u16 {
 class WebSocket final : public Core::EventReceiver {
     C_OBJECT(WebSocket)
 public:
-    static NonnullRefPtr<WebSocket> create(ConnectionInfo, RefPtr<WebSocketImpl> = nullptr);
+    static NonnullRefPtr<WebSocket> create(ConnectionInfo, NonnullRefPtr<WebSocketImpl>);
     virtual ~WebSocket() override = default;
 
     URL::URL const& url() const { return m_connection.url(); }
@@ -55,7 +57,7 @@ public:
     void send(Message const&);
 
     // This can only be used if the `ready_state` is `ReadyState::Open`
-    void close(u16 code = 1005, ByteString const& reason = {});
+    void close(u16 code = to_underlying(CloseStatusCode::NoStatusReceived), ByteString const& reason = {});
 
     Function<void()> on_open;
     Function<void(u16 code, ByteString reason, bool was_clean)> on_close;
@@ -72,7 +74,7 @@ public:
     Function<void(Error)> on_error;
 
 private:
-    WebSocket(ConnectionInfo, RefPtr<WebSocketImpl>);
+    WebSocket(ConnectionInfo, NonnullRefPtr<WebSocketImpl>);
 
     // As defined in section 5.2
     enum class OpCode : u8 {
@@ -97,7 +99,6 @@ private:
     void notify_error(Error);
     void notify_message(Message);
 
-    void fatal_error(Error);
     void discard_connection();
 
     enum class InternalState {
@@ -127,11 +128,12 @@ private:
 
     bool m_discard_connection_requested { false };
 
-    u16 m_last_close_code { 1005 };
+    u16 m_last_close_code { to_underlying(CloseStatusCode::NoStatusReceived) };
     ByteString m_last_close_message;
 
     ConnectionInfo m_connection;
     RefPtr<WebSocketImpl> m_impl;
+    RefPtr<Core::Timer> m_closing_handshake_timer;
 
     Vector<u8> m_buffered_data;
     ByteBuffer m_fragmented_data_buffer;

@@ -7,20 +7,29 @@
 #pragma once
 
 #include <LibJS/Forward.h>
-#include <LibWeb/Bindings/AudioListenerPrototype.h>
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/WebAudio/AudioParam.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::WebAudio {
 
 // https://webaudio.github.io/web-audio-api/#AudioListener
-class AudioListener final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(AudioListener, Bindings::PlatformObject);
+class AudioListener final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(AudioListener, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(AudioListener);
 
 public:
-    static GC::Ref<AudioListener> create(JS::Realm&, GC::Ref<BaseAudioContext>);
+    static constexpr size_t position_x_offset() { return offsetof(AudioListener, m_position_x); }
+    static constexpr size_t position_y_offset() { return offsetof(AudioListener, m_position_y); }
+    static constexpr size_t position_z_offset() { return offsetof(AudioListener, m_position_z); }
+    static constexpr size_t forward_x_offset() { return offsetof(AudioListener, m_forward_x); }
+    static constexpr size_t forward_y_offset() { return offsetof(AudioListener, m_forward_y); }
+    static constexpr size_t forward_z_offset() { return offsetof(AudioListener, m_forward_z); }
+    static constexpr size_t up_x_offset() { return offsetof(AudioListener, m_up_x); }
+    static constexpr size_t up_y_offset() { return offsetof(AudioListener, m_up_y); }
+    static constexpr size_t up_z_offset() { return offsetof(AudioListener, m_up_z); }
+    static GC::Ref<AudioListener> create(GC::Ref<BaseAudioContext>);
     virtual ~AudioListener() override;
 
     GC::Ref<AudioParam> forward_x() const { return m_forward_x; }
@@ -37,10 +46,9 @@ public:
     WebIDL::ExceptionOr<void> set_orientation(float x, float y, float z, float x_up, float y_up, float z_up);
 
 private:
-    explicit AudioListener(JS::Realm&, GC::Ref<BaseAudioContext>);
+    explicit AudioListener(GC::Ref<BaseAudioContext>);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     GC::Ref<AudioParam> m_forward_x;
     GC::Ref<AudioParam> m_forward_y;

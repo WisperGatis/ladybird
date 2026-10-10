@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const httpServer = httpTestServer();
+
+        const childUrl = new URL(
+            await httpServer.createEcho("GET", "/oop-iframe-crash-window-child", {
+                status: 200,
+                headers: { "Content-Type": "text/html" },
+                body: "<!DOCTYPE html>child",
+            })
+        );
+        childUrl.hostname = uniqueLocalhostHostname("oop-iframe-crash-window");
+
+        const iframe = document.createElement("iframe");
+        const loaded = new Promise(resolve => iframe.addEventListener("load", resolve, { once: true }));
+        iframe.src = childUrl;
+        document.body.appendChild(iframe);
+
+        // A navigation replaces the entry of a document that is not completely loaded.
+        await loaded;
+        if (remoteFrameCount() !== 1) {
+            println("iframe did not become remote");
+            return;
+        }
+        const contentWindow = iframe.contentWindow;
+
+        internals.crashRemoteFrameProcesses();
+
+        if (!(await waitForCondition(() => remoteFrameCount() === 0))) {
+            println("iframe did not collapse after its process crashed");
+            return;
+        }
+        println(`contentWindow kept: ${iframe.contentWindow === contentWindow}`);
+
+        // The frame's lost document is navigated through its WindowProxy.
+        const nextChildUrl = new URL(
+            await httpServer.createEcho("GET", "/oop-iframe-crash-window-next-child", {
+                status: 200,
+                headers: { "Content-Type": "text/html" },
+                body: "<!DOCTYPE html>next child",
+            })
+        );
+        nextChildUrl.hostname = uniqueLocalhostHostname("oop-iframe-crash-window-next");
+        const historyLength = history.length;
+        iframe.contentWindow.location = nextChildUrl;
+
+        if (!(await waitForCondition(() => remoteFrameCount() === 1))) {
+            println("iframe did not load after its process crashed");
+            return;
+        }
+        println(internals.dumpSiteIsolationProcessTree().trimEnd());
+        // This document learns of the new entry after the UI process commits it.
+        await waitForCondition(() => history.length > historyLength);
+        println(`history grew by ${history.length - historyLength}`);
+    });
+</script>

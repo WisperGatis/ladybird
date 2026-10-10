@@ -7,33 +7,35 @@
 #pragma once
 
 #include <AK/HashMap.h>
-#include <AK/Tuple.h>
-#include <LibGfx/Bitmap.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/ViewTransitionPrototype.h>
-#include <LibWeb/CSS/Enums.h>
-#include <LibWeb/CSS/Filter.h>
-#include <LibWeb/CSS/PreferredColorScheme.h>
-#include <LibWeb/CSS/Transformation.h>
+#include <AK/Optional.h>
+#include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/Forward.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 #include <LibWeb/DOM/PseudoElement.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::ViewTransition {
 
+// A translate() <transform-function> style value built as a bare Rust handle: captured transforms
+// are only stored and (eventually) serialized into the dynamic view transition style sheet, so no
+// C++ wrapper facade is needed.
+CSS::RustStyleValueHandle make_translation_transform(CSSPixels x, CSSPixels y);
+
 // https://drafts.csswg.org/css-view-transitions-1/#named-view-transition-pseudo
 class NamedViewTransitionPseudoElement
-    : public DOM::PseudoElementTreeNode {
-    GC_CELL(NamedViewTransitionPseudoElement, DOM::PseudoElementTreeNode);
+    : public DOM::SyntheticPseudoElementTreeNode {
+    GC_CELL(NamedViewTransitionPseudoElement, DOM::SyntheticPseudoElementTreeNode);
     GC_DECLARE_ALLOCATOR(NamedViewTransitionPseudoElement);
 
-    NamedViewTransitionPseudoElement(CSS::PseudoElement, FlyString);
-
-    CSS::PseudoElement m_type;
+    NamedViewTransitionPseudoElement(CSS::PseudoElement, Utf16FlyString);
 
     // Several of the view transition pseudo-elements are named view transition pseudo-elements, which are
     // functional tree-abiding view transition pseudo-elements associated with a view transition name.
-    FlyString m_view_transition_name;
+    Utf16FlyString m_view_transition_name;
 };
 
 // https://drafts.csswg.org/css-view-transitions-1/#::view-transition-old
@@ -43,9 +45,9 @@ class ReplacedNamedViewTransitionPseudoElement
     GC_CELL(ReplacedNamedViewTransitionPseudoElement, NamedViewTransitionPseudoElement);
     GC_DECLARE_ALLOCATOR(ReplacedNamedViewTransitionPseudoElement);
 
-    ReplacedNamedViewTransitionPseudoElement(CSS::PseudoElement, FlyString, RefPtr<Gfx::ImmutableBitmap>);
+    ReplacedNamedViewTransitionPseudoElement(CSS::PseudoElement, Utf16FlyString, Optional<Gfx::DecodedImageFrame>);
 
-    RefPtr<Gfx::ImmutableBitmap> m_content;
+    Optional<Gfx::DecodedImageFrame> m_content;
 };
 
 // https://drafts.csswg.org/css-view-transitions-1/#captured-element
@@ -53,16 +55,15 @@ struct CapturedElement : public JS::Cell {
     GC_CELL(CapturedElement, JS::Cell)
     GC_DECLARE_ALLOCATOR(CapturedElement);
 
-    RefPtr<Gfx::ImmutableBitmap> old_image {};
+    Optional<Gfx::DecodedImageFrame> old_image {};
     CSSPixels old_width = 0;
     CSSPixels old_height = 0;
-    // FIXME: Make this an identity transform function by default.
-    CSS::Transformation old_transform = CSS::Transformation(CSS::TransformFunction::Translate, Vector<CSS::TransformValue>());
+    CSS::RustStyleValueHandle old_transform = make_translation_transform(0, 0);
     Optional<CSS::WritingMode> old_writing_mode {};
     Optional<CSS::Direction> old_direction {};
     // FIXME: old_text_orientation
     Optional<CSS::MixBlendMode> old_mix_blend_mode {};
-    CSS::Filter old_backdrop_filter {};
+    CSS::RustStyleValueHandle old_backdrop_filter {};
     Optional<CSS::PreferredColorScheme> old_color_scheme {};
     GC::Ptr<DOM::Element> new_element {};
 
@@ -79,12 +80,13 @@ private:
 // https://drafts.csswg.org/css-view-transitions-1/#callbackdef-viewtransitionupdatecallback
 using ViewTransitionUpdateCallback = GC::Ptr<WebIDL::CallbackType>;
 
-class ViewTransition final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(ViewTransition, Bindings::PlatformObject);
+class ViewTransition final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(ViewTransition, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(ViewTransition);
 
 public:
-    static GC::Ref<ViewTransition> create(JS::Realm&);
+    static GC::Ref<ViewTransition> create(GC::Ref<DOM::Document>, GC::Ref<WebIDL::Promise> ready_promise,
+        GC::Ref<WebIDL::Promise> update_callback_done_promise, GC::Ref<WebIDL::Promise> finished_promise);
     virtual ~ViewTransition() override = default;
 
     // https://drafts.csswg.org/css-view-transitions-1/#dom-viewtransition-updatecallbackdone
@@ -119,6 +121,7 @@ public:
 
     // https://drafts.csswg.org/css-view-transitions-1/#skip-the-view-transition
     void skip_the_view_transition(JS::Value reason);
+    void skip_the_view_transition(GC::Ref<WebIDL::DOMException> reason);
 
     // https://drafts.csswg.org/css-view-transitions-1/#handle-transition-frame
     void handle_transition_frame();
@@ -140,13 +143,16 @@ public:
     void set_update_callback(ViewTransitionUpdateCallback callback) { m_update_callback = callback; }
 
 private:
-    ViewTransition(JS::Realm&, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>);
-    virtual void initialize(JS::Realm&) override;
+    ViewTransition(GC::Ref<DOM::Document>, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>, GC::Ref<WebIDL::Promise>);
 
-    virtual void visit_edges(JS::Cell::Visitor&) override;
+    DOM::Document& document() const { return m_document; }
+
+    virtual void visit_edges(GC::Cell::Visitor&) override;
+
+    GC::Ref<DOM::Document> m_document;
 
     // https://drafts.csswg.org/css-view-transitions-1/#viewtransition-named-elements
-    HashMap<FlyString, GC::Ptr<CapturedElement>> m_named_elements = {};
+    HashMap<Utf16FlyString, GC::Ptr<CapturedElement>> m_named_elements = {};
 
     // https://drafts.csswg.org/css-view-transitions-1/#viewtransition-phase
     Phase m_phase = Phase::PendingCapture;
@@ -164,7 +170,7 @@ private:
     GC::Ref<WebIDL::Promise> m_finished_promise;
 
     // https://drafts.csswg.org/css-view-transitions-1/#viewtransition-transition-root-pseudo-element
-    GC::Ref<DOM::PseudoElementTreeNode> m_transition_root_pseudo_element;
+    GC::Ref<DOM::SyntheticPseudoElementTreeNode> m_transition_root_pseudo_element;
 
     // https://drafts.csswg.org/css-view-transitions-1/#viewtransition-initial-snapshot-containing-block-size
     Optional<CSSPixelSize> m_initial_snapshot_containing_block_size;

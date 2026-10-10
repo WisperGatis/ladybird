@@ -1,0 +1,103 @@
+<!doctype html>
+<script src="../include.js"></script>
+<script src="recording-test.js"></script>
+<style>
+    body { margin: 0; }
+    canvas { display: block; width: 100px; height: 100px; background: green; }
+    #boundary { position: absolute; left: 200px; top: 0; width: 100px; height: 100px; }
+</style>
+<canvas id="full" width="100" height="100"></canvas>
+<div id="boundary"><canvas id="partial" width="100" height="100"></canvas></div>
+<script>
+let previousLayoutCount;
+displayListTest({
+    setup: removeBodyWhitespace,
+    steps: [
+        {
+            name: "unchanged canvas preserves cached paint after full relayout",
+            mutate: () => {
+                previousLayoutCount = internals.fullLayoutCount();
+                // Reassigning the width requests layout even when the value is unchanged.
+                // Without a rendering context, there is no canvas content to reset.
+                full.width = full.width;
+            },
+            check: equal => {
+                equal(internals.fullLayoutCount(), previousLayoutCount + 1, "full layout count");
+                equal(full.getBoundingClientRect().width, 100, "canvas width");
+            },
+            expect: `
+                damage: rows=0 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport COPY
+            `,
+        },
+        {
+            name: "unchanged canvas preserves cached paint after partial relayout",
+            mutate: () => {
+                previousLayoutCount = internals.partialLayoutCount();
+                partial.width = partial.width;
+            },
+            check: equal => {
+                equal(internals.partialLayoutCount(), previousLayoutCount + 1, "partial layout count");
+                equal(partial.getBoundingClientRect().width, 100, "canvas width");
+            },
+            expect: `
+                damage: rows=4 moved=0 order=1 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport ASSEMBLE
+                  @viewport/preamble COPY
+                  @viewport/background/hit-test COPY
+                  @viewport/scroll-metadata COPY
+                  @viewport/background COPY
+                  @viewport/border COPY
+                  BlockContainer<HTML>/descendants(background-and-borders) ASSEMBLE
+                  @viewport/foreground/hit-test COPY
+                  @viewport/foreground COPY
+                  BlockContainer<HTML>/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML> ASSEMBLE
+                    BlockContainer<HTML>/preamble COPY
+                    BlockContainer<HTML>/background/hit-test COPY
+                    BlockContainer<HTML>/scroll-metadata COPY
+                    BlockContainer<HTML>/background COPY
+                    BlockContainer<HTML>/border COPY
+                    BlockContainer<BODY>/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<BODY>/background/hit-test COPY
+                      BlockContainer<BODY>/scroll-metadata COPY
+                      BlockContainer<BODY>/background COPY
+                      BlockContainer<BODY>/border COPY
+                      CanvasBox<CANVAS>#full/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#boundary/descendants(background-and-borders) REPLAN
+                    BlockContainer<BODY>/descendants(inline-background-and-borders) ASSEMBLE
+                      CanvasBox<CANVAS>#full/descendants(inline-background-and-borders) COPY
+                      BlockContainer<DIV>#boundary/descendants(inline-background-and-borders) REPLAN
+                    BlockContainer<HTML>/foreground/hit-test COPY
+                    BlockContainer<HTML>/foreground COPY
+                    BlockContainer<BODY>/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>/foreground/hit-test COPY
+                      BlockContainer<BODY>/foreground COPY
+                      CanvasBox<CANVAS>#full/descendants(foreground) COPY
+                      BlockContainer<DIV>#boundary/descendants(foreground) REPLAN
+                      BlockContainer<BODY>/outline COPY
+                      BlockContainer<BODY>/overlay/hit-test COPY
+                      BlockContainer<BODY>/overlay COPY
+                    BlockContainer<DIV>#boundary REPLAN
+                      BlockContainer<DIV>#boundary/background/hit-test COPY
+                      BlockContainer<DIV>#boundary/scroll-metadata COPY
+                      BlockContainer<DIV>#boundary/background COPY
+                      BlockContainer<DIV>#boundary/border COPY
+                      CanvasBox<CANVAS>#partial/descendants(background-and-borders) COPY
+                      CanvasBox<CANVAS>#partial/descendants(floats) COPY
+                      CanvasBox<CANVAS>#partial/descendants(inline-background-and-borders) COPY
+                      BlockContainer<DIV>#boundary/foreground/hit-test COPY
+                      BlockContainer<DIV>#boundary/foreground COPY
+                      CanvasBox<CANVAS>#partial/descendants(foreground) COPY
+                      BlockContainer<DIV>#boundary/outline COPY
+                      BlockContainer<DIV>#boundary/overlay/hit-test COPY
+                      BlockContainer<DIV>#boundary/overlay COPY
+                    BlockContainer<HTML>/outline COPY
+                  @viewport/outline COPY
+            `,
+        },
+    ],
+});
+</script>

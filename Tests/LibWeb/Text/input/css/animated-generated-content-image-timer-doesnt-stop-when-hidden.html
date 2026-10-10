@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    #target::before {
+        content: url("../wpt-import/images/anim-gr.gif");
+    }
+</style>
+<div id="target"></div>
+<script>
+    const imageURL = "../wpt-import/images/anim-gr.gif";
+
+    promiseTest(async () => {
+        await new Promise(resolve => window.addEventListener("load", resolve));
+
+        internals.dumpLayoutTree(document);
+        println(`timer active before hiding: ${internals.imageAnimationStateForURL(imageURL).timerActive}`);
+
+        target.style.display = "none";
+        internals.dumpLayoutTree(document);
+
+        println(`timer active after hiding: ${internals.imageAnimationStateForURL(imageURL).timerActive}`);
+    });
+</script>

@@ -16,26 +16,28 @@
 namespace Web::HTML {
 
 class HTMLDetailsElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLDetailsElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLDetailsElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLDetailsElement);
 
 public:
     virtual ~HTMLDetailsElement() override;
 
+    virtual bool is_html_details_element() const final { return true; }
+
     // https://www.w3.org/TR/html-aria/#el-details
     virtual Optional<ARIA::Role> default_role() const override { return ARIA::Role::group; }
 
+    bool is_default_summary(HTMLSummaryElement const& summary) const;
+
 private:
     HTMLDetailsElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual void inserted() override;
-    virtual void children_changed(ChildrenChangedMetadata const*) override;
-    virtual void attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void children_changed(ChildrenChangedMetadata const&) override;
+    virtual void attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    void queue_a_details_toggle_event_task(String old_state, String new_state);
+    void queue_a_details_toggle_event_task(Utf16FlyString old_state, Utf16FlyString new_state);
     void ensure_details_exclusivity_by_closing_other_elements_if_needed();
     void ensure_details_exclusivity_by_closing_the_given_element_if_needed();
 
@@ -46,8 +48,16 @@ private:
     // https://html.spec.whatwg.org/multipage/interactive-elements.html#details-toggle-task-tracker
     Optional<ToggleTaskTracker> m_details_toggle_task_tracker;
 
+    GC::Ptr<HTML::HTMLSummaryElement> m_default_summary;
     GC::Ptr<HTML::HTMLSlotElement> m_summary_slot;
     GC::Ptr<HTML::HTMLSlotElement> m_descendants_slot;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLDetailsElement>() const { return is_html_details_element(); }
 
 }

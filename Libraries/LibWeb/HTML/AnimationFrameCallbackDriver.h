@@ -13,7 +13,7 @@
 #include <LibGC/Ptr.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
@@ -24,6 +24,8 @@ class WEB_API AnimationFrameCallbackDriver final : public JS::Cell {
     using Callback = GC::Ref<GC::Function<void(double)>>;
 
 public:
+    [[nodiscard]] static GC::Ref<AnimationFrameCallbackDriver> create();
+
     [[nodiscard]] WebIDL::UnsignedLong add(Callback handler);
     bool remove(WebIDL::UnsignedLong);
     bool has_callbacks() const;

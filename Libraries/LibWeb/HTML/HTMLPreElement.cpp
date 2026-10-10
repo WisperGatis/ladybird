@@ -4,9 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLPreElementPrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/HTML/HTMLPreElement.h>
 #include <LibWeb/HTML/Numbers.h>
@@ -22,13 +20,7 @@ HTMLPreElement::HTMLPreElement(DOM::Document& document, DOM::QualifiedName quali
 
 HTMLPreElement::~HTMLPreElement() = default;
 
-void HTMLPreElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLPreElement);
-    Base::initialize(realm);
-}
-
-bool HTMLPreElement::is_presentational_hint(FlyString const& name) const
+bool HTMLPreElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -36,14 +28,13 @@ bool HTMLPreElement::is_presentational_hint(FlyString const& name) const
     return name == HTML::AttributeNames::wrap;
 }
 
-void HTMLPreElement::apply_presentational_hints(GC::Ref<CSS::CascadedProperties> cascaded_properties) const
+void HTMLPreElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
-    HTMLElement::apply_presentational_hints(cascaded_properties);
+    HTMLElement::apply_presentational_hints(properties);
 
-    for_each_attribute([&](auto const& name, auto const&) {
-        if (name == HTML::AttributeNames::wrap) {
-            cascaded_properties->set_property_from_presentational_hint(CSS::PropertyID::TextWrapMode, CSS::KeywordStyleValue::create(CSS::Keyword::Wrap));
-        }
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View) {
+        if (name == HTML::AttributeNames::wrap)
+            properties.append({ .property_id = CSS::PropertyID::TextWrapMode, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Wrap) });
     });
 }
 

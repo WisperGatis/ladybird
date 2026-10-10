@@ -1,20 +1,23 @@
-#import <UIEvents/UIEvent.idl>
-#import <DOM/StaticRange.idl>
-
 // https://w3c.github.io/uievents/#inputevent
 [Exposed=Window]
 interface InputEvent : UIEvent {
-    constructor(DOMString type, optional InputEventInit eventInitDict = {});
-    readonly attribute Utf16USVString? data;
+    constructor([FlyString] DOMString type, optional InputEventInit eventInitDict = {});
+    readonly attribute USVString? data;
     readonly attribute boolean isComposing;
     readonly attribute DOMString inputType;
 
+    // https://w3c.github.io/input-events/#interface-InputEvent
+    [DirectGetter] readonly attribute DataTransfer? dataTransfer;
     sequence<StaticRange> getTargetRanges();
 };
 
 // https://w3c.github.io/uievents/#dictdef-inputeventinit
 dictionary InputEventInit : UIEventInit {
-    Utf16DOMString? data = null;
+    DOMString? data = null;
     boolean isComposing = false;
-    DOMString inputType = "";
+    [FlyString] DOMString inputType = "";
+
+    // https://w3c.github.io/input-events/#interface-InputEvent
+    DataTransfer? dataTransfer = null;
+    sequence<StaticRange> targetRanges = [];
 };

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <AK/HashTable.h>
 #include <AK/SourceLocation.h>
 #include <AK/TemporaryChange.h>
@@ -31,18 +32,35 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     m_context.types.extend(module.type_section().types());
     m_context.data_count = module.data_count_section().count();
 
+    // https://webassembly.github.io/spec/core/valid/modules.html#types
+    // Intern the type section's recursive groups as defined types ("the defined type sequence
+    // dt* is of the form roll*_x(rectype)") before anything else can refer to them; the rest of
+    // the sub type validation rule runs in validate(TypeSection const&) below.
+    {
+        auto canonical_types = TRY(canonicalize_module_types(module.type_section()));
+        m_context.canonical_types.extend(canonical_types);
+        module.set_canonical_types(move(canonical_types));
+    }
+    TRY(validate(module.type_section()));
+
     for (auto& import_ : module.import_section().imports()) {
         TRY(import_.description().visit(
             [&](TypeIndex const& index) -> ErrorOr<void, ValidationError> {
-                if (m_context.types.size() > index.value())
-                    m_context.functions.append(m_context.types[index.value()]);
-                else
+                if (m_context.types.size() <= index.value())
                     return Errors::invalid("TypeIndex"sv);
+
+                auto const& type = m_context.types[index.value()];
+                if (!type.is_function())
+                    return Errors::invalid("function import type"sv);
+
+                m_context.functions.append(type.function());
+                m_context.function_type_indices.append(index);
                 m_context.imported_function_count++;
                 return {};
             },
             [&](FunctionType const& type) -> ErrorOr<void, ValidationError> {
                 m_context.functions.append(type);
+                m_context.function_type_indices.append({});
                 m_context.imported_function_count++;
                 return {};
             },
@@ -69,11 +87,13 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
         return Errors::invalid("FunctionSection"sv);
 
     m_context.functions.ensure_capacity(module.function_section().types().size() + m_context.functions.size());
-    for (auto& index : module.function_section().types())
-        if (m_context.types.size() > index.value())
-            m_context.functions.append(m_context.types[index.value()]);
-        else
+    m_context.function_type_indices.ensure_capacity(module.function_section().types().size() + m_context.function_type_indices.size());
+    for (auto& index : module.function_section().types()) {
+        if (m_context.types.size() <= index.value() || !m_context.types[index.value()].is_function())
             return Errors::invalid("TypeIndex"sv);
+        m_context.functions.append(m_context.types[index.value()].function());
+        m_context.function_type_indices.append(index);
+    }
 
     m_context.tables.ensure_capacity(m_context.tables.size() + module.table_section().tables().size());
     for (auto& table : module.table_section().tables())
@@ -121,6 +141,8 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     }
     for (auto& segment : module.global_section().entries())
         scan_expression_for_function_indices(segment.expression());
+    for (auto& table : module.table_section().tables())
+        scan_expression_for_function_indices(table.initializer());
 
     TRY(validate(module.import_section()));
     TRY(validate(module.export_section()));
@@ -131,9 +153,121 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     TRY(validate(module.memory_section()));
     TRY(validate(module.table_section()));
     TRY(validate(module.code_section()));
+    TRY(validate(module.tag_section()));
+
+    for (auto& entry : module.code_section().functions())
+        module.set_minimum_call_record_allocation_size(max(entry.func().body().compiled_instructions.max_call_rec_size, module.minimum_call_record_allocation_size()));
 
     module.set_validation_status(Module::ValidationStatus::Valid, {});
     return {};
+}
+
+void compile_module_to_native(Module& module)
+{
+    auto cache_config = module.take_cranelift_cache_config();
+    auto stats = module.take_compile_stats();
+
+    bool installing = false;
+    bool capturing = false;
+
+    if (cache_config.has_value()) {
+        auto hash = ReadonlyBytes { cache_config->wasm_hash.data(), 32 };
+        if (!cache_config->existing_blob.is_empty())
+            installing = try_install_cranelift_cache_blob(hash, cache_config->existing_blob.bytes());
+        if (!installing && cache_config->on_compiled) {
+            begin_cranelift_cache_capture();
+            capturing = true;
+        }
+    }
+
+    ScopeGuard cleanup = [&] {
+        auto cranelift_start = MonotonicTime::now();
+        flush_cranelift_batch();
+        auto cranelift_duration = MonotonicTime::now() - cranelift_start;
+
+        if (installing)
+            abort_cranelift_cache_install();
+
+        size_t produced_blob_size = 0;
+        if (capturing) {
+            auto hash = ReadonlyBytes { cache_config->wasm_hash.data(), 32 };
+            if (auto blob = serialize_cranelift_cache_blob(hash); blob.has_value() && cache_config->on_compiled) {
+                produced_blob_size = blob->size();
+                cache_config->on_compiled(blob.release_value());
+            } else {
+                abort_cranelift_cache_capture();
+            }
+        }
+
+        if (stats.has_value()) {
+            stats->cranelift_time = cranelift_duration;
+            stats->cranelift_blob_size_bytes = produced_blob_size;
+            stats->cache_hit = installing;
+            size_t count = 0;
+            size_t tier_up_functions = 0;
+            size_t tier_up_checkpoints = 0;
+            for (auto& entry : module.code_section().functions()) {
+                auto const& ci = entry.func().body().compiled_instructions;
+                if (ci.cranelift_compiled)
+                    ++count;
+                if (ci.has_tier_up_checkpoints) {
+                    ++tier_up_functions;
+                    for (auto const& dispatch : ci.dispatches) {
+                        if (dispatch.instruction->opcode() == Instructions::synthetic_tier_up)
+                            ++tier_up_checkpoints;
+                    }
+                }
+            }
+            stats->function_count = count;
+            stats->tier_up_function_count = tier_up_functions;
+            stats->tier_up_checkpoint_count = tier_up_checkpoints;
+            record_module_stats(stats.release_value());
+        }
+
+        set_cranelift_active_function_index(NumericLimits<u32>::max());
+    };
+
+    size_t imported_function_count = 0;
+    for (auto& import_ : module.import_section().imports()) {
+        import_.description().visit(
+            [&](TypeIndex const& type_index) {
+                auto& types = module.type_section().types();
+                if (type_index.value() < types.size() && types[type_index.value()].is_function())
+                    ++imported_function_count;
+            },
+            [&](FunctionType const&) { ++imported_function_count; },
+            [&](auto const&) {});
+    }
+
+    size_t function_index = imported_function_count;
+    for (auto& entry : module.code_section().functions()) {
+        auto& compiled = entry.func().body().compiled_instructions;
+        set_cranelift_active_function_index(static_cast<u32>(function_index++));
+        if (compiled.cranelift_eligible)
+            try_cranelift_compile(compiled, compiled.cranelift_result_arity);
+    }
+}
+
+ErrorOr<void, ValidationError> ensure_cranelift_compiled(Module& module)
+{
+    if (!module.try_begin_cranelift_compilation()) {
+        module.wait_for_cranelift_compilation();
+        return {};
+    }
+
+    if (module.validation_status() == Module::ValidationStatus::Invalid) {
+        module.finish_cranelift_compilation();
+        return ValidationError { module.validation_error() };
+    }
+
+    compile_module_to_native(module);
+    module.finish_cranelift_compilation();
+    return {};
+}
+
+void start_cranelift_compilation(Module& module)
+{
+    (void)ensure_cranelift_compiled(module);
 }
 
 ErrorOr<void, ValidationError> Validator::validate(ImportSection const& section)
@@ -190,13 +324,20 @@ ErrorOr<void, ValidationError> Validator::validate(DataSection const& section)
 ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section)
 {
     for (auto& segment : section.segments()) {
+        // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
+        // - The reference type elemtype is valid.
+        TRY(validate(segment.type));
+        if (!segment.type.is_reference())
+            return Errors::invalid("element reference type"sv);
+
         TRY(segment.mode.visit(
             [](ElementSection::Declarative const&) -> ErrorOr<void, ValidationError> { return {}; },
             [](ElementSection::Passive const&) -> ErrorOr<void, ValidationError> { return {}; },
             [&](ElementSection::Active const& active) -> ErrorOr<void, ValidationError> {
+                // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
                 TRY(validate(active.index));
                 auto table = m_context.tables[active.index.value()];
-                if (table.element_type() != segment.type)
+                if (!matches_reference_type(segment.type, table.element_type(), m_context.type_context()))
                     return Errors::invalid("active element reference type"sv);
                 auto at = table.limits().address_value_type();
                 auto expression_result = TRY(validate(active.expression, { at }));
@@ -210,9 +351,12 @@ ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section
         for (auto& expression : segment.init) {
             if (expression.instructions().is_empty())
                 continue;
+            // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
             auto result = TRY(validate(expression, { segment.type }));
             if (!result.is_constant)
                 return Errors::invalid("element initializer"sv);
+            if (result.result_types.size() != 1)
+                return Errors::invalid("element initializer type"sv, segment.type, result.result_types);
         }
     }
     return {};
@@ -220,14 +364,19 @@ ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section
 
 ErrorOr<void, ValidationError> Validator::validate(GlobalSection const& section)
 {
+    // https://webassembly.github.io/spec/core/valid/modules.html#modules
+    auto section_validator = fork();
+    section_validator.m_context.globals = m_globals_without_internal_globals;
+
     for (auto& entry : section.entries()) {
         auto& type = entry.type();
-        TRY(validate(type));
-        auto expression_result = TRY(validate(entry.expression(), { type.type() }));
+        TRY(section_validator.validate(type));
+        auto expression_result = TRY(section_validator.validate(entry.expression(), { type.type() }));
         if (!expression_result.is_constant)
             return Errors::invalid("global variable initializer"sv);
-        if (expression_result.result_types.size() != 1 || !expression_result.result_types.first().is_of_kind(type.type().kind()))
+        if (expression_result.result_types.size() != 1)
             return Errors::invalid("global variable initializer type"sv, ValueType(ValueType::I32), expression_result.result_types);
+        section_validator.m_context.globals.append(type);
     }
 
     return {};
@@ -240,50 +389,111 @@ ErrorOr<void, ValidationError> Validator::validate(MemorySection const& section)
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/modules.html#tables
 ErrorOr<void, ValidationError> Validator::validate(TableSection const& section)
 {
-    for (auto& entry : section.tables())
-        TRY(validate(entry.type()));
+    auto section_validator = fork();
+    section_validator.m_context.globals = m_globals_without_internal_globals;
+
+    for (auto& entry : section.tables()) {
+        TRY(section_validator.validate(entry.type()));
+        auto expression_result = TRY(section_validator.validate(entry.initializer(), { entry.type().element_type() }));
+        if (!expression_result.is_constant)
+            return Errors::invalid("table initializer"sv);
+        if (expression_result.result_types.size() != 1)
+            return Errors::invalid("table initializer type"sv, entry.type().element_type(), expression_result.result_types);
+    }
     return {};
 }
 
 ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
 {
+    Vector<CodeSection::Func const*> callee_bodies;
+    callee_bodies.resize(m_context.imported_function_count + section.functions().size());
+
     size_t index = m_context.imported_function_count;
     for (auto& entry : section.functions()) {
         auto function_index = index++;
-        TRY(validate(FunctionIndex { function_index }));
+        VERIFY(function_index <= NumericLimits<u32>::max());
+        TRY(validate(FunctionIndex { static_cast<u32>(function_index) }));
         auto& function_type = m_context.functions[function_index];
         auto& function = entry.func();
 
         auto function_validator = fork();
         function_validator.m_context.locals = {};
         function_validator.m_context.locals.extend(function_type.parameters());
+        function_validator.m_context.current_function_parameter_count = function_type.parameters().size();
         for (auto& local : function.locals()) {
+            // https://webassembly.github.io/spec/core/valid/modules.html#functions
+            // The locals' value types must be valid (in particular, type uses must exist).
+            TRY(function_validator.validate(local.type()));
             for (size_t i = 0; i < local.n(); ++i)
                 function_validator.m_context.locals.append(local.type());
         }
 
-        function_validator.m_frames.empend(function_type, FrameKind::Function, (size_t)0);
-        function_validator.m_max_frame_size = max(function_validator.m_max_frame_size, function_validator.m_frames.size());
+        // https://webassembly.github.io/spec/core/valid/modules.html#functions
+        function_validator.m_local_initialized.clear_with_capacity();
+        function_validator.m_local_init_log.clear_with_capacity();
+        for (auto& parameter : function_type.parameters()) {
+            (void)parameter;
+            function_validator.m_local_initialized.append(true);
+        }
+        for (auto& local : function.locals()) {
+            for (size_t i = 0; i < local.n(); ++i)
+                function_validator.m_local_initialized.append(local.type().is_defaultable());
+        }
 
-        auto results = TRY(function_validator.validate(function.body(), function_type.results()));
+        function_validator.push_frame(Frame { function_type, FrameKind::Function, (size_t)0 });
+
+        auto results = TRY(function_validator.validate(function.body(), function_type.results(), callee_bodies.span(), function_index));
         if (results.result_types.size() != function_type.results().size())
             return Errors::invalid("function result"sv, function_type.results(), results.result_types);
+
+        callee_bodies[function_index] = &function;
+
+        if (function.body().compiled_instructions.max_call_rec_size != 0) {
+            size_t max_callee_locals = 0;
+            for (auto& insn : function.body().instructions()) {
+                if (!first_is_one_of(insn.opcode(), Instructions::call, Instructions::synthetic_call_with_record_0, Instructions::synthetic_call_with_record_1))
+                    continue;
+                auto callee_index = insn.arguments().template get<FunctionIndex>();
+                if (callee_index.value() - m_context.imported_function_count < section.functions().size())
+                    max_callee_locals = max(max_callee_locals, section.functions()[callee_index.value() - m_context.imported_function_count].func().total_local_count());
+            }
+
+            function.body().compiled_instructions.max_call_rec_size += max_callee_locals;
+        }
     }
+
+    return {};
+}
+
+ErrorOr<void, ValidationError> Validator::validate(TagSection const& section)
+{
+    for (auto& entry : section.tags())
+        TRY(validate(entry));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/types.html#recursive-types
+ErrorOr<void, ValidationError> Validator::validate(TypeSection const& section)
+{
+    for (size_t type_index = 0; type_index < section.types().size(); ++type_index)
+        TRY(validate(section.types()[type_index], type_index));
 
     return {};
 }
 
 ErrorOr<void, ValidationError> Validator::validate(TableType const& type)
 {
+    TRY(validate(type.element_type()));
     Optional<u64> bound = type.limits().address_type() == AddressType::I64 ? Optional<u64> {} : (1ull << 32) - 1;
     return validate(type.limits(), bound);
 }
 
 ErrorOr<void, ValidationError> Validator::validate(MemoryType const& type)
 {
-    u64 bound = type.limits().address_type() == AddressType::I64 ? 1ull << 48 : 1ull << 16;
+    u64 bound = type.limits().address_type() == AddressType::I64 ? 1ull << 48 : Constants::wasm32_max_pages;
     return validate(type.limits(), bound);
 }
 
@@ -292,17 +502,101 @@ ErrorOr<void, ValidationError> Validator::validate(Wasm::TagType const& tag_type
     // The function type t1^n -> t2^m must be valid
     TRY(validate(tag_type.type()));
     auto& type = m_context.types[tag_type.type().value()];
+    if (!type.is_function())
+        return Errors::invalid("TagType"sv);
+
+    auto& func = type.function();
+
     // The type sequence t2^m must be empty
-    if (!type.results().is_empty())
+    if (!func.results().is_empty())
         return Errors::invalid("TagType"sv);
     return {};
+}
+
+ErrorOr<void, ValidationError> Validator::validate(ValueType const& type)
+{
+    if (type.is_typeuse()) {
+        TRY(validate(type.unsafe_typeindex()));
+    }
+
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/types.html#recursive-types
+ErrorOr<void, ValidationError> Validator::validate(TypeSection::Type const& type, size_t this_type_index)
+{
+    // - The length of x* is less than or equal to 1.
+    if (type.supertypes().size() > 1)
+        return Errors::invalid("supertype count, only a single supertype is allowed"sv);
+
+    // - For all x in x*:
+    for (auto supertype_index : type.supertypes()) {
+        // - The index x is less than x0.
+        if (supertype_index.value() >= this_type_index)
+            return Errors::invalid("supertype index, must precede the subtype"sv);
+
+        // - The type C.types[x] exists.
+        TRY(validate(supertype_index));
+
+        // - The sub type unroll(C.types[x]) is of the form (sub y* comptype').
+        auto const& supertype = m_context.types[supertype_index.value()];
+        if (supertype.is_final())
+            return Errors::invalid("supertype, must not be final"sv);
+
+        // - The composite type comptype matches the composite type comptype'.
+        auto const* defined_type = m_context.canonical_types[this_type_index];
+        auto const* defined_supertype = m_context.canonical_types[supertype_index.value()];
+        if (!matches_composite_type(defined_type->expansion(), defined_supertype->expansion(), TypeContext {}))
+            return Errors::invalid("subtype, composite type must match its declared supertype"sv);
+    }
+
+    return type.description().visit(
+        [&](FunctionType const& function) { return validate(function); },
+        [&](StructType const& struct_) { return validate(struct_); },
+        [&](ArrayType const& array) { return validate(array); });
+}
+
+ErrorOr<void, ValidationError> Validator::validate(FunctionType const& type)
+{
+    for (auto param : type.parameters()) {
+        TRY(validate(param));
+    }
+
+    for (auto param : type.results()) {
+        TRY(validate(param));
+    }
+
+    return {};
+}
+
+ErrorOr<void, ValidationError> Validator::validate(StructType const& type)
+{
+    for (auto field : type.fields()) {
+        TRY(validate(field.type()));
+    }
+
+    return {};
+}
+
+ErrorOr<void, ValidationError> Validator::validate(ArrayType const& array)
+{
+    return validate(array.type().type());
+}
+
+ErrorOr<void, ValidationError> Validator::validate(GlobalType const& type)
+{
+    return validate(type.type());
 }
 
 ErrorOr<FunctionType, ValidationError> Validator::validate(BlockType const& type)
 {
     if (type.kind() == BlockType::Index) {
         TRY(validate(type.type_index()));
-        return m_context.types[type.type_index().value()];
+
+        if (!m_context.types[type.type_index().value()].is_function())
+            return Errors::invalid("BlockType"sv);
+
+        return m_context.types[type.type_index().value()].function();
     }
 
     if (type.kind() == BlockType::Type) {
@@ -1307,7 +1601,14 @@ VALIDATE_INSTRUCTION(ref_func)
         return Errors::invalid("function reference"sv);
 
     is_constant = true;
-    stack.append(ValueType(ValueType::FunctionReference));
+
+    // https://webassembly.github.io/gc/core/valid/instructions.html#xref-syntax-instructions-syntax-instr-ref-mathsf-ref-func-x
+    // ref.func x : [] → [(ref dt)]
+    auto type_index = m_context.function_type_indices[index.value()];
+    auto ref_type = type_index.has_value() ? ValueType(ValueType::TypeUseReference, *type_index) : ValueType(ValueType::FunctionReference);
+    ref_type.set_nullable(false);
+    stack.append(ref_type);
+
     return {};
 }
 
@@ -1338,46 +1639,52 @@ VALIDATE_INSTRUCTION(select_typed)
     if (required_types.size() != 1)
         return Errors::invalid("select types"sv, "exactly one type"sv, required_types);
 
+    // https://webassembly.github.io/spec/core/valid/instructions.html#parametric-instructions
+    // select t: valid with [t t i32] -> [t] if the value type t is valid; both operands must match the annotated type.
+    TRY(validate(required_types.first()));
     TRY(stack.take<ValueType::I32>());
-    auto arg0_type = TRY(stack.take_last());
-    auto arg1_type = TRY(stack.take_last());
+    TRY(stack.take(required_types.first()));
+    TRY(stack.take(required_types.first()));
 
-    if (arg0_type != arg1_type || arg0_type != required_types.first())
-        return Errors::invalid("select argument types"sv, Vector { required_types.first(), required_types.first() }, Vector { arg0_type, arg1_type });
-
-    stack.append(arg0_type.is_known ? arg0_type : arg1_type);
+    stack.append(required_types.first());
 
     return {};
 }
 
 // https://webassembly.github.io/spec/core/bikeshed/#variable-instructions%E2%91%A2
+// https://webassembly.github.io/spec/core/valid/instructions.html#variable-instructions
 VALIDATE_INSTRUCTION(local_get)
 {
-    auto index = instruction.local_index();
-    TRY(validate(index));
+    auto index = TRY(validate(instruction.local_index()));
+    if (!m_local_initialized[index.value()])
+        return Errors::invalid("local.get of an uninitialized non-defaultable local"sv);
 
     stack.append(m_context.locals[index.value()]);
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/instructions.html#variable-instructions
 VALIDATE_INSTRUCTION(local_set)
 {
-    auto index = instruction.local_index();
-    TRY(validate(index));
+    auto index = TRY(validate(instruction.local_index()));
 
     auto& value_type = m_context.locals[index.value()];
     TRY(stack.take(value_type));
+    mark_local_initialized(index.value());
 
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/instructions.html#variable-instructions
+// local.tee x is valid with the instruction type t ->_x t; afterwards the local counts as
+// initialized (the init set x).
 VALIDATE_INSTRUCTION(local_tee)
 {
-    auto index = instruction.local_index();
-    TRY(validate(index));
+    auto index = TRY(validate(instruction.local_index()));
 
     auto& value_type = m_context.locals[index.value()];
     TRY(stack.take(value_type));
+    mark_local_initialized(index.value());
     stack.append(value_type);
 
     return {};
@@ -1475,11 +1782,8 @@ VALIDATE_INSTRUCTION(table_copy)
     auto lhs_table = TRY(validate(args.lhs));
     auto rhs_table = TRY(validate(args.rhs));
 
-    if (lhs_table.element_type() != rhs_table.element_type())
+    if (!matches_reference_type(rhs_table.element_type(), lhs_table.element_type(), m_context.type_context()))
         return Errors::non_conforming_types("table.copy"sv, lhs_table.element_type(), rhs_table.element_type());
-
-    if (!lhs_table.element_type().is_reference())
-        return Errors::invalid("table.copy element type"sv, "a reference type"sv, lhs_table.element_type());
 
     auto const lhs_at = lhs_table.limits().address_value_type();
     auto const rhs_at = rhs_table.limits().address_value_type();
@@ -1501,7 +1805,7 @@ VALIDATE_INSTRUCTION(table_init)
 
     auto& element_type = m_context.elements[args.element_index.value()];
 
-    if (table.element_type() != element_type)
+    if (!matches_reference_type(element_type, table.element_type(), m_context.type_context()))
         return Errors::non_conforming_types("table.init"sv, table.element_type(), element_type);
 
     TRY((stack.take<ValueType::I32, ValueType::I32>()));
@@ -1525,6 +1829,9 @@ VALIDATE_INSTRUCTION(i32_load)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > sizeof(i32))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(i32));
 
@@ -1540,6 +1847,9 @@ VALIDATE_INSTRUCTION(i64_load)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > sizeof(i64))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(i64));
 
@@ -1553,6 +1863,9 @@ VALIDATE_INSTRUCTION(f32_load)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > sizeof(float))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(float));
@@ -1568,6 +1881,9 @@ VALIDATE_INSTRUCTION(f64_load)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > sizeof(double))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(double));
 
@@ -1581,6 +1897,9 @@ VALIDATE_INSTRUCTION(i32_load16_s)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 16 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 16 / 8);
@@ -1596,6 +1915,9 @@ VALIDATE_INSTRUCTION(i32_load16_u)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 16 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 16 / 8);
 
@@ -1609,6 +1931,9 @@ VALIDATE_INSTRUCTION(i32_load8_s)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 8 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 8 / 8);
@@ -1624,6 +1949,9 @@ VALIDATE_INSTRUCTION(i32_load8_u)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 8 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 8 / 8);
 
@@ -1637,6 +1965,9 @@ VALIDATE_INSTRUCTION(i64_load32_s)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 32 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 32 / 8);
@@ -1652,6 +1983,9 @@ VALIDATE_INSTRUCTION(i64_load32_u)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 32 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 32 / 8);
 
@@ -1665,6 +1999,9 @@ VALIDATE_INSTRUCTION(i64_load16_s)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 16 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 16 / 8);
@@ -1680,6 +2017,9 @@ VALIDATE_INSTRUCTION(i64_load16_u)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 16 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 16 / 8);
 
@@ -1693,6 +2033,9 @@ VALIDATE_INSTRUCTION(i64_load8_s)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 8 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 8 / 8);
@@ -1708,6 +2051,9 @@ VALIDATE_INSTRUCTION(i64_load8_u)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 8 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 8 / 8);
 
@@ -1721,6 +2067,9 @@ VALIDATE_INSTRUCTION(i32_store)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > sizeof(i32))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(i32));
@@ -1737,6 +2086,9 @@ VALIDATE_INSTRUCTION(i64_store)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > sizeof(i64))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(i64));
 
@@ -1751,6 +2103,9 @@ VALIDATE_INSTRUCTION(f32_store)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > sizeof(float))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(float));
@@ -1767,6 +2122,9 @@ VALIDATE_INSTRUCTION(f64_store)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > sizeof(double))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(double));
 
@@ -1781,6 +2139,9 @@ VALIDATE_INSTRUCTION(i32_store16)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 16 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 16 / 8);
@@ -1797,6 +2158,9 @@ VALIDATE_INSTRUCTION(i32_store8)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 8 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 8 / 8);
 
@@ -1811,6 +2175,9 @@ VALIDATE_INSTRUCTION(i64_store32)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 32 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 32 / 8);
@@ -1827,6 +2194,9 @@ VALIDATE_INSTRUCTION(i64_store16)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1ull << arg.align) > 16 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 16 / 8);
 
@@ -1841,6 +2211,9 @@ VALIDATE_INSTRUCTION(i64_store8)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > 8 / 8)
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, 8 / 8);
@@ -1966,6 +2339,10 @@ VALIDATE_INSTRUCTION(structured_end)
 
     for (auto& result : results)
         stack.append(result);
+
+    // Locals initialized within the block become uninitialized again when it exits.
+    // https://webassembly.github.io/spec/core/appendix/algorithm.html
+    roll_back_local_initializations(last_frame.local_init_log_height);
     m_frames.take_last();
 
     return {};
@@ -1992,6 +2369,10 @@ VALIDATE_INSTRUCTION(structured_else)
 
     frame.kind = FrameKind::Else;
     frame.unreachable = false;
+
+    // https://webassembly.github.io/spec/core/appendix/algorithm.html
+    roll_back_local_initializations(frame.local_init_log_height);
+
     for (auto& parameter : block_type.parameters())
         stack.append(parameter);
 
@@ -2007,10 +2388,15 @@ VALIDATE_INSTRUCTION(block)
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
 
-    m_frames.empend(block_type, FrameKind::Block, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    push_frame(Frame { block_type, FrameKind::Block, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
+
+    args.meta = Instruction::StructuredInstructionArgs::Meta {
+        .arity = static_cast<u32>(block_type.results().size()),
+        .parameter_count = static_cast<u32>(parameters.size()),
+        .tier_up_eligible = false,
+    };
 
     return {};
 }
@@ -2024,10 +2410,17 @@ VALIDATE_INSTRUCTION(loop)
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
 
-    m_frames.empend(block_type, FrameKind::Loop, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    auto const tier_up_eligible = parameters.is_empty() && stack.size() == 0;
+
+    push_frame(Frame { block_type, FrameKind::Loop, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
+
+    args.meta = Instruction::StructuredInstructionArgs::Meta {
+        .arity = static_cast<u32>(block_type.results().size()),
+        .parameter_count = static_cast<u32>(parameters.size()),
+        .tier_up_eligible = tier_up_eligible,
+    };
 
     return {};
 }
@@ -2045,10 +2438,15 @@ VALIDATE_INSTRUCTION(if_)
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
 
-    m_frames.empend(block_type, FrameKind::If, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    push_frame(Frame { block_type, FrameKind::If, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
+
+    args.meta = Instruction::StructuredInstructionArgs::Meta {
+        .arity = static_cast<u32>(block_type.results().size()),
+        .parameter_count = static_cast<u32>(parameters.size()),
+        .tier_up_eligible = false,
+    };
 
     return {};
 }
@@ -2060,11 +2458,18 @@ VALIDATE_INSTRUCTION(throw_)
     TRY(validate(tag_index));
 
     auto tag_type = m_context.tags[tag_index.value()];
+    TRY(validate(tag_type.type()));
     auto& type = m_context.types[tag_type.type().value()];
-    if (!type.results().is_empty())
-        return Errors::invalid("throw type"sv, "empty"sv, type.results());
 
-    for (auto const& parameter : type.parameters().in_reverse())
+    if (!type.is_function())
+        return Errors::invalid("throw type"sv, "a function type"sv, type);
+
+    auto& func = type.function();
+
+    if (!func.results().is_empty())
+        return Errors::invalid("throw type"sv, "empty"sv, func.results());
+
+    for (auto const& parameter : func.parameters().in_reverse())
         TRY(stack.take(parameter));
 
     m_frames.last().unreachable = true;
@@ -2090,66 +2495,77 @@ VALIDATE_INSTRUCTION(throw_ref)
 VALIDATE_INSTRUCTION(try_table)
 {
     auto& args = instruction.arguments().get<Instruction::TryTableArgs>();
-    auto block_type = TRY(validate(args.try_.block_type));
+    auto block_type = TRY(validate(args.block_type));
+
+    // https://webassembly.github.io/spec/core/valid/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-try-table-xref-syntax-types-syntax-blocktype-mathit-blocktype-xref-syntax-instructions-syntax-catch-mathit-catch-ast-xref-syntax-instructions-syntax-instr-mathit-instr-ast
+    // try_table bt catch* instr* is valid with [t1*] -> [t2*] if:
+    //  - The block type bt is valid as some instruction type [t1*] -> [t2*].
+    //  - For all catch in catch*: the catch clause catch is valid.
+    //    Note: the catch clauses are validated under C, without the try_table's own label.
+    for (auto& catch_ : args.catches()) {
+        // - The label C.labels[l] exists.
+        auto label = catch_.target_label();
+        TRY(validate(label));
+        auto& target_label_type = m_frames[(m_frames.size() - 1) - label.value()].labels();
+
+        Vector<ValueType> expected_label_types;
+        if (auto tag = catch_.matching_tag_index(); tag.has_value()) {
+            // - The tag C.tags[x] exists.
+            TRY(validate(tag.value()));
+            auto tag_type = m_context.tags[tag->value()];
+            TRY(validate(tag_type.type()));
+            auto& type = m_context.types[tag_type.type().value()];
+
+            // - The expansion of C.tags[x] is (func t* -> ε).
+            if (!type.is_function())
+                return Errors::invalid("catch tag type"sv, "a function type"sv, type);
+            auto& func = type.function();
+            if (!func.results().is_empty())
+                return Errors::invalid("catch tag type"sv, "no results"sv, func.results());
+
+            expected_label_types.extend(func.parameters());
+        }
+
+        // catch x l:         the result type t* matches the label C.labels[l].
+        // catch_ref x l:     the result type t* (ref exn) matches the label C.labels[l].
+        // catch_all l:       the result type ε matches the label C.labels[l].
+        // catch_all_ref l:   the result type (ref exn) matches the label C.labels[l].
+        if (catch_.is_ref())
+            expected_label_types.append(ValueType(ValueType::ExceptionReference, false));
+
+        if (!matches_result_types(expected_label_types.span(), target_label_type.span(), m_context.type_context()))
+            return Errors::non_conforming_types("catch"sv, expected_label_types.span(), target_label_type.span());
+    }
 
     auto& parameters = block_type.parameters();
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
 
-    m_frames.empend(block_type, FrameKind::TryTable, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    args.meta = Instruction::TryTableArgs::Meta {
+        .arity = static_cast<u32>(block_type.results().size()),
+        .parameter_count = static_cast<u32>(parameters.size()),
+        .tier_up_eligible = false,
+    };
+
+    push_frame(Frame { block_type, FrameKind::TryTable, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
 
-    for (auto& catch_ : args.catches) {
-        auto label = catch_.target_label();
-        TRY(validate(label));
-        auto& target_label_type = m_frames[(m_frames.size() - 1) - label.value()].labels();
-
-        if (auto tag = catch_.matching_tag_index(); tag.has_value()) {
-            TRY(validate(tag.value()));
-            auto tag_type = m_context.tags[tag->value()];
-            auto& type = m_context.types[tag_type.type().value()];
-            if (!type.results().is_empty())
-                return Errors::invalid("catch type"sv, "empty"sv, type.results());
-
-            Span<ValueType const> parameters_to_check = type.parameters().span();
-            if (catch_.is_ref()) {
-                // catch_ref x l
-                auto& parameters = type.parameters();
-                if (parameters.is_empty() || parameters.last().kind() != ValueType::ExceptionReference)
-                    return Errors::invalid("catch_ref type"sv, "[..., exnref]"sv, parameters);
-                parameters_to_check = parameters_to_check.slice(0, parameters.size() - 1);
-            } else {
-                // catch x l
-                // (noop here)
-            }
-
-            if (parameters_to_check != target_label_type.span())
-                return Errors::non_conforming_types("catch"sv, parameters_to_check, target_label_type.span());
-        } else {
-            if (catch_.is_ref()) {
-                // catch_all_ref l
-                if (target_label_type.size() != 1 || target_label_type[0].kind() != ValueType::ExceptionReference)
-                    return Errors::invalid("catch_all_ref type"sv, "[exnref]"sv, target_label_type);
-            } else {
-                // catch_all l
-                if (!target_label_type.is_empty())
-                    return Errors::invalid("catch_all type"sv, "empty"sv, target_label_type);
-            }
-        }
-    }
     return {};
 }
 
 VALIDATE_INSTRUCTION(br)
 {
-    auto label = instruction.arguments().get<LabelIndex>();
-    TRY(validate(label));
+    auto& args = instruction.arguments().get<Instruction::BranchArgs>();
+    TRY(validate(args.label));
 
-    auto& type = m_frames[(m_frames.size() - 1) - label.value()].labels();
+    auto& target = m_frames[(m_frames.size() - 1) - args.label.value()];
+
+    auto& type = target.labels();
     for (size_t i = 1; i <= type.size(); ++i)
         TRY(stack.take(type[type.size() - i]));
+
+    args.has_stack_adjustment = target.initial_size != stack.size();
 
     m_frames.last().unreachable = true;
     stack.resize(m_frames.last().initial_size);
@@ -2158,12 +2574,13 @@ VALIDATE_INSTRUCTION(br)
 
 VALIDATE_INSTRUCTION(br_if)
 {
-    auto label = instruction.arguments().get<LabelIndex>();
-    TRY(validate(label));
+    auto& args = instruction.arguments().get<Instruction::BranchArgs>();
+    TRY(validate(args.label));
 
     TRY(stack.take<ValueType::I32>());
 
-    auto& type = m_frames[(m_frames.size() - 1) - label.value()].labels();
+    auto& target = m_frames[(m_frames.size() - 1) - args.label.value()];
+    auto& type = target.labels();
 
     Vector<StackEntry> entries;
     entries.ensure_capacity(type.size());
@@ -2176,6 +2593,8 @@ VALIDATE_INSTRUCTION(br_if)
 
     for (size_t i = 0; i < entries.size(); ++i)
         stack.append(entries[entries.size() - i - 1]);
+
+    args.has_stack_adjustment = target.initial_size != stack.size();
 
     return {};
 }
@@ -2250,17 +2669,21 @@ VALIDATE_INSTRUCTION(call_indirect)
     auto table = TRY(validate(args.table));
     TRY(validate(args.type));
 
-    if (table.element_type().kind() != ValueType::FunctionReference)
+    if (!matches_reference_type(table.element_type(), ValueType(ValueType::FunctionReference), m_context.type_context()))
         return Errors::invalid("table element type for call.indirect"sv, "a function reference"sv, table.element_type());
 
     auto& type = m_context.types[args.type.value()];
 
+    if (!type.is_function())
+        return Errors::invalid("type for call.indirect"sv, "a function type"sv, type);
+
+    auto& func = type.function();
     TRY(stack.take(table.limits().address_value_type()));
 
-    for (size_t i = 0; i < type.parameters().size(); ++i)
-        TRY(stack.take(type.parameters()[type.parameters().size() - i - 1]));
+    for (size_t i = 0; i < func.parameters().size(); ++i)
+        TRY(stack.take(func.parameters()[func.parameters().size() - i - 1]));
 
-    for (auto& type : type.results())
+    for (auto& type : func.results())
         stack.append(type);
 
     return {};
@@ -2292,19 +2715,77 @@ VALIDATE_INSTRUCTION(return_call_indirect)
     TRY(validate(args.type));
 
     auto& table = m_context.tables[args.table.value()];
-    if (table.element_type().kind() != ValueType::FunctionReference)
+    if (!matches_reference_type(table.element_type(), ValueType(ValueType::FunctionReference), m_context.type_context()))
         return Errors::invalid("table element type for call.indirect"sv, "a function reference"sv, table.element_type());
 
     auto& type = m_context.types[args.type.value()];
+    if (!type.is_function())
+        return Errors::invalid("type for return_call_indirect"sv, "a function type"sv, table.element_type());
+
+    auto& func = type.function();
 
     TRY(stack.take<ValueType::I32>());
 
-    for (size_t i = 0; i < type.parameters().size(); ++i)
-        TRY(stack.take(type.parameters()[type.parameters().size() - i - 1]));
+    for (size_t i = 0; i < func.parameters().size(); ++i)
+        TRY(stack.take(func.parameters()[func.parameters().size() - i - 1]));
 
     auto& return_types = m_frames.first().type.results();
-    if (return_types != type.results())
-        return Errors::invalid("return_call_indirect target"sv, type.results(), return_types);
+    if (return_types != func.results())
+        return Errors::invalid("return_call_indirect target"sv, func.results(), return_types);
+
+    m_frames.last().unreachable = true;
+    stack.resize(m_frames.last().initial_size);
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(call_ref)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    TRY(validate(type_index));
+
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_function())
+        return Errors::invalid("type for call_ref"sv, "a function type"sv, type);
+
+    auto const& func = type.function();
+
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+
+    for (size_t i = 0; i < func.parameters().size(); ++i)
+        TRY(stack.take(func.parameters()[func.parameters().size() - i - 1]));
+
+    for (auto const& type : func.results())
+        stack.append(type);
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(return_call_ref)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    TRY(validate(type_index));
+
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_function())
+        return Errors::invalid("type for return_call_ref"sv, "a function type"sv, type);
+
+    auto const& func = type.function();
+
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+
+    for (size_t i = 0; i < func.parameters().size(); ++i)
+        TRY(stack.take(func.parameters()[func.parameters().size() - i - 1]));
+
+    auto const& return_types = m_frames.first().type.results();
+    auto const& callee_results = func.results();
+    if (return_types.size() != callee_results.size())
+        return Errors::invalid("return_call_ref target"sv, callee_results, return_types);
+    for (size_t i = 0; i < return_types.size(); ++i) {
+        StackEntry entry { callee_results[i] };
+        if (entry != return_types[i])
+            return Errors::invalid("return_call_ref target"sv, callee_results, return_types);
+    }
 
     m_frames.last().unreachable = true;
     stack.resize(m_frames.last().initial_size);
@@ -2317,6 +2798,9 @@ VALIDATE_INSTRUCTION(v128_load)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > sizeof(u128))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(u128));
@@ -2336,6 +2820,9 @@ VALIDATE_INSTRUCTION(v128_load8x8_s)
 
     TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -2350,6 +2837,9 @@ VALIDATE_INSTRUCTION(v128_load8x8_u)
     constexpr auto max_alignment = N * M / 8;
 
     TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
@@ -2366,6 +2856,9 @@ VALIDATE_INSTRUCTION(v128_load16x4_s)
 
     TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -2380,6 +2873,9 @@ VALIDATE_INSTRUCTION(v128_load16x4_u)
     constexpr auto max_alignment = N * M / 8;
 
     TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
@@ -2396,6 +2892,9 @@ VALIDATE_INSTRUCTION(v128_load32x2_s)
 
     TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -2411,6 +2910,9 @@ VALIDATE_INSTRUCTION(v128_load32x2_u)
 
     TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -2424,6 +2926,9 @@ VALIDATE_INSTRUCTION(v128_load8_splat)
     constexpr auto max_alignment = N / 8;
 
     TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
@@ -2439,6 +2944,9 @@ VALIDATE_INSTRUCTION(v128_load16_splat)
 
     TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -2452,6 +2960,9 @@ VALIDATE_INSTRUCTION(v128_load32_splat)
     constexpr auto max_alignment = N / 8;
 
     TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
@@ -2467,6 +2978,9 @@ VALIDATE_INSTRUCTION(v128_load64_splat)
 
     TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -2478,6 +2992,9 @@ VALIDATE_INSTRUCTION(v128_store)
     auto& arg = instruction.arguments().get<Instruction::MemoryArgument>();
 
     TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1ull << arg.align) > sizeof(u128))
         return Errors::out_of_bounds("memory op alignment"sv, 1ull << arg.align, 0, sizeof(u128));
@@ -3001,6 +3518,9 @@ VALIDATE_INSTRUCTION(v128_load8_lane)
 
     auto memory = TRY(validate(arg.memory.memory_index));
 
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
+
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
 
@@ -3021,6 +3541,9 @@ VALIDATE_INSTRUCTION(v128_load16_lane)
         return Errors::out_of_bounds("lane index"sv, arg.lane, 0u, max_lane);
 
     auto memory = TRY(validate(arg.memory.memory_index));
+
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
 
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
@@ -3043,6 +3566,9 @@ VALIDATE_INSTRUCTION(v128_load32_lane)
 
     auto memory = TRY(validate(arg.memory.memory_index));
 
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
+
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
 
@@ -3063,6 +3589,9 @@ VALIDATE_INSTRUCTION(v128_load64_lane)
         return Errors::out_of_bounds("lane index"sv, arg.lane, 0u, max_lane);
 
     auto memory = TRY(validate(arg.memory.memory_index));
+
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
 
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
@@ -3085,6 +3614,9 @@ VALIDATE_INSTRUCTION(v128_store8_lane)
 
     auto memory = TRY(validate(arg.memory.memory_index));
 
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
+
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
 
@@ -3104,6 +3636,9 @@ VALIDATE_INSTRUCTION(v128_store16_lane)
         return Errors::out_of_bounds("lane index"sv, arg.lane, 0u, max_lane);
 
     auto memory = TRY(validate(arg.memory.memory_index));
+
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
 
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
@@ -3125,6 +3660,9 @@ VALIDATE_INSTRUCTION(v128_store32_lane)
 
     auto memory = TRY(validate(arg.memory.memory_index));
 
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
+
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
 
@@ -3145,6 +3683,9 @@ VALIDATE_INSTRUCTION(v128_store64_lane)
 
     auto memory = TRY(validate(arg.memory.memory_index));
 
+    if (arg.memory.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.memory.align, 0, 64);
+
     if ((1 << arg.memory.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.memory.align, 0u, max_alignment);
 
@@ -3161,6 +3702,9 @@ VALIDATE_INSTRUCTION(v128_load32_zero)
 
     auto memory = TRY(validate(arg.memory_index));
 
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
 
@@ -3176,6 +3720,9 @@ VALIDATE_INSTRUCTION(v128_load64_zero)
     constexpr auto max_alignment = N / 8;
 
     auto memory = TRY(validate(arg.memory_index));
+
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
 
     if ((1 << arg.align) > max_alignment)
         return Errors::out_of_bounds("memory op alignment"sv, 1 << arg.align, 0u, max_alignment);
@@ -3995,10 +4542,641 @@ VALIDATE_INSTRUCTION(i32x4_relaxed_dot_i8x16_i7x16_add_s)
     return stack.take_and_put<ValueType::V128, ValueType::V128, ValueType::V128>(ValueType::V128);
 }
 
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+VALIDATE_INSTRUCTION(ref_eq)
+{
+    TRY(stack.take(ValueType(ValueType::EqReference)));
+    TRY(stack.take(ValueType(ValueType::EqReference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+VALIDATE_INSTRUCTION(ref_as_non_null)
+{
+    auto entry = TRY(stack.take_last());
+    if (entry.is_known && !entry.concrete_type.is_reference())
+        return Errors::invalid_stack_state(stack, Tuple { "reference" });
+
+    if (entry.is_known) {
+        auto type = entry.concrete_type;
+        type.set_nullable(false);
+        stack.append(type);
+    } else {
+        stack.append(entry);
+    }
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#control-instructions
+VALIDATE_INSTRUCTION(br_on_null)
+{
+    auto& args = instruction.arguments().get<Instruction::BranchArgs>();
+    TRY(validate(args.label));
+
+    auto entry = TRY(stack.take_last());
+    if (entry.is_known && !entry.concrete_type.is_reference())
+        return Errors::invalid_stack_state(stack, Tuple { "reference" });
+
+    auto& target = m_frames[(m_frames.size() - 1) - args.label.value()];
+    auto& type = target.labels();
+
+    for (size_t i = 0; i < type.size(); ++i)
+        TRY(stack.take(type[type.size() - i - 1]));
+    for (auto& label_type : type)
+        stack.append(label_type);
+
+    if (entry.is_known) {
+        auto result = entry.concrete_type;
+        result.set_nullable(false);
+        stack.append(result);
+    } else {
+        stack.append(entry);
+    }
+
+    args.has_stack_adjustment = target.initial_size != stack.size();
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#control-instructions
+VALIDATE_INSTRUCTION(br_on_non_null)
+{
+    auto& args = instruction.arguments().get<Instruction::BranchArgs>();
+    TRY(validate(args.label));
+
+    auto& target = m_frames[(m_frames.size() - 1) - args.label.value()];
+    auto& type = target.labels();
+    if (type.is_empty() || !type.last().is_reference())
+        return Errors::invalid("br_on_non_null label type"sv, "t* (ref null? ht)"sv, type);
+
+    auto expected = type.last();
+    expected.set_nullable(true);
+    TRY(stack.take(expected));
+
+    for (size_t i = 0; i + 1 < type.size(); ++i)
+        TRY(stack.take(type[type.size() - i - 2]));
+    for (size_t i = 0; i + 1 < type.size(); ++i)
+        stack.append(type[i]);
+
+    args.has_stack_adjustment = target.initial_size != stack.size();
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(struct_new)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    TRY(validate(type_index));
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.new type"sv, "a struct type"sv, type);
+
+    auto& fields = type.struct_().fields();
+    for (size_t i = 0; i < fields.size(); ++i)
+        TRY(stack.take(fields[fields.size() - i - 1].type().unpacked()));
+
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(struct_new_default)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    TRY(validate(type_index));
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.new_default type"sv, "a struct type"sv, type);
+
+    for (auto& field : type.struct_().fields()) {
+        if (!field.type().is_defaultable())
+            return Errors::invalid("struct.new_default field type, must be defaultable"sv);
+    }
+
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+ErrorOr<void, ValidationError> Validator::validate_struct_get(Stack& stack, Instruction const& instruction, bool requires_packed)
+{
+    auto& args = instruction.arguments().get<Instruction::StructFieldArgs>();
+    TRY(validate(args.type_index));
+    auto const& type = m_context.types[args.type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.get type"sv, "a struct type"sv, type);
+
+    auto& fields = type.struct_().fields();
+    if (args.field_index >= fields.size())
+        return Errors::invalid("struct.get field index"sv);
+    auto field_type = fields[args.field_index].type();
+    if (field_type.is_packed() != requires_packed)
+        return Errors::invalid("struct.get signedness, present iff the field type is packed"sv);
+
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    stack.append(field_type.unpacked());
+    return {};
+}
+
+VALIDATE_INSTRUCTION(struct_get)
+{
+    return validate_struct_get(stack, instruction, false);
+}
+
+VALIDATE_INSTRUCTION(struct_get_s)
+{
+    return validate_struct_get(stack, instruction, true);
+}
+
+VALIDATE_INSTRUCTION(struct_get_u)
+{
+    return validate_struct_get(stack, instruction, true);
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(struct_set)
+{
+    auto& args = instruction.arguments().get<Instruction::StructFieldArgs>();
+    TRY(validate(args.type_index));
+    auto const& type = m_context.types[args.type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.set type"sv, "a struct type"sv, type);
+
+    auto& fields = type.struct_().fields();
+    if (args.field_index >= fields.size())
+        return Errors::invalid("struct.set field index"sv);
+    auto& field = fields[args.field_index];
+    if (!field.is_mutable())
+        return Errors::invalid("struct.set field, must be mutable"sv);
+
+    TRY(stack.take(field.type().unpacked()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    return {};
+}
+
+ErrorOr<FieldType, ValidationError> Validator::array_field_type(TypeIndex type_index, StringView instruction_name, bool requires_mutable)
+{
+    TRY(validate(type_index));
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_array())
+        return Errors::invalid(instruction_name, "an array type"sv, type);
+    if (requires_mutable && !type.array().type().is_mutable())
+        return Errors::invalid(instruction_name, "a mutable array type"sv, type);
+    return type.array().type();
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.new type"sv, false));
+
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(field.type().unpacked()));
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_default)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.new_default type"sv, false));
+    if (!field.type().is_defaultable())
+        return Errors::invalid("array.new_default element type, must be defaultable"sv);
+
+    TRY(stack.take<ValueType::I32>());
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_fixed)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayNewFixedArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.new_fixed type"sv, false));
+
+    for (size_t i = 0; i < args.count; ++i)
+        TRY(stack.take(field.type().unpacked()));
+    stack.append(ValueType(ValueType::TypeUseReference, args.type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_data)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayDataArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.new_data type"sv, false));
+    if (field.type().is_reference())
+        return Errors::invalid("array.new_data element type"sv, "a numeric or vector type"sv, field.type());
+
+    if (!m_context.data_count.has_value())
+        return Errors::invalid("array.new_data, requires data count section"sv);
+    TRY(validate(args.data_index));
+
+    TRY((stack.take<ValueType::I32, ValueType::I32>()));
+    stack.append(ValueType(ValueType::TypeUseReference, args.type_index, false));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_elem)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayElemArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.new_elem type"sv, false));
+    if (!field.type().is_reference())
+        return Errors::invalid("array.new_elem element type"sv, "a reference type"sv, field.type());
+
+    TRY(validate(args.element_index));
+    auto segment_type = m_context.elements[args.element_index.value()];
+    if (!matches_reference_type(segment_type, field.type(), m_context.type_context()))
+        return Errors::invalid("array.new_elem element segment type"sv, field.type(), segment_type);
+
+    TRY((stack.take<ValueType::I32, ValueType::I32>()));
+    stack.append(ValueType(ValueType::TypeUseReference, args.type_index, false));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+ErrorOr<void, ValidationError> Validator::validate_array_get(Stack& stack, Instruction const& instruction, bool requires_packed)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.get type"sv, false));
+    if (field.type().is_packed() != requires_packed)
+        return Errors::invalid("array.get signedness, present iff the element type is packed"sv);
+
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+    stack.append(field.type().unpacked());
+    return {};
+}
+
+VALIDATE_INSTRUCTION(array_get)
+{
+    return validate_array_get(stack, instruction, false);
+}
+
+VALIDATE_INSTRUCTION(array_get_s)
+{
+    return validate_array_get(stack, instruction, true);
+}
+
+VALIDATE_INSTRUCTION(array_get_u)
+{
+    return validate_array_get(stack, instruction, true);
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_set)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.set type"sv, true));
+
+    TRY(stack.take(field.type().unpacked()));
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_len)
+{
+    TRY(stack.take(ValueType(ValueType::ArrayReference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_fill)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.fill type"sv, true));
+
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(field.type().unpacked()));
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_copy)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayCopyArgs>();
+    auto destination_field = TRY(array_field_type(args.destination_type_index, "array.copy destination type"sv, true));
+    auto source_field = TRY(array_field_type(args.source_type_index, "array.copy source type"sv, false));
+
+    if (!matches_field_type(FieldType { false, source_field.type() }, FieldType { false, destination_field.type() }, m_context.type_context()))
+        return Errors::invalid("array.copy source element type"sv, destination_field.type(), source_field.type());
+
+    TRY((stack.take<ValueType::I32, ValueType::I32>()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.source_type_index)));
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.destination_type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_init_data)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayDataArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.init_data type"sv, true));
+    if (field.type().is_reference())
+        return Errors::invalid("array.init_data element type"sv, "a numeric or vector type"sv, field.type());
+
+    if (!m_context.data_count.has_value())
+        return Errors::invalid("array.init_data, requires data count section"sv);
+    TRY(validate(args.data_index));
+
+    TRY((stack.take<ValueType::I32, ValueType::I32, ValueType::I32>()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_init_elem)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayElemArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.init_elem type"sv, true));
+    if (!field.type().is_reference())
+        return Errors::invalid("array.init_elem element type"sv, "a reference type"sv, field.type());
+
+    TRY(validate(args.element_index));
+    auto segment_type = m_context.elements[args.element_index.value()];
+    if (!matches_reference_type(segment_type, field.type(), m_context.type_context()))
+        return Errors::invalid("array.init_elem element segment type"sv, field.type(), segment_type);
+
+    TRY((stack.take<ValueType::I32, ValueType::I32, ValueType::I32>()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+ErrorOr<void, ValidationError> Validator::validate_ref_test_or_cast(Stack& stack, Instruction const& instruction)
+{
+    auto type = instruction.arguments().get<ValueType>();
+    TRY(validate(type));
+
+    auto top = ValueType(top_of_heap_type(type, m_context.type_context()));
+    TRY(stack.take(top));
+    return {};
+}
+
+VALIDATE_INSTRUCTION(ref_test)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+VALIDATE_INSTRUCTION(ref_test_null)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+VALIDATE_INSTRUCTION(ref_cast)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(instruction.arguments().get<ValueType>());
+    return {};
+}
+
+VALIDATE_INSTRUCTION(ref_cast_null)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(instruction.arguments().get<ValueType>());
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#control-instructions
+ErrorOr<void, ValidationError> Validator::validate_br_on_cast(Stack& stack, Instruction const& instruction, bool branch_on_failure)
+{
+    auto& args = instruction.arguments().get<Instruction::BranchOnCastArgs>();
+    TRY(validate(args.branch.label));
+    TRY(validate(args.source_type));
+    TRY(validate(args.target_type));
+
+    if (!matches_reference_type(args.target_type, args.source_type, m_context.type_context()))
+        return Errors::invalid("br_on_cast target type"sv, args.source_type, args.target_type);
+
+    auto& target = m_frames[(m_frames.size() - 1) - args.branch.label.value()];
+    auto& label_types = target.labels();
+    if (label_types.is_empty() || !label_types.last().is_reference())
+        return Errors::invalid("br_on_cast label type"sv, "t* rt"sv, label_types);
+    auto& label_reference_type = label_types.last();
+
+    // https://webassembly.github.io/spec/core/valid/conventions.html#conventions
+    // rt1 \ rt2 = (ref ht1)        if rt2 = (ref null ht2)
+    //           = (ref null1? ht1) otherwise
+    auto difference = args.source_type;
+    if (args.target_type.is_nullable())
+        difference.set_nullable(false);
+
+    auto& branched_type = branch_on_failure ? difference : args.target_type;
+    if (!matches_reference_type(branched_type, label_reference_type, m_context.type_context()))
+        return Errors::invalid("br_on_cast label type"sv, label_reference_type, branched_type);
+
+    TRY(stack.take(args.source_type));
+    for (size_t i = 0; i + 1 < label_types.size(); ++i)
+        TRY(stack.take(label_types[label_types.size() - i - 2]));
+    for (size_t i = 0; i + 1 < label_types.size(); ++i)
+        stack.append(label_types[i]);
+
+    stack.append(branch_on_failure ? args.target_type : difference);
+    args.branch.has_stack_adjustment = target.initial_size != stack.size();
+    return {};
+}
+
+VALIDATE_INSTRUCTION(br_on_cast)
+{
+    return validate_br_on_cast(stack, instruction, false);
+}
+
+VALIDATE_INSTRUCTION(br_on_cast_fail)
+{
+    return validate_br_on_cast(stack, instruction, true);
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#external-reference-instructions
+VALIDATE_INSTRUCTION(any_convert_extern)
+{
+    auto entry = TRY(stack.take_last());
+    bool nullable = true;
+    if (entry.is_known) {
+        if (!matches_value_type(entry.concrete_type, ValueType(ValueType::ExternReference), m_context.type_context()))
+            return Errors::invalid("any.convert_extern operand"sv, ValueType(ValueType::ExternReference), entry);
+        nullable = entry.concrete_type.is_nullable();
+    } else {
+        nullable = false;
+    }
+    stack.append(ValueType(ValueType::AnyReference, nullable));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#external-reference-instructions
+VALIDATE_INSTRUCTION(extern_convert_any)
+{
+    auto entry = TRY(stack.take_last());
+    bool nullable = true;
+    if (entry.is_known) {
+        if (!matches_value_type(entry.concrete_type, ValueType(ValueType::AnyReference), m_context.type_context()))
+            return Errors::invalid("extern.convert_any operand"sv, ValueType(ValueType::AnyReference), entry);
+        nullable = entry.concrete_type.is_nullable();
+    } else {
+        nullable = false;
+    }
+    stack.append(ValueType(ValueType::ExternReference, nullable));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#scalar-reference-instructions
+VALIDATE_INSTRUCTION(ref_i31)
+{
+    TRY(stack.take<ValueType::I32>());
+    stack.append(ValueType(ValueType::I31Reference, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#scalar-reference-instructions
+VALIDATE_INSTRUCTION(i31_get_s)
+{
+    TRY(stack.take(ValueType(ValueType::I31Reference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+VALIDATE_INSTRUCTION(i31_get_u)
+{
+    TRY(stack.take(ValueType(ValueType::I31Reference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
 VALIDATE_INSTRUCTION(synthetic_end_expression)
 {
     is_constant = true;
     return {}; // Always valid.
+}
+
+// https://webassembly.github.io/threads/core/valid/instructions.html#atomic-memory-instructions
+ErrorOr<void, ValidationError> Validator::validate_atomic_memory_argument(Instruction::MemoryArgument const& arg, size_t access_size)
+{
+    if (arg.align > 64)
+        return Errors::out_of_bounds("memory op alignment value"sv, arg.align, 0, 64);
+
+    // Unlike plain memory accesses, atomic accesses must be exactly naturally aligned.
+    if ((1ull << arg.align) != access_size)
+        return Errors::invalid("atomic memory op alignment"sv, access_size, 1ull << arg.align);
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_load)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_store)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type()));
+    TRY((take_memory_address(stack, memory, arg.memory)));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_rmw)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type()));
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_rmw_cmpxchg)
+{
+    auto const& arg = instruction.arguments().get<Instruction::AtomicMemoryArgument>();
+    auto memory = TRY(validate(arg.memory.memory_index));
+    TRY(validate_atomic_memory_argument(arg.memory, arg.access_size()));
+
+    TRY(stack.take(arg.value_type())); // replacement
+    TRY(stack.take(arg.value_type())); // expected
+    TRY((take_memory_address(stack, memory, arg.memory)));
+    stack.append(arg.value_type());
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_notify)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i32)));
+
+    TRY((stack.take<ValueType::I32>())); // count
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_wait32)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i32)));
+
+    TRY((stack.take<ValueType::I64>())); // timeout
+    TRY((stack.take<ValueType::I32>())); // expected
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(memory_atomic_wait64)
+{
+    auto const& arg = instruction.arguments().get<Instruction::MemoryArgument>();
+    auto memory = TRY(validate(arg.memory_index));
+    TRY(validate_atomic_memory_argument(arg, sizeof(i64)));
+
+    TRY((stack.take<ValueType::I64>())); // timeout
+    TRY((stack.take<ValueType::I64>())); // expected
+    TRY((take_memory_address(stack, memory, arg)));
+    stack.append(ValueType(ValueType::I32));
+
+    return {};
+}
+
+VALIDATE_INSTRUCTION(atomic_fence)
+{
+    return {};
 }
 
 ErrorOr<void, ValidationError> Validator::validate(Instruction const& instruction, Stack& stack, bool& is_constant)
@@ -4018,11 +5196,11 @@ ErrorOr<void, ValidationError> Validator::validate(Instruction const& instructio
     }
 }
 
-ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Expression const& expression, Vector<ValueType> const& result_types)
+ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Expression const& expression, Vector<ValueType> const& result_types, Span<CodeSection::Func const* const> callee_bodies, size_t current_function_index)
 {
     if (m_frames.is_empty())
         m_frames.empend(FunctionType { {}, result_types }, FrameKind::Function, (size_t)0);
-    auto stack = Stack(m_frames);
+    auto stack = Stack(m_frames, m_context.type_context());
     bool is_constant_expression = true;
 
     for (auto& instruction : expression.instructions()) {
@@ -4041,13 +5219,60 @@ ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Ex
     m_frames.take_last();
 
     expression.set_stack_usage_hint(stack.max_known_size());
-    expression.set_frame_usage_hint(m_max_frame_size);
 
     VERIFY(m_frames.is_empty());
-    m_max_frame_size = 0;
 
     // Now that we're in happy land, try to compile the expression down to a list of labels to help dispatch.
-    expression.compiled_instructions = try_compile_instructions(expression, m_context.functions.span());
+    expression.compiled_instructions = try_compile_instructions(expression, m_context.functions.span(), callee_bodies, current_function_index, m_context.locals.size(), m_context.imported_function_count);
+
+    if (expression.compiled_instructions.direct && !is_constant_expression) {
+        bool has_unsupported_types = false;
+        for (auto& type : m_context.locals) {
+            if (type.is_reference() || type.kind() == ValueType::V128) {
+                has_unsupported_types = true;
+                break;
+            }
+        }
+        if (!has_unsupported_types) {
+            for (auto& type : result_types) {
+                if (type.is_reference() || type.kind() == ValueType::V128) {
+                    has_unsupported_types = true;
+                    break;
+                }
+            }
+        }
+        // Also skip 64-bit addressing (cranelift truncates base to u32).
+        if (!has_unsupported_types) {
+            for (auto& mem : m_context.memories) {
+                if (mem.limits().address_type() == AddressType::I64) {
+                    has_unsupported_types = true;
+                    break;
+                }
+            }
+        }
+        // Also skip if any call targets a function with multi-value returns.
+        if (!has_unsupported_types) {
+            for (auto& insn : expression.instructions()) {
+                if (insn.opcode() == Instructions::call) {
+                    auto func_idx = insn.arguments().get<FunctionIndex>().value();
+                    if (func_idx < m_context.functions.size() && m_context.functions[func_idx].results().size() > 1) {
+                        has_unsupported_types = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Also skip multi-value return functions.
+        if (!has_unsupported_types && result_types.size() <= 1) {
+            expression.compiled_instructions.cranelift_eligible = true;
+            expression.compiled_instructions.cranelift_result_arity = static_cast<u32>(result_types.size());
+            expression.compiled_instructions.cranelift_local_count = static_cast<u32>(m_context.locals.size()) + expression.compiled_instructions.cranelift_inlined_locals;
+            expression.compiled_instructions.cranelift_param_count = static_cast<u32>(m_context.current_function_parameter_count);
+            expression.compiled_instructions.cranelift_local_types.ensure_capacity(m_context.locals.size());
+            for (auto& type : m_context.locals)
+                expression.compiled_instructions.cranelift_local_types.unchecked_append(to_underlying(type.kind()));
+        }
+    }
 
     return ExpressionTypeResult { stack.release_vector(), is_constant_expression };
 }

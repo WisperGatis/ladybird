@@ -12,7 +12,7 @@
 namespace Web::DOM {
 
 class WEB_API ParentNode : public Node {
-    WEB_PLATFORM_OBJECT(ParentNode, Node);
+    WEB_NON_IDL_WRAPPABLE(ParentNode, Node);
     GC_DECLARE_ALLOCATOR(ParentNode);
 
 public:
@@ -25,47 +25,44 @@ public:
     GC::Ptr<Element> last_element_child();
     u32 child_element_count() const;
 
-    WebIDL::ExceptionOr<GC::Ptr<Element>> query_selector(StringView);
-    WebIDL::ExceptionOr<GC::Ref<NodeList>> query_selector_all(StringView);
+    WebIDL::ExceptionOr<GC::Ptr<Element>> query_selector(Utf16View);
+    WebIDL::ExceptionOr<GC::Ref<NodeList>> query_selector_all(Utf16View);
 
     GC::Ref<HTMLCollection> children();
 
-    GC::Ref<HTMLCollection> get_elements_by_tag_name(FlyString const&);
-    GC::Ref<HTMLCollection> get_elements_by_tag_name_ns(Optional<FlyString>, FlyString const&);
+    GC::Ref<HTMLCollection> get_elements_by_tag_name(Utf16FlyString const&);
+    GC::Ref<HTMLCollection> get_elements_by_tag_name_ns(Optional<Utf16FlyString>, Utf16FlyString const&);
 
-    WebIDL::ExceptionOr<void> prepend(Vector<Variant<GC::Root<Node>, Utf16String>> const& nodes);
-    WebIDL::ExceptionOr<void> append(Vector<Variant<GC::Root<Node>, Utf16String>> const& nodes);
-    WebIDL::ExceptionOr<void> replace_children(Vector<Variant<GC::Root<Node>, Utf16String>> const& nodes);
+    WebIDL::ExceptionOr<void> prepend(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes);
+    WebIDL::ExceptionOr<void> append(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes);
+    WebIDL::ExceptionOr<void> replace_children(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes);
     WebIDL::ExceptionOr<void> move_before(GC::Ref<Node> node, GC::Ptr<Node> child);
 
-    GC::Ref<HTMLCollection> get_elements_by_class_name(StringView);
+    GC::Ref<HTMLCollection> get_elements_by_class_name(Utf16View);
 
-    GC::Ptr<Element> get_element_by_id(FlyString const& id) const;
+    GC::Ptr<Element> get_element_by_id(Utf16View id) const;
 
 protected:
-    ParentNode(JS::Realm& realm, Document& document, NodeType type)
-        : Node(realm, document, type)
-    {
-    }
-
     ParentNode(Document& document, NodeType type)
         : Node(document, type)
     {
     }
 
-    virtual void visit_edges(Cell::Visitor&) override;
-
 private:
-    GC::Ptr<HTMLCollection> m_children;
+    friend class Node;
+
+    // The counters behind Node::dom_tree_version() and Node::character_data_version(), for the tree rooted here.
+    u64 m_dom_tree_version { 0 };
+    u64 m_character_data_version { 0 };
 };
 
 template<>
 inline bool Node::fast_is<ParentNode>() const { return is_parent_node(); }
 
 template<typename U>
-inline U* Node::shadow_including_first_ancestor_of_type()
+inline U* Node::first_flat_tree_ancestor_of_type()
 {
-    for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+    for (auto* ancestor = flat_tree_parent(); ancestor; ancestor = ancestor->flat_tree_parent()) {
         if (is<U>(*ancestor))
             return &as<U>(*ancestor);
     }

@@ -1,0 +1,6 @@
+delayed transition uses the compositor before start: true
+delayed compositor effect requests one start frame: true
+delayed compositor effect republishes at active start: true
+seeking reaches the delayed transition's active phase: true
+transitionstart fires after seeking and rendering: true
+active compositor effect retains an end wake-up: true

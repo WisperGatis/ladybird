@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<div id="target" style="width: 100px; height: 100px"></div>
+<script>
+    test(() => {
+        const target = document.getElementById('target');
+        const visualContextUpdateCount = () =>
+            internals.accumulatedVisualContextTreeBuildCount() + internals.accumulatedVisualContextIncrementalUpdateCount();
+
+        target.getBoundingClientRect();
+        const initialUpdateCount = visualContextUpdateCount();
+        const lines = [];
+
+        for (const width of [110, 120, 130]) {
+            target.style.width = `${width}px`;
+            lines.push(`offset width: ${target.offsetWidth}`);
+        }
+
+        lines.push(`visual context updates after layout-only reads: ${visualContextUpdateCount() - initialUpdateCount}`);
+        const fullLayoutCount = internals.fullLayoutCount();
+        target.offsetWidth;
+        lines.push(`extra layouts after clean read: ${internals.fullLayoutCount() - fullLayoutCount}`);
+
+        lines.push(`bounding rect width: ${target.getBoundingClientRect().width}`);
+        lines.push(`visual context updates after identity transform read: ${visualContextUpdateCount() - initialUpdateCount}`);
+
+        const transformedChild = document.createElement('div');
+        transformedChild.style.transform = 'translateX(10px)';
+        target.appendChild(transformedChild);
+        lines.push(`bounding rect with transformed child: ${target.getBoundingClientRect().width}`);
+        lines.push(`visual context updates after unrelated transform read: ${visualContextUpdateCount() - initialUpdateCount}`);
+
+        target.style.transform = 'translateX(10px)';
+        lines.push(`transformed rect x: ${target.getBoundingClientRect().x}`);
+        lines.push(`visual context updates after non-identity transform read: ${visualContextUpdateCount() - initialUpdateCount}`);
+
+        for (const line of lines)
+            println(line);
+    });
+</script>

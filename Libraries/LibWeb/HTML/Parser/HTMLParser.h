@@ -6,239 +6,223 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
+#include <LibGC/Function.h>
 #include <LibGfx/Color.h>
 #include <LibJS/Heap/Cell.h>
-#include <LibWeb/DOM/Node.h>
+#include <LibURL/Forward.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/DOM/DocumentFragment.h>
+#include <LibWeb/DOM/FragmentSerializationMode.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLTokenizer.h>
-#include <LibWeb/HTML/Parser/ListOfActiveFormattingElements.h>
-#include <LibWeb/HTML/Parser/StackOfOpenElements.h>
-#include <LibWeb/MimeSniff/MimeType.h>
+#include <LibWeb/HTML/Parser/ParserScriptingMode.h>
+#include <LibWeb/Platform/Timer.h>
+#include <LibWebCommon/MimeSniff/MimeType.h>
 
-#ifdef LIBWEB_USE_SWIFT
-#    include <LibGC/ForeignCell.h>
-
-namespace Web {
-
-class SpeculativeHTMLParser;
-
-}
-#endif
+struct RustFfiHtmlParserHandle;
+struct RustFfiHtmlParserAttribute;
 
 namespace Web::HTML {
 
-#define ENUMERATE_INSERTION_MODES               \
-    __ENUMERATE_INSERTION_MODE(Initial)         \
-    __ENUMERATE_INSERTION_MODE(BeforeHTML)      \
-    __ENUMERATE_INSERTION_MODE(BeforeHead)      \
-    __ENUMERATE_INSERTION_MODE(InHead)          \
-    __ENUMERATE_INSERTION_MODE(InHeadNoscript)  \
-    __ENUMERATE_INSERTION_MODE(AfterHead)       \
-    __ENUMERATE_INSERTION_MODE(InBody)          \
-    __ENUMERATE_INSERTION_MODE(Text)            \
-    __ENUMERATE_INSERTION_MODE(InTable)         \
-    __ENUMERATE_INSERTION_MODE(InTableText)     \
-    __ENUMERATE_INSERTION_MODE(InCaption)       \
-    __ENUMERATE_INSERTION_MODE(InColumnGroup)   \
-    __ENUMERATE_INSERTION_MODE(InTableBody)     \
-    __ENUMERATE_INSERTION_MODE(InRow)           \
-    __ENUMERATE_INSERTION_MODE(InCell)          \
-    __ENUMERATE_INSERTION_MODE(InSelect)        \
-    __ENUMERATE_INSERTION_MODE(InSelectInTable) \
-    __ENUMERATE_INSERTION_MODE(InTemplate)      \
-    __ENUMERATE_INSERTION_MODE(AfterBody)       \
-    __ENUMERATE_INSERTION_MODE(InFrameset)      \
-    __ENUMERATE_INSERTION_MODE(AfterFrameset)   \
-    __ENUMERATE_INSERTION_MODE(AfterAfterBody)  \
-    __ENUMERATE_INSERTION_MODE(AfterAfterFrameset)
+class IncrementalDocumentParser;
 
 class WEB_API HTMLParser final : public JS::Cell {
     GC_CELL(HTMLParser, JS::Cell);
     GC_DECLARE_ALLOCATOR(HTMLParser);
 
-    friend class HTMLTokenizer;
-
 public:
-    ~HTMLParser();
+    virtual ~HTMLParser() override;
 
     static GC::Ref<HTMLParser> create_for_scripting(DOM::Document&);
+    static GC::Ref<HTMLParser> create_with_open_input_stream(DOM::Document&, EncodingConfidence = EncodingConfidence::Irrelevant);
     static GC::Ref<HTMLParser> create_with_uncertain_encoding(DOM::Document&, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type = {});
-    static GC::Ref<HTMLParser> create(DOM::Document&, StringView input, StringView encoding);
+    static GC::Ref<HTMLParser> create_from_byte_string(DOM::Document&, StringView input, ParserScriptingMode, StringView encoding);
+    static GC::Ref<HTMLParser> create_for_decoded_string(DOM::Document&, Utf16View input, ParserScriptingMode, Utf16View encoding);
 
     void run(HTMLTokenizer::StopAtInsertionPoint = HTMLTokenizer::StopAtInsertionPoint::No);
     void run(URL::URL const&, HTMLTokenizer::StopAtInsertionPoint = HTMLTokenizer::StopAtInsertionPoint::No);
+    void run_until_completion(HTMLTokenizer::StopAtInsertionPoint = HTMLTokenizer::StopAtInsertionPoint::No);
+    void pop_all_open_elements();
 
-    static void the_end(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser> = nullptr);
+    struct ParserlessCompletionToken {
+        u64 parser_generation;
+    };
+    static ParserlessCompletionToken parserless_completion_token(DOM::Document const&);
+    static void the_end(GC::Ref<DOM::Document>, ParserlessCompletionToken);
+    static void the_end(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>);
 
     DOM::Document& document();
     enum class AllowDeclarativeShadowRoots {
         No,
         Yes,
     };
-    static WebIDL::ExceptionOr<Vector<GC::Root<DOM::Node>>> parse_html_fragment(DOM::Element& context_element, StringView, AllowDeclarativeShadowRoots = AllowDeclarativeShadowRoots::No);
+
+    static WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View markup,
+        AllowDeclarativeShadowRoots = AllowDeclarativeShadowRoots::No, ParserScriptingMode = ParserScriptingMode::Inert);
 
     enum class SerializableShadowRoots {
         No,
         Yes,
     };
-    static String serialize_html_fragment(DOM::Node const&, SerializableShadowRoots, Vector<GC::Root<DOM::ShadowRoot>> const&, DOM::FragmentSerializationMode = DOM::FragmentSerializationMode::Inner);
-
-    enum class InsertionMode {
-#define __ENUMERATE_INSERTION_MODE(mode) mode,
-        ENUMERATE_INSERTION_MODES
-#undef __ENUMERATE_INSERTION_MODE
-    };
-
-    InsertionMode insertion_mode() const { return m_insertion_mode; }
-
-    static bool is_special_tag(FlyString const& tag_name, Optional<FlyString> const& namespace_);
+    static Utf16String serialize_html_fragment(DOM::Node const&, SerializableShadowRoots, ReadonlySpan<GC::Ref<DOM::ShadowRoot>>, DOM::FragmentSerializationMode = DOM::FragmentSerializationMode::Inner);
 
     HTMLTokenizer& tokenizer() { return m_tokenizer; }
+    bool streaming_body_is_exhausted() const { return m_streaming_body_is_exhausted; }
+    void did_exhaust_streaming_body(Badge<IncrementalDocumentParser>) { m_streaming_body_is_exhausted = true; }
+
+    void set_allow_declarative_shadow_roots(AllowDeclarativeShadowRoots allow) { m_allow_declarative_shadow_roots = allow; }
+
+    void configure_element_created_by_rust_parser(DOM::Element&);
+    GC::Ref<DOM::Element> create_element_for_rust_parser(Utf16FlyString const&, ReadonlySpan<RustFfiHtmlParserAttribute>, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement>, bool has_template_element_on_stack);
+    void prepare_svg_script_for_rust_parser(SVG::SVGScriptElement&, size_t source_line_number);
+    void set_script_source_line_from_rust_parser(DOM::Element&, size_t source_line_number);
+    void mark_script_already_started_from_rust_parser(HTMLScriptElement&);
+    void process_meta_element_from_rust_parser(HTMLMetaElement&);
+    void stop_parsing_from_rust_parser();
+    bool process_script_end_tag_from_rust_parser(HTMLScriptElement&);
+    bool process_svg_script_end_tag_from_rust_parser(SVG::SVGScriptElement&);
 
     // https://html.spec.whatwg.org/multipage/parsing.html#abort-a-parser
     void abort();
 
     bool aborted() const { return m_aborted; }
     bool stopped() const { return m_stop_parsing; }
+    bool is_paused() const { return m_parser_pause_flag; }
+    bool is_script_created() const { return m_script_created; }
+
+    EncodingConfidence encoding_confidence() const { return m_encoding_confidence; }
+    void set_change_encoding_callback(GC::Ref<GC::Function<bool(StringView)>> callback) { m_change_encoding_callback = callback; }
+    void set_ready_for_more_input_callback(GC::Ref<GC::Function<void()>> callback) { m_ready_for_more_input_callback = callback; }
+    void set_parsing_complete_callback(GC::Ref<GC::Function<void()>> callback) { m_parsing_complete_callback = callback; }
 
     size_t script_nesting_level() const { return m_script_nesting_level; }
 
+    void schedule_resume_check();
+    void set_post_parse_action(Function<void()> action) { m_post_parse_action = move(action); }
+    void invoke_post_parse_action_for_testing() { invoke_post_parse_action(); }
+
 private:
-    HTMLParser(DOM::Document&, StringView input, StringView encoding);
-    HTMLParser(DOM::Document&);
+    static GC::Ptr<DOM::DocumentFragment> try_parse_html_fragment_fast(DOM::Element&, Utf16View);
 
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual void initialize(JS::Realm&) override;
-
-    char const* insertion_mode_name() const;
-
-    DOM::QuirksMode which_quirks_mode(HTMLToken const&) const;
-
-    void handle_initial(HTMLToken&);
-    void handle_before_html(HTMLToken&);
-    void handle_before_head(HTMLToken&);
-    void handle_in_head(HTMLToken&);
-    void handle_in_head_noscript(HTMLToken&);
-    void handle_after_head(HTMLToken&);
-    void handle_in_body(HTMLToken&);
-    void handle_after_body(HTMLToken&);
-    void handle_after_after_body(HTMLToken&);
-    void handle_text(HTMLToken&);
-    void handle_in_table(HTMLToken&);
-    void handle_in_table_body(HTMLToken&);
-    void handle_in_row(HTMLToken&);
-    void handle_in_cell(HTMLToken&);
-    void handle_in_table_text(HTMLToken&);
-    void handle_in_select_in_table(HTMLToken&);
-    void handle_in_select(HTMLToken&);
-    void handle_in_caption(HTMLToken&);
-    void handle_in_column_group(HTMLToken&);
-    void handle_in_template(HTMLToken&);
-    void handle_in_frameset(HTMLToken&);
-    void handle_after_frameset(HTMLToken&);
-    void handle_after_after_frameset(HTMLToken&);
-
-    void stop_parsing() { m_stop_parsing = true; }
-
-    void generate_implied_end_tags(FlyString const& exception = {});
-    void generate_all_implied_end_tags_thoroughly();
-    GC::Ref<DOM::Element> create_element_for(HTMLToken const&, Optional<FlyString> const& namespace_, DOM::Node& intended_parent);
-
-    struct AdjustedInsertionLocation {
-        GC::Ptr<DOM::Node> parent;
-        GC::Ptr<DOM::Node> insert_before_sibling;
-    };
-
-    AdjustedInsertionLocation find_appropriate_place_for_inserting_node(GC::Ptr<DOM::Element> override_target = nullptr);
-
-    void insert_an_element_at_the_adjusted_insertion_location(GC::Ref<DOM::Element>);
-
-    DOM::Text* find_character_insertion_node();
-    void flush_character_insertions();
-    enum class OnlyAddToElementStack {
+    enum class ScriptCreatedParser {
         No,
         Yes,
     };
-    GC::Ref<DOM::Element> insert_foreign_element(HTMLToken const&, Optional<FlyString> const& namespace_, OnlyAddToElementStack);
-    GC::Ref<DOM::Element> insert_html_element(HTMLToken const&);
-    [[nodiscard]] GC::Ptr<DOM::Element> current_node();
-    [[nodiscard]] GC::Ptr<DOM::Element> adjusted_current_node();
-    [[nodiscard]] GC::Ptr<DOM::Element> node_before_current_node();
-    void insert_character(u32 data);
-    void insert_comment(HTMLToken&);
-    void reconstruct_the_active_formatting_elements();
-    void close_a_p_element();
-    void process_using_the_rules_for(InsertionMode, HTMLToken&);
-    void process_using_the_rules_for_foreign_content(HTMLToken&);
-    void parse_generic_raw_text_element(HTMLToken&);
-    void increment_script_nesting_level();
-    void decrement_script_nesting_level();
-    void reset_the_insertion_mode_appropriately();
 
-    void adjust_mathml_attributes(HTMLToken&);
-    void adjust_svg_tag_names(HTMLToken&);
-    void adjust_svg_attributes(HTMLToken&);
-    static void adjust_foreign_attributes(HTMLToken&);
-
-    enum AdoptionAgencyAlgorithmOutcome {
-        DoNothing,
-        RunAnyOtherEndTagSteps,
+    enum class FragmentParser {
+        No,
+        Yes,
     };
 
-    AdoptionAgencyAlgorithmOutcome run_the_adoption_agency_algorithm(HTMLToken&);
-    void clear_the_stack_back_to_a_table_context();
-    void clear_the_stack_back_to_a_table_body_context();
-    void clear_the_stack_back_to_a_table_row_context();
-    void close_the_cell();
+    HTMLParser(DOM::Document&, ParserScriptingMode, StringView input, StringView encoding, EncodingConfidence);
+    HTMLParser(DOM::Document&, ParserScriptingMode, Utf16View input, Utf16View encoding, EncodingConfidence);
+    HTMLParser(DOM::Document&, ParserScriptingMode, Utf16View input, FragmentParser);
+    HTMLParser(DOM::Document&, ParserScriptingMode, ScriptCreatedParser, EncodingConfidence);
 
-    InsertionMode m_insertion_mode { InsertionMode::Initial };
-    InsertionMode m_original_insertion_mode { InsertionMode::Initial };
+    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void finalize() override;
 
-    StackOfOpenElements m_stack_of_open_elements;
-    Vector<InsertionMode> m_stack_of_template_insertion_modes;
-    ListOfActiveFormattingElements m_list_of_active_formatting_elements;
+    void stop_parsing() { m_stop_parsing = true; }
 
+    // https://html.spec.whatwg.org/multipage/parsing.html#start-the-speculative-html-parser
+    void start_the_speculative_html_parser();
+    // https://html.spec.whatwg.org/multipage/parsing.html#stop-the-speculative-html-parser
+    void stop_the_speculative_html_parser();
+
+    GC::Ref<DOM::Element> create_element_for(Utf16FlyString const&, ReadonlySpan<RustFfiHtmlParserAttribute>, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent);
+    void increment_script_nesting_level();
+    void decrement_script_nesting_level();
+    void change_the_encoding(StringView new_encoding);
+
+    void resume_after_parser_blocking_script();
+    void invoke_post_parse_action();
+    static void the_end(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>, u64 parser_generation);
+
+    bool m_streaming_body_is_exhausted { false };
     HTMLTokenizer m_tokenizer;
+    RustFfiHtmlParserHandle* m_rust_parser { nullptr };
 
-    bool m_next_line_feed_can_be_ignored { false };
-
-    bool m_foster_parenting { false };
-    bool m_frameset_ok { true };
     bool m_parsing_fragment { false };
 
-    // https://html.spec.whatwg.org/multipage/parsing.html#scripting-flag
-    // The scripting flag is set to "enabled" if scripting was enabled for the Document with which the parser is associated when the parser was created, and "disabled" otherwise.
-    bool m_scripting_enabled { true };
+    // https://html.spec.whatwg.org/multipage/parsing.html#scripting-mode
+    ParserScriptingMode m_scripting_mode {};
 
-    bool m_invoked_via_document_write { false };
+    // https://html.spec.whatwg.org/multipage/parsing.html#allow-declarative-shadow-roots
+    AllowDeclarativeShadowRoots m_allow_declarative_shadow_roots { AllowDeclarativeShadowRoots::No };
+
+    bool m_script_created { false };
+
     bool m_aborted { false };
     bool m_parser_pause_flag { false };
     bool m_stop_parsing { false };
+    bool m_resume_check_pending { false };
     size_t m_script_nesting_level { 0 };
 
-    JS::Realm& realm();
+    // https://html.spec.whatwg.org/multipage/parsing.html#concept-encoding-confidence
+    EncodingConfidence m_encoding_confidence;
+    GC::Ptr<GC::Function<bool(StringView)>> m_change_encoding_callback;
+    GC::Ptr<GC::Function<void()>> m_ready_for_more_input_callback;
+    GC::Ptr<GC::Function<void()>> m_parsing_complete_callback;
+
+    Function<void()> m_post_parse_action;
 
     GC::Ptr<DOM::Document> m_document;
-    GC::Ptr<HTMLHeadElement> m_head_element;
     GC::Ptr<HTMLFormElement> m_form_element;
     GC::Ptr<DOM::Element> m_context_element;
 
-#ifdef LIBWEB_USE_SWIFT
-    GC::ForeignPtr<Web::SpeculativeHTMLParser> m_speculative_parser;
-#endif
+    // https://html.spec.whatwg.org/multipage/parsing.html#root-insertion-target
+    GC::Ptr<DOM::DocumentFragment> m_root_insertion_target;
 
-    Vector<HTMLToken> m_pending_table_character_tokens;
+    // https://html.spec.whatwg.org/multipage/parsing.html#active-speculative-html-parser
+    GC::Ptr<SpeculativeHTMLParser> m_active_speculative_html_parser;
+};
 
-    GC::Ptr<DOM::Text> m_character_insertion_node;
-    StringBuilder m_character_insertion_builder { StringBuilder::Mode::UTF16 };
-} SWIFT_UNSAFE_REFERENCE;
+class HTMLParserEndState final : public JS::Cell {
+    GC_CELL(HTMLParserEndState, JS::Cell);
+    GC_DECLARE_ALLOCATOR(HTMLParserEndState);
 
-RefPtr<CSS::StyleValue const> parse_dimension_value(StringView);
-RefPtr<CSS::StyleValue const> parse_nonzero_dimension_value(StringView);
-Optional<Color> parse_legacy_color_value(StringView);
+public:
+    static GC::Ref<HTMLParserEndState> create(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>, u64 parser_generation);
 
-// Swift interop
-using HTMLParserGCPtr = GC::Ptr<HTMLParser>;
-using HTMLParserGCRef = GC::Ref<HTMLParser>;
+    void cancel();
+    void schedule_progress_check();
+
+private:
+    enum class Phase {
+        WaitingForDeferredScripts,
+        WaitingForDOMContentLoaded,
+        WaitingForASAPScripts,
+        WaitingForLoadEventDelay,
+        Completed,
+        Cancelled,
+    };
+
+    HTMLParserEndState(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>, u64 parser_generation);
+
+    virtual void visit_edges(Cell::Visitor&) override;
+
+    void check_progress();
+    void advance_to_dom_content_loaded_phase();
+    void complete();
+
+    Phase m_phase { Phase::WaitingForDeferredScripts };
+    bool m_check_pending { false };
+
+    GC::Ref<DOM::Document> m_document;
+    GC::Ptr<HTMLParser> m_parser;
+    u64 m_parser_generation { 0 };
+    GC::Ref<Platform::Timer> m_timeout;
+};
+
+RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View);
+RefPtr<CSS::StyleValue const> parse_nonzero_dimension_value(Utf16View);
+Optional<Color> parse_legacy_color_value(Utf16View);
+RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View);
+
+u64 parser_non_append_insertions();
 
 }

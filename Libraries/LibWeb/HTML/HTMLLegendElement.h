@@ -7,12 +7,11 @@
 #pragma once
 
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/Layout/LegendBox.h>
 
 namespace Web::HTML {
 
 class HTMLLegendElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLLegendElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLLegendElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLLegendElement);
 
 public:
@@ -20,14 +19,13 @@ public:
 
     HTMLFormElement* form();
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
-    Layout::LegendBox* layout_node();
-    Layout::LegendBox const* layout_node() const;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
 private:
     HTMLLegendElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void inserted() override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<DOM::Node> old_ancestor) override;
 };
 
 }

@@ -1,0 +1,1 @@
+PASS: available width still fits max-content (work + checks)

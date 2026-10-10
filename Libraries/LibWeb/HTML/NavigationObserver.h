@@ -6,30 +6,41 @@
 
 #pragma once
 
+#include <AK/IntrusiveList.h>
+#include <LibGC/Cell.h>
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
-#include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::HTML {
 
-class WEB_API NavigationObserver final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(NavigationObserver, Bindings::PlatformObject);
+class WEB_API NavigationObserver final : public GC::Cell {
+    GC_CELL(NavigationObserver, GC::Cell);
     GC_DECLARE_ALLOCATOR(NavigationObserver);
 
 public:
+    [[nodiscard]] static GC::Ref<NavigationObserver> create(LocalNavigable&);
+
     [[nodiscard]] GC::Ptr<GC::Function<void()>> navigation_complete() const { return m_navigation_complete; }
     void set_navigation_complete(Function<void()>);
 
-private:
-    NavigationObserver(JS::Realm&, Navigable&);
+    [[nodiscard]] GC::Ptr<GC::Function<void()>> ongoing_navigation_changed() const { return m_ongoing_navigation_changed; }
+    void set_ongoing_navigation_changed(Function<void()>);
 
-    virtual void visit_edges(Cell::Visitor&) override;
+private:
+    explicit NavigationObserver(LocalNavigable&);
+
+    virtual void visit_edges(GC::Cell::Visitor&) override;
     virtual void finalize() override;
 
-    GC::Ref<Navigable> m_navigable;
+    IntrusiveListNode<NavigationObserver> m_list_node;
+    GC::Ref<LocalNavigable> m_navigable;
     GC::Ptr<GC::Function<void()>> m_navigation_complete;
+    GC::Ptr<GC::Function<void()>> m_ongoing_navigation_changed;
+
+public:
+    using NavigationObserversList = IntrusiveList<&NavigationObserver::m_list_node>;
 };
 
 }

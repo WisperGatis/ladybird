@@ -6,110 +6,126 @@
 
 #pragma once
 
+#include <AK/StringView.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Weakable.h>
+#include <LibJS/HostObjectABI.h>
+#include <LibJS/Runtime/HostObject.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibURL/Origin.h>
+#include <LibWeb/Bindings/IntrinsicDefinitions.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::Bindings {
 
-#define WEB_PLATFORM_OBJECT(class_, base_class)                               \
-    JS_OBJECT(class_, base_class)                                             \
-    virtual bool implements_interface(String const& interface) const override \
-    {                                                                         \
-        if (interface == #class_)                                             \
-            return true;                                                      \
-        return Base::implements_interface(interface);                         \
-    }
+enum class NamedPropertyDeletionResult : u8 {
+    // If the named property deleter has an identifier, but does not return a boolean.
+    // This is done because we don't know the return type of the deleter outside of the IDL generator.
+    NotRelevant,
+    DidNotFail,
+    DidFail,
+};
+
+// The engine flags of every platform object's host class.
+constexpr u32 platform_object_host_class_flags = JS_HOST_CLASS_IS_PLATFORM_OBJECT
+    | JS_HOST_CLASS_REQUIRES_SLOW_ADD_OWN_PROPERTY
+    | JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH;
+
+// What the internal methods of a legacy platform object need to know about the interfaces it implements, accumulated
+// over its interface's inheritance chain. A wrapper's host class points at it through its user data, which is null
+// for wrappers that are not legacy platform objects.
+//
+// The functions perform the special operations of the interfaces on the wrapped implementation object. Each one comes
+// from the nearest interface in the chain that declares the operation, and is null if none does.
+struct LegacyPlatformObjectInfo {
+    using IndexedPropertyGetter = Optional<JS::Value> (*)(JS::HostObject const& wrapper, WrapperWorld&, JS::Realm&, size_t index);
+    using NamedPropertyGetter = JS::Value (*)(JS::HostObject const& wrapper, WrapperWorld&, JS::Realm&, Utf16FlyString const& name);
+    using IndexedPropertySetter = WebIDL::ExceptionOr<void> (*)(JS::HostObject& wrapper, JS::Realm&, u32 index, JS::Value);
+    using NamedPropertySetter = WebIDL::ExceptionOr<void> (*)(JS::HostObject& wrapper, JS::Realm&, Utf16FlyString const& name, JS::Value);
+    using NamedPropertyDeleter = WebIDL::ExceptionOr<NamedPropertyDeletionResult> (*)(JS::HostObject& wrapper, Utf16FlyString const& name);
+
+    bool supports_indexed_properties { false };
+    bool supports_named_properties { false };
+    bool has_indexed_property_setter { false };
+    bool has_named_property_setter { false };
+    bool has_named_property_deleter { false };
+    bool has_legacy_unenumerable_named_properties_interface_extended_attribute { false };
+    bool has_legacy_override_built_ins_interface_extended_attribute { false };
+    bool has_global_interface_extended_attribute { false };
+    bool indexed_property_setter_has_identifier { false };
+    bool named_property_setter_has_identifier { false };
+    bool named_property_deleter_has_identifier { false };
+
+    // Returns no value for an index that is not a supported property index.
+    IndexedPropertyGetter item_value { nullptr };
+    NamedPropertyGetter named_item_value { nullptr };
+
+    // The steps to set the value of a new or an existing indexed property, for an indexed property setter declared
+    // without an identifier, and the method steps of one declared with an identifier.
+    IndexedPropertySetter set_value_of_new_indexed_property { nullptr };
+    IndexedPropertySetter set_value_of_existing_indexed_property { nullptr };
+    IndexedPropertySetter set_value_of_indexed_property { nullptr };
+
+    // The same for the named property setter.
+    NamedPropertySetter set_value_of_new_named_property { nullptr };
+    NamedPropertySetter set_value_of_existing_named_property { nullptr };
+    NamedPropertySetter set_value_of_named_property { nullptr };
+
+    NamedPropertyDeleter delete_value { nullptr };
+};
+
+[[nodiscard]] inline LegacyPlatformObjectInfo const* legacy_platform_object_info_of(JS::HostObject const& wrapper)
+{
+    return static_cast<LegacyPlatformObjectInfo const*>(wrapper.host_class().user_data);
+}
+
+template<typename Implementation>
+[[nodiscard]] Implementation& wrapped_implementation_of(JS::HostObject const& wrapper)
+{
+    return static_cast<Implementation&>(*static_cast<Wrappable*>(wrapper.wrappable().ptr()));
+}
+
+// The internal methods of wrapper host classes. Wrappers of [Global] interfaces and of interfaces without special
+// operations have the ordinary internal methods, but preserve the wrapper once script gives it state of its own: a new
+// own property, another prototype or non-extensibility. A [Global] wrapper's prototype is immutable through its host
+// class flags instead. Legacy platform objects have the internal methods that WebIDL defines for them. A DOMException
+// wrapper is an ordinary wrapper that also exposes the error data of its implementation object.
+//
+// Outside LibWeb, their addresses are not constant expressions on Windows, where the tables are imported from a DLL.
+extern WEB_API JSHostObjectHooks const platform_object_hooks;
+extern WEB_API JSHostObjectHooks const global_platform_object_hooks;
+extern WEB_API JSHostObjectHooks const legacy_platform_object_hooks;
+extern JSHostObjectHooks const dom_exception_wrapper_hooks;
+
+// The finalize hook of every wrapper host class calls this to remove the wrapper from its world.
+void finalize_platform_object(JS::HostObject& wrapper);
 
 // https://webidl.spec.whatwg.org/#dfn-platform-object
-class WEB_API PlatformObject : public JS::Object {
-    JS_OBJECT(PlatformObject, JS::Object);
+// Only host classes give objects the platform object flag, so every platform object is a host object: a wrapper, whose
+// wrappable slot holds its implementation object, or a WindowProxy, whose wrappable slot is null.
+[[nodiscard]] inline JS::HostObject* as_platform_object(JS::Object& object)
+{
+    if (!object.is_platform_object())
+        return nullptr;
+    return static_cast<JS::HostObject*>(&object);
+}
 
-public:
-    virtual ~PlatformObject() override;
+[[nodiscard]] inline JS::HostObject const* as_platform_object(JS::Object const& object)
+{
+    if (!object.is_platform_object())
+        return nullptr;
+    return static_cast<JS::HostObject const*>(&object);
+}
 
-    JS::Realm& realm() const;
+// https://webidl.spec.whatwg.org/#dfn-named-property-visibility
+// The wrapper must be a legacy platform object or the wrapper of a [Global] interface.
+WEB_API JS::ThrowCompletionOr<bool> is_named_property_exposed_on_object(JS::HostObject const& wrapper, JS::PropertyKey const&);
 
-    // https://webidl.spec.whatwg.org/#implements
-    // This is implemented by overrides that get generated by the WEB_PLATFORM_OBJECT macro.
-    [[nodiscard]] virtual bool implements_interface(String const&) const { return false; }
-
-    // ^JS::Object
-    virtual JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> internal_get_own_property(JS::PropertyKey const&) const override;
-    virtual JS::ThrowCompletionOr<bool> internal_set(JS::PropertyKey const&, JS::Value, JS::Value, JS::CacheableSetPropertyMetadata* = nullptr, PropertyLookupPhase = PropertyLookupPhase::OwnProperty) override;
-    virtual JS::ThrowCompletionOr<bool> internal_define_own_property(JS::PropertyKey const&, JS::PropertyDescriptor&, Optional<JS::PropertyDescriptor>* precomputed_get_own_property = nullptr) override;
-    virtual JS::ThrowCompletionOr<bool> internal_delete(JS::PropertyKey const&) override;
-    virtual JS::ThrowCompletionOr<bool> internal_prevent_extensions() override;
-    virtual JS::ThrowCompletionOr<GC::RootVector<JS::Value>> internal_own_property_keys() const override;
-
-    JS::ThrowCompletionOr<bool> is_named_property_exposed_on_object(JS::PropertyKey const&) const;
-
-protected:
-    explicit PlatformObject(JS::Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    explicit PlatformObject(JS::Object& prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-
-    struct LegacyPlatformObjectFlags {
-        u16 supports_indexed_properties : 1 = false;
-        u16 supports_named_properties : 1 = false;
-        u16 has_indexed_property_setter : 1 = false;
-        u16 has_named_property_setter : 1 = false;
-        u16 has_named_property_deleter : 1 = false;
-        u16 has_legacy_unenumerable_named_properties_interface_extended_attribute : 1 = false;
-        u16 has_legacy_override_built_ins_interface_extended_attribute : 1 = false;
-        u16 has_global_interface_extended_attribute : 1 = false;
-        u16 indexed_property_setter_has_identifier : 1 = false;
-        u16 named_property_setter_has_identifier : 1 = false;
-        u16 named_property_deleter_has_identifier : 1 = false;
-    };
-    Optional<LegacyPlatformObjectFlags> m_legacy_platform_object_flags = {};
-
-    enum class IgnoreNamedProps {
-        No,
-        Yes,
-    };
-    JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> legacy_platform_object_get_own_property(JS::PropertyKey const&, IgnoreNamedProps ignore_named_props) const;
-
-    virtual Optional<JS::Value> item_value(size_t index) const;
-    virtual JS::Value named_item_value(FlyString const& name) const;
-    virtual Vector<FlyString> supported_property_names() const;
-    virtual bool is_supported_property_name(FlyString const&) const;
-    bool is_supported_property_index(u32) const;
-
-    // NOTE: These will crash if you make has_named_property_setter return true but do not override these methods.
-    // NOTE: This is only used if named_property_setter_has_identifier returns false, otherwise set_value_of_named_property is used instead.
-    virtual WebIDL::ExceptionOr<void> set_value_of_new_named_property(String const&, JS::Value);
-    virtual WebIDL::ExceptionOr<void> set_value_of_existing_named_property(String const&, JS::Value);
-
-    // NOTE: These will crash if you make has_named_property_setter return true but do not override these methods.
-    // NOTE: This is only used if you make named_property_setter_has_identifier return true, otherwise set_value_of_{new,existing}_named_property is used instead.
-    virtual WebIDL::ExceptionOr<void> set_value_of_named_property(String const&, JS::Value);
-
-    // NOTE: These will crash if you make has_indexed_property_setter return true but do not override these methods.
-    // NOTE: This is only used if indexed_property_setter_has_identifier returns false, otherwise set_value_of_indexed_property is used instead.
-    virtual WebIDL::ExceptionOr<void> set_value_of_new_indexed_property(u32, JS::Value);
-    virtual WebIDL::ExceptionOr<void> set_value_of_existing_indexed_property(u32, JS::Value);
-
-    // NOTE: These will crash if you make has_named_property_setter return true but do not override these methods.
-    // NOTE: This is only used if indexed_property_setter_has_identifier returns true, otherwise set_value_of_{new,existing}_indexed_property is used instead.
-    virtual WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, JS::Value);
-
-    enum class DidDeletionFail {
-        // If the named property deleter has an identifier, but does not return a boolean.
-        // This is done because we don't know the return type of the deleter outside of the IDL generator.
-        NotRelevant,
-        No,
-        Yes,
-    };
-
-    // NOTE: This will crash if you make has_named_property_deleter return true but do not override this method.
-    virtual WebIDL::ExceptionOr<DidDeletionFail> delete_value(String const&);
-
-    virtual bool eligible_for_own_property_enumeration_fast_path() const override final { return false; }
-
-private:
-    WebIDL::ExceptionOr<void> invoke_indexed_property_setter(JS::PropertyKey const&, JS::Value);
-    WebIDL::ExceptionOr<void> invoke_named_property_setter(FlyString const&, JS::Value);
-};
+// Defines the property via OrdinaryDefineOwnProperty and, if that created a new own property,
+// preserves the object's wrapper so the expando stays alive as long as the wrappable does.
+// Wrapper host classes with a custom [[DefineOwnProperty]] must route their ordinary path through this.
+WEB_API JS::ThrowCompletionOr<bool> ordinary_define_own_property_and_preserve_wrapper_if_needed(JS::HostObject& wrapper, JS::PropertyKey const&, JS::PropertyDescriptor&, Optional<JS::PropertyDescriptor>* precomputed_get_own_property);
 
 }

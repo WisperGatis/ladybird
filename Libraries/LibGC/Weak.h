@@ -40,6 +40,7 @@ public:
     }
 
     size_t ref_count() const { return m_ref_count; }
+    static constexpr size_t value_offset() { return offsetof(WeakImpl, m_ptr); }
 
     enum class State {
         Allocated,
@@ -64,6 +65,21 @@ public:
     Weak(T const* ptr);
     Weak(T const& ptr);
 
+    Weak(Weak&& other)
+        : m_impl(exchange(other.m_impl, WeakImpl::the_null_weak_impl))
+    {
+    }
+
+    Weak& operator=(Weak&& other)
+    {
+        if (this != &other) {
+            m_impl = exchange(other.m_impl, WeakImpl::the_null_weak_impl);
+        }
+        return *this;
+    }
+
+    Weak(Weak const&) = default;
+
     template<typename U>
     Weak(Weak<U> const& other)
     requires(IsConvertible<U*, T*>);
@@ -74,6 +90,14 @@ public:
     Weak(Ref<U> const& other)
     requires(IsConvertible<U*, T*>);
 
+    Weak(Ptr<T> const& other);
+
+    template<typename U>
+    Weak(Ptr<U> const& other)
+    requires(IsConvertible<U*, T*>);
+
+    Weak& operator=(Weak const& other) = default;
+
     template<typename U>
     Weak& operator=(Weak<U> const& other)
     requires(IsConvertible<U*, T*>)
@@ -83,6 +107,12 @@ public:
     }
 
     Weak& operator=(Ref<T> const& other);
+
+    Weak& operator=(Ptr<T> const& other);
+
+    template<typename U>
+    Weak& operator=(Ptr<U> const& other)
+    requires(IsConvertible<U*, T*>);
 
     template<typename U>
     Weak& operator=(Ref<U> const& other)
@@ -103,7 +133,7 @@ public:
     T* operator->() const
     {
         ASSERT(ptr());
-        return ptr();
+        return ptr().ptr();
     }
 
     [[nodiscard]] T& operator*() const
@@ -117,7 +147,7 @@ public:
     explicit operator bool() const { return !!ptr(); }
     bool operator!() const { return !ptr(); }
 
-    operator T*() const { return ptr(); }
+    operator T*() const { return ptr().ptr(); }
 
     Ref<T> as_nonnull() const
     {
@@ -131,16 +161,27 @@ private:
     NonnullRefPtr<WeakImpl> m_impl { WeakImpl::the_null_weak_impl };
 };
 
+// NOTE: Unlike GC::Function, captures in this callback are not visited by the garbage collector.
+//       Do not capture GC-managed objects without ensuring they are kept alive through other means.
+template<typename T, typename Callback>
+auto weak_callback(T& obj, Callback&& callback)
+{
+    return [weak = Weak<T> { obj }, cb = forward<Callback>(callback)](auto&&... args) mutable {
+        if (weak)
+            cb(*weak, forward<decltype(args)>(args)...);
+    };
+}
+
 template<typename T, typename U>
 inline bool operator==(Weak<T> const& a, Ptr<U> const& b)
 {
-    return a.ptr() == b.ptr();
+    return a.ptr() == b;
 }
 
 template<typename T, typename U>
 inline bool operator==(Weak<T> const& a, Ref<U> const& b)
 {
-    return a.ptr() == b.ptr();
+    return a.ptr() == b;
 }
 
 }
@@ -148,18 +189,10 @@ inline bool operator==(Weak<T> const& a, Ref<U> const& b)
 namespace AK {
 
 template<typename T>
-struct Traits<GC::Weak<T>> : public DefaultTraits<GC::Weak<T>> {
-    static unsigned hash(GC::Weak<T> const& value)
-    {
-        return Traits<T*>::hash(value.ptr());
-    }
-};
-
-template<typename T>
 struct Formatter<GC::Weak<T>> : Formatter<T const*> {
     ErrorOr<void> format(FormatBuilder& builder, GC::Weak<T> const& value)
     {
-        return Formatter<T const*>::format(builder, value.ptr());
+        return Formatter<T const*>::format(builder, value.ptr().ptr());
     }
 };
 

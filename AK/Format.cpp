@@ -15,8 +15,13 @@
 #include <AK/LexicalPath.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
-#include <AK/StringFloatingPointConversions.h>
+#include <AK/StringConversions.h>
+#include <AK/ThreadID.h>
+#include <AK/Time.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16StringBuilder.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -31,6 +36,10 @@
 
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
+#endif
+
+#if defined(AK_OS_FREEBSD)
+#    include <pthread_np.h>
 #endif
 
 namespace AK {
@@ -209,16 +218,40 @@ bool FormatParser::consume_replacement_field(size_t& index)
     return true;
 }
 
+ErrorOr<void> FormatBuilder::append(char ch)
+{
+    if (m_string_builder)
+        return m_string_builder->try_append(ch);
+    m_utf16_builder->append_ascii(ch);
+    return {};
+}
+
+ErrorOr<void> FormatBuilder::append(StringView string)
+{
+    if (m_string_builder)
+        return m_string_builder->try_append(string);
+    m_utf16_builder->append(Utf16String::from_utf8_without_validation(string));
+    return {};
+}
+
+ErrorOr<void> FormatBuilder::append(Utf16View const& string)
+{
+    if (m_string_builder)
+        return m_string_builder->try_append(string);
+    m_utf16_builder->append(string);
+    return {};
+}
+
 ErrorOr<void> FormatBuilder::put_padding(char fill, size_t amount)
 {
     for (size_t i = 0; i < amount; ++i)
-        TRY(m_builder.try_append(fill));
+        TRY(append(fill));
     return {};
 }
 ErrorOr<void> FormatBuilder::put_literal(StringView value)
 {
     for (size_t i = 0; i < value.length(); ++i) {
-        TRY(m_builder.try_append(value[i]));
+        TRY(append(value[i]));
         if (value[i] == '{' || value[i] == '}')
             ++i;
     }
@@ -239,19 +272,25 @@ ErrorOr<void> FormatBuilder::put_string(
         value = value.substring_view(0, used_by_string);
 
     if (align == Align::Left || align == Align::Default) {
-        TRY(m_builder.try_append(value));
+        TRY(append(value));
         TRY(put_padding(fill, used_by_padding));
     } else if (align == Align::Center) {
         auto const used_by_left_padding = used_by_padding / 2;
         auto const used_by_right_padding = ceil_div<size_t, size_t>(used_by_padding, 2);
 
         TRY(put_padding(fill, used_by_left_padding));
-        TRY(m_builder.try_append(value));
+        TRY(append(value));
         TRY(put_padding(fill, used_by_right_padding));
     } else if (align == Align::Right) {
         TRY(put_padding(fill, used_by_padding));
-        TRY(m_builder.try_append(value));
+        TRY(append(value));
     }
+    return {};
+}
+
+ErrorOr<void> FormatBuilder::put_string(Utf16View const& value)
+{
+    TRY(append(value));
     return {};
 }
 
@@ -299,25 +338,25 @@ ErrorOr<void> FormatBuilder::put_u64(
 
     auto const put_prefix = [&]() -> ErrorOr<void> {
         if (is_negative)
-            TRY(m_builder.try_append('-'));
+            TRY(append('-'));
         else if (sign_mode == SignMode::Always)
-            TRY(m_builder.try_append('+'));
+            TRY(append('+'));
         else if (sign_mode == SignMode::Reserved)
-            TRY(m_builder.try_append(' '));
+            TRY(append(' '));
 
         if (prefix) {
             if (base == 2) {
                 if (upper_case)
-                    TRY(m_builder.try_append("0B"sv));
+                    TRY(append("0B"sv));
                 else
-                    TRY(m_builder.try_append("0b"sv));
+                    TRY(append("0b"sv));
             } else if (base == 8) {
-                TRY(m_builder.try_append("0"sv));
+                TRY(append("0"sv));
             } else if (base == 16) {
                 if (upper_case)
-                    TRY(m_builder.try_append("0X"sv));
+                    TRY(append("0X"sv));
                 else
-                    TRY(m_builder.try_append("0x"sv));
+                    TRY(append("0x"sv));
             }
         }
         return {};
@@ -325,7 +364,7 @@ ErrorOr<void> FormatBuilder::put_u64(
 
     auto const put_digits = [&]() -> ErrorOr<void> {
         for (size_t i = 0; i < used_by_digits; ++i)
-            TRY(m_builder.try_append(buffer[i]));
+            TRY(append(buffer[i]));
         return {};
     };
 
@@ -337,7 +376,7 @@ ErrorOr<void> FormatBuilder::put_u64(
         TRY(put_padding(fill, used_by_right_padding));
     } else if (align == Align::Center) {
         auto const used_by_left_padding = used_by_padding / 2;
-        auto const used_by_right_padding = ceil_div<size_t, size_t>(used_by_padding, 2);
+        auto const used_by_right_padding = used_by_padding - used_by_left_padding;
 
         TRY(put_padding(fill, used_by_left_padding));
         TRY(put_prefix());
@@ -455,27 +494,17 @@ ErrorOr<void> FormatBuilder::put_fixed_point(
     return {};
 }
 
-static ErrorOr<void> round_up_digits(StringBuilder& digits_builder)
+static bool round_up_digits(Span<char> digits)
 {
-    auto digits_buffer = TRY(digits_builder.to_byte_buffer());
-    int current_position = digits_buffer.size() - 1;
-
-    while (current_position >= 0) {
-        if (digits_buffer[current_position] == '.') {
-            --current_position;
-            continue;
+    for (auto index = digits.size(); index > 0; --index) {
+        auto& digit = digits[index - 1];
+        if (digit != '9') {
+            ++digit;
+            return false;
         }
-        ++digits_buffer[current_position];
-        if (digits_buffer[current_position] <= '9')
-            break;
-        digits_buffer[current_position] = '0';
-        --current_position;
+        digit = '0';
     }
-
-    digits_builder.clear();
-    if (current_position < 0)
-        TRY(digits_builder.try_append('1'));
-    return digits_builder.try_append(digits_buffer);
+    return true;
 }
 
 ErrorOr<void> FormatBuilder::put_f64_with_precision(
@@ -498,10 +527,10 @@ ErrorOr<void> FormatBuilder::put_f64_with_precision(
     if (is_negative)
         value = -value;
 
-    TRY(format_builder.put_u64(static_cast<u64>(value), base, false, upper_case, false, use_separator, Align::Right, 0, ' ', sign_mode, is_negative));
+    auto integer_value = static_cast<u64>(value);
     value -= static_cast<i64>(value);
 
-    bool did_emit_decimals = false;
+    Vector<char, 32> fraction_digits;
 
     if (precision > 0) {
         // FIXME: This is a terrible approximation but doing it properly would be a lot of work. If someone is up for that, a good
@@ -523,32 +552,26 @@ ErrorOr<void> FormatBuilder::put_f64_with_precision(
             if (value > NumericLimits<u32>::max())
                 value -= static_cast<u64>(value) - (static_cast<u64>(value) % 10);
 
-            if (digit == 0)
-                TRY(string_builder.try_append('.'));
-
-            TRY(string_builder.try_append('0' + (static_cast<u32>(value) % 10)));
-            did_emit_decimals = true;
+            TRY(fraction_digits.try_append('0' + (static_cast<u32>(value) % 10)));
         }
     }
 
     // Round up if the following decimal is 5 or higher
-    if (static_cast<u64>(value * 10.0) % 10 >= 5)
-        TRY(round_up_digits(string_builder));
+    if (static_cast<u64>(value * 10.0) % 10 >= 5) {
+        if (round_up_digits(fraction_digits.span()))
+            ++integer_value;
+    }
 
-    if (did_emit_decimals && display_mode == RealNumberDisplayMode::Default) {
-        while (!string_builder.is_empty()) {
-            // Strip trailing zero decimals.
-            if (string_builder.string_view().ends_with('0')) {
-                string_builder.trim(1);
-                continue;
-            }
-            // Strip trailing decimal point.
-            if (string_builder.string_view().ends_with('.')) {
-                string_builder.trim(1);
-                break;
-            }
-            break;
-        }
+    if (display_mode == RealNumberDisplayMode::Default) {
+        while (!fraction_digits.is_empty() && fraction_digits.last() == '0')
+            fraction_digits.take_last();
+    }
+
+    TRY(format_builder.put_u64(integer_value, base, false, upper_case, false, use_separator, Align::Right, 0, ' ', sign_mode, is_negative));
+
+    if (!fraction_digits.is_empty()) {
+        TRY(string_builder.try_append('.'));
+        TRY(string_builder.try_append(StringView { fraction_digits.data(), fraction_digits.size() }));
     }
 
     return put_string(string_builder.string_view(), align, min_width, NumericLimits<size_t>::max(), fill);
@@ -590,7 +613,7 @@ ErrorOr<void> FormatBuilder::put_f32_or_f64(
         return put_string(special_case_builder.string_view(), align, min_width, NumericLimits<size_t>::max(), fill);
     }
 
-    auto const [sign, mantissa, exponent] = convert_floating_point_to_decimal_exponential_form(value);
+    auto const [sign, mantissa, exponent] = convert_to_decimal_exponential_form(value);
 
     auto convert_to_decimal_digits_array = [](auto x, auto& digits) -> size_t {
         size_t length = 0;
@@ -743,8 +766,10 @@ ErrorOr<void> FormatBuilder::put_f80(
     if (is_negative)
         value = -value;
 
-    TRY(format_builder.put_u64(static_cast<u64>(value), base, false, upper_case, false, use_separator, Align::Right, 0, ' ', sign_mode, is_negative));
+    auto integer_value = static_cast<u64>(value);
     value -= static_cast<i64>(value);
+
+    Vector<char, 32> fraction_digits;
 
     if (precision > 0) {
         // FIXME: This is a terrible approximation but doing it properly would be a lot of work. If someone is up for that, a good
@@ -766,16 +791,22 @@ ErrorOr<void> FormatBuilder::put_f80(
             if (value > NumericLimits<u32>::max())
                 value -= static_cast<u64>(value) - (static_cast<u64>(value) % 10);
 
-            if (digit == 0)
-                TRY(string_builder.try_append('.'));
-
-            TRY(string_builder.try_append('0' + (static_cast<u32>(value) % 10)));
+            TRY(fraction_digits.try_append('0' + (static_cast<u32>(value) % 10)));
         }
     }
 
     // Round up if the following decimal is 5 or higher
-    if (static_cast<u64>(value * 10.0l) % 10 >= 5)
-        TRY(round_up_digits(string_builder));
+    if (static_cast<u64>(value * 10.0l) % 10 >= 5) {
+        if (round_up_digits(fraction_digits.span()))
+            ++integer_value;
+    }
+
+    TRY(format_builder.put_u64(integer_value, base, false, upper_case, false, use_separator, Align::Right, 0, ' ', sign_mode, is_negative));
+
+    if (!fraction_digits.is_empty()) {
+        TRY(string_builder.try_append('.'));
+        TRY(string_builder.try_append(StringView { fraction_digits.data(), fraction_digits.size() }));
+    }
 
     TRY(put_string(string_builder.string_view(), align, min_width, NumericLimits<size_t>::max(), fill));
     return {};
@@ -787,7 +818,7 @@ ErrorOr<void> FormatBuilder::put_hexdump(ReadonlyBytes bytes, size_t width, char
         TRY(put_padding(fill, 4));
         for (size_t j = i - min(i, width); j < i; ++j) {
             auto ch = bytes[j];
-            TRY(m_builder.try_append(ch >= 32 && ch <= 127 ? ch : '.')); // silly hack
+            TRY(append(ch >= 32 && ch <= 127 ? ch : '.')); // silly hack
         }
         return {};
     };
@@ -809,6 +840,15 @@ ErrorOr<void> FormatBuilder::put_hexdump(ReadonlyBytes bytes, size_t width, char
 }
 
 ErrorOr<void> vformat(StringBuilder& builder, StringView fmtstr, TypeErasedFormatParams& params)
+{
+    FormatBuilder fmtbuilder { builder };
+    FormatParser parser { fmtstr };
+
+    TRY(vformat_impl(params, fmtbuilder, parser));
+    return {};
+}
+
+ErrorOr<void> vformat(Utf16StringBuilder& builder, StringView fmtstr, TypeErasedFormatParams& params)
 {
     FormatBuilder fmtbuilder { builder };
     FormatParser parser { fmtstr };
@@ -1150,22 +1190,22 @@ void vout(FILE* file, StringView fmtstr, TypeErasedFormatParams& params, bool ne
 #if defined(AK_OS_WINDOWS)
 ErrorOr<void> Formatter<Error>::format_windows_error(FormatBuilder& builder, Error const& error)
 {
-    thread_local HashMap<u32, ByteString> windows_errors;
+    static thread_local HashMap<u32, ByteString> windows_errors;
 
-    int code = error.code();
-    Optional<ByteString&> string = windows_errors.get(static_cast<u32>(code));
+    u32 code = error.code();
+    Optional<ByteString&> string = windows_errors.get(code);
     if (string.has_value()) {
         return Formatter<StringView>::format(builder, string->view());
     }
 
-    TCHAR* message = nullptr;
+    TCHAR message[256] = {};
     u32 size = FormatMessage(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr,
-        static_cast<DWORD>(code),
+        code,
         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
         message,
-        0,
+        256,
         nullptr);
     if (size == 0) {
         auto format_error = GetLastError();
@@ -1173,8 +1213,7 @@ ErrorOr<void> Formatter<Error>::format_windows_error(FormatBuilder& builder, Err
     }
 
     auto& string_in_map = windows_errors.ensure(code, [message, size] { return ByteString { message, size }; });
-    LocalFree(message);
-    return Formatter<StringView>::format(builder, string_in_map.view());
+    return Formatter<FormatString>::format(builder, "Error {:x}: {}"sv, code, string_in_map.view());
 }
 #else
 ErrorOr<void> Formatter<Error>::format_windows_error(FormatBuilder&, Error const&)
@@ -1297,11 +1336,21 @@ void set_rich_debug_enabled(bool value)
     is_rich_debug_enabled = value;
 }
 
+#define DEFAULT_FORMAT "\033[0m"
+#define BOLD_YELLOW_FORMAT "\033[33;1m"
+
+static auto current_process_id()
+{
+#if defined(AK_OS_WINDOWS)
+    return GetCurrentProcessId();
+#else
+    return getpid();
+#endif
+}
+
+static auto s_main_thread_id = ThreadID::current();
+
 #ifdef AK_OS_WINDOWS
-
-#    define YELLOW(str) "\33[93m" str "\33[0m"
-
-static int main_thread_id = GetCurrentThreadId();
 
 static int initialize_console_settings()
 {
@@ -1327,8 +1376,10 @@ static int initialize_console_settings()
         return 0;
     }
 
-    // Set the output code page to UTF-8 to support Emoji and other Unicode characters
-    (void)SetConsoleOutputCP(CP_UTF8);
+    // Switch the output code page to UTF-8 to support Emoji and other Unicode characters. The shared helper
+    // saves the console's original code page so windows_shutdown() can restore it; this static initializer
+    // runs before windows_init(), so the save must happen here.
+    use_utf8_console_output();
 
     return 0;
 }
@@ -1345,36 +1396,31 @@ void vdbg(StringView fmtstr, TypeErasedFormatParams& params, bool newline)
     StringBuilder builder;
 
     if (is_rich_debug_enabled) {
-#ifndef AK_OS_WINDOWS
         auto process_name = process_name_for_logging();
         if (!process_name.is_empty()) {
-            struct timespec ts = {};
-            clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-            auto pid = getpid();
-#    if defined(AK_OS_SERENITY) || defined(AK_OS_LINUX)
-            // Linux and Serenity handle thread IDs as if they are related to process ids
-            auto tid = gettid();
-            if (pid == tid)
-#    endif
-            {
-                builder.appendff("{}.{:03} \033[33;1m{}({})\033[0m: ", ts.tv_sec, ts.tv_nsec / 1000000, process_name, pid);
+            bool const colorize = ak_colorize_output();
+            auto time = MonotonicTime::now_coarse();
+            builder.appendff("{}.{:03} ", time.truncated_seconds(), time.nanoseconds_within_second() / 1000000);
+            if (colorize)
+                builder.append(BOLD_YELLOW_FORMAT ""sv);
+            builder.append(process_name);
+            auto process_id = current_process_id();
+            builder.appendff("({})", process_id);
+            auto thread_id = ThreadID::current();
+
+            if (thread_id.is_valid() && thread_id != s_main_thread_id) {
+                char thread_name[16];
+                auto thread_name_result = pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+                if (thread_name_result == 0 && strlen(thread_name) > 0)
+                    builder.appendff(" {}", thread_name);
+                else
+                    builder.append(" Thread"sv);
+                builder.appendff("({})", thread_id);
             }
-#    if defined(AK_OS_SERENITY) || defined(AK_OS_LINUX)
-            else {
-                builder.appendff("{}.{:03} \033[33;1m{}({}:{})\033[0m: ", ts.tv_sec, ts.tv_nsec / 1000000, process_name, pid, tid);
-            }
-#    endif
+            if (colorize)
+                builder.append(DEFAULT_FORMAT ""sv);
+            builder.append(": "sv);
         }
-#else
-        auto process_name = process_name_for_logging();
-        if (!process_name.is_empty()) {
-            int tid = GetCurrentThreadId();
-            if (tid == main_thread_id)
-                builder.appendff(YELLOW("{}: "), process_name);
-            else
-                builder.appendff(YELLOW("{}:{}: "), process_name, tid);
-        }
-#endif
     }
 
     MUST(vformat(builder, fmtstr, params));

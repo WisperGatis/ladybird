@@ -15,6 +15,10 @@
 
 namespace Requests {
 
+// A message this size or larger crosses between WebContent and RequestServer in shared memory, in either direction —
+// since a single IPC message can't carry more than IPC::MAX_MESSAGE_PAYLOAD_SIZE.
+static constexpr size_t WEBSOCKET_SHARED_MEMORY_THRESHOLD = 16 * MiB;
+
 class RequestClient;
 
 class WebSocket : public RefCounted<WebSocket> {
@@ -42,12 +46,12 @@ public:
         Closed = 3,
     };
 
-    static NonnullRefPtr<WebSocket> create_from_id(Badge<RequestClient>, RequestClient& client, i64 websocket_id)
+    static NonnullRefPtr<WebSocket> create_from_id(Badge<RequestClient>, RequestClient& client, u64 websocket_id)
     {
         return adopt_ref(*new WebSocket(client, websocket_id));
     }
 
-    i64 id() const { return m_websocket_id; }
+    u64 id() const { return m_websocket_id; }
 
     ReadyState ready_state();
     void set_ready_state(ReadyState);
@@ -55,7 +59,7 @@ public:
     ByteString subprotocol_in_use();
     void set_subprotocol_in_use(ByteString);
 
-    void send(ByteBuffer binary_or_text_message, bool is_text);
+    void send(ReadonlyBytes binary_or_text_message, bool is_text);
     void send(StringView text_message);
     void close(u16 code = 1005, ByteString reason = {});
 
@@ -63,6 +67,7 @@ public:
     Function<void(Message)> on_message;
     Function<void(Error)> on_error;
     Function<void(u16 code, ByteString reason, bool was_clean)> on_close;
+    Function<void()> on_ready_state_change;
     Function<CertificateAndKey()> on_certificate_requested;
 
     void did_open(Badge<RequestClient>);
@@ -70,13 +75,15 @@ public:
     void did_error(Badge<RequestClient>, i32);
     void did_close(Badge<RequestClient>, u16, ByteString, bool);
     void did_request_certificates(Badge<RequestClient>);
+    void detach_from_client(Badge<RequestClient>);
 
 private:
-    explicit WebSocket(RequestClient&, i64 websocket_id);
+    WebSocket(RequestClient&, u64 websocket_id);
+
     WeakPtr<RequestClient> m_client;
     ReadyState m_ready_state { ReadyState::Connecting };
     ByteString m_subprotocol;
-    i64 m_websocket_id { -1 };
+    u64 m_websocket_id { 0 };
 };
 
 }

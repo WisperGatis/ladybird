@@ -1,17 +1,22 @@
 /*
  * Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
  * Copyright (c) 2023-2025, Tim Flynn <trflynn89@ladybird.org>
+ * Copyright (c) 2025, Gregory Bertilson <gregory@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <AK/Atomic.h>
+#include <AK/Math.h>
+#include <AK/Mutex.h>
 #include <AK/SourceLocation.h>
 #include <AK/Vector.h>
+#include <AK/kmalloc.h>
 #include <LibCore/ThreadedPromise.h>
+#include <LibMedia/Audio/CoreAudioChannelLayout.h>
 #include <LibMedia/Audio/PlaybackStreamAudioUnit.h>
-#include <LibThreading/Mutex.h>
 
+#include <AudioToolbox/AudioFormat.h>
 #include <AudioUnit/AudioUnit.h>
 
 namespace Audio {
@@ -66,11 +71,87 @@ struct AudioTask {
     Optional<double> data {};
 };
 
+template<typename T>
+class CoreAudioPropertyValue {
+    AK_MAKE_NONCOPYABLE(CoreAudioPropertyValue);
+
+public:
+    static ErrorOr<CoreAudioPropertyValue<T>> create(u32 size)
+    {
+        auto ptr = reinterpret_cast<T*>(kmalloc(size));
+        if (ptr == nullptr)
+            return Error::from_errno(ENOMEM);
+        return CoreAudioPropertyValue<T>(ptr, size);
+    }
+
+    CoreAudioPropertyValue(T* ptr, u32 size)
+        : m_ptr(ptr)
+        , m_size(size)
+    {
+    }
+    CoreAudioPropertyValue(CoreAudioPropertyValue&& other)
+        : m_ptr(exchange(other.m_ptr, nullptr))
+        , m_size(exchange(other.m_size, 0))
+    {
+    }
+    ~CoreAudioPropertyValue()
+    {
+        kfree(m_ptr);
+    }
+
+    u32 size() const { return m_size; }
+    T* ptr() const { return m_ptr; }
+    T* operator->() const { return m_ptr; }
+    T& operator*() const { return *m_ptr; }
+
+private:
+    T* m_ptr;
+    u32 m_size;
+};
+
+template<typename T>
+static ErrorOr<CoreAudioPropertyValue<T>> get_audio_unit_property(AudioComponentInstance& instance, u32 property)
+{
+    u32 size = 0;
+    AU_TRY(AudioUnitGetPropertyInfo(
+        instance,
+        property,
+        kAudioUnitScope_Output,
+        AUDIO_UNIT_OUTPUT_BUS,
+        &size,
+        nullptr));
+    VERIFY(size >= sizeof(T));
+
+    auto result = TRY(CoreAudioPropertyValue<T>::create(size));
+    AU_TRY(AudioUnitGetProperty(
+        instance,
+        property,
+        kAudioUnitScope_Output,
+        AUDIO_UNIT_OUTPUT_BUS,
+        result.ptr(),
+        &size));
+    VERIFY(result.size() == size);
+    return result;
+}
+
+template<typename T>
+static ErrorOr<void> set_audio_unit_property(AudioComponentInstance& instance, u32 property, CoreAudioPropertyValue<T> const& value)
+{
+    AU_TRY(AudioUnitSetProperty(
+        instance,
+        property,
+        kAudioUnitScope_Input,
+        AUDIO_UNIT_OUTPUT_BUS,
+        value.ptr(),
+        value.size()));
+    return {};
+}
+
 class AudioState : public RefCounted<AudioState> {
 public:
-    static ErrorOr<NonnullRefPtr<AudioState>> create(AudioStreamBasicDescription description, PlaybackStream::AudioDataRequestCallback data_request_callback, OutputState initial_output_state)
+    static ErrorOr<NonnullRefPtr<AudioState>> create(PlaybackStream::AudioDataRequestCallback data_request_callback, OutputState initial_output_state)
     {
-        auto state = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) AudioState(description, move(data_request_callback), initial_output_state)));
+        auto state = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) AudioState(move(data_request_callback), initial_output_state)));
 
         AudioComponentDescription component_description;
         component_description.componentType = kAudioUnitType_Output;
@@ -82,13 +163,16 @@ public:
         auto* component = AudioComponentFindNext(NULL, &component_description);
         AU_TRY(AudioComponentInstanceNew(component, &state->m_audio_unit));
 
-        AU_TRY(AudioUnitSetProperty(
-            state->m_audio_unit,
-            kAudioUnitProperty_StreamFormat,
-            kAudioUnitScope_Input,
-            AUDIO_UNIT_OUTPUT_BUS,
-            &description,
-            sizeof(description)));
+        auto description = TRY(get_audio_unit_property<AudioStreamBasicDescription>(state->m_audio_unit, kAudioUnitProperty_StreamFormat));
+
+        description->mFormatID = kAudioFormatLinearPCM;
+        description->mFormatFlags = kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked;
+
+        TRY(set_audio_unit_property(state->m_audio_unit, kAudioUnitProperty_StreamFormat, description));
+
+        auto layout = TRY(get_audio_unit_property<AudioChannelLayout>(state->m_audio_unit, kAudioUnitProperty_AudioChannelLayout));
+        auto channel_map = TRY(core_audio_channel_layout_to_channel_map(*layout, layout.size()));
+        state->m_sample_specification = SampleSpecification(static_cast<u32>(description->mSampleRate), channel_map);
 
         AURenderCallbackStruct callbackStruct;
         callbackStruct.inputProc = &AudioState::on_audio_unit_buffer_request;
@@ -116,20 +200,26 @@ public:
 
     void queue_task(AudioTask task)
     {
-        Threading::MutexLocker lock(m_task_queue_mutex);
+        MutexLocker lock(m_task_queue_mutex);
         m_task_queue.append(move(task));
         m_task_queue_is_empty = false;
     }
 
+    void notify_data_available()
+    {
+        m_data_notified = true;
+    }
+
+    SampleSpecification const& sample_specification() const { return m_sample_specification; }
+
     AK::Duration last_sample_time() const
     {
-        return AK::Duration::from_milliseconds(m_last_sample_time.load());
+        return AK::Duration::from_time_units(m_output_time, 1, m_sample_specification.sample_rate());
     }
 
 private:
-    AudioState(AudioStreamBasicDescription description, PlaybackStream::AudioDataRequestCallback data_request_callback, OutputState initial_output_state)
-        : m_description(description)
-        , m_paused(initial_output_state == OutputState::Playing ? Paused::No : Paused::Yes)
+    AudioState(PlaybackStream::AudioDataRequestCallback data_request_callback, OutputState initial_output_state)
+        : m_paused(initial_output_state == OutputState::Playing ? Paused::No : Paused::Explicit)
         , m_data_request_callback(move(data_request_callback))
     {
     }
@@ -141,7 +231,7 @@ private:
         if (m_task_queue_is_empty.load())
             return {};
 
-        Threading::MutexLocker lock(m_task_queue_mutex);
+        MutexLocker lock(m_task_queue_mutex);
 
         m_task_queue_is_empty = m_task_queue.size() == 1;
         return m_task_queue.take_first();
@@ -153,12 +243,19 @@ private:
         VERIFY(output_buffer_list->mNumberBuffers == 1);
 
         auto& state = *static_cast<AudioState*>(user_data);
+        VERIFY(state.m_sample_specification.is_valid());
+
+        auto was_paused = state.m_paused;
+
+        if (state.m_paused == Paused::Underrun && state.m_data_notified.exchange(false))
+            state.m_paused = Paused::No;
 
         VERIFY(time_stamp->mFlags & kAudioTimeStampSampleTimeValid);
-        auto sample_time_seconds = time_stamp->mSampleTime / state.m_description.mSampleRate;
-
-        auto last_sample_time = static_cast<i64>(sample_time_seconds * 1000.0);
-        state.m_last_sample_time.store(last_sample_time);
+        auto sample_time = AK::clamp_to<i64>(time_stamp->mSampleTime);
+        auto output_time = state.m_frames_written_at_resume + (sample_time - state.m_sample_time_at_resume);
+        output_time = min(output_time, state.m_frames_written);
+        auto output_timestamp = AK::Duration::from_time_units(output_time, 1, state.sample_specification().sample_rate());
+        state.m_output_time = output_time;
 
         if (auto task = state.dequeue_task(); task.has_value()) {
             OSStatus error = noErr;
@@ -169,12 +266,12 @@ private:
                 break;
 
             case AudioTask::Type::Pause:
-                state.m_paused = Paused::Yes;
+                state.m_paused = Paused::Explicit;
                 break;
 
             case AudioTask::Type::PauseAndDiscard:
                 error = AudioUnitReset(state.m_audio_unit, kAudioUnitScope_Global, AUDIO_UNIT_OUTPUT_BUS);
-                state.m_paused = Paused::Yes;
+                state.m_paused = Paused::Explicit;
                 break;
 
             case AudioTask::Type::Volume:
@@ -184,65 +281,75 @@ private:
             }
 
             if (error == noErr)
-                task->resolve(AK::Duration::from_milliseconds(last_sample_time));
+                task->resolve(output_timestamp);
             else
                 task->reject(error);
         }
 
-        Bytes output_buffer {
-            reinterpret_cast<u8*>(output_buffer_list->mBuffers[0].mData),
-            output_buffer_list->mBuffers[0].mDataByteSize
-        };
+        auto& raw_buffer = output_buffer_list->mBuffers[0];
+        auto output_buffer = Bytes(reinterpret_cast<u8*>(raw_buffer.mData), raw_buffer.mDataByteSize).reinterpret<float>();
+        output_buffer = output_buffer.trim(static_cast<size_t>(frames_to_render) * state.m_sample_specification.channel_count());
 
         if (state.m_paused == Paused::No) {
-            auto written_bytes = state.m_data_request_callback(output_buffer, PcmSampleFormat::Float32, frames_to_render);
+            if (was_paused != Paused::No) {
+                state.m_frames_written_at_resume = state.m_frames_written;
+                state.m_sample_time_at_resume = sample_time;
+            }
 
-            if (written_bytes.is_empty())
-                state.m_paused = Paused::Yes;
+            auto written_buffer = state.m_data_request_callback(output_buffer);
+            state.m_frames_written += static_cast<i64>(written_buffer.size() / state.m_sample_specification.channel_count());
+
+            if (written_buffer.is_empty())
+                state.m_paused = Paused::Underrun;
         }
 
-        if (state.m_paused == Paused::Yes)
+        if (state.m_paused != Paused::No)
             output_buffer.fill(0);
 
         return noErr;
     }
 
     AudioComponentInstance m_audio_unit { nullptr };
-    AudioStreamBasicDescription m_description {};
+    SampleSpecification m_sample_specification;
 
-    Threading::Mutex m_task_queue_mutex;
+    Mutex m_task_queue_mutex;
     Vector<AudioTask, 4> m_task_queue;
     Atomic<bool> m_task_queue_is_empty { true };
 
-    enum class Paused {
-        Yes,
+    enum class Paused : u8 {
         No,
+        Explicit,
+        Underrun,
     };
-    Paused m_paused { Paused::Yes };
+    Paused m_paused { Paused::Explicit };
 
     PlaybackStream::AudioDataRequestCallback m_data_request_callback;
-    Atomic<i64> m_last_sample_time { 0 };
+    Atomic<bool> m_data_notified { false };
+    i64 m_sample_time_at_resume { 0 };
+    i64 m_frames_written_at_resume { 0 };
+    i64 m_frames_written { 0 };
+    Atomic<i64> m_output_time { 0 };
 };
 
-ErrorOr<NonnullRefPtr<PlaybackStream>> PlaybackStream::create(OutputState initial_output_state, u32 sample_rate, u8 channels, u32 target_latency_ms, AudioDataRequestCallback&& data_request_callback)
+NonnullRefPtr<PlaybackStream::CreatePromise> PlaybackStream::create_platform_playback_stream(OutputState initial_output_state, u32 target_latency_ms, AudioDataRequestCallback&& data_request_callback)
 {
-    return PlaybackStreamAudioUnit::create(initial_output_state, sample_rate, channels, target_latency_ms, move(data_request_callback));
+    return PlaybackStreamAudioUnit::create(initial_output_state, target_latency_ms, move(data_request_callback));
 }
 
-ErrorOr<NonnullRefPtr<PlaybackStream>> PlaybackStreamAudioUnit::create(OutputState initial_output_state, u32 sample_rate, u8 channels, u32, AudioDataRequestCallback&& data_request_callback)
+NonnullRefPtr<PlaybackStream::CreatePromise> PlaybackStreamAudioUnit::create(OutputState initial_output_state, u32, AudioDataRequestCallback&& data_request_callback)
 {
-    AudioStreamBasicDescription description {};
-    description.mFormatID = kAudioFormatLinearPCM;
-    description.mFormatFlags = kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked;
-    description.mSampleRate = sample_rate;
-    description.mChannelsPerFrame = channels;
-    description.mBitsPerChannel = sizeof(float) * 8;
-    description.mBytesPerFrame = sizeof(float) * channels;
-    description.mBytesPerPacket = description.mBytesPerFrame;
-    description.mFramesPerPacket = 1;
-
-    auto state = TRY(AudioState::create(description, move(data_request_callback), initial_output_state));
-    return TRY(adopt_nonnull_ref_or_enomem(new (nothrow) PlaybackStreamAudioUnit(move(state))));
+    auto promise = CreatePromise::construct();
+    // FIXME: Create the AudioState off this thread. It sets up the audio output synchronously, which can take up to
+    //        50ms under normal circumstances.
+    auto state_or_error = AudioState::create(move(data_request_callback), initial_output_state);
+    if (state_or_error.is_error()) {
+        promise->reject(state_or_error.release_error());
+        return promise;
+    }
+    auto state = state_or_error.release_value();
+    auto stream = adopt_ref(*new PlaybackStreamAudioUnit(move(state)));
+    promise->resolve(stream);
+    return promise;
 }
 
 PlaybackStreamAudioUnit::PlaybackStreamAudioUnit(NonnullRefPtr<AudioState> impl)
@@ -252,9 +359,9 @@ PlaybackStreamAudioUnit::PlaybackStreamAudioUnit(NonnullRefPtr<AudioState> impl)
 
 PlaybackStreamAudioUnit::~PlaybackStreamAudioUnit() = default;
 
-void PlaybackStreamAudioUnit::set_underrun_callback(Function<void()>)
+SampleSpecification PlaybackStreamAudioUnit::sample_specification() const
 {
-    // FIXME: Implement this.
+    return m_state->sample_specification();
 }
 
 NonnullRefPtr<Core::ThreadedPromise<AK::Duration>> PlaybackStreamAudioUnit::resume()
@@ -281,7 +388,12 @@ NonnullRefPtr<Core::ThreadedPromise<void>> PlaybackStreamAudioUnit::discard_buff
     return promise;
 }
 
-ErrorOr<AK::Duration> PlaybackStreamAudioUnit::total_time_played()
+void PlaybackStreamAudioUnit::notify_data_available()
+{
+    m_state->notify_data_available();
+}
+
+AK::Duration PlaybackStreamAudioUnit::total_time_played() const
 {
     return m_state->last_sample_time();
 }

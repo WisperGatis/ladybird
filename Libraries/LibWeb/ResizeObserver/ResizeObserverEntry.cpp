@@ -5,10 +5,9 @@
  */
 
 #include <LibGC/Heap.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/ResizeObserverEntryPrototype.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/DOM/Element.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
 
 namespace Web::ResizeObserver {
@@ -16,22 +15,22 @@ namespace Web::ResizeObserver {
 GC_DEFINE_ALLOCATOR(ResizeObserverEntry);
 
 // https://drafts.csswg.org/resize-observer-1/#create-and-populate-resizeobserverentry-h
-WebIDL::ExceptionOr<GC::Ref<ResizeObserverEntry>> ResizeObserverEntry::create_and_populate(JS::Realm& realm, DOM::Element& target)
+WebIDL::ExceptionOr<GC::Ref<ResizeObserverEntry>> ResizeObserverEntry::create_and_populate(Layout::BegunRead const& read, DOM::Element& target)
 {
     // 1. Let this be a new ResizeObserverEntry.
     // 2. Set this.target slot to target.
-    auto resize_observer_entry = realm.create<ResizeObserverEntry>(realm, target);
+    auto resize_observer_entry = GC::Heap::the().allocate<ResizeObserverEntry>(target);
 
     // 3. Set this.borderBoxSize slot to result of calculating box size given target and observedBox of "border-box".
-    auto border_box_size = ResizeObserverSize::calculate_box_size(realm, target, Bindings::ResizeObserverBoxOptions::BorderBox);
+    auto border_box_size = ResizeObserverSize::calculate_box_size(target, ObservedBox::BorderBox);
     resize_observer_entry->m_border_box_size.append(border_box_size);
 
     // 4. Set this.contentBoxSize slot to result of calculating box size given target and observedBox of "content-box".
-    auto content_box_size = ResizeObserverSize::calculate_box_size(realm, target, Bindings::ResizeObserverBoxOptions::ContentBox);
+    auto content_box_size = ResizeObserverSize::calculate_box_size(target, ObservedBox::ContentBox);
     resize_observer_entry->m_content_box_size.append(content_box_size);
 
     // 5. Set this.devicePixelContentBoxSize slot to result of calculating box size given target and observedBox of "device-pixel-content-box".
-    auto device_pixel_content_box_size = ResizeObserverSize::calculate_box_size(realm, target, Bindings::ResizeObserverBoxOptions::DevicePixelContentBox);
+    auto device_pixel_content_box_size = ResizeObserverSize::calculate_box_size(target, ObservedBox::DevicePixelContentBox);
     resize_observer_entry->m_device_pixel_content_box_size.append(device_pixel_content_box_size);
 
     // 6. Set this.contentRect to logical this.contentBoxSize given target and observedBox of "content-box".
@@ -41,30 +40,27 @@ WebIDL::ExceptionOr<GC::Ref<ResizeObserverEntry>> ResizeObserverEntry::create_an
     double height = content_box_size->block_size();
 
     // 7. If target is not an SVG element or target is an SVG element with an associated CSS layout box do these steps:
-    if (!target.is_svg_element() && target.paintable_box()) {
-        auto const& paintable_box = *target.paintable_box();
-        auto absolute_padding_rect = paintable_box.absolute_padding_box_rect();
+    // NB: Layout was up to date when observations were gathered, but a previous
+    //     observer's callback may have invalidated it before we get here.
+    //     This matches the behavior of all major browsers.
+    auto const* layout_node = target.unsafe_layout_node(read);
+    if (!target.is_svg_element() && layout_node && Painting::has_committed_box(*layout_node)) {
+        auto absolute_padding_rect = Painting::absolute_padding_box_rect(*layout_node);
         // Set this.contentRect.top to target.padding top.
         y = absolute_padding_rect.y().to_double();
         // Set this.contentRect.left to target.padding left.
         x = absolute_padding_rect.x().to_double();
-    } else if (target.is_svg_element() && target.paintable_box()) {
+    } else if (target.is_svg_element() && layout_node && Painting::has_committed_box(*layout_node)) {
         // 8. If target is an SVG element without an associated CSS layout box do these steps:
         // Set this.contentRect.top and this.contentRect.left to 0.
         // NOTE: This is already done by the default constructor.
     }
-    resize_observer_entry->m_content_rect = MUST(Geometry::DOMRectReadOnly::construct_impl(realm, x, y, width, height));
+    resize_observer_entry->m_content_rect = Geometry::DOMRectReadOnly::create(x, y, width, height);
 
     return resize_observer_entry;
 }
 
-void ResizeObserverEntry::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(ResizeObserverEntry);
-    Base::initialize(realm);
-}
-
-void ResizeObserverEntry::visit_edges(JS::Cell::Visitor& visitor)
+void ResizeObserverEntry::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_target);
@@ -72,32 +68,6 @@ void ResizeObserverEntry::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_border_box_size);
     visitor.visit(m_device_pixel_content_box_size);
     visitor.visit(m_content_rect);
-}
-
-static GC::Ref<JS::Object> to_js_array(JS::Realm& realm, Vector<GC::Ref<ResizeObserverSize>> const& sizes)
-{
-    GC::RootVector<JS::Value> vector(realm.heap());
-    for (auto const& size : sizes)
-        vector.append(JS::Value(size.ptr()));
-
-    auto array = JS::Array::create_from(realm, vector);
-    MUST(array->set_integrity_level(JS::Object::IntegrityLevel::Frozen));
-    return array;
-}
-
-GC::Ref<JS::Object> ResizeObserverEntry::border_box_size_js_array() const
-{
-    return to_js_array(realm(), m_border_box_size);
-}
-
-GC::Ref<JS::Object> ResizeObserverEntry::content_box_size_js_array() const
-{
-    return to_js_array(realm(), m_content_box_size);
-}
-
-GC::Ref<JS::Object> ResizeObserverEntry::device_pixel_content_box_size_js_array() const
-{
-    return to_js_array(realm(), m_device_pixel_content_box_size);
 }
 
 }

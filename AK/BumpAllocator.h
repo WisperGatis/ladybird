@@ -27,10 +27,7 @@ class BumpAllocator {
 public:
     BumpAllocator()
     {
-        if constexpr (use_mmap)
-            m_chunk_size = chunk_size;
-        else
-            m_chunk_size = kmalloc_good_size(chunk_size);
+        m_chunk_size = chunk_size;
     }
 
     ~BumpAllocator()
@@ -87,7 +84,7 @@ public:
                 munmap((void*)chunk, m_chunk_size);
 #endif
             } else {
-                kfree_sized((void*)chunk, m_chunk_size);
+                kfree((void*)chunk);
             }
         });
     }

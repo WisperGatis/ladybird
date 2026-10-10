@@ -25,7 +25,7 @@ RefPtr<::JS::VM> g_vm;
 bool g_collect_on_every_allocation = false;
 ByteString g_currently_running_test;
 HashMap<Utf16String, FunctionWithLength> s_exposed_global_functions;
-Function<void()> g_main_hook;
+void (*g_main_hook)() = nullptr;
 HashMap<bool*, Tuple<ByteString, ByteString, char>> g_extra_args;
 IntermediateRunFileResult (*g_run_file)(ByteString const&, JS::Realm&, JS::ExecutionContext&) = nullptr;
 ByteString g_test_root;
@@ -99,6 +99,7 @@ int main(int argc, char** argv)
     bool print_progress = false;
     bool print_json = false;
     bool per_file = false;
+    bool print_each_test = false;
     StringView specified_test_root;
     ByteString common_path;
     Vector<ByteString> test_globs;
@@ -123,8 +124,8 @@ int main(int argc, char** argv)
 
     args_parser.add_option(print_json, "Show results as JSON", "json", 'j');
     args_parser.add_option(per_file, "Show detailed per-file results as JSON (implies -j)", "per-file");
+    args_parser.add_option(print_each_test, "Print each test file before running it", "verbose", 'v');
     args_parser.add_option(g_collect_on_every_allocation, "Collect garbage after every allocation", "collect-often", 'g');
-    args_parser.add_option(JS::Bytecode::g_dump_bytecode, "Dump the bytecode", "dump-bytecode", 'd');
     args_parser.add_option(test_globs, "Only run tests matching the given glob", "filter", 'f', "glob");
     for (auto& entry : g_extra_args)
         args_parser.add_option(*entry.key, entry.value.get<0>().characters(), entry.value.get<1>().characters(), entry.value.get<2>());
@@ -155,7 +156,7 @@ int main(int argc, char** argv)
             return 1;
         }
         test_root = LexicalPath::join(*ladybird_source_dir, g_test_root_fragment).string();
-        common_path = LexicalPath::join(*ladybird_source_dir, "Libraries"sv, "LibJS"sv, "Tests"sv, "test-common.js"sv).string();
+        common_path = LexicalPath::join(*ladybird_source_dir, "Tests"sv, "LibJS"sv, "Runtime"sv, "test-common.js"sv).string();
     }
     if (!FileSystem::is_directory(test_root)) {
         warnln("Test root is not a directory: {}", test_root);
@@ -168,7 +169,7 @@ int main(int argc, char** argv)
             warnln("No test root given, {} requires the LADYBIRD_SOURCE_DIR environment variable to be set", g_program_name);
             return 1;
         }
-        common_path = LexicalPath::join(*ladybird_source_dir, "Libraries"sv, "LibJS"sv, "Tests"sv, "test-common.js"sv).string();
+        common_path = LexicalPath::join(*ladybird_source_dir, "Tests"sv, "LibJS"sv, "Runtime"sv, "test-common.js"sv).string();
     }
 
     auto test_root_or_error = FileSystem::real_path(test_root);
@@ -193,24 +194,10 @@ int main(int argc, char** argv)
     if (g_main_hook)
         g_main_hook();
 
-    if (!g_vm) {
+    if (!g_vm)
         g_vm = JS::VM::create();
-        g_vm->set_dynamic_imports_allowed(true);
 
-        // Configure the test VM to support additional import attributes
-        // This allows tests to use import attributes beyond just "type"
-        Test::JS::g_vm->host_get_supported_import_attributes = []() -> Vector<Utf16String> {
-            return {
-                "type"_utf16,
-                "key"_utf16,     // Used in modules/import-with-attributes.mjs test
-                "key1"_utf16,    // Used in modules/basic-modules.js
-                "key2"_utf16,    // Used in modules/import-with-attributes.mjs test
-                "default"_utf16, // Used in modules/import-with-attributes.mjs test
-            };
-        };
-    }
-
-    Test::JS::TestRunner test_runner(test_root, common_path, print_times, print_progress, print_json, per_file);
+    Test::JS::TestRunner test_runner(test_root, common_path, print_times, print_progress, print_json, per_file, print_each_test);
     test_runner.run(test_globs);
 
     g_vm = nullptr;

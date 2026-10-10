@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    body {
+        margin: 0;
+    }
+    #scaled {
+        transform: scale(0.5);
+        transform-origin: 0 0;
+    }
+    iframe {
+        display: block;
+        border: 0;
+        width: 600px;
+        height: 400px;
+    }
+</style>
+<div id="scaled"><iframe id="middle"></iframe></div>
+<script>
+    // The in-process iframe clicks in its own viewport, which a CSS transform scales in the top document's. The
+    // isolated iframe inside it keeps its CSS size under that transform, and sees the click where it landed in its own
+    // viewport.
+    promiseTest(async () => {
+        const childUrl = new URL(
+            await httpTestServer().createEcho("GET", "/oop-scaled-click", {
+                status: 200,
+                headers: { "Content-Type": "text/html" },
+                body: `<!DOCTYPE html><body style="margin: 0"><script>
+                    addEventListener("mousedown", event => top.postMessage({ x: event.clientX, y: event.clientY, width: innerWidth, height: innerHeight }, "*"));
+                    top.postMessage("ready", "*");
+                <\/script>`,
+            })
+        );
+        childUrl.hostname = uniqueLocalhostHostname("oop-scaled-click");
+
+        const nextMessage = () => new Promise(resolve => addEventListener("message", event => resolve(event.data), { once: true }));
+        const middle = document.getElementById("middle");
+        const ready = nextMessage();
+        middle.srcdoc = `<!DOCTYPE html><body style="margin: 0">
+            <iframe id="inner" src="${childUrl}" style="display: block; border: 0; width: 200px; height: 100px; margin-left: 300px"></iframe>
+            <script>
+                addEventListener("message", () => {
+                    const rect = document.getElementById("inner").getBoundingClientRect();
+                    internals.clickThroughUIProcess(rect.left + 10, rect.top + 10);
+                });
+            <\/script>`;
+        await ready;
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+        const clicked = nextMessage();
+        middle.contentWindow.postMessage("click", "*");
+        const click = await clicked;
+        println(`click reached the isolated iframe at: ${click.x}, ${click.y} in a ${click.width}x${click.height} viewport`);
+        println(internals.dumpSiteIsolationProcessTree().trimEnd());
+    });
+</script>

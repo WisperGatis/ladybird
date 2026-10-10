@@ -11,12 +11,12 @@
 #include <LibWeb/HTML/HTMLTableRowElement.h>
 #include <LibWeb/HTML/HTMLTableSectionElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
-#include <LibWeb/WebIDL/Types.h>
+#include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
 
 class HTMLTableElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLTableElement, HTMLElement);
+    WEB_WRAPPABLE(HTMLTableElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLTableElement);
 
 public:
@@ -41,6 +41,7 @@ public:
     GC::Ref<HTMLTableSectionElement> create_t_body();
 
     GC::Ref<DOM::HTMLCollection> rows();
+    GC::Ref<DOM::HTMLCollection> rows() const { return const_cast<HTMLTableElement&>(*this).rows(); }
     WebIDL::ExceptionOr<GC::Ref<HTMLTableRowElement>> insert_row(WebIDL::Long index);
     WebIDL::ExceptionOr<void> delete_row(WebIDL::Long index);
 
@@ -54,14 +55,11 @@ private:
     HTMLTableElement(DOM::Document&, DOM::QualifiedName);
 
     virtual bool is_html_table_element() const override { return true; }
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(GC::Ref<CSS::CascadedProperties>) const override;
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
-
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     GC::Ptr<DOM::HTMLCollection> mutable m_rows;
     GC::Ptr<DOM::HTMLCollection> mutable m_t_bodies;
     Optional<u32> m_cellpadding;

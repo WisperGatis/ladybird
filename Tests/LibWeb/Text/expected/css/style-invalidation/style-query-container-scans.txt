@@ -1,0 +1,3 @@
+dependent before: rgb(0, 0, 0)
+dependent after unrelated change: rgb(0, 0, 0)
+dependent after: rgb(1, 2, 3)

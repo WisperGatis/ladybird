@@ -6,18 +6,26 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibGC/HeapAccess.h>
 #include <LibGC/RootVector.h>
 
 namespace GC {
 
+RootVectorBase::RootVectorBase()
+    : RootVectorBase(Heap::the())
+{
+}
+
 RootVectorBase::RootVectorBase(Heap& heap)
     : m_heap(&heap)
 {
+    ASSERT(!heap_access_is_forbidden_on_this_thread());
     m_heap->did_create_root_vector({}, *this);
 }
 
 RootVectorBase::~RootVectorBase()
 {
+    ASSERT(!heap_access_is_forbidden_on_this_thread());
     m_heap->did_destroy_root_vector({}, *this);
 }
 

@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/SVGTitleElementPrototype.h>
+#include <AK/TemporaryChange.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
 
@@ -19,29 +20,39 @@ SVGTitleElement::SVGTitleElement(DOM::Document& document, DOM::QualifiedName qua
 {
 }
 
-void SVGTitleElement::initialize(JS::Realm& realm)
+CSS::ElementBoxKind SVGTitleElement::box_kind() const
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTitleElement);
-    Base::initialize(realm);
+    return CSS::ElementBoxKind::NoBox;
 }
 
-GC::Ptr<Layout::Node> SVGTitleElement::create_layout_node(GC::Ref<CSS::ComputedProperties>)
-{
-    return nullptr;
-}
-
-void SVGTitleElement::children_changed(ChildrenChangedMetadata const* metadata)
+void SVGTitleElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Base::children_changed(metadata);
+    if (!m_suppresses_title_change_reports)
+        report_title_change_to_page();
+}
 
-    auto& page = document().page();
-    if (document().browsing_context() != &page.top_level_browsing_context())
+void SVGTitleElement::report_title_change_to_page()
+{
+    auto navigable = document().navigable();
+    if (!navigable || !navigable->is_top_level_traversable())
         return;
 
     auto* document_element = document().document_element();
 
     if (document_element == parent() && is<SVGElement>(document_element))
-        page.client().page_did_change_title(document().title());
+        document().page().client().page_did_change_title(document().title());
+}
+
+void SVGTitleElement::set_text(Utf16View value)
+{
+    // NB: Replacing the children removes the old text before it inserts the new one. The page hears the title once,
+    //     after both steps, rather than an empty title in between.
+    {
+        TemporaryChange suppress_title_change_reports { m_suppresses_title_change_reports, true };
+        string_replace_all(value);
+    }
+    report_title_change_to_page();
 }
 
 }

@@ -6,24 +6,25 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
+#include <LibCompositing/Types.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/HTML/InitialInsertion.h>
+#include <LibWebCommon/HTML/InitialInsertion.h>
+#include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 
 namespace Web::HTML {
 
 class WEB_API NavigableContainer : public HTMLElement {
-    WEB_PLATFORM_OBJECT(NavigableContainer, HTMLElement);
+    WEB_NON_IDL_WRAPPABLE(NavigableContainer, HTMLElement);
 
 public:
-    static GC::Ptr<NavigableContainer> navigable_container_with_content_navigable(GC::Ref<Navigable> navigable);
-
     virtual ~NavigableContainer() override;
 
     static HashTable<NavigableContainer*>& all_instances();
 
     GC::Ptr<Navigable> content_navigable() { return m_content_navigable; }
-    GC::Ptr<Navigable const> content_navigable() const { return m_content_navigable.ptr(); }
+    GC::Ptr<Navigable const> content_navigable() const { return m_content_navigable; }
 
     DOM::Document const* content_document() const;
     DOM::Document const* content_document_without_origin_check() const;
@@ -33,6 +34,13 @@ public:
     DOM::Document const* get_svg_document() const;
 
     void destroy_the_child_navigable();
+    static void continue_destroying_the_child_navigable(Navigable&);
+
+    void swap_content_navigable_to_remote(Badge<Page>, ReplicatedNavigableState);
+    void swap_content_navigable_to_local(Badge<Page>, LocalNavigable&);
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#completely-finish-loading
+    void content_navigable_completely_finished_loading();
 
     // All elements that extend NavigableContainer "potentially delay the load event".
     // (embed, frame, iframe, and object)
@@ -40,6 +48,13 @@ public:
     bool currently_delays_the_load_event() const;
 
     bool content_navigable_has_session_history_entry_and_ready_for_navigation() const;
+
+    ReplicatedContainerState replicated_container_state();
+
+    // The UI process routes input over a navigable another process hosts by the rect of its container's content box
+    // in the viewport of the local root, and tells that navigable the part of it the top-level viewport shows. Both
+    // are reported whenever they change.
+    void report_content_navigable_viewport_rect(Layout::BegunRead const& read);
 
 protected:
     NavigableContainer(DOM::Document&, DOM::QualifiedName);
@@ -50,20 +65,30 @@ protected:
     Optional<URL::URL> shared_attribute_processing_steps_for_iframe_and_frame(InitialInsertion initial_insertion);
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#navigate-an-iframe-or-frame
-    void navigate_an_iframe_or_frame(URL::URL url, ReferrerPolicy::ReferrerPolicy referrer_policy, Optional<String> srcdoc_string = {}, InitialInsertion = InitialInsertion::No);
+    void navigate_an_iframe_or_frame(URL::URL url, ReferrerPolicy::ReferrerPolicy referrer_policy, Optional<Utf16String> srcdoc_string = {}, InitialInsertion = InitialInsertion::No);
 
-    WebIDL::ExceptionOr<void> create_new_child_navigable(GC::Ptr<GC::Function<void()>> after_session_history_update = {});
+    void create_new_child_navigable();
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#content-navigable
     GC::Ptr<Navigable> m_content_navigable { nullptr };
 
-    void set_potentially_delays_the_load_event(bool value) { m_potentially_delays_the_load_event = value; }
-
-    void set_content_navigable_has_session_history_entry_and_ready_for_navigation();
+    void set_potentially_delays_the_load_event(bool value);
 
 private:
     virtual bool is_navigable_container() const override { return true; }
+
+    virtual void finalize() override;
+
+    static void finish_destroying_the_child_navigable(Navigable&);
+
     bool m_potentially_delays_the_load_event { true };
+
+    struct ReportedContentNavigableViewport {
+        DevicePixelRect rect;
+        DevicePixelRect intersection;
+        bool operator==(ReportedContentNavigableViewport const&) const = default;
+    };
+    Optional<ReportedContentNavigableViewport> m_reported_content_navigable_viewport;
 };
 
 }

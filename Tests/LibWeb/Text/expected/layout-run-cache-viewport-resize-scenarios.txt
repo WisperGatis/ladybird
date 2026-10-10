@@ -1,0 +1,2 @@
+viewport resize scenarios cases: 32
+viewport resize scenarios failures: 0

@@ -4,138 +4,115 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/BinarySearch.h>
-#include <AK/Utf8View.h>
+#include <AK/UnicodeUtils.h>
+#include <AK/Utf16StringBuilder.h>
+#include <LibJS/ScriptAndModuleABIConversions.h>
 #include <LibJS/SourceCode.h>
-#include <LibJS/SourceRange.h>
-#include <LibJS/Token.h>
+#include <LibTextCodec/Decoder.h>
 
 namespace JS {
 
-NonnullRefPtr<SourceCode const> SourceCode::create(String filename, Utf16String code)
+using namespace EmbeddingABI;
+
+static_assert(sizeof(Utf16String) == sizeof(JSOwnedUtf16String));
+static_assert(alignof(Utf16String) == alignof(JSOwnedUtf16String));
+
+// The source code's string, which the runtime keeps in an AK::Utf16String of its own for as long as the source code
+// lives.
+static Utf16String const& string_in_place_from_abi(JSOwnedUtf16String const* string)
 {
-    return adopt_ref(*new SourceCode(move(filename), move(code)));
+    return *reinterpret_cast<Utf16String const*>(string);
 }
 
-SourceCode::SourceCode(String filename, Utf16String code)
-    : m_filename(move(filename))
-    , m_code(move(code))
+// What SourceCode decodes its source bytes to: the code units in the range, with the encoding of a byte order mark
+// taking precedence over the given one.
+static Utf16String decode_source_bytes(ReadonlyBytes source_bytes, StringView source_encoding, size_t length_in_code_units)
 {
+    if (length_in_code_units == 0)
+        return {};
+
+    StringView input { source_bytes };
+    auto decoder = TextCodec::decoder_for(source_encoding);
+    VERIFY(decoder.has_value());
+    TextCodec::Decoder* actual_decoder = &decoder.value();
+
+    auto unicode_decoder = TextCodec::bom_sniff_to_decoder(input);
+    if (unicode_decoder.has_value()) {
+        auto input_bytes = input.bytes();
+        auto byte_order_mark_size = input_bytes.size() >= 3 && input_bytes[0] == 0xEF && input_bytes[1] == 0xBB && input_bytes[2] == 0xBF ? 3 : 2;
+        actual_decoder = &unicode_decoder.value();
+        input = input.substring_view(byte_order_mark_size);
+    }
+
+    Utf16StringBuilder builder(length_in_code_units);
+    size_t current_offset = 0;
+    auto result = actual_decoder->process_code_points(input, [&](auto code_point) -> ErrorOr<void> {
+        char16_t code_units[2];
+        size_t code_point_length_in_code_units = 0;
+        (void)AK::UnicodeUtils::code_point_to_utf16(code_point, [&](auto code_unit) {
+            code_units[code_point_length_in_code_units++] = code_unit;
+        });
+
+        for (size_t i = 0; i < code_point_length_in_code_units; ++i) {
+            if (current_offset + i < length_in_code_units)
+                builder.append_code_unit(code_units[i]);
+        }
+
+        current_offset += code_point_length_in_code_units;
+        return {};
+    });
+    result.release_value_but_fixme_should_propagate_errors();
+
+    return builder.to_string();
 }
 
-void SourceCode::fill_position_cache() const
+NonnullRefPtr<SourceCode const> SourceCode::create(Utf16String filename, Utf16String code)
 {
-    constexpr size_t predicted_minimum_cached_positions = 8;
-    constexpr size_t minimum_distance_between_cached_positions = 32;
-    constexpr size_t maximum_distance_between_cached_positions = 8192;
-
-    if (m_code.is_empty())
-        return;
-
-    u32 previous_code_point = 0;
-    size_t line = 1;
-    size_t column = 1;
-    size_t offset_of_last_starting_point = 0;
-
-    m_cached_positions.ensure_capacity(predicted_minimum_cached_positions + (m_code.length_in_code_units() / maximum_distance_between_cached_positions));
-    m_cached_positions.append({ .line = 1, .column = 1, .offset = 0 });
-
-    auto view = m_code.utf16_view();
-
-    for (auto it = view.begin(); it != view.end(); ++it) {
-        u32 code_point = *it;
-        bool is_line_terminator = code_point == '\r' || (code_point == '\n' && previous_code_point != '\r') || code_point == LINE_SEPARATOR || code_point == PARAGRAPH_SEPARATOR;
-
-        auto offset = view.iterator_offset(it);
-
-        bool is_nonempty_line = is_line_terminator && previous_code_point != '\n' && previous_code_point != LINE_SEPARATOR && previous_code_point != PARAGRAPH_SEPARATOR && (code_point == '\n' || previous_code_point != '\r');
-        auto distance_between_cached_position = offset - offset_of_last_starting_point;
-
-        if ((distance_between_cached_position >= minimum_distance_between_cached_positions && is_nonempty_line) || distance_between_cached_position >= maximum_distance_between_cached_positions) {
-            m_cached_positions.append({ .line = line, .column = column, .offset = offset });
-            offset_of_last_starting_point = offset;
-        }
-
-        if (is_line_terminator) {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
-
-        previous_code_point = code_point;
-    }
+    return adopt_source_code_from_abi(js_source_code_create(owned_utf16_string_to_abi(move(filename)), owned_utf16_string_to_abi(move(code))));
 }
 
-SourceRange SourceCode::range_from_offsets(u32 start_offset, u32 end_offset) const
+NonnullRefPtr<SourceCode const> SourceCode::create(Utf16String filename, size_t length_in_code_units, ByteString source_encoding, Core::ImmutableBytes source_bytes)
 {
-    // If the underlying code is an empty string, the range is 1,1 - 1,1 no matter what.
-    if (m_code.is_empty())
-        return { *this, { .line = 1, .column = 1, .offset = 0 }, { .line = 1, .column = 1, .offset = 0 } };
+    return create(move(filename), decode_source_bytes(source_bytes.bytes(), source_encoding.view(), length_in_code_units));
+}
 
-    if (m_cached_positions.is_empty())
-        fill_position_cache();
+Utf16String const& SourceCode::filename() const
+{
+    return string_in_place_from_abi(js_source_code_filename_address(source_code_to_abi(*this)));
+}
 
-    Position current { .line = 1, .column = 1, .offset = 0 };
+Utf16String const& SourceCode::code() const
+{
+    return string_in_place_from_abi(js_source_code_code_address(source_code_to_abi(*this)));
+}
 
-    if (!m_cached_positions.is_empty()) {
-        Position const dummy;
-        size_t nearest_index = 0;
-        binary_search(m_cached_positions, dummy, &nearest_index,
-            [&](auto&, auto& starting_point) {
-                return start_offset - starting_point.offset;
-            });
+size_t SourceCode::length_in_code_units() const
+{
+    return js_source_code_length_in_code_units(source_code_to_abi(*this));
+}
 
-        current = m_cached_positions[nearest_index];
-    }
+u16 const* SourceCode::utf16_data() const
+{
+    return js_source_code_utf16_data(source_code_to_abi(*this));
+}
 
-    Optional<Position> start;
-    Optional<Position> end;
+Utf16String SourceCode::source_text_from_offsets(size_t start_offset, size_t length) const
+{
+    if (length == 0)
+        return {};
 
-    u32 previous_code_point = 0;
+    VERIFY(start_offset <= NumericLimits<size_t>::max() - length);
+    return Utf16String::from_utf16(code().utf16_view().substring_view(start_offset, length));
+}
 
-    auto view = m_code.utf16_view();
+void SourceCode::ref() const
+{
+    js_source_code_retain(source_code_to_abi(*this));
+}
 
-    for (auto it = view.iterator_at_code_unit_offset(current.offset); it != view.end(); ++it) {
-        // If we're on or after the start offset, this is the start position.
-        if (!start.has_value() && view.iterator_offset(it) >= start_offset) {
-            start = Position {
-                .line = current.line,
-                .column = current.column,
-                .offset = start_offset,
-            };
-        }
-
-        // If we're on or after the end offset, this is the end position.
-        if (!end.has_value() && view.iterator_offset(it) >= end_offset) {
-            end = Position {
-                .line = current.line,
-                .column = current.column,
-                .offset = end_offset,
-            };
-            break;
-        }
-
-        u32 code_point = *it;
-
-        bool const is_line_terminator = code_point == '\r' || (code_point == '\n' && previous_code_point != '\r') || code_point == LINE_SEPARATOR || code_point == PARAGRAPH_SEPARATOR;
-        previous_code_point = code_point;
-
-        if (is_line_terminator) {
-            current.line += 1;
-            current.column = 1;
-            continue;
-        }
-
-        current.column += 1;
-    }
-
-    // If we didn't find both a start and end position, just return 1,1-1,1.
-    // FIXME: This is a hack. Find a way to return the nicest possible values here.
-    if (!start.has_value() || !end.has_value())
-        return SourceRange { *this, { .line = 1, .column = 1 }, { .line = 1, .column = 1 } };
-
-    return SourceRange { *this, *start, *end };
+void SourceCode::unref() const
+{
+    js_source_code_release(source_code_to_abi(*this));
 }
 
 }

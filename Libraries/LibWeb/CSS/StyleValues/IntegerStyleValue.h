@@ -7,38 +7,47 @@
 #pragma once
 
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
-class IntegerStyleValue final : public StyleValue {
+class WEB_API IntegerStyleValue final : public StyleValue {
 public:
-    static ValueComparingNonnullRefPtr<IntegerStyleValue const> create(i64 value)
+    static ValueComparingNonnullRefPtr<IntegerStyleValue const> create(i32 value)
     {
+        // Small integers are common enough (z-index, column counts, spans) that they are
+        // interned, making repeated creations allocation-free.
+        static constexpr i32 first_interned_value = -1;
+        static constexpr i32 last_interned_value = 255;
+        if (value >= first_interned_value && value <= last_interned_value) {
+            static auto const& instances = *[] {
+                auto* instances = new (nothrow) Vector<NonnullRefPtr<IntegerStyleValue const>>();
+                instances->ensure_capacity(last_interned_value - first_interned_value + 1);
+                for (i32 interned_value = first_interned_value; interned_value <= last_interned_value; ++interned_value)
+                    instances->unchecked_append(adopt_ref(*new (nothrow) IntegerStyleValue(interned_value)));
+                return instances;
+            }();
+            return instances[value - first_interned_value];
+        }
         return adopt_ref(*new (nothrow) IntegerStyleValue(value));
     }
 
-    i64 integer() const { return m_value; }
+    i32 integer() const { return m_value->integer.value; }
 
-    virtual String to_string(SerializationMode) const override;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, FlyString const& associated_property) const override;
-
-    bool equals(StyleValue const& other) const override
-    {
-        if (type() != other.type())
-            return false;
-        auto const& other_integer = other.as_integer();
-        return m_value == other_integer.m_value;
-    }
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
-    explicit IntegerStyleValue(i64 value)
-        : StyleValue(Type::Integer)
-        , m_value(value)
+    friend class StyleValue;
+
+    explicit IntegerStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValue(Type::Integer, data)
     {
     }
 
-    i64 m_value { 0 };
+    explicit IntegerStyleValue(i32 value)
+        : StyleValue(Type::Integer, StyleValueFFI::rust_style_value_create_integer(value))
+    {
+    }
 };
 
 }

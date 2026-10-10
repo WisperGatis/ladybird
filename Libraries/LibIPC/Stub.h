@@ -8,7 +8,9 @@
 #pragma once
 
 #include <AK/ByteString.h>
+#include <AK/Format.h>
 #include <AK/OwnPtr.h>
+#include <AK/StringView.h>
 #include <LibIPC/Forward.h>
 
 namespace AK {
@@ -27,11 +29,15 @@ public:
     virtual ByteString name() const = 0;
     virtual ErrorOr<OwnPtr<MessageBuffer>> handle(NonnullOwnPtr<Message>) = 0;
 
+    // Called when a message fails verification before dispatch. A connection that can act on a
+    // misbehaving peer overrides this.
+    virtual void did_misbehave(StringView message_name, StringView reason)
+    {
+        dbgln("IPC: {} rejected: {}", message_name, reason);
+    }
+
 protected:
     Stub() = default;
-
-private:
-    ByteString m_name;
 };
 
 }

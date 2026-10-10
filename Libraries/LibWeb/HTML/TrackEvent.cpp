@@ -1,48 +1,45 @@
 /*
  * Copyright (c) 2023, Tim Flynn <trflynn89@serenityos.org>
+ * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/TrackEventPrototype.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/HTML/AudioTrack.h>
+#include <LibWeb/HTML/TextTrack.h>
 #include <LibWeb/HTML/TrackEvent.h>
+#include <LibWeb/HTML/VideoTrack.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(TrackEvent);
 
-GC::Ref<TrackEvent> TrackEvent::create(JS::Realm& realm, FlyString const& event_name, TrackEventInit event_init)
+GC::Ref<TrackEvent> TrackEvent::create(FlyString const& event_name, TrackEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
 {
-    return realm.create<TrackEvent>(realm, event_name, move(event_init));
+    return GC::Heap::the().allocate<TrackEvent>(event_name, event_init, time_stamp);
 }
 
-WebIDL::ExceptionOr<GC::Ref<TrackEvent>> TrackEvent::construct_impl(JS::Realm& realm, FlyString const& event_name, TrackEventInit event_init)
+GC::Ref<TrackEvent> TrackEvent::create(Utf16FlyString const& event_name, TrackEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
 {
-    return create(realm, event_name, move(event_init));
+    return GC::Heap::the().allocate<TrackEvent>(FlyString { event_name.to_utf16_string().to_utf8() }, event_init, time_stamp);
 }
 
-TrackEvent::TrackEvent(JS::Realm& realm, FlyString const& event_name, TrackEventInit event_init)
-    : DOM::Event(realm, event_name, event_init)
-    , m_track(move(event_init.track))
+TrackEvent::TrackEvent(FlyString const& event_name, TrackEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
+    : DOM::Event(event_name, event_init, time_stamp)
+    , m_track(event_init.track)
 {
 }
 
-void TrackEvent::initialize(JS::Realm& realm)
+void TrackEvent::visit_edges(Visitor& visitor)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(TrackEvent);
-    Base::initialize(realm);
+    Base::visit_edges(visitor);
+    visitor.visit(m_track);
 }
 
-Variant<Empty, GC::Root<VideoTrack>, GC::Root<AudioTrack>, GC::Root<TextTrack>> TrackEvent::track() const
+NullableTrackType TrackEvent::track() const
 {
-    // FIXME: This is a bit awkward. When creating a nullable union, our IDL generator creates a type of
-    //        Optional<Variant<...>>, using an empty Optional to represent null. But when retrieving the
-    //        attribute, it expects a type of Variant<Empty, ...>, using Empty to represent null.
-    if (!m_track.has_value())
-        return Empty {};
-
-    return *m_track;
+    return m_track;
 }
 
 }

@@ -7,8 +7,10 @@
 #include <LibTest/TestCase.h>
 
 #include <AK/JsonObject.h>
+#include <AK/JsonObjectSerializer.h>
 #include <AK/JsonValue.h>
 #include <AK/StringBuilder.h>
+#include <math.h>
 
 TEST_CASE(load_form)
 {
@@ -319,6 +321,32 @@ TEST_CASE(json_parse_fails_on_invalid_number)
 #undef EXPECT_JSON_PARSE_TO_FAIL
 }
 
+TEST_CASE(json_parse_rejects_excessive_nesting_depth)
+{
+    StringBuilder input;
+    constexpr size_t nesting_depth = 4096;
+
+    input.append_repeated('[', nesting_depth);
+    input.append('0');
+    input.append_repeated(']', nesting_depth);
+
+    auto parsed = JsonValue::from_string(input.string_view());
+    EXPECT(parsed.is_error());
+}
+
+TEST_CASE(json_parse_accepts_reasonable_nesting_depth)
+{
+    StringBuilder input;
+    constexpr size_t nesting_depth = 64;
+
+    input.append_repeated('[', nesting_depth);
+    input.append('0');
+    input.append_repeated(']', nesting_depth);
+
+    auto parsed = JsonValue::from_string(input.string_view());
+    EXPECT(!parsed.is_error());
+}
+
 struct CustomError {
 };
 
@@ -510,8 +538,10 @@ TEST_CASE(json_array_ensure_capacity)
 {
     auto array = setup_json_array();
     size_t new_capacity { 16 };
+    EXPECT(array.values().capacity() < new_capacity);
     array.ensure_capacity(new_capacity);
-    EXPECT_EQ(array.values().capacity(), new_capacity);
+    // The capacity takes in whatever slack the allocator's block has, so we only require at least new_capacity.
+    EXPECT(array.values().capacity() >= new_capacity);
 }
 
 TEST_CASE(json_array_for_each)
@@ -543,6 +573,30 @@ TEST_CASE(json_array_serialize)
     StringBuilder builder {};
     array.serialize(builder);
     EXPECT_EQ(builder.string_view(), raw_json);
+}
+
+TEST_CASE(json_serialize_non_finite_numbers_as_null)
+{
+    EXPECT_EQ(JsonValue { INFINITY }.serialized(), "null"sv);
+
+    JsonArray array;
+    array.must_append(-INFINITY);
+    array.must_append(NAN);
+    array.must_append(1.5);
+    EXPECT_EQ(array.serialized(), "[null,null,1.5]"sv);
+
+    JsonObject object;
+    object.set("a"sv, INFINITY);
+    EXPECT_EQ(object.serialized(), R"({"a":null})"sv);
+
+    StringBuilder builder;
+    auto serializer = MUST(JsonObjectSerializer<>::try_create(builder));
+    MUST(serializer.add("a"sv, NAN));
+    MUST(serializer.add("b"sv, -INFINITY));
+    MUST(serializer.add("c"sv, 1.5f));
+    MUST(serializer.add("d"sv, 2.5));
+    MUST(serializer.finish());
+    EXPECT_EQ(builder.string_view(), R"({"a":null,"b":null,"c":1.5,"d":2.5})"sv);
 }
 
 TEST_CASE(json_array_values)
@@ -638,4 +692,27 @@ TEST_CASE(json_object_move_from_value)
     auto array2 = object.get_array("baz"sv);
     EXPECT_EQ(array2->at(0).as_bool(), false);
     EXPECT_EQ(array2->at(1).as_string(), "string"sv);
+}
+
+TEST_CASE(invalid_utf8)
+{
+    // Incomplete 2-byte sequence
+    EXPECT(JsonValue::from_string("{\"key\": \"value\xcf\"}"sv).is_error());
+    EXPECT(JsonValue::from_string("{\"key\xcf\": \"value\"}"sv).is_error());
+
+    // Incomplete 3-byte sequence
+    EXPECT(JsonValue::from_string("{\"key\": \"value\xef\xbf\"}"sv).is_error());
+    EXPECT(JsonValue::from_string("{\"key\xef\xbf\": \"value\"}"sv).is_error());
+
+    // Invalid start byte
+    EXPECT(JsonValue::from_string("{\"key\": \"value\xf8\"}"sv).is_error());
+    EXPECT(JsonValue::from_string("{\"key\xf8\": \"value\"}"sv).is_error());
+
+    // Invalid continuation byte
+    EXPECT(JsonValue::from_string("{\"key\": \"value\xc3\x28\"}"sv).is_error());
+    EXPECT(JsonValue::from_string("{\"key\xc3\x28\": \"value\"}"sv).is_error());
+
+    // Multiple invalid bytes
+    EXPECT(JsonValue::from_string("{\"key\": \"value\xff\xff\"}"sv).is_error());
+    EXPECT(JsonValue::from_string("{\"key\xff\xff\": \"value\"}"sv).is_error());
 }

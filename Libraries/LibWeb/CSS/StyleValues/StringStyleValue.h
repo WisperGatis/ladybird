@@ -6,8 +6,7 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
+#include <AK/Utf16FlyString.h>
 #include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
@@ -15,29 +14,17 @@ namespace Web::CSS {
 
 class StringStyleValue : public StyleValueWithDefaultOperators<StringStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<StringStyleValue const> create(FlyString const& string)
-    {
-        return adopt_ref(*new (nothrow) StringStyleValue(string));
-    }
     virtual ~StringStyleValue() override = default;
 
-    FlyString const& string_value() const { return m_string; }
-    virtual String to_string(SerializationMode) const override { return serialize_a_string(m_string); }
-    virtual Vector<Parser::ComponentValue> tokenize() const override
-    {
-        return { Parser::Token::create_string(m_string) };
-    }
-
-    bool properties_equal(StringStyleValue const& other) const { return m_string == other.m_string; }
+    Utf16FlyString string_value() const { return css_string_from_rust(&m_value->string.string); }
 
 private:
-    explicit StringStyleValue(FlyString const& string)
-        : StyleValueWithDefaultOperators(Type::String)
-        , m_string(string)
+    friend class StyleValue;
+
+    explicit StringStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::String, data)
     {
     }
-
-    FlyString m_string;
 };
 
 }

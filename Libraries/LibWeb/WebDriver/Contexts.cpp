@@ -5,19 +5,29 @@
  */
 
 #include <AK/JsonObject.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/WebDriver/Contexts.h>
 
 namespace Web::WebDriver {
 
 // https://w3c.github.io/webdriver/#dfn-web-window-identifier
-static JS::PropertyKey const WEB_WINDOW_IDENTIFIER { "window-fcc6-11e5-b4f8-330a88ab9d7f"_utf16_fly_string };
+static auto const& WEB_WINDOW_IDENTIFIER = *new JS::PropertyKey("window-fcc6-11e5-b4f8-330a88ab9d7f"_utf16_fly_string);
 
 // https://w3c.github.io/webdriver/#dfn-web-frame-identifier
-static JS::PropertyKey const WEB_FRAME_IDENTIFIER { "frame-075b-4da1-b6ba-e579c2d3230a"_utf16_fly_string };
+static auto const& WEB_FRAME_IDENTIFIER = *new JS::PropertyKey("frame-075b-4da1-b6ba-e579c2d3230a"_utf16_fly_string);
+
+// NB: Only a top-level browsing context has a window handle, and another process may host the one of a frame. The id
+//     of a frame's navigable identifies the frame instead.
+static String window_handle(HTML::LocalNavigable const& navigable)
+{
+    if (navigable.is_top_level_traversable())
+        return as<HTML::LocalTraversableNavigable>(navigable).window_handle().to_utf8();
+    return MUST(String::formatted("{}-{}", navigable.id().namespace_id, navigable.id().local_id));
+}
 
 // https://w3c.github.io/webdriver/#dfn-windowproxy-reference-object
 JsonObject window_proxy_reference_object(HTML::WindowProxy const& window)
@@ -28,7 +38,9 @@ JsonObject window_proxy_reference_object(HTML::WindowProxy const& window)
     // NOTE: We look at the active browsing context's active document's node navigable instead.
     //      Because a Browsing context's top-level traversable is this navigable's top level traversable.
     //      Ref: https://html.spec.whatwg.org/multipage/document-sequences.html#bc-traversable
-    auto navigable = window.associated_browsing_context()->active_document()->navigable();
+    auto browsing_context = window.associated_browsing_context();
+    VERIFY(browsing_context);
+    auto navigable = browsing_context->active_document()->navigable();
 
     auto const& identifier = navigable->is_top_level_traversable()
         ? WEB_WINDOW_IDENTIFIER
@@ -39,18 +51,20 @@ JsonObject window_proxy_reference_object(HTML::WindowProxy const& window)
 
     // identifier
     //    Associated window handle of the window’s browsing context.
-    object.set(MUST(identifier.as_string().view().to_utf8()), navigable->traversable_navigable()->window_handle());
+    object.set(MUST(identifier.as_string().view().to_utf8()), window_handle(*navigable));
 
     return object;
 }
 
-static GC::Ptr<HTML::Navigable> find_navigable_with_handle(StringView handle, bool should_be_top_level)
+static GC::Ptr<HTML::LocalNavigable> find_navigable_with_handle(Utf16View handle_utf16, bool should_be_top_level)
 {
-    for (auto navigable : Web::HTML::all_navigables()) {
+    auto handle = MUST(handle_utf16.to_utf8());
+
+    for (auto navigable : Web::HTML::all_local_navigables()) {
         if (navigable->is_top_level_traversable() != should_be_top_level)
             continue;
 
-        if (navigable->traversable_navigable()->window_handle() == handle)
+        if (window_handle(*navigable) == handle)
             return navigable;
     }
 
@@ -64,7 +78,7 @@ bool represents_a_web_frame(JS::Value value)
     if (!value.is_object())
         return false;
 
-    auto result = value.as_object().has_own_property(WEB_WINDOW_IDENTIFIER);
+    auto result = value.as_object().has_own_property(WEB_FRAME_IDENTIFIER);
     return !result.is_error() && result.value();
 }
 
@@ -77,7 +91,7 @@ ErrorOr<GC::Ref<HTML::WindowProxy>, WebDriver::Error> deserialize_web_frame(JS::
         return WebDriver::Error::from_code(WebDriver::ErrorCode::InvalidArgument, "Object is not a web frame"sv);
 
     // 2. Let reference be the result of getting the web frame identifier property from object.
-    auto reference = property.value().as_string().utf8_string();
+    auto reference = property.value().as_string().utf16_string_view();
 
     // 3. Let browsing context be the browsing context whose window handle is reference, or null if no such browsing
     //    context exists.
@@ -112,7 +126,7 @@ ErrorOr<GC::Ref<HTML::WindowProxy>, WebDriver::Error> deserialize_web_window(JS:
         return WebDriver::Error::from_code(WebDriver::ErrorCode::InvalidArgument, "Object is not a web window"sv);
 
     // 2. Let reference be the result of getting the web window identifier property from object.
-    auto reference = property.value().as_string().utf8_string();
+    auto reference = property.value().as_string().utf16_string_view();
 
     // 3. Let browsing context be the browsing context whose window handle is reference, or null if no such browsing
     //    context exists.

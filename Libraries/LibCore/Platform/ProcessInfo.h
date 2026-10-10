@@ -15,9 +15,19 @@
 namespace Core::Platform {
 
 struct ProcessInfo {
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit ProcessInfo(pid_t pid)
         : pid(pid)
     {
+    }
+
+    void reset_cpu_time()
+    {
+        cpu_percent = 0.0f;
+#if defined(AK_OS_MACH)
+        has_cpu_time_baseline = false;
+#endif
     }
 
     pid_t pid { 0 };
@@ -28,7 +38,8 @@ struct ProcessInfo {
     u64 time_spent_in_process { 0 };
 
 #if defined(AK_OS_MACH)
-    Core::MachPort child_task_port;
+    Core::MachPort task_name_port;
+    bool has_cpu_time_baseline { false };
 #endif
 };
 

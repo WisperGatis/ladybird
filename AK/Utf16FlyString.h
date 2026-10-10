@@ -10,6 +10,7 @@
 #include <AK/Optional.h>
 #include <AK/Traits.h>
 #include <AK/Utf16String.h>
+#include <AK/kmalloc.h>
 
 namespace AK {
 
@@ -18,15 +19,72 @@ class [[nodiscard]] Utf16FlyString {
     AK_MAKE_DEFAULT_COPYABLE(Utf16FlyString);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     constexpr Utf16FlyString() = default;
+    ALWAYS_INLINE ~Utf16FlyString() = default;
 
     static Utf16FlyString from_utf8(StringView);
     static Utf16FlyString from_utf8(String const& string) { return from_utf8_without_validation(string); }
     static Utf16FlyString from_utf8(FlyString const& string) { return from_utf8_without_validation(string); }
+    static Utf16FlyString from_fly_string(FlyString const& string) { return from_utf8_without_validation(string); }
+    static Utf16FlyString from_ascii_without_validation(StringView);
     static Utf16FlyString from_utf8_without_validation(StringView);
     static Utf16FlyString from_utf8_but_should_be_ported_to_utf16(StringView string) { return from_utf8_without_validation(string); }
 
     static Utf16FlyString from_utf16(Utf16View const&);
+
+    // NB: These round-trip the one-word raw representation through FFI bridges (e.g. the LibWeb
+    //     Rust style value data), which retain the raw value and manage its reference manually.
+    //     to_raw_leaked() leaks one reference to the bridge, from_raw() reconstructs a fly string
+    //     without consuming the bridge's reference, and unref_raw() releases it.
+    [[nodiscard]] FlatPtr to_raw_leaked() const
+    {
+        if (m_data.has_long_storage())
+            m_data.data({})->ref();
+        return m_data.raw({});
+    }
+
+    // Transfer this string's existing ownership reference to an FFI caller. The caller must
+    // eventually pass the raw value to adopt_raw() or unref_raw().
+    [[nodiscard]] FlatPtr into_raw() &&
+    {
+        return m_data.leak_raw(Badge<Utf16FlyString> {});
+    }
+
+    [[nodiscard]] FlatPtr raw_identity() const { return m_data.raw({}); }
+    [[nodiscard]] bool has_short_ascii_storage() const { return m_data.has_short_ascii_storage(); }
+
+    [[nodiscard]] static Utf16FlyString from_raw(FlatPtr raw)
+    {
+        auto base = Detail::Utf16StringBase::adopt_raw(Badge<Utf16FlyString> {}, raw);
+        if (base.has_long_storage())
+            base.data({})->ref();
+
+        Utf16FlyString string;
+        string.m_data = move(base);
+        return string;
+    }
+
+    // Adopt a raw value produced by into_raw() without changing its reference count.
+    [[nodiscard]] static Utf16FlyString adopt_raw(FlatPtr raw)
+    {
+        return Utf16FlyString { Detail::Utf16StringBase::adopt_raw(Badge<Utf16FlyString> {}, raw) };
+    }
+
+    static void ref_raw(FlatPtr raw)
+    {
+        auto string = adopt_raw(raw);
+        if (string.m_data.has_long_storage())
+            string.m_data.data({})->ref();
+        (void)move(string).into_raw();
+    }
+
+    static void unref_raw(FlatPtr raw)
+    {
+        // Adopt the bridge's reference and let it drop.
+        auto string = adopt_raw(raw);
+    }
 
     template<typename T>
     requires(IsOneOf<RemoveCVReference<T>, Utf16String, Utf16FlyString>)
@@ -110,6 +168,10 @@ public:
     }
 
     [[nodiscard]] ALWAYS_INLINE bool equals_ignoring_ascii_case(Utf16View const& other) const { return m_data.equals_ignoring_ascii_case(other); }
+    [[nodiscard]] ALWAYS_INLINE bool equals_ignoring_ascii_case(StringView other) const { return view().equals_ignoring_ascii_case(other); }
+
+    [[nodiscard]] ALWAYS_INLINE bool starts_with(StringView string) const { return view().starts_with(string); }
+    [[nodiscard]] ALWAYS_INLINE bool starts_with_ignoring_ascii_case(StringView string) const { return view().starts_with_ignoring_ascii_case(string); }
 
     template<typename... Ts>
     [[nodiscard]] ALWAYS_INLINE bool is_one_of(Ts&&... strings) const
@@ -124,6 +186,7 @@ public:
     }
 
     [[nodiscard]] ALWAYS_INLINE u32 hash() const { return m_data.hash(); }
+    [[nodiscard]] ALWAYS_INLINE u32 ascii_case_insensitive_hash() const { return view().ascii_case_insensitive_hash(); }
     [[nodiscard]] ALWAYS_INLINE bool is_empty() const { return m_data.is_empty(); }
     [[nodiscard]] ALWAYS_INLINE bool is_ascii() const { return m_data.is_ascii(); }
 
@@ -136,18 +199,36 @@ public:
     [[nodiscard]] ALWAYS_INLINE size_t code_unit_offset_of(size_t code_point_offset) const { return m_data.code_unit_offset_of(code_point_offset); }
     [[nodiscard]] ALWAYS_INLINE size_t code_point_offset_of(size_t code_unit_offset) const { return m_data.code_point_offset_of(code_unit_offset); }
 
-    constexpr Utf16FlyString(Badge<Optional<Utf16FlyString>>, nullptr_t)
+    constexpr Utf16FlyString(Badge<SentinelOptionalTraits<Utf16FlyString>>, nullptr_t)
         : m_data(Badge<Utf16FlyString> {}, nullptr)
     {
     }
 
-    [[nodiscard]] constexpr bool is_invalid(Badge<Optional<Utf16FlyString>>) const { return m_data.raw({}) == 0; }
+    [[nodiscard]] constexpr bool is_invalid(Badge<SentinelOptionalTraits<Utf16FlyString>>) const { return m_data.raw({}) == 0; }
 
     // This is primarily interesting to unit tests.
     [[nodiscard]] static size_t number_of_utf16_fly_strings();
 
+    [[nodiscard]] static constexpr Utf16FlyString from_ascii_short_string_without_validation(char const* data, size_t length)
+    {
+        VERIFY(length <= Detail::MAX_SHORT_STRING_BYTE_COUNT);
+        auto short_string = Detail::ShortString::create_with_byte_count(length);
+        for (size_t i = 0; i < length; ++i)
+            short_string.storage[i] = static_cast<u8>(data[i]);
+        return Utf16FlyString { Detail::Utf16StringBase { short_string } };
+    }
+
+    [[nodiscard]] static constexpr Utf16FlyString from_ascii_short_string_without_validation(char16_t const* data, size_t length)
+    {
+        VERIFY(length <= Detail::MAX_SHORT_STRING_BYTE_COUNT);
+        auto short_string = Detail::ShortString::create_with_byte_count(length);
+        for (size_t i = 0; i < length; ++i)
+            short_string.storage[i] = static_cast<u8>(data[i]);
+        return Utf16FlyString { Detail::Utf16StringBase { short_string } };
+    }
+
 private:
-    ALWAYS_INLINE explicit Utf16FlyString(Detail::Utf16StringBase data)
+    ALWAYS_INLINE constexpr explicit Utf16FlyString(Detail::Utf16StringBase data)
         : m_data(move(data))
     {
     }
@@ -159,93 +240,19 @@ private:
 };
 
 template<>
-class Optional<Utf16FlyString> : public OptionalBase<Utf16FlyString> {
-    template<typename U>
-    friend class Optional;
+struct SentinelOptionalTraits<Utf16FlyString> {
+    static constexpr Utf16FlyString sentinel_value() { return Utf16FlyString({}, nullptr); }
+    static constexpr bool is_sentinel(Utf16FlyString const& value) { return value.is_invalid({}); }
+};
+
+template<>
+class Optional<Utf16FlyString> : public SentinelOptional<Utf16FlyString> {
+    AK_MAKE_DEFAULT_MOVABLE(Optional);
+    AK_MAKE_DEFAULT_COPYABLE(Optional);
 
 public:
-    using ValueType = Utf16FlyString;
-
-    constexpr Optional() = default;
-
-    template<SameAs<OptionalNone> V>
-    constexpr Optional(V) { }
-
-    constexpr Optional(Optional<Utf16FlyString> const& other)
-        : m_value(other.m_value)
-    {
-    }
-
-    constexpr Optional(Optional&& other)
-        : m_value(move(other.m_value))
-    {
-    }
-
-    template<typename U = Utf16FlyString>
-    requires(!IsSame<OptionalNone, RemoveCVReference<U>>)
-    explicit(!IsConvertible<U&&, Utf16FlyString>) constexpr Optional(U&& value)
-    requires(!IsSame<RemoveCVReference<U>, Optional<Utf16FlyString>> && IsConstructible<Utf16FlyString, U &&>)
-        : m_value(forward<U>(value))
-    {
-    }
-
-    template<SameAs<OptionalNone> V>
-    constexpr Optional& operator=(V)
-    {
-        clear();
-        return *this;
-    }
-
-    constexpr Optional& operator=(Optional const& other)
-    {
-        if (this != &other)
-            m_value = other.m_value;
-        return *this;
-    }
-
-    constexpr Optional& operator=(Optional&& other)
-    {
-        if (this != &other)
-            m_value = other.m_value;
-        return *this;
-    }
-
-    constexpr void clear()
-    {
-        m_value = empty_value;
-    }
-
-    [[nodiscard]] constexpr bool has_value() const
-    {
-        return !m_value.is_invalid({});
-    }
-
-    [[nodiscard]] constexpr Utf16FlyString& value() &
-    {
-        VERIFY(has_value());
-        return m_value;
-    }
-
-    [[nodiscard]] constexpr Utf16FlyString const& value() const&
-    {
-        VERIFY(has_value());
-        return m_value;
-    }
-
-    [[nodiscard]] constexpr Utf16FlyString value() &&
-    {
-        return release_value();
-    }
-
-    [[nodiscard]] constexpr Utf16FlyString release_value()
-    {
-        VERIFY(has_value());
-        return exchange(m_value, empty_value);
-    }
-
-private:
-    static constexpr Utf16FlyString empty_value { {}, nullptr };
-    Utf16FlyString m_value { empty_value };
+    using SentinelOptional::SentinelOptional;
+    ALWAYS_INLINE ~Optional() = default;
 };
 
 template<>
@@ -258,7 +265,7 @@ template<>
 struct Formatter<Utf16FlyString> : Formatter<Utf16String> {
     ErrorOr<void> format(FormatBuilder& builder, Utf16FlyString const& string)
     {
-        return Formatter<Utf16String>::format(builder, string.to_utf16_string());
+        return Formatter<Utf16String> {}.format(builder, string.to_utf16_string());
     }
 };
 
@@ -280,15 +287,26 @@ inline constexpr bool IsHashCompatible<Utf16FlyString, Utf16String> = true;
 
 }
 
-[[nodiscard]] ALWAYS_INLINE AK::Utf16FlyString operator""_utf16_fly_string(char const* string, size_t length)
+[[nodiscard]] ALWAYS_INLINE constexpr AK::Utf16FlyString operator""_utf16_fly_string(char const* string, size_t length)
 {
+    // OPTIMIZATION: Short ASCII strings become compile-time constants with no runtime validation or table lookup.
+    if (length <= AK::Detail::MAX_SHORT_STRING_BYTE_COUNT
+        && AK::all_of(string, string + length, AK::is_ascii)) {
+        return AK::Utf16FlyString::from_ascii_short_string_without_validation(string, length);
+    }
+
     AK::StringView view { string, length };
 
     ASSERT(AK::Utf8View { view }.validate());
     return AK::Utf16FlyString::from_utf8_without_validation(view);
 }
 
-[[nodiscard]] ALWAYS_INLINE AK::Utf16FlyString operator""_utf16_fly_string(char16_t const* string, size_t length)
+[[nodiscard]] ALWAYS_INLINE constexpr AK::Utf16FlyString operator""_utf16_fly_string(char16_t const* string, size_t length)
 {
+    // OPTIMIZATION: Short ASCII strings become compile-time constants with no runtime work.
+    if (length <= AK::Detail::MAX_SHORT_STRING_BYTE_COUNT
+        && AK::all_of(string, string + length, AK::is_ascii))
+        return AK::Utf16FlyString::from_ascii_short_string_without_validation(string, length);
+
     return AK::Utf16FlyString::from_utf16({ string, length });
 }

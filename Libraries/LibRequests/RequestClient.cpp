@@ -4,15 +4,40 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/Promise.h>
 #include <LibCore/System.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 
 namespace Requests {
 
+static Optional<Core::ImmutableBytes> map_javascript_bytecode_file(int fd, u64 size)
+{
+    ArmedScopeGuard close_fd = [fd] {
+        (void)Core::System::close(fd);
+    };
+
+    if (!AK::is_within_range<size_t>(size)) {
+        dbgln("RequestClient: Received JavaScript bytecode cache file outside mappable range");
+        return {};
+    }
+
+    close_fd.disarm();
+    auto payload = Core::ImmutableBytes::map_from_fd_range_and_close(fd, "javascript bytecode cache"sv, 0, static_cast<size_t>(size));
+    if (payload.is_error()) {
+        dbgln("RequestClient: Failed to map JavaScript bytecode cache file: {}", payload.error());
+        return {};
+    }
+
+    return payload.release_value();
+}
+
 RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport))
 {
+    m_request_server_client_id = send_sync<Messages::RequestServer::GetClientId>()->client_id();
 }
 
 RequestClient::~RequestClient() = default;
@@ -24,30 +49,125 @@ void RequestClient::die()
             request->did_finish({}, {}, {}, NetworkError::RequestServerDied);
     }
 
+    auto websockets = move(m_websockets);
+
     m_requests.clear();
+    m_websockets.clear();
+
+    for (auto& [id, websocket] : websockets) {
+        auto ready_state = websocket->ready_state();
+        websocket->detach_from_client({});
+        websocket->set_ready_state(WebSocket::ReadyState::Closed);
+
+        auto error = ready_state == WebSocket::ReadyState::Connecting
+            ? WebSocket::Error::CouldNotEstablishConnection
+            : WebSocket::Error::ServerClosedSocket;
+        websocket->did_error({}, to_underlying(error));
+        websocket->did_close({}, to_underlying(::WebSocket::CloseStatusCode::AbnormalClosure), {}, false);
+    }
+
+    if (auto request_server_died_callback = move(on_request_server_died)) {
+        Core::deferred_invoke([request_server_died_callback = move(request_server_died_callback)]() mutable {
+            request_server_died_callback();
+        });
+    }
 }
 
-void RequestClient::ensure_connection(URL::URL const& url, ::RequestServer::CacheLevel cache_level)
+RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, TransferLease transfer_lease, Optional<u32> address_selection_hint, CacheMissNotification cache_miss_notification, u64 originating_page_id, Optional<HTTP::NetworkIsolationKey> network_isolation_key)
 {
-    async_ensure_connection(url, cache_level);
-}
+    auto request_id = m_next_request_id++;
+    auto headers = request_headers.map([](auto const& headers) { return headers.headers().span(); }).value_or({});
 
-RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, HTTP::HeaderMap const& request_headers, ReadonlyBytes request_body, Core::ProxyData const& proxy_data)
-{
-    auto body_result = ByteBuffer::copy(request_body);
-    if (body_result.is_error())
-        return nullptr;
-
-    static i32 s_next_request_id = 0;
-    auto request_id = s_next_request_id++;
-
-    IPCProxy::async_start_request(request_id, method, url, request_headers, body_result.release_value(), proxy_data);
-    auto request = Request::create_from_id({}, *this, request_id);
+    auto transfer_lease_key = transfer_lease == TransferLease::Yes
+        ? Optional<RequestTransferLeaseKey> { { m_request_server_client_id, request_id } }
+        : Optional<RequestTransferLeaseKey> {};
+    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, move(network_isolation_key), include_credentials, transfer_lease_key.has_value(), address_selection_hint, cache_miss_notification == CacheMissNotification::Yes, Core::System::getpid(), originating_page_id);
+    auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
 
-void RequestClient::request_started(i32 request_id, IPC::File response_file)
+RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease)
+{
+    auto request_id = m_next_request_id++;
+
+    auto transfer_lease_key = transfer_lease == TransferLease::Yes
+        ? Optional<RequestTransferLeaseKey> { { source_client_id, source_request_id } }
+        : Optional<RequestTransferLeaseKey> {};
+    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value());
+    auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
+    m_requests.set(request_id, request);
+    return request;
+}
+
+ErrorOr<bool> RequestClient::store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, URL::URL const& url, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, ReadonlyBytes data)
+{
+    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(data.size()));
+    memcpy(buffer.data<void>(), data.data(), data.size());
+
+    auto headers = request_headers.map([](auto const& headers) { return headers.headers(); }).value_or({});
+    return IPCProxy::store_cache_associated_data(network_isolation_key, url, method, headers, vary_key, associated_data, move(buffer));
+}
+
+ErrorOr<Optional<Core::AnonymousBuffer>> RequestClient::retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, URL::URL const& url, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
+{
+    auto headers = request_headers.map([](auto const& headers) { return headers.headers(); }).value_or({});
+    return IPCProxy::retrieve_cache_associated_data(network_isolation_key, url, method, headers, vary_key, associated_data);
+}
+
+ErrorOr<bool> RequestClient::create_synthetic_cache_entry(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, URL::URL const& url, ByteString const& method)
+{
+    return IPCProxy::create_synthetic_cache_entry(network_isolation_key, url, method);
+}
+
+bool RequestClient::stop_request(Badge<Request>, Request& request)
+{
+    auto stopped_request = m_requests.take(request.id());
+    if (!stopped_request.has_value())
+        return false;
+
+    // This is sent asynchronously so that stopping a request whose RequestServer connection has been lost does not
+    // crash on a synchronous send to a dead connection.
+    async_stop_request(request.id());
+    return true;
+}
+
+void RequestClient::release_request_transfer_lease(Badge<Request>, Request& request, RequestTransferLeaseKey transfer_lease)
+{
+    release_request_transfer_lease(transfer_lease);
+
+    // A request that has finished stays registered only for the sake of its lease — so it goes along with the lease.
+    if (request.is_finished())
+        m_requests.remove(request.id());
+}
+
+void RequestClient::release_request_transfer_lease(RequestTransferLeaseKey transfer_lease)
+{
+    async_release_request_transfer_lease(transfer_lease.source_client_id, transfer_lease.source_request_id);
+}
+
+void RequestClient::ensure_connection(URL::URL const& url, RequestServer::CacheLevel cache_level)
+{
+    auto request_id = m_next_request_id++;
+    async_ensure_connection(request_id, url, cache_level);
+}
+
+bool RequestClient::set_certificate(Badge<Request>, Request& request, ByteString certificate, ByteString key)
+{
+    if (!m_requests.contains(request.id()))
+        return false;
+    return IPCProxy::set_certificate(request.id(), move(certificate), move(key));
+}
+
+void RequestClient::request_requires_network(u64 request_id)
+{
+    if (auto request = m_requests.get(request_id); request.has_value()) {
+        if ((*request)->on_requires_network)
+            (*request)->on_requires_network();
+    }
+}
+
+void RequestClient::request_started(u64 request_id, IPC::File response_file)
 {
     auto request = m_requests.get(request_id);
     if (!request.has_value()) {
@@ -59,105 +179,147 @@ void RequestClient::request_started(i32 request_id, IPC::File response_file)
     request.value()->set_request_fd({}, response_fd);
 }
 
-bool RequestClient::stop_request(Badge<Request>, Request& request)
+void RequestClient::request_body_file_available(u64 request_id, IPC::File response_file, u64 offset, u64 size)
 {
-    if (!m_requests.contains(request.id()))
-        return false;
-    return IPCProxy::stop_request(request.id());
-}
-
-bool RequestClient::set_certificate(Badge<Request>, Request& request, ByteString certificate, ByteString key)
-{
-    if (!m_requests.contains(request.id()))
-        return false;
-    return IPCProxy::set_certificate(request.id(), move(certificate), move(key));
-}
-
-void RequestClient::request_finished(i32 request_id, u64 total_size, RequestTimingInfo timing_info, Optional<NetworkError> network_error)
-{
-    RefPtr<Request> request;
-    if ((request = m_requests.get(request_id).value_or(nullptr))) {
-        request->did_finish({}, total_size, timing_info, network_error);
-    }
-    m_requests.remove(request_id);
-}
-
-void RequestClient::headers_became_available(i32 request_id, HTTP::HeaderMap response_headers, Optional<u32> status_code, Optional<String> reason_phrase)
-{
-    auto request = const_cast<Request*>(m_requests.get(request_id).value_or(nullptr));
-    if (!request) {
-        warnln("Received headers for non-existent request {}", request_id);
+    auto request = m_requests.get(request_id);
+    if (!request.has_value()) {
+        warnln("Received response body file for non-existent request {}", request_id);
         return;
     }
-    request->did_receive_headers({}, response_headers, status_code, reason_phrase);
+
+    auto response_fd = response_file.take_fd();
+    request.value()->set_request_body_file({}, response_fd, offset, size);
 }
 
-void RequestClient::certificate_requested(i32 request_id)
+void RequestClient::request_cached_body_file_available(u64 request_id, IPC::File response_file, u64 offset, u64 size)
 {
-    if (auto request = const_cast<Request*>(m_requests.get(request_id).value_or(nullptr))) {
-        request->did_request_certificates({});
+    auto request = m_requests.get(request_id);
+    if (!request.has_value()) {
+        warnln("Received cached response body file for non-existent request {}", request_id);
+        return;
     }
+
+    auto response_fd = response_file.take_fd();
+    request.value()->set_request_cached_body_file({}, response_fd, offset, size);
 }
 
-RefPtr<WebSocket> RequestClient::websocket_connect(URL::URL const& url, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderMap const& request_headers)
+void RequestClient::request_finished(u64 request_id, u64 total_size, RequestTimingInfo timing_info, Optional<NetworkError> network_error)
+{
+    RefPtr<Request> request = m_requests.get(request_id).value_or(nullptr);
+    if (!request)
+        return;
+
+    request->did_finish({}, total_size, timing_info, network_error);
+
+    // A leased request stays registered after it finishes — just as RequestServer keeps a leased request alive after
+    // completion: Another client may still adopt it — and the request_transferred that follows has to find the request
+    // here to tear it down. It's unregistered when it's transferred, when its lease is released, or when it's stopped.
+    // Gecko and WebKit work the same way: The process a navigation response is taken away from keeps its state for the
+    // request until the one notification telling it to let go — and nothing tears it down before that notification.
+    if (!request->has_transfer_lease())
+        m_requests.remove(request_id);
+}
+
+void RequestClient::headers_became_available(u64 request_id, Vector<HTTP::Header> response_headers, Optional<u32> status_code, Optional<String> reason_phrase, Optional<IPC::File> javascript_bytecode_file, u64 javascript_bytecode_size, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state)
+{
+    Optional<Core::ImmutableBytes> javascript_bytecode;
+    if (javascript_bytecode_file.has_value())
+        javascript_bytecode = map_javascript_bytecode_file(javascript_bytecode_file->take_fd(), javascript_bytecode_size);
+
+    if (auto request = m_requests.get(request_id); request.has_value())
+        (*request)->did_receive_headers({}, HTTP::HeaderList::create(move(response_headers)), status_code, reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
+    else
+        warnln("Received headers for non-existent request {}", request_id);
+}
+
+void RequestClient::request_transferred(u64 request_id)
+{
+    auto request = m_requests.take(request_id);
+    if (!request.has_value())
+        return;
+
+    (*request)->did_transfer({});
+}
+
+void RequestClient::certificate_requested(u64 request_id)
+{
+    if (auto request = m_requests.get(request_id); request.has_value())
+        (*request)->did_request_certificates({});
+}
+
+RefPtr<WebSocket> RequestClient::websocket_connect(URL::URL const& url, Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers)
 {
     auto websocket_id = m_next_websocket_id++;
-    IPCProxy::async_websocket_connect(websocket_id, url, origin, protocols, extensions, request_headers);
+    IPCProxy::async_websocket_connect(websocket_id, url, network_isolation_key, origin, protocols, extensions, request_headers.headers());
     auto connection = WebSocket::create_from_id({}, *this, websocket_id);
     m_websockets.set(websocket_id, connection);
     return connection;
 }
 
-void RequestClient::websocket_connected(i64 websocket_id)
+void RequestClient::websocket_connected(u64 websocket_id)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value())
-        maybe_connection.value()->did_open({});
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->did_open({});
 }
 
-void RequestClient::websocket_received(i64 websocket_id, bool is_text, ByteBuffer data)
+void RequestClient::websocket_received(u64 websocket_id, bool is_text, ByteBuffer data)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value())
-        maybe_connection.value()->did_receive({}, move(data), is_text);
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->did_receive({}, move(data), is_text);
 }
 
-void RequestClient::websocket_errored(i64 websocket_id, i32 message)
+void RequestClient::websocket_received_shared(u64 websocket_id, bool is_text, Core::AnonymousBuffer data)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value())
-        maybe_connection.value()->did_error({}, message);
+    auto connection = m_websockets.get(websocket_id);
+    if (!connection.has_value())
+        return;
+
+    auto byte_buffer_or_error = ByteBuffer::copy(data.bytes());
+    if (byte_buffer_or_error.is_error()) {
+        // NB: A WebSocket can't skip a message — so, the connection closes with 1009 (message too big) instead. And the
+        // Closing state keeps the messages that are already on their way here from reaching the page.
+        dbgln("websocket_received_shared: failed to copy {} bytes from shared buffer: {}", data.size(), byte_buffer_or_error.error());
+        (*connection)->set_ready_state(WebSocket::ReadyState::Closing);
+        (*connection)->did_error({}, to_underlying(WebSocket::Error::ServerClosedSocket));
+        (*connection)->close(1009, "Message too big");
+        return;
+    }
+    (*connection)->did_receive({}, byte_buffer_or_error.release_value(), is_text);
 }
 
-void RequestClient::websocket_closed(i64 websocket_id, u16 code, ByteString reason, bool clean)
+void RequestClient::websocket_errored(u64 websocket_id, i32 message)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value())
-        maybe_connection.value()->did_close({}, code, move(reason), clean);
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->did_error({}, message);
 }
 
-void RequestClient::websocket_ready_state_changed(i64 websocket_id, u32 ready_state)
+void RequestClient::websocket_closed(u64 websocket_id, u16 code, ByteString reason, bool clean)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value()) {
-        VERIFY(ready_state <= static_cast<u32>(WebSocket::ReadyState::Closed));
-        maybe_connection.value()->set_ready_state(static_cast<WebSocket::ReadyState>(ready_state));
+    if (auto connection = m_websockets.take(websocket_id); connection.has_value()) {
+        (*connection)->set_ready_state(WebSocket::ReadyState::Closed);
+        (*connection)->did_close({}, code, move(reason), clean);
     }
 }
 
-void RequestClient::websocket_subprotocol(i64 websocket_id, ByteString subprotocol)
+void RequestClient::websocket_ready_state_changed(u64 websocket_id, u32 ready_state)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value()) {
-        maybe_connection.value()->set_subprotocol_in_use(move(subprotocol));
+    VERIFY(ready_state <= static_cast<u32>(WebSocket::ReadyState::Closed));
+
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->set_ready_state(static_cast<WebSocket::ReadyState>(ready_state));
+}
+
+void RequestClient::websocket_subprotocol(u64 websocket_id, ByteString subprotocol)
+{
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value()) {
+        (*connection)->set_subprotocol_in_use(move(subprotocol));
     }
 }
 
-void RequestClient::websocket_certificate_requested(i64 websocket_id)
+void RequestClient::websocket_certificate_requested(u64 websocket_id)
 {
-    auto maybe_connection = m_websockets.get(websocket_id);
-    if (maybe_connection.has_value())
-        maybe_connection.value()->did_request_certificates({});
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->did_request_certificates({});
 }
 
 }

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #container { width: 400px; }
+    #cached {
+        overflow: hidden;
+    }
+    #inner { width: 50%; height: 40px; }
+</style>
+<div id="container">
+    <div id="cached">
+        <div id="inner"></div>
+    </div>
+</div>
+<script>
+    layoutTest({
+        steps: [
+            {
+                name: "changed available width misses the cache",
+                mutate: () => {
+                    container.style.width = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                `,
+                check: equal => {
+                    equal(inner.getBoundingClientRect().width, 100, "inner width");
+                },
+            },
+        ],
+    });
+</script>

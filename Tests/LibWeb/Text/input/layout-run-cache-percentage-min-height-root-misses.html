@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script src="layout-test.js"></script>
+<style>
+    body { margin: 0; }
+    #container { width: 300px; height: 100px; }
+    #cached { width: 200px; overflow: hidden; min-height: 50%; }
+    #inner { width: 100px; height: 40px; }
+</style>
+<div id="container"><div id="cached"><div id="inner"></div></div></div>
+<script>
+    let heightBefore;
+    layoutTest({
+        steps: [
+            {
+                name: "changing the containing block height",
+                mutate: () => {
+                    heightBefore = cached.getBoundingClientRect().height;
+                    // The root itself observes the percentage basis through min-height.
+                    container.style.height = "200px";
+                },
+                expect: `
+                    layout FULL
+                      @viewport/block RUN (cache=bypass)
+                        BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<DIV>#cached/block RUN (cache=miss)
+                            BlockContainer<DIV>#cached/block (measurement) RUN (cache=bypass)
+                `,
+                check: equal => {
+                    equal(heightBefore, 50, "height before");
+                    equal(cached.getBoundingClientRect().height, 100, "height after");
+                },
+            },
+        ],
+    });
+</script>

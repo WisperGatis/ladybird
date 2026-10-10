@@ -1,0 +1,2 @@
+PASS: paint-only changes preserve the cached run and selection (work + checks)
+PASS: cached selection matches fresh layout (work + checks)

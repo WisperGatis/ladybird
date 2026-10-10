@@ -1,0 +1,2 @@
+pushState() added an entry: true
+PASS

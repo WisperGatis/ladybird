@@ -35,9 +35,9 @@
 #include <AK/ScopeGuard.h>
 #include <AK/Span.h>
 #include <AK/StdLibExtras.h>
-#include <AK/Swift.h>
 #include <AK/TypeCasts.h>
 #include <AK/Types.h>
+#include <AK/kmalloc.h>
 
 // BlockRuntime methods for Objective-C block closure support.
 extern "C" void* _Block_copy(void const*);
@@ -84,6 +84,8 @@ class Function<Out(In...)> {
     AK_MAKE_NONCOPYABLE(Function);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     using FunctionType = Out(In...);
     using ReturnType = Out;
 
@@ -201,6 +203,8 @@ private:
     };
 
     class CallableWrapperBase {
+        AK_ALLOC_WITH_KMALLOC;
+
     public:
         virtual ~CallableWrapperBase() = default;
         // Note: This is not const to allow storing mutable lambdas.
@@ -358,6 +362,7 @@ private:
         case FunctionKind::Inline:
         case FunctionKind::Block:
             other_wrapper->init_and_swap(m_storage, inline_capacity);
+            other_wrapper->~CallableWrapperBase();
             m_kind = other.m_kind;
             break;
         case FunctionKind::Outline:
@@ -380,7 +385,7 @@ private:
     static constexpr size_t inline_capacity = 4 * sizeof(void*);
 
     alignas(inline_alignment) u8 m_storage[inline_capacity];
-} SWIFT_UNSAFE_REFERENCE;
+};
 
 }
 

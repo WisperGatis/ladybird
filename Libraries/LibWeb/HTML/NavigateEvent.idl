@@ -1,27 +1,21 @@
-#import <DOM/AbortSignal.idl>
-#import <DOM/Event.idl>
-#import <HTML/NavigationDestination.idl>
-#import <HTML/NavigationType.idl>
-#import <XHR/FormData.idl>
-
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-navigateevent-interface
 [Exposed=Window]
 interface NavigateEvent : Event {
     constructor(DOMString type, NavigateEventInit eventInitDict);
 
     readonly attribute NavigationType navigationType;
-    readonly attribute NavigationDestination destination;
+    [DirectGetter] readonly attribute NavigationDestination destination;
     readonly attribute boolean canIntercept;
     readonly attribute boolean userInitiated;
     readonly attribute boolean hashChange;
-    readonly attribute AbortSignal signal;
-    readonly attribute FormData? formData;
+    [DirectGetter] readonly attribute AbortSignal signal;
+    [DirectGetter] readonly attribute FormData? formData;
     readonly attribute DOMString? downloadRequest;
     readonly attribute any info;
     readonly attribute boolean hasUAVisualTransition;
-    readonly attribute Element? sourceElement;
+    [DirectGetter] readonly attribute Element? sourceElement;
 
-    undefined intercept(optional NavigationInterceptOptions options = {});
+    [NeedsCallerRealm] undefined intercept(optional NavigationInterceptOptions options = {});
     undefined scroll();
 };
 

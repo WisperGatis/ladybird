@@ -20,6 +20,8 @@ namespace AK {
 template<typename T>
 class FixedArray {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     FixedArray() = default;
 
     static ErrorOr<FixedArray<T>> create(std::initializer_list<T> initializer)
@@ -99,7 +101,7 @@ public:
             return;
         for (size_t i = 0; i < m_size; ++i)
             m_elements[i].~T();
-        kfree_sized(m_elements, storage_allocation_size(m_size));
+        kfree(m_elements);
         m_elements = nullptr;
     }
 

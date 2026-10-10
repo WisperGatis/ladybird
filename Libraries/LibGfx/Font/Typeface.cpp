@@ -4,37 +4,72 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <harfbuzz/hb-ot.h>
 #include <harfbuzz/hb.h>
 
 #include <LibGfx/Font/Font.h>
+#include <LibGfx/Font/FontDatabase.h>
+#include <LibGfx/Font/FontVariationSettings.h>
 #include <LibGfx/Font/Typeface.h>
 #include <LibGfx/Font/TypefaceSkia.h>
+#include <LibIPC/Decoder.h>
+#include <LibIPC/Encoder.h>
 
 namespace Gfx {
 
-ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_resource(Core::Resource const& resource, int ttc_index)
+ErrorOr<Vector<String>> Typeface::local_font_names() const
 {
-    auto font_data = Gfx::FontData::create_from_resource(resource);
-    return try_load_from_font_data(move(font_data), ttc_index);
+    // https://drafts.csswg.org/css-fonts-4/#local-font-fallback
+    // NB: local() identifies a face by its full name or PostScript name, never by its family.
+    //     Prefer US English names, or the first available localization if English is absent.
+    auto* face = harfbuzz_typeface();
+    unsigned entry_count = 0;
+    auto const* entries = hb_ot_name_list_names(face, &entry_count);
+    Vector<String> names;
+    for (auto name_id : { HB_OT_NAME_ID_FULL_NAME, HB_OT_NAME_ID_POSTSCRIPT_NAME }) {
+        hb_language_t language = HB_LANGUAGE_INVALID;
+        for (unsigned index = 0; index < entry_count; ++index) {
+            auto const& entry = entries[index];
+            if (entry.name_id != name_id)
+                continue;
+            if (language == HB_LANGUAGE_INVALID)
+                language = entry.language;
+            if (entry.language == hb_language_from_string("en", -1) || entry.language == hb_language_from_string("en-us", -1)) {
+                language = entry.language;
+                break;
+            }
+        }
+        if (language == HB_LANGUAGE_INVALID)
+            continue;
+        auto length = hb_ot_name_get_utf8(face, name_id, language, nullptr, nullptr);
+        if (length == 0 || length == NumericLimits<unsigned>::max())
+            continue;
+        auto bytes = TRY(ByteBuffer::create_uninitialized(static_cast<size_t>(length) + 1));
+        auto capacity = length + 1;
+        hb_ot_name_get_utf8(face, name_id, language, &capacity, reinterpret_cast<char*>(bytes.data()));
+        names.append(TRY(String::from_utf8({ reinterpret_cast<char const*>(bytes.data()), capacity })));
+    }
+    return names;
 }
 
-ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_font_data(NonnullOwnPtr<Gfx::FontData> font_data, int ttc_index)
+ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_mapped_file(NonnullOwnPtr<Core::MappedFile> mapped_file, u32 ttc_index)
 {
-    auto typeface = TRY(try_load_from_externally_owned_memory(font_data->bytes(), ttc_index));
-    typeface->m_font_data = move(font_data);
-    return typeface;
+    auto bytes = mapped_file->bytes();
+    return TypefaceSkia::load_from_buffer(bytes, ttc_index, make_ref_counted<FontDataBacking>(move(mapped_file)));
 }
 
-ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_temporary_memory(ReadonlyBytes bytes, int ttc_index)
+ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_anonymous_buffer(Core::AnonymousBuffer anonymous_buffer, u32 ttc_index)
 {
-    auto buffer = TRY(ByteBuffer::copy(bytes));
-    auto font_data = FontData::create_from_byte_buffer(move(buffer));
-    return try_load_from_font_data(move(font_data), ttc_index);
+    auto bytes = anonymous_buffer.bytes();
+    return TypefaceSkia::load_from_buffer(bytes, ttc_index, make_ref_counted<FontDataBacking>(move(anonymous_buffer)));
 }
 
-ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_externally_owned_memory(ReadonlyBytes bytes, int ttc_index)
+ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_temporary_memory(ReadonlyBytes bytes, u32 ttc_index)
 {
-    return TypefaceSkia::load_from_buffer(bytes, ttc_index);
+    auto anonymous_buffer = TRY(Core::AnonymousBuffer::create_with_size(bytes.size()));
+    if (!bytes.is_empty())
+        memcpy(anonymous_buffer.data<void>(), bytes.data(), bytes.size());
+    return try_load_from_anonymous_buffer(move(anonymous_buffer), ttc_index);
 }
 
 Typeface::Typeface() = default;
@@ -47,10 +82,18 @@ Typeface::~Typeface()
         hb_blob_destroy(m_harfbuzz_blob);
 }
 
-NonnullRefPtr<Font> Typeface::font(float point_size) const
+void Typeface::clear_font_cache() const
 {
-    auto it = m_fonts.find(point_size);
-    if (it != m_fonts.end())
+    MutexLocker locker { m_fonts_mutex };
+    m_fonts.clear();
+}
+
+NonnullRefPtr<Font> Typeface::font(float point_size, FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features) const
+{
+    MutexLocker locker { m_fonts_mutex };
+    FontCacheKey key { point_size, variations.to_sorted_list(), shape_features };
+
+    if (auto it = m_fonts.find(key); it != m_fonts.end())
         return *it->value;
 
     // FIXME: It might be nice to have a global cap on the number of fonts we cache
@@ -59,18 +102,164 @@ NonnullRefPtr<Font> Typeface::font(float point_size) const
     if (m_fonts.size() > max_cached_font_size_count)
         m_fonts.remove(m_fonts.begin());
 
-    auto font = adopt_ref(*new Font(*this, point_size, point_size));
-    m_fonts.set(point_size, font);
+    RefPtr<Typeface const> used_typeface = const_cast<Typeface*>(this);
+    if (!variations.is_empty()) {
+        if (auto const* skia_typeface = as_if<TypefaceSkia const>(this))
+            if (auto derived = skia_typeface->clone_with_variations(variations.to_sorted_list()))
+                used_typeface = move(derived);
+    }
+
+    auto font = adopt_ref(*new Font(*used_typeface, point_size, point_size, variations, shape_features));
+    m_fonts.set(key, font);
     return font;
 }
 
 hb_face_t* Typeface::harfbuzz_typeface() const
 {
+    call_once(m_harfbuzz_face_once, [&] {
+        m_harfbuzz_face = create_harfbuzz_face();
+        hb_face_make_immutable(m_harfbuzz_face);
+    });
+    return m_harfbuzz_face;
+}
+
+// Recording asks for this while the document thread may ask the same typeface for it, so the
+// read of a half-written memo has to be impossible. The same `call_once` the HarfBuzz face uses
+// above publishes it.
+Typeface::BoundingBoxInFontUnits Typeface::bounding_box_in_font_units() const
+{
+    call_once(m_bounding_box_once, [&] {
+        auto* face = harfbuzz_typeface();
+        auto* head_table = hb_face_reference_table(face, HB_TAG('h', 'e', 'a', 'd'));
+        unsigned head_table_length = 0;
+        auto const* head_table_data = reinterpret_cast<u8 const*>(hb_blob_get_data(head_table, &head_table_length));
+
+        // https://learn.microsoft.com/en-us/typography/opentype/spec/head
+        // xMin, yMin, xMax and yMax are big-endian int16 values at byte offsets 36, 38, 40 and 42 of a 54-byte table.
+        constexpr unsigned head_table_size = 54;
+        if (head_table_data && head_table_length >= head_table_size) {
+            auto read_i16 = [&](unsigned offset) {
+                return static_cast<i16>((head_table_data[offset] << 8) | head_table_data[offset + 1]);
+            };
+            m_bounding_box_in_font_units.x_min = read_i16(36);
+            m_bounding_box_in_font_units.y_min = read_i16(38);
+            m_bounding_box_in_font_units.x_max = read_i16(40);
+            m_bounding_box_in_font_units.y_max = read_i16(42);
+            m_bounding_box_in_font_units.units_per_em = hb_face_get_upem(face);
+        }
+        hb_blob_destroy(head_table);
+    });
+    return m_bounding_box_in_font_units;
+}
+
+hb_face_t* Typeface::create_harfbuzz_face() const
+{
     if (!m_harfbuzz_blob)
         m_harfbuzz_blob = hb_blob_create(reinterpret_cast<char const*>(buffer().data()), buffer().size(), HB_MEMORY_MODE_READONLY, nullptr, [](void*) { });
-    if (!m_harfbuzz_face)
-        m_harfbuzz_face = hb_face_create(m_harfbuzz_blob, ttc_index());
-    return m_harfbuzz_face;
+    return hb_face_create(m_harfbuzz_blob, ttc_index());
+}
+
+void Typeface::encode_font_data_for_ipc(IPC::Encoder& encoder) const
+{
+    if (m_system_font_identifier.has_value()) {
+        MUST(encoder.encode(FontDataFormat::SystemFontId));
+        MUST(encoder.encode(m_system_font_identifier->generation));
+        MUST(encoder.encode(m_system_font_identifier->face_id));
+        return;
+    }
+
+    if (m_file_path.has_value()) {
+        MUST(encoder.encode(FontDataFormat::MappedFile));
+        MUST(encoder.encode(*m_file_path));
+        MUST(encoder.encode(ttc_index()));
+        return;
+    }
+
+    VERIFY(m_font_data);
+
+    m_font_data->storage.visit(
+        [&](Core::AnonymousBuffer const& anonymous_buffer) {
+            MUST(encoder.encode(FontDataFormat::RawFontData));
+            MUST(encoder.encode(anonymous_buffer));
+            MUST(encoder.encode(ttc_index()));
+        },
+        [&](NonnullOwnPtr<Core::MappedFile> const&) {
+            // NB: SharedMappedFile backing should have an associated m_system_font_identifier or m_file_path and
+            //     therefore have already been handled above.
+            VERIFY_NOT_REACHED();
+        });
+}
+
+void Typeface::copy_font_data_from(Typeface const& other)
+{
+    m_font_data = other.m_font_data;
+    m_system_font_identifier = other.m_system_font_identifier;
+    m_file_path = other.m_file_path;
+}
+
+}
+
+namespace IPC {
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Gfx::Typeface const& typeface)
+{
+    typeface.encode_font_data_for_ipc(encoder);
+    return {};
+}
+
+template<>
+ErrorOr<NonnullRefPtr<Gfx::Typeface const>> decode(Decoder& decoder)
+{
+    auto format = TRY(decoder.decode<Gfx::Typeface::FontDataFormat>());
+
+    switch (format) {
+    case Gfx::Typeface::FontDataFormat::RawFontData: {
+        auto font_data = TRY(decoder.decode<Core::AnonymousBuffer>());
+        auto ttc_index = TRY(decoder.decode<u32>());
+        if (!font_data.is_valid())
+            return Error::from_string_literal("Typeface IPC data contained invalid font data");
+        return TRY(Gfx::Typeface::try_load_from_anonymous_buffer(move(font_data), ttc_index));
+    }
+    case Gfx::Typeface::FontDataFormat::MappedFile: {
+        auto file_path = TRY(decoder.decode<String>());
+        auto ttc_index = TRY(decoder.decode<u32>());
+
+        auto backing = make_ref_counted<Gfx::Typeface::FontDataBacking>(TRY(Core::MappedFile::map(file_path)));
+        auto bytes = backing->storage.get<NonnullOwnPtr<Core::MappedFile>>()->bytes();
+
+        auto typeface = TRY(Gfx::TypefaceSkia::load_from_buffer(bytes, ttc_index, backing));
+        typeface->set_file_path(move(file_path));
+        return typeface;
+    }
+    case Gfx::Typeface::FontDataFormat::SystemFont: {
+        auto family_name = TRY(decoder.decode<String>());
+        auto weight = TRY(decoder.decode<u16>());
+        auto width = TRY(decoder.decode<u16>());
+        auto slope = TRY(decoder.decode<u8>());
+        auto typeface = TRY(Gfx::TypefaceSkia::match_family_style(family_name.bytes_as_string_view(), weight, width, slope));
+        if (!typeface)
+            return Error::from_string_literal("Typeface IPC data referred to an unavailable system font");
+        return typeface.release_nonnull();
+    }
+    case Gfx::Typeface::FontDataFormat::SystemUIFont: {
+        auto style = TRY(decoder.decode<Gfx::SystemUIFontStyle>());
+        auto typeface = TRY(Gfx::TypefaceSkia::match_system_ui(style.kind, 0, style.weight, style.width, style.slope));
+        if (!typeface)
+            return Error::from_string_literal("Typeface IPC data referred to an unavailable system UI font");
+        return typeface.release_nonnull();
+    }
+    case Gfx::Typeface::FontDataFormat::SystemFontId: {
+        auto generation = TRY(decoder.decode<u64>());
+        auto face_id = TRY(decoder.decode<u64>());
+        auto matched_typeface = Gfx::FontDatabase::the().get_typeface_by_id(generation, face_id);
+        if (!matched_typeface)
+            return Error::from_string_literal("Typeface IPC data referred to an unavailable system font");
+        return matched_typeface.release_nonnull();
+    }
+    }
+
+    return Error::from_string_literal("Typeface IPC data contained invalid font data format");
 }
 
 }

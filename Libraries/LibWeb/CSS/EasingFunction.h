@@ -6,62 +6,50 @@
 
 #pragma once
 
-#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
 
-struct LinearEasingFunction {
-    struct ControlPoint {
-        Optional<double> input;
-        double output;
-    };
-
-    Vector<ControlPoint> control_points;
-    String stringified;
-
-    double evaluate_at(double input_progress, bool before_flag) const;
-};
-
-struct CubicBezierEasingFunction {
-    double x1;
-    double y1;
-    double x2;
-    double y2;
-    String stringified;
-
-    struct CachedSample {
-        double x;
-        double y;
-        double t;
-    };
-
-    mutable Vector<CachedSample> m_cached_x_samples {};
-
-    double evaluate_at(double input_progress, bool before_flag) const;
-};
-
-struct StepsEasingFunction {
-    i64 interval_count;
-    StepPosition position;
-    String stringified;
-
-    double evaluate_at(double input_progress, bool before_flag) const;
-};
-
-struct EasingFunction : public Variant<LinearEasingFunction, CubicBezierEasingFunction, StepsEasingFunction> {
-    using Variant::Variant;
+// An easing function, held as the descriptor the Rust animation code evaluates.
+class EasingFunction {
+public:
+    using Descriptor = Compositing::RustFFI::FfiEasingDescriptor;
+    using LinearPoint = Compositing::RustFFI::FfiLinearEasingPoint;
 
     static EasingFunction linear();
-    static EasingFunction ease_in();
-    static EasingFunction ease_out();
-    static EasingFunction ease_in_out();
     static EasingFunction ease();
 
     static EasingFunction from_style_value(StyleValue const&);
 
+    // The descriptor borrows this function's control points.
+    Descriptor descriptor() const
+    {
+        auto descriptor = m_descriptor;
+        descriptor.linear_points = m_linear_points.data();
+        descriptor.linear_point_count = m_linear_points.size();
+        return descriptor;
+    }
+
+    // The descriptor reads its control points from a copy in storage the caller keeps alive.
+    Descriptor descriptor_with_points_in(Vector<LinearPoint>& storage) const
+    {
+        storage.extend(m_linear_points);
+        auto descriptor = m_descriptor;
+        descriptor.linear_points = storage.data();
+        descriptor.linear_point_count = storage.size();
+        return descriptor;
+    }
+
     double evaluate_at(double input_progress, bool before_flag) const;
-    String to_string() const;
+    Utf16String const& to_utf16_string() const { return m_text; }
+
+    // NB: The serialization is of the value the function was made from, so it tells functions apart.
+    bool operator==(EasingFunction const& other) const { return m_text == other.m_text; }
+
+private:
+    Descriptor m_descriptor {};
+    Vector<LinearPoint> m_linear_points;
+    Utf16String m_text;
 };
 
 }

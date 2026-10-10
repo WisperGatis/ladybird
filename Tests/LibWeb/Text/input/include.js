@@ -52,6 +52,80 @@ function timeout(ms) {
     return promise;
 }
 
+async function waitForCondition(condition, attempts = 600, interval = 25) {
+    while (!condition()) {
+        if (attempts-- === 0) return false;
+        await timeout(interval);
+    }
+    return true;
+}
+
+async function setSystemVisibilityState(state) {
+    // Tests assume that the document reflects the UI process's system visibility state and that
+    // no previous visibility state change is still pending.
+    if (document.visibilityState === state) {
+        return;
+    }
+
+    const visibilityChanged = new Promise(resolve =>
+        document.addEventListener("visibilitychange", resolve, { once: true })
+    );
+    internals.setSystemVisibilityState(state);
+    await visibilityChanged;
+}
+
+function withCollectedWrapper(makeAndMark, reacquire, verify) {
+    let wasPreserved = false;
+    (() => {
+        const wrapper = makeAndMark();
+        wasPreserved = internals.wrapperIsPreserved(wrapper);
+    })();
+
+    if (!wasPreserved) {
+        throw new Error("Expected wrapper to be preserved before GC");
+    }
+
+    internals.gc();
+    verify(reacquire());
+}
+
+function scrollendEvent(target) {
+    const { promise, resolve } = Promise.withResolvers();
+    target.addEventListener("scrollend", resolve, { once: true });
+    return promise;
+}
+
+async function scrollSettled(target, action) {
+    const scrollend = scrollendEvent(target);
+    await action();
+    await scrollend;
+}
+
+async function scrollOffsetStopsChanging(readScrollOffset) {
+    let previousScrollOffset = null;
+    while (previousScrollOffset !== readScrollOffset()) {
+        previousScrollOffset = readScrollOffset();
+        for (let frame = 0; frame < 5; frame++) {
+            await animationFrame();
+        }
+    }
+}
+
+async function waitForImageAnimationState(url, predicate, targetWindow = window) {
+    return new Promise(async resolve => {
+        while (true) {
+            try {
+                const state = targetWindow.internals.imageAnimationStateForURL(url);
+                if (predicate(state)) return resolve(state);
+            } catch {
+                // The image hasn't loaded yet.
+            }
+
+            await animationFrame();
+        }
+    });
+}
+
 const __testErrorHandlerController = new AbortController();
 window.addEventListener(
     "error",
@@ -102,37 +176,72 @@ function promiseTest(f) {
     });
 }
 
+let __pageEchoScope = null;
+
+// The echo server, the HTTP cache and the cookie jar are shared by every test and every --repeat run, so echo paths
+// are scoped to the page that creates them. A test that spans page loads names a scope of its own to share them.
 class HTTPTestServer {
-    constructor(baseURL) {
+    constructor(baseURL, echoScope = null) {
         this.baseURL = baseURL;
+        this.echoScope = echoScope;
+    }
+    withEchoScope(echoScope) {
+        return new HTTPTestServer(this.baseURL, echoScope);
+    }
+    echoURL(path) {
+        return `${this.baseURL}${this.#echoPath(path)}`;
     }
     async createEcho(method, path, options) {
+        const echoPath = this.#echoPath(path);
         const result = await fetch(`${this.baseURL}/echo`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
             },
-            body: JSON.stringify({ ...options, method, path }),
+            body: JSON.stringify({ ...options, method, path: echoPath }),
         });
         if (!result.ok) {
             throw new Error("Error creating echo: " + result.statusText);
         }
-        return `${this.baseURL}${path}`;
+        return `${this.baseURL}${echoPath}`;
+    }
+    recordedRequestHeadersURL(echoURL) {
+        return `${this.baseURL}/recorded-request-headers${new URL(echoURL).pathname}`;
     }
     getStaticURL(path) {
         return `${this.baseURL}/static/${path}`;
     }
+    #echoPath(path) {
+        const echoScope = this.echoScope ?? (__pageEchoScope ??= crypto.randomUUID());
+        return `/echo/${echoScope}${path}`;
+    }
 }
 
 const __httpTestServer = (function () {
-    if (globalThis.internals && globalThis.internals.getEchoServerPort)
-        return new HTTPTestServer(`http://127.0.0.1:${internals.getEchoServerPort()}`);
+    if (globalThis.internals && globalThis.internals.getEchoServerPort) {
+        const echoServerPort = internals.getEchoServerPort();
+        const isLoadedFromEchoServer = location.protocol === "http:" && location.port === String(echoServerPort);
+
+        // Tests loaded through the echo server should create echo URLs on their current origin,
+        // so same-origin iframe/fetch checks keep working with unique localhost hostnames.
+        const baseURL = isLoadedFromEchoServer ? location.origin : `http://localhost:${echoServerPort}`;
+        return new HTTPTestServer(baseURL);
+    }
 
     return null;
 })();
 
 function httpTestServer() {
-    if (!__httpTestServer)
+    if (!__httpTestServer) {
         throw new Error("window.internals must be exposed to use HTTPTestServer");
+    }
     return __httpTestServer;
 }
+
+// Per-call unique loopback host, so tests that mutate global per-host state
+// (e.g. HSTS) don't collide under the parallel runner or --repeat clones.
+function uniqueLocalhostHostname(prefix) {
+    return `${prefix}-${crypto.randomUUID()}.localhost`;
+}
+
+const remoteFrameCount = () => (internals.dumpSiteIsolationProcessTree().match(/remote/g) || []).length;

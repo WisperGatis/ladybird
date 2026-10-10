@@ -6,21 +6,35 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/Badge.h>
 #include <AK/ByteString.h>
+#include <AK/ConditionVariable.h>
 #include <AK/DistinctNumeric.h>
+#include <AK/FixedArray.h>
+#include <AK/Function.h>
 #include <AK/LEB128.h>
+#include <AK/Mutex.h>
+#include <AK/NumericLimits.h>
+#include <AK/Optional.h>
+#include <AK/OwnPtr.h>
 #include <AK/Result.h>
 #include <AK/String.h>
+#include <AK/Time.h>
 #include <AK/UFixedBigInt.h>
 #include <AK/Variant.h>
 #include <AK/WeakPtr.h>
+#include <AK/kmalloc.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibWasm/Constants.h>
 #include <LibWasm/Export.h>
 #include <LibWasm/Forward.h>
 #include <LibWasm/Opcode.h>
 
 namespace Wasm {
+
+class DefinedType;
+class Module;
 
 template<size_t M>
 using NativeIntegralType = Conditional<M == 8, u8, Conditional<M == 16, u16, Conditional<M == 32, u32, Conditional<M == 64, u64, void>>>>;
@@ -67,17 +81,39 @@ WASM_API ByteString parse_error_to_byte_string(ParseError);
 template<typename T>
 using ParseResult = ErrorOr<T, ParseError>;
 
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, TypeIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, FunctionIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, TableIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, ElementIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, MemoryIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, TagIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, LocalIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, GlobalIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, LabelIndex);
-AK_TYPEDEF_DISTINCT_ORDERED_ID(size_t, DataIndex);
-AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(u64, InstructionPointer, Arithmetic, Comparison, Flags, Increment);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, TypeIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, FunctionIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, TableIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, ElementIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, MemoryIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, TagIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, LocalIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, GlobalIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, LabelIndex);
+AK_TYPEDEF_DISTINCT_ORDERED_ID(u32, DataIndex);
+AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(u32, InstructionPointer, Arithmetic, Comparison, Flags, Increment);
+
+}
+
+namespace AK {
+
+template<>
+struct SentinelOptionalTraits<Wasm::InstructionPointer> {
+    static constexpr Wasm::InstructionPointer sentinel_value() { return { NumericLimits<Wasm::InstructionPointer::Type>::max() }; }
+    static constexpr bool is_sentinel(Wasm::InstructionPointer const& value) { return value.value() == NumericLimits<Wasm::InstructionPointer::Type>::max(); }
+};
+
+template<>
+class Optional<Wasm::InstructionPointer> : public SentinelOptional<Wasm::InstructionPointer> {
+public:
+    using SentinelOptional::SentinelOptional;
+};
+
+}
+
+namespace Wasm {
+
+constexpr static inline auto LocalArgumentMarker = static_cast<LocalIndex::Type>(1) << (sizeof(LocalIndex::Type) * 8 - 1);
 
 ParseError with_eof_check(Stream const& stream, ParseError error_if_not_eof);
 
@@ -88,7 +124,7 @@ struct GenericIndexParser {
         auto value_or_error = stream.read_value<LEB128<u32>>();
         if (value_or_error.is_error())
             return with_eof_check(stream, ParseError::ExpectedIndex);
-        size_t value = value_or_error.release_value();
+        u32 value = value_or_error.release_value();
         return T { value };
     }
 };
@@ -157,19 +193,38 @@ private:
     Vector<u8, 8> m_buffer;
 };
 
-// https://webassembly.github.io/spec/core/bikeshed/#value-types%E2%91%A2
+// https://webassembly.github.io/spec/core/syntax/types.html#value-types
+// valtype ::= numtype | vectype | reftype
+// https://webassembly.github.io/spec/core/syntax/types.html#reference-types
+// reftype  ::= ref null? heaptype
+// https://webassembly.github.io/spec/core/syntax/types.html#heap-types
+// heaptype ::= absheaptype | typeidx
+// absheaptype ::= func | nofunc | extern | noextern | any | eq | i31 | struct | array | none | exn | noexn
+// https://webassembly.github.io/spec/core/syntax/types.html#composite-types
+// packtype ::= i8 | i16
 class ValueType {
 public:
-    enum Kind {
+    enum Kind : u8 {
         I32,
         I64,
         F32,
         F64,
         V128,
+        I8,  // as packtype
+        I16, // as packtype
         FunctionReference,
+        NoFunctionReference,
         ExternReference,
+        NoExternReference,
+        AnyReference,
+        EqReference,
+        I31Reference,
+        StructReference,
+        ArrayReference,
+        NoneReference,
         ExceptionReference,
-        UnsupportedHeapReference, // Stub for wasm-gc proposal's reference types.
+        NoExceptionReference,
+        TypeUseReference,
     };
 
     explicit ValueType(Kind kind)
@@ -177,18 +232,61 @@ public:
     {
     }
 
+    explicit ValueType(Kind kind, bool nullable)
+        : m_kind(kind)
+        , m_nullable(nullable)
+    {
+    }
+
+    explicit ValueType(Kind kind, TypeIndex type_index, bool nullable = true)
+        : m_kind(kind)
+        , m_nullable(nullable)
+        , m_type_index(type_index)
+    {
+        VERIFY(kind == TypeUseReference);
+    }
+
     bool operator==(ValueType const&) const = default;
 
-    auto is_reference() const { return m_kind == ExternReference || m_kind == FunctionReference || m_kind == UnsupportedHeapReference; }
+    bool is_nullable() const { return m_nullable; }
+    void set_nullable(bool nullable) { m_nullable = nullable; }
+
+    auto is_reference() const { return m_kind >= FunctionReference; }
     auto is_vector() const { return m_kind == V128; }
-    auto is_numeric() const { return !is_reference() && !is_vector(); }
+    auto is_packed() const { return m_kind == I8 || m_kind == I16; }
+    auto is_numeric() const { return !is_reference() && !is_vector() && !is_packed(); }
+    auto is_typeuse() const { return m_kind == TypeUseReference; }
     auto kind() const { return m_kind; }
+
+    // https://webassembly.github.io/spec/core/syntax/types.html#aux-unpack
+    // unpack(valtype)  = valtype
+    // unpack(packtype) = i32
+    ValueType unpacked() const
+    {
+        if (is_packed())
+            return ValueType(I32);
+        return *this;
+    }
+
+    // https://webassembly.github.io/spec/core/valid/types.html#defaultable-types
+    bool is_defaultable() const
+    {
+        if (is_reference())
+            return m_nullable;
+        return true;
+    }
+
+    auto unsafe_typeindex() const
+    {
+        VERIFY(m_kind == TypeUseReference);
+        return m_type_index;
+    }
 
     static ParseResult<ValueType> parse(Stream& stream);
 
-    static ByteString kind_name(Kind kind)
+    ByteString kind_name() const
     {
-        switch (kind) {
+        switch (m_kind) {
         case I32:
             return "i32";
         case I64:
@@ -199,21 +297,47 @@ public:
             return "f64";
         case V128:
             return "v128";
+        case I8:
+            return "i8";
+        case I16:
+            return "i16";
         case FunctionReference:
-            return "funcref";
+            return m_nullable ? "funcref" : "(ref func)";
+        case NoFunctionReference:
+            return m_nullable ? "nullfuncref" : "(ref nofunc)";
         case ExternReference:
-            return "externref";
+            return m_nullable ? "externref" : "(ref extern)";
+        case NoExternReference:
+            return m_nullable ? "nullexternref" : "(ref noextern)";
+        case AnyReference:
+            return m_nullable ? "anyref" : "(ref any)";
+        case EqReference:
+            return m_nullable ? "eqref" : "(ref eq)";
+        case I31Reference:
+            return m_nullable ? "i31ref" : "(ref i31)";
+        case StructReference:
+            return m_nullable ? "structref" : "(ref struct)";
+        case ArrayReference:
+            return m_nullable ? "arrayref" : "(ref array)";
+        case NoneReference:
+            return m_nullable ? "nullref" : "(ref none)";
         case ExceptionReference:
-            return "exnref";
-        case UnsupportedHeapReference:
-            return "todo.heapref";
+            return m_nullable ? "exnref" : "(ref exn)";
+        case NoExceptionReference:
+            return m_nullable ? "nullexnref" : "(ref noexn)";
+        case TypeUseReference:
+            return ByteString::formatted("(ref {}{})", m_nullable ? "null " : "", unsafe_typeindex().value());
         }
         VERIFY_NOT_REACHED();
     }
 
 private:
     Kind m_kind;
+    bool m_nullable { true };
+    TypeIndex m_type_index;
 };
+
+static_assert(sizeof(ValueType) == 8);
 
 // https://webassembly.github.io/spec/core/bikeshed/#result-types%E2%91%A2
 class ResultType {
@@ -248,6 +372,57 @@ public:
 private:
     Vector<ValueType> m_parameters;
     Vector<ValueType> m_results;
+};
+
+// https://webassembly.github.io/spec/core/bikeshed/#composite-types%E2%91%A0
+class FieldType {
+public:
+    FieldType(bool is_mutable, ValueType type_)
+        : m_is_mutable(is_mutable)
+        , m_type(type_)
+    {
+    }
+
+    auto& type() const { return m_type; }
+    auto is_mutable() const { return m_is_mutable; }
+
+    static ParseResult<FieldType> parse(ConstrainedStream& stream);
+
+private:
+    bool m_is_mutable { false };
+    ValueType m_type;
+};
+
+// https://webassembly.github.io/spec/core/bikeshed/#composite-types%E2%91%A0
+class StructType {
+public:
+    StructType(Vector<FieldType> fields)
+        : m_fields(move(fields))
+    {
+    }
+
+    auto& fields() const { return m_fields; }
+
+    static ParseResult<StructType> parse(ConstrainedStream& stream);
+
+private:
+    Vector<FieldType> m_fields;
+};
+
+// https://webassembly.github.io/spec/core/bikeshed/#composite-types%E2%91%A0
+class ArrayType {
+public:
+    ArrayType(FieldType type)
+        : m_type(type)
+    {
+    }
+
+    auto& type() const { return m_type; }
+
+    static ParseResult<ArrayType> parse(ConstrainedStream& stream);
+
+private:
+    FieldType m_type;
 };
 
 // https://webassembly.github.io/memory64/core/bikeshed/#address-type%E2%91%A0
@@ -454,6 +629,8 @@ private:
 // https://webassembly.github.io/spec/core/bikeshed/#numeric-instructions%E2%91%A6
 class Instruction {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     explicit Instruction(OpCode opcode)
         : m_opcode(opcode)
         , m_arguments(static_cast<u8>(0))
@@ -470,15 +647,43 @@ public:
         TableIndex rhs;
     };
 
-    struct StructuredInstructionArgs {
+    template<typename ExtraData>
+    struct StructuredInstructionArgsBase {
+        using Extra = ExtraData;
+
         BlockType block_type;
-        InstructionPointer end_ip;
-        Optional<InstructionPointer> else_ip;
+        InstructionPointer end_ip; // 'end' instruction IP if there is no 'else'; otherwise IP of instruction after 'end'.
+        ExtraData extra;
+
+        struct Meta {
+            u32 arity;
+            u32 parameter_count;
+            bool tier_up_eligible;
+        };
+        mutable Meta meta {};
+    };
+
+    struct StructuredInstructionArgs : StructuredInstructionArgsBase<Optional<InstructionPointer>> {
+        using Base = StructuredInstructionArgsBase<Optional<InstructionPointer>>;
+        using Meta = typename Base::Meta;
+
+        StructuredInstructionArgs(BlockType block_type, InstructionPointer end_ip, Optional<InstructionPointer> else_ip, Meta meta = {})
+            : Base { block_type, end_ip, else_ip, meta }
+        {
+        }
+
+        auto& else_ip() { return extra; }
+        auto& else_ip() const { return extra; }
     };
 
     struct TableBranchArgs {
         Vector<LabelIndex> labels;
         LabelIndex default_;
+    };
+
+    struct BranchArgs {
+        LabelIndex label;
+        mutable bool has_stack_adjustment { false };
     };
 
     struct IndirectCallArgs {
@@ -490,6 +695,66 @@ public:
         u32 align;
         u64 offset;
         MemoryIndex memory_index { 0 };
+    };
+
+    // Proposal "threads"
+    struct AtomicMemoryArgument {
+        enum class Width : u8 {
+            I32,
+            I64,
+            I8As32, // i8 stack, memory accessed zero-extended to i32.
+            I16As32,
+            I8As64,
+            I16As64,
+            I32As64,
+        };
+        enum class Op : u8 {
+            None,
+            Add,
+            Sub,
+            And,
+            Or,
+            Xor,
+            Xchg,
+        };
+
+        MemoryArgument memory;
+        Width width;
+        Op op { Op::None };
+
+        size_t access_size() const
+        {
+            switch (width) {
+            case Width::I8As32:
+            case Width::I8As64:
+                return 1;
+            case Width::I16As32:
+            case Width::I16As64:
+                return 2;
+            case Width::I32:
+            case Width::I32As64:
+                return 4;
+            case Width::I64:
+                return 8;
+            }
+            VERIFY_NOT_REACHED();
+        }
+
+        ValueType value_type() const
+        {
+            switch (width) {
+            case Width::I32:
+            case Width::I8As32:
+            case Width::I16As32:
+                return ValueType { ValueType::I32 };
+            case Width::I64:
+            case Width::I8As64:
+            case Width::I16As64:
+            case Width::I32As64:
+                return ValueType { ValueType::I64 };
+            }
+            VERIFY_NOT_REACHED();
+        }
     };
 
     struct MemoryAndLaneArgument {
@@ -516,10 +781,88 @@ public:
         MemoryIndex memory_index;
     };
 
+    // Proposal "gc"
+    struct StructFieldArgs {
+        TypeIndex type_index;
+        u32 field_index;
+    };
+
+    struct ArrayNewFixedArgs {
+        TypeIndex type_index;
+        u32 count;
+    };
+
+    struct ArrayDataArgs {
+        TypeIndex type_index;
+        DataIndex data_index;
+    };
+
+    struct ArrayElemArgs {
+        TypeIndex type_index;
+        ElementIndex element_index;
+    };
+
+    struct ArrayCopyArgs {
+        TypeIndex destination_type_index;
+        TypeIndex source_type_index;
+    };
+
+    struct BranchOnCastArgs {
+        BranchArgs branch;
+        ValueType source_type; // Nullability carries the castop null_1? flag.
+        ValueType target_type; // Nullability carries the castop null_2? flag.
+    };
+
     // Proposal "exception-handling"
-    struct TryTableArgs {
-        StructuredInstructionArgs try_; // "else" unused.
-        Vector<Catch> catches;
+    struct TryTableArgs : StructuredInstructionArgsBase<OwnPtr<FixedArray<Catch>>> {
+        using Base = StructuredInstructionArgsBase<OwnPtr<FixedArray<Catch>>>;
+        using Meta = typename Base::Meta;
+
+        TryTableArgs(BlockType block_type, InstructionPointer end_ip, ReadonlySpan<Catch> catches, Meta meta = {})
+            : Base { block_type, end_ip, create_catches(catches), meta }
+        {
+        }
+
+        TryTableArgs(TryTableArgs const& other)
+            : Base { other.block_type, other.end_ip, clone_catches(other.extra), other.meta }
+        {
+        }
+
+        TryTableArgs& operator=(TryTableArgs const& other)
+        {
+            if (this == &other)
+                return *this;
+            block_type = other.block_type;
+            end_ip = other.end_ip;
+            extra = clone_catches(other.extra);
+            meta = other.meta;
+            return *this;
+        }
+
+        TryTableArgs(TryTableArgs&&) = default;
+        TryTableArgs& operator=(TryTableArgs&&) = default;
+
+        ReadonlySpan<Catch> catches() const
+        {
+            if (!extra)
+                return {};
+            return extra->span();
+        }
+
+    private:
+        static OwnPtr<FixedArray<Catch>> create_catches(ReadonlySpan<Catch> catches)
+        {
+            if (catches.is_empty())
+                return nullptr;
+            return make<FixedArray<Catch>>(MUST(FixedArray<Catch>::create(catches)));
+        }
+
+        static OwnPtr<FixedArray<Catch>> clone_catches(OwnPtr<FixedArray<Catch>> const& catches)
+        {
+            if (!catches)
+                return nullptr;
+            return make<FixedArray<Catch>>(MUST(catches->clone()));
+        }
     };
 
     struct ShuffleArgument {
@@ -564,12 +907,21 @@ public:
 
     LocalIndex local_index() const { return m_local_index; }
 
+    void set_local_index(Badge<Module>, LocalIndex index) { m_local_index = index; }
+
 private:
     OpCode m_opcode { 0 };
     LocalIndex m_local_index;
 
     Variant<
+        ArrayCopyArgs,
+        ArrayDataArgs,
+        ArrayElemArgs,
+        ArrayNewFixedArgs,
+        AtomicMemoryArgument,
         BlockType,
+        BranchArgs,
+        BranchOnCastArgs,
         DataIndex,
         ElementIndex,
         FunctionIndex,
@@ -584,6 +936,7 @@ private:
         MemoryCopyArgs,
         MemoryIndexArgument,
         MemoryInitArgs,
+        StructFieldArgs,
         StructuredInstructionArgs,
         ShuffleArgument,
         TableBranchArgs,
@@ -591,6 +944,7 @@ private:
         TableIndex,
         TableTableArgs,
         TryTableArgs,
+        TypeIndex,
         ValueType,
         Vector<ValueType>,
         double,
@@ -601,6 +955,30 @@ private:
         u8> // Empty state
         m_arguments;
 };
+
+}
+
+namespace AK {
+
+template<>
+struct SentinelOptionalTraits<Wasm::Instruction> {
+    static Wasm::Instruction sentinel_value() { return Wasm::Instruction { Wasm::OpCode { NumericLimits<Wasm::OpCode::Type>::max() } }; }
+    static bool is_sentinel(Wasm::Instruction const& value) { return value.opcode().value() == NumericLimits<Wasm::OpCode::Type>::max(); }
+};
+
+template<>
+class Optional<Wasm::Instruction> : public SentinelOptional<Wasm::Instruction> {
+public:
+    using SentinelOptional::SentinelOptional;
+};
+
+}
+
+namespace Wasm {
+
+static_assert(sizeof(Optional<Instruction>) == sizeof(Instruction));
+
+static_assert(sizeof(Optional<InstructionPointer>) == sizeof(InstructionPointer));
 
 struct Dispatch {
     enum RegisterOrStack : u8 {
@@ -614,26 +992,109 @@ struct Dispatch {
         R7,
         CountRegisters,
         Stack = CountRegisters,
+        CallRecord,
+        LastCallRecord = NumericLimits<u8>::max(),
     };
+
+    static_assert(is_power_of_two(to_underlying(Stack)), "Stack marker must be a single bit");
 
     union {
         OpCode instruction_opcode;
         FlatPtr handler_ptr;
     };
     Instruction const* instruction { nullptr };
-    union {
-        struct {
-            RegisterOrStack sources[3];
-            RegisterOrStack destination;
-        };
-        u32 sources_and_destination;
-    };
 };
+
+union SourcesAndDestination {
+    struct {
+        Dispatch::RegisterOrStack sources[3];
+        Dispatch::RegisterOrStack destination;
+    };
+    u32 sources_and_destination;
+};
+
+class InstructionStorage {
+    using Chunk = FixedArray<Optional<Instruction>>;
+
+public:
+    InstructionStorage() = default;
+    InstructionStorage(InstructionStorage const&) = delete;
+    InstructionStorage& operator=(InstructionStorage const&) = delete;
+    InstructionStorage(InstructionStorage&&) = default;
+    InstructionStorage& operator=(InstructionStorage&&) = default;
+
+    Instruction& append(Instruction);
+
+    size_t size() const { return m_size; }
+    size_t capacity() const { return m_capacity; }
+    bool is_empty() const { return m_size == 0; }
+
+private:
+    void add_chunk();
+
+    Vector<Chunk, 0, FastLastAccess::Yes> m_chunks;
+    size_t m_size { 0 };
+    size_t m_capacity { 0 };
+    size_t m_next_index_in_last_chunk { 0 };
+};
+
+void free_cranelift_code(void* handle);
+
+struct CraneliftTrap {
+    u32 offset { 0 };
+    u8 code { 0 };
+    u8 _padding[3] { 0, 0, 0 };
+};
+static_assert(sizeof(CraneliftTrap) == 8);
+
 struct CompiledInstructions {
     Vector<Dispatch> dispatches;
-    Vector<Instruction, 0, FastLastAccess::Yes> extra_instruction_storage;
-    bool direct = false; // true if all dispatches contain handler_ptr, otherwise false and all contain instruction_opcode.
+    Vector<SourcesAndDestination> src_dst_mappings;
+    InstructionStorage extra_instruction_storage;
+
+    Vector<u8> cranelift_local_types;
+
+    // Pointer/size_t-sized members first, then the u32, then the bools, so the trailing scalars pack
+    // into one word instead of scattering padding between them.
+
+    // Native entry point for this function (conforms to the interpreter handler ABI). Zero until
+    // the background/AOT compile has fully installed the code. Published with an atomic store-release
+    // as the LAST step of install_compiled_function() and read with an atomic load-acquire at every
+    // execution-decision site, so a function can tier up to JIT concurrently with execution without
+    // a reader ever observing a half-installed function. dispatches[0].handler_ptr always stays the
+    // C++ interpreter handler, so the interpreter path is valid regardless of compilation state.
+    FlatPtr cranelift_entry = 0;
+    void* cranelift_code_handle = nullptr; // Owned; freed when the owning Module is destroyed.
+    size_t cranelift_code_size = 0;
+    CraneliftTrap const* cranelift_traps = nullptr; // Owned by cranelift_code_handle.
+    size_t cranelift_trap_count = 0;
+    size_t max_call_arg_count = 0;
+    size_t max_call_rec_size = 0;
+
+    u32 cranelift_result_arity = 0;   // result count to hand to try_cranelift_compile(); only meaningful when cranelift_eligible.
+    u32 cranelift_local_count = 0;    // total locals (params + declared + inlined); lets Cranelift promote locals to SSA instead of memory. Only meaningful when cranelift_eligible.
+    u32 cranelift_param_count = 0;    // leading locals that are parameters; the compiled entry block zero-initializes everything past them. Only meaningful when cranelift_eligible.
+    u32 cranelift_inlined_locals = 0; // extra locals appended for inlined callee bodies (see try_compile_instructions); the frame is grown by this much in both interpreter and JIT paths.
+    u32 max_label_depth = 0;          // max concurrent labels (incl. the function-level label) the compiled stream can push.
+
+    bool direct = false;                  // true if all dispatches contain handler_ptr, otherwise false and all contain instruction_opcode.
+    bool cranelift_eligible = false;      // true if this expression cleared the Cranelift type/shape checks during validation.
+    bool has_tier_up_checkpoints = false; // true if try_compile_instructions inserted synthetic_tier_up ops (Tier-Up sites).
+    bool cranelift_compiled = false;
 };
+
+// Read the native entry with acquire ordering: a non-zero result means the function is fully
+// installed and every cranelift_* field written before publication is visible to this thread.
+inline FlatPtr cranelift_entry_acquire(CompiledInstructions const& ci)
+{
+    return AK::atomic_load(const_cast<FlatPtr volatile*>(&ci.cranelift_entry), AK::MemoryOrder::memory_order_acquire);
+}
+
+// Publish the native entry with release ordering. Must be the LAST write of install.
+inline void publish_cranelift_entry(CompiledInstructions& ci, FlatPtr entry)
+{
+    AK::atomic_store(&ci.cranelift_entry, entry, AK::MemoryOrder::memory_order_release);
+}
 
 template<Enum auto... Vs>
 consteval auto as_ordered()
@@ -727,9 +1188,63 @@ private:
 
 class TypeSection {
 public:
+    // https://webassembly.github.io/spec/core/syntax/types.html#recursive-types
+    // https://webassembly.github.io/spec/core/syntax/types.html#composite-types
+    class Type {
+    public:
+        using CompositeType = Variant<FunctionType, StructType, ArrayType>;
+
+        struct RecGroupSpan {
+            u32 first_type_index { 0 };
+            u32 size { 1 };
+        };
+
+        Type(CompositeType type, Vector<TypeIndex> supertypes = {}, bool is_final = true)
+            : m_description(move(type))
+            , m_supertypes(move(supertypes))
+            , m_is_final(is_final)
+        {
+        }
+
+        auto& description() const { return m_description; }
+
+        auto& function() const { return m_description.get<FunctionType>(); }
+        auto& unsafe_function() const { return m_description.unsafe_get<FunctionType>(); }
+        bool is_function() const { return m_description.has<FunctionType>(); }
+
+        auto& struct_() const { return m_description.get<StructType>(); }
+        bool is_struct() const { return m_description.has<StructType>(); }
+
+        auto& array() const { return m_description.get<ArrayType>(); }
+        bool is_array() const { return m_description.has<ArrayType>(); }
+
+        // sub final? x* ct
+        auto& supertypes() const { return m_supertypes; }
+        bool is_final() const { return m_is_final; }
+
+        auto& rec_group() const { return m_rec_group; }
+        void set_rec_group(RecGroupSpan span) { m_rec_group = span; }
+
+        ByteString name() const
+        {
+            return m_description.visit(
+                [](FunctionType const&) -> ByteString { return "function type"; },
+                [](StructType const&) -> ByteString { return "struct type"; },
+                [](ArrayType const&) -> ByteString { return "array type"; });
+        }
+
+        static ParseResult<Type> parse(ConstrainedStream& stream, Optional<u8> leading_tag = {});
+
+    private:
+        CompositeType m_description;
+        Vector<TypeIndex> m_supertypes;
+        bool m_is_final { true };
+        RecGroupSpan m_rec_group;
+    };
+
     TypeSection() = default;
 
-    explicit TypeSection(Vector<FunctionType> types)
+    explicit TypeSection(Vector<Type> types)
         : m_types(move(types))
     {
     }
@@ -739,7 +1254,7 @@ public:
     static ParseResult<TypeSection> parse(ConstrainedStream& stream);
 
 private:
-    Vector<FunctionType> m_types;
+    Vector<Type> m_types;
 };
 
 class ImportSection {
@@ -806,21 +1321,45 @@ private:
     Vector<TypeIndex> m_types;
 };
 
+class Expression {
+public:
+    explicit Expression(Vector<Instruction> instructions)
+        : m_instructions(move(instructions))
+    {
+    }
+
+    auto& instructions() const { return m_instructions; }
+
+    static ParseResult<Expression> parse(ConstrainedStream& stream, Optional<size_t> size_hint = {});
+
+    void set_stack_usage_hint(size_t value) const { m_stack_usage_hint = value; }
+    auto stack_usage_hint() const { return m_stack_usage_hint; }
+
+    mutable CompiledInstructions compiled_instructions;
+
+private:
+    Vector<Instruction> m_instructions;
+    mutable Optional<size_t> m_stack_usage_hint;
+};
+
 class TableSection {
 public:
     class Table {
     public:
-        explicit Table(TableType type)
+        explicit Table(TableType type, Expression initializer)
             : m_type(move(type))
+            , m_initializer(move(initializer))
         {
         }
 
         auto& type() const { return m_type; }
+        auto& initializer() const { return m_initializer; }
 
         static ParseResult<Table> parse(ConstrainedStream& stream);
 
     private:
         TableType m_type;
+        Expression m_initializer;
     };
 
 public:
@@ -870,30 +1409,6 @@ public:
 
 private:
     Vector<Memory> m_memories;
-};
-
-class Expression {
-public:
-    explicit Expression(Vector<Instruction> instructions)
-        : m_instructions(move(instructions))
-    {
-    }
-
-    auto& instructions() const { return m_instructions; }
-
-    static ParseResult<Expression> parse(ConstrainedStream& stream, Optional<size_t> size_hint = {});
-
-    void set_stack_usage_hint(size_t value) const { m_stack_usage_hint = value; }
-    auto stack_usage_hint() const { return m_stack_usage_hint; }
-    void set_frame_usage_hint(size_t value) const { m_frame_usage_hint = value; }
-    auto frame_usage_hint() const { return m_frame_usage_hint; }
-
-    mutable CompiledInstructions compiled_instructions;
-
-private:
-    Vector<Instruction> m_instructions;
-    mutable Optional<size_t> m_stack_usage_hint;
-    mutable Optional<size_t> m_frame_usage_hint;
 };
 
 class GlobalSection {
@@ -1064,6 +1579,8 @@ public:
             : m_locals(move(locals))
             , m_body(move(body))
         {
+            for (auto const& local : m_locals)
+                m_total_local_count += local.n();
         }
 
         auto& locals() const { return m_locals; }
@@ -1071,9 +1588,12 @@ public:
 
         static ParseResult<Func> parse(ConstrainedStream& stream, size_t size_hint);
 
+        auto total_local_count() const { return m_total_local_count; }
+
     private:
         Vector<Locals> m_locals;
         Expression m_body;
+        size_t m_total_local_count { 0 };
     };
     class Code {
     public:
@@ -1169,29 +1689,9 @@ private:
 
 class TagSection {
 public:
-    class Tag {
-    public:
-        using Flags = TagType::Flags;
-
-        Tag(TypeIndex type, Flags flags)
-            : m_type(type)
-            , m_flags(flags)
-        {
-        }
-
-        auto type() const { return m_type; }
-        auto flags() const { return m_flags; }
-
-        static ParseResult<Tag> parse(ConstrainedStream& stream);
-
-    private:
-        TypeIndex m_type;
-        Flags m_flags { Flags::None };
-    };
-
     TagSection() = default;
 
-    explicit TagSection(Vector<Tag> tags)
+    explicit TagSection(Vector<TagType> tags)
         : m_tags(move(tags))
     {
     }
@@ -1201,10 +1701,41 @@ public:
     static ParseResult<TagSection> parse(ConstrainedStream& stream);
 
 private:
-    Vector<Tag> m_tags;
+    Vector<TagType> m_tags;
 };
 
-class WASM_API Module : public RefCounted<Module>
+enum class CompileToNative : u8 {
+    No,
+    Yes,
+};
+
+// Lightweight per-module compile stats accumulator. Exposed to embedders via record_module_stats() below.
+// The cranelift_* and cache_hit fields are filled in by compile_module_to_native() once native compilation actually runs (possibly on another thread).
+struct ModuleStats {
+    Array<u8, 32> wasm_hash {};
+    size_t input_size_bytes { 0 };
+    AK::Duration parse_time;
+    AK::Duration validate_time;
+    AK::Duration cranelift_time;
+    size_t cranelift_blob_size_bytes { 0 };
+    size_t function_count { 0 };
+    size_t tier_up_function_count { 0 };   // functions instrumented with tier-up checkpoints
+    size_t tier_up_checkpoint_count { 0 }; // total tier-up checkpoints inserted across the module
+    bool cache_hit { false };
+};
+
+// Caller-supplied hooks for the Cranelift on-disk cache.
+//   - `wasm_hash` is a 32-byte digest of the wasm bytes; embedded in produced blobs and verified against `existing_blob` before any install.
+//   - `existing_blob` is the prior cache hit (or empty for a miss); the native-compile pass tries to install it before falling through to cranelift.
+//     Owned, since the compile may run asynchronously long after the config was assembled.
+//   - `on_compiled` is invoked exactly once if a fresh blob was produced; never invoked on a cache hit nor when no cranelift output was captured.
+struct CompileCacheConfig {
+    Array<u8, 32> wasm_hash {};
+    ByteBuffer existing_blob;
+    AK::Function<void(ByteBuffer)> on_compiled;
+};
+
+class WASM_API Module : public AtomicRefCounted<Module>
     , public Weakable<Module> {
 public:
     enum class ValidationStatus {
@@ -1251,11 +1782,50 @@ public:
     ValidationStatus validation_status() const { return m_validation_status; }
     StringView validation_error() const LIFETIME_BOUND { return *m_validation_error; }
     void set_validation_error(ByteString error) { m_validation_error = move(error); }
+    bool has_attempted_cranelift_compilation() const { return m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) == 2; }
+    bool try_begin_cranelift_compilation() const
+    {
+        u8 not_started = 0;
+        return m_cranelift_compilation_state.compare_exchange_strong(not_started, 1, AK::MemoryOrder::memory_order_acq_rel);
+    }
+    void finish_cranelift_compilation() const
+    {
+        MutexLocker locker(m_cranelift_compilation_mutex);
+        m_cranelift_compilation_state.store(2, AK::MemoryOrder::memory_order_release);
+        m_cranelift_compilation_state_changed.broadcast();
+    }
+    void wait_for_cranelift_compilation() const
+    {
+        if (m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) != 1)
+            return;
+
+        MutexLocker locker(m_cranelift_compilation_mutex);
+        m_cranelift_compilation_state_changed.wait_while([this] {
+            return m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) == 1;
+        });
+    }
+
+    // Disk-cache config for native compilation. Parked here by the embedder before compilation is kicked off, and consumed by whichever path ends up driving compile_module_to_native() first.
+    void set_cranelift_cache_config(CompileCacheConfig config) { m_cranelift_cache_config = move(config); }
+    Optional<CompileCacheConfig> take_cranelift_cache_config() { return move(m_cranelift_cache_config); }
+
+    // Compile stats parked here by the embedder; compile_module_to_native() fills in the cranelift_* / cache_hit fields once native compilation runs, then records them.
+    void set_compile_stats(ModuleStats stats) { m_compile_stats = move(stats); }
+    Optional<ModuleStats> take_compile_stats() { return move(m_compile_stats); }
 
     static ParseResult<NonnullRefPtr<Module>> parse(Stream& stream);
 
+    size_t minimum_call_record_allocation_size() const { return m_minimum_call_record_allocation_size; }
+    void set_minimum_call_record_allocation_size(size_t size) { m_minimum_call_record_allocation_size = size; }
+
+    // The defined type of each (flattened) type-section entry; filled in during validation.
+    // https://webassembly.github.io/spec/core/valid/conventions.html#defined-types
+    auto& canonical_types() const { return m_canonical_types; }
+    void set_canonical_types(Vector<DefinedType const*> types) { m_canonical_types = move(types); }
+
 private:
     void set_validation_status(ValidationStatus status) { m_validation_status = status; }
+    void preprocess();
 
     Vector<CustomSection> m_custom_sections;
     TypeSection m_type_section;
@@ -1274,8 +1844,50 @@ private:
 
     ValidationStatus m_validation_status { ValidationStatus::Unchecked };
     Optional<ByteString> m_validation_error;
+    mutable Atomic<u8> m_cranelift_compilation_state { 0 };
+    mutable Mutex m_cranelift_compilation_mutex;
+    mutable ConditionVariable m_cranelift_compilation_state_changed { m_cranelift_compilation_mutex };
+    Optional<CompileCacheConfig> m_cranelift_cache_config;
+    Optional<ModuleStats> m_compile_stats;
+
+    Vector<DefinedType const*> m_canonical_types;
+
+    size_t m_minimum_call_record_allocation_size { 0 };
 };
 
-CompiledInstructions try_compile_instructions(Expression const&, Span<FunctionType const> functions);
+CompiledInstructions try_compile_instructions(Expression const&, Span<FunctionType const> functions, Span<CodeSection::Func const* const> callee_bodies = {}, size_t current_function_index = 0, size_t caller_local_count = 0, size_t imported_function_count = 0);
+ErrorOr<void, ValidationError> ensure_cranelift_compiled(Module&);
+WASM_API void start_cranelift_compilation(Module&);
+bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity = 0);
+void flush_cranelift_batch();
+void discard_cranelift_batch();
+
+void compile_module_to_native(Module&);
+
+WASM_API ByteString const& cranelift_compiler_path();
+WASM_API ErrorOr<Core::AnonymousBuffer> compile_cranelift_buffer(Core::AnonymousBuffer const&);
+
+using CraneliftCompileCallback = Function<Core::AnonymousBuffer(Core::AnonymousBuffer const&)>;
+WASM_API void set_cranelift_compile_callback(CraneliftCompileCallback);
+
+WASM_API void record_module_stats(ModuleStats);
+WASM_API void dump_module_stats();
+
+// Cranelift disk-cache plumbing. Validator drives these around CodeSection validation:
+//   1. set_cranelift_active_function_index() before each function so cache-hit installs
+//      and post-compile capture know which function they're talking about.
+//   2. begin_cranelift_cache_capture() to start collecting compiled bytes + relocs.
+//   3. try_install_cranelift_cache_blob() with the wasm-bytes hash + stored blob; if
+//      it returns true, individual try_cranelift_compile calls will short-circuit by
+//      installing from the stashed records instead of queueing fresh compiles.
+//   4. After flush, serialize_cranelift_cache_blob() returns a blob to hand to the
+//      cache store (or {} if nothing was captured); abort_cranelift_cache_capture()
+//      throws the capture away.
+void set_cranelift_active_function_index(u32 function_index);
+void begin_cranelift_cache_capture();
+void abort_cranelift_cache_capture();
+void abort_cranelift_cache_install();
+Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash);
+bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, ReadonlyBytes blob);
 
 }

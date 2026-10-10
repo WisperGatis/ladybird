@@ -6,6 +6,7 @@
  */
 
 #include <AK/Base64.h>
+#include <AK/IPv4Address.h>
 #include <LibCore/ConfigFile.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
@@ -21,6 +22,18 @@ constexpr auto DEFAULT_SERVER = "www.google.com"sv;
 static ByteBuffer operator""_b(char const* string, size_t length)
 {
     return ByteBuffer::copy(string, length).release_value();
+}
+
+TEST_CASE(test_TLS_rejects_embedded_null_in_expected_host)
+{
+    char host_bytes[] { 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 't', 'e', 's', 't', '\0', 'x' };
+    ByteString host { host_bytes, sizeof(host_bytes) };
+    Core::SocketAddress address { IPv4Address { 127, 0, 0, 1 }, 0 };
+
+    auto result = TLS::TLSv12::connect(address, host);
+    EXPECT(result.is_error());
+    if (result.is_error())
+        EXPECT(!result.error().is_errno());
 }
 
 TEST_CASE(test_TLS_hello_handshake)
@@ -49,7 +62,8 @@ TEST_CASE(test_TLS_hello_handshake)
             return;
 
         auto line = TRY_OR_FAIL(tls->read_until_any_of(read_buffer, Array { "\r\n"sv }));
-        EXPECT(line.starts_with("HTTP/1.1 204 No Content"_b));
+        auto no_content_prefix = "HTTP/1.1 204 No Content"_b;
+        EXPECT(line.starts_with(no_content_prefix));
         loop.quit(0);
     };
     tls->set_notifications_enabled(true);

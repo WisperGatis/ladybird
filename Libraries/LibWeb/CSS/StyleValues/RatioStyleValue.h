@@ -6,44 +6,35 @@
 
 #pragma once
 
-#include <LibWeb/CSS/Ratio.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
 
 class RatioStyleValue final : public StyleValueWithDefaultOperators<RatioStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<RatioStyleValue const> create(Ratio ratio)
+    static ValueComparingNonnullRefPtr<RatioStyleValue const> create(ValueComparingNonnullRefPtr<StyleValue const> numerator, ValueComparingNonnullRefPtr<StyleValue const> denominator)
     {
-        return adopt_ref(*new (nothrow) RatioStyleValue(move(ratio)));
+        return adopt_ref(*new (nothrow) RatioStyleValue(move(numerator), move(denominator)));
     }
     virtual ~RatioStyleValue() override = default;
 
-    Ratio const& ratio() const { return m_ratio; }
-    Ratio& ratio() { return m_ratio; }
-
-    virtual String to_string(SerializationMode) const override { return m_ratio.to_string(); }
-    Vector<Parser::ComponentValue> tokenize() const override
-    {
-        return {
-            Parser::Token::create_number(Number { Number::Type::Number, m_ratio.numerator() }),
-            Parser::Token::create_whitespace(" "_string),
-            Parser::Token::create_delim('/'),
-            Parser::Token::create_whitespace(" "_string),
-            Parser::Token::create_number(Number { Number::Type::Number, m_ratio.denominator() }),
-        };
-    }
-
-    bool properties_equal(RatioStyleValue const& other) const { return m_ratio == other.m_ratio; }
+    Ratio resolved() const;
 
 private:
-    RatioStyleValue(Ratio&& ratio)
-        : StyleValueWithDefaultOperators(Type::Ratio)
-        , m_ratio(ratio)
+    friend class StyleValue;
+
+    explicit RatioStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Ratio, data)
     {
     }
 
-    Ratio m_ratio;
+    RatioStyleValue(ValueComparingNonnullRefPtr<StyleValue const> numerator, ValueComparingNonnullRefPtr<StyleValue const> denominator)
+        : StyleValueWithDefaultOperators(Type::Ratio, StyleValueFFI::rust_style_value_create_ratio(StyleValueFFI::rust_style_value_retain(numerator->rust_style_value_data()), StyleValueFFI::rust_style_value_retain(denominator->rust_style_value_data())))
+    {
+    }
+
+    ValueComparingNonnullRefPtr<StyleValue const> numerator() const { return wrap_rust_child(m_value->ratio.numerator); }
+    ValueComparingNonnullRefPtr<StyleValue const> denominator() const { return wrap_rust_child(m_value->ratio.denominator); }
 };
 
 }

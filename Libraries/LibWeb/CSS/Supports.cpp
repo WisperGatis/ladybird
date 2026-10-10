@@ -1,92 +1,39 @@
 /*
- * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/Realm.h>
+#include <LibWeb/CSS/Query.h>
 #include <LibWeb/CSS/Supports.h>
+#include <LibWeb/Dump.h>
 
 namespace Web::CSS {
 
-Supports::Supports(NonnullOwnPtr<BooleanExpression>&& condition)
-    : m_condition(move(condition))
+bool supports_condition_matches(RustQueryHandle const& handle)
 {
-    m_matches = m_condition->evaluate_to_boolean(nullptr);
+    auto result = Parser::ValueParserFFI::css_query_evaluate_supports(handle.data());
+    if (result > to_underlying(MatchResult::Unknown)) {
+        dbgln("supports_condition_matches: unexpected query handle kind");
+        return false;
+    }
+    return result == 1;
 }
 
-MatchResult Supports::Declaration::evaluate(DOM::Document const*) const
+Utf16String serialize_supports_condition(RustQueryHandle const& handle)
 {
-    return as_match_result(m_matches);
+    Utf16String serialized;
+    auto set_serialized_query = [](void* context, u16 const* code_units, size_t length) {
+        *static_cast<Utf16String*>(context) = Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(code_units), length });
+    };
+    VERIFY(Parser::ValueParserFFI::css_query_serialize_condition(handle.data(), &serialized, set_serialized_query));
+    return serialized;
 }
 
-String Supports::Declaration::to_string() const
+void dump_supports_condition(StringBuilder& builder, RustQueryHandle const& handle, int indent_levels)
 {
-    return m_declaration;
-}
-
-void Supports::Declaration::dump(StringBuilder& builder, int indent_levels) const
-{
-    indent(builder, indent_levels);
-    builder.appendff("Declaration: `{}`, matches={}\n", m_declaration, m_matches);
-}
-
-MatchResult Supports::Selector::evaluate(DOM::Document const*) const
-{
-    return as_match_result(m_matches);
-}
-
-String Supports::Selector::to_string() const
-{
-    return MUST(String::formatted("selector({})", m_selector));
-}
-
-void Supports::Selector::dump(StringBuilder& builder, int indent_levels) const
-{
-    indent(builder, indent_levels);
-    builder.appendff("Selector: `{}` matches={}\n", m_selector, m_matches);
-}
-
-MatchResult Supports::FontTech::evaluate(DOM::Document const*) const
-{
-    return as_match_result(m_matches);
-}
-
-String Supports::FontTech::to_string() const
-{
-    return MUST(String::formatted("font-tech({})", m_tech));
-}
-
-void Supports::FontTech::dump(StringBuilder& builder, int indent_levels) const
-{
-    indent(builder, indent_levels);
-    builder.appendff("FontTech: `{}` matches={}\n", m_tech, m_matches);
-}
-
-MatchResult Supports::FontFormat::evaluate(DOM::Document const*) const
-{
-    return as_match_result(m_matches);
-}
-
-String Supports::FontFormat::to_string() const
-{
-    return MUST(String::formatted("font-format({})", m_format));
-}
-
-void Supports::FontFormat::dump(StringBuilder& builder, int indent_levels) const
-{
-    indent(builder, indent_levels);
-    builder.appendff("FontFormat: `{}` matches={}\n", m_format, m_matches);
-}
-
-String Supports::to_string() const
-{
-    return m_condition->to_string();
-}
-
-void Supports::dump(StringBuilder& builder, int indent_levels) const
-{
-    m_condition->dump(builder, indent_levels);
+    dump_indent(builder, indent_levels);
+    builder.appendff("Supports condition: `{}` (matches = {})\n", serialize_supports_condition(handle), supports_condition_matches(handle));
 }
 
 }

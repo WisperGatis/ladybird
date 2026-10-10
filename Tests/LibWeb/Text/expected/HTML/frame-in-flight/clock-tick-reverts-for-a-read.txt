@@ -1,0 +1,4 @@
+lane as the task begins: ticking
+lane after a tick: ticking
+the read answers as of the animation's timeline: true
+lane after the read: ticking

@@ -1,6 +1,4 @@
-#import <UIEvents/EventModifier.idl>
-
-// https://www.w3.org/TR/uievents/#idl-keyboardevent
+// https://w3c.github.io/uievents/#idl-keyboardevent
 [Exposed=Window]
 interface KeyboardEvent : UIEvent {
 
@@ -13,7 +11,7 @@ interface KeyboardEvent : UIEvent {
     const unsigned long DOM_KEY_LOCATION_NUMPAD = 0x03;
 
     readonly attribute DOMString key;
-    readonly attribute DOMString code;
+    readonly attribute [FlyString] DOMString code;
     readonly attribute unsigned long location;
 
     readonly attribute boolean ctrlKey;
@@ -27,17 +25,18 @@ interface KeyboardEvent : UIEvent {
     readonly attribute unsigned long charCode;
     readonly attribute unsigned long keyCode;
 
-    boolean getModifierState(DOMString keyArg);
+    boolean getModifierState([FlyString] DOMString keyArg);
 
     // https://w3c.github.io/uievents/#dom-keyboardevent-initkeyboardevent
-    undefined initKeyboardEvent(DOMString typeArg, optional boolean bubblesArg = false, optional boolean cancelableArg = false, optional WindowProxy? viewArg = null, optional DOMString keyArg = "", optional unsigned long locationArg = 0, optional boolean ctrlKey = false, optional boolean altKey = false, optional boolean shiftKey = false, optional boolean metaKey = false);
+    // FIXME: Spec issue: We use a WindowProxy instead of a Window: https://github.com/w3c/uievents/issues/388
+    undefined initKeyboardEvent([FlyString] DOMString typeArg, optional boolean bubblesArg = false, optional boolean cancelableArg = false, optional WindowProxy? viewArg = null, optional DOMString keyArg = "", optional unsigned long locationArg = 0, optional boolean ctrlKey = false, optional boolean altKey = false, optional boolean shiftKey = false, optional boolean metaKey = false);
 
 };
 
-// https://www.w3.org/TR/uievents/#dictdef-keyboardeventinit
+// https://w3c.github.io/uievents/#dictdef-keyboardeventinit
 dictionary KeyboardEventInit : EventModifierInit {
     DOMString key = "";
-    DOMString code = "";
+    [FlyString] DOMString code = "";
     unsigned long location = 0;
     boolean repeat = false;
     boolean isComposing = false;

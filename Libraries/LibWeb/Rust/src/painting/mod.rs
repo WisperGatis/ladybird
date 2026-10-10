@@ -1,0 +1,57 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+pub mod border_radii;
+pub(crate) mod caret;
+pub(crate) mod chrome_geometry;
+pub(crate) mod client_rects;
+pub(crate) mod content_visibility;
+pub(crate) mod css_filter;
+mod devtools_layout;
+pub mod display_list;
+mod dump;
+pub mod ffi;
+pub mod fragment_ownership;
+pub mod hit_test;
+pub mod host;
+pub(crate) mod image_content;
+pub(crate) mod image_map_areas;
+pub(crate) mod intersection_observer;
+pub(crate) mod layer_image_paint_facts;
+pub mod layout_tree_dump;
+pub(crate) mod node_painting;
+pub(crate) mod paint_changes;
+pub(crate) mod paint_order;
+pub(crate) mod paint_order_plan;
+pub(crate) mod paint_passes;
+pub(crate) mod paint_read;
+pub mod paint_state;
+pub mod paintable_build;
+pub mod paintable_data;
+pub mod paintable_geometry;
+pub(crate) mod paintable_rows;
+pub(crate) mod presentation;
+pub(crate) mod published_frame;
+pub mod record;
+pub(crate) mod recording_slot;
+pub(crate) mod rect_to_viewport_transform;
+pub(crate) mod replaced_paint_facts;
+pub(crate) mod scroll_chain;
+pub(crate) mod scroll_snap;
+pub mod scrollable_overflow;
+pub mod selection;
+pub mod stacking_context;
+pub mod style_queries;
+pub(crate) mod svg_filter;
+pub(crate) mod svg_masking;
+pub(crate) mod svg_paint_resources;
+pub(crate) mod svg_viewport;
+pub mod text_fragment;
+pub mod visual_animation_builder;
+pub mod visual_context;
+pub(crate) mod visual_lines;
+
+pub use libcompositing_rust::{filter_bytes, force_dark, visual_animation};

@@ -3,24 +3,40 @@
  * Copyright (c) 2022-2025, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2022, Tobias Christiansen <tobyase@serenityos.org>
  * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2022-2025, Tim Flynn <trflynn89@ladybird.org>
+ * Copyright (c) 2022-2026, Tim Flynn <trflynn89@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
 #include <AK/LexicalPath.h>
+#include <AK/RefCounted.h>
 #include <AK/Time.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <AK/Vector.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
+#if !defined(AK_OS_MACOS)
+#    include <LibCore/Socket.h>
+#else
+#    include <LibIPC/TransportBootstrapMach.h>
+#endif
+#include <LibGC/Heap.h>
+#include <LibGC/Timer.h>
+#include <LibHTTP/Cookie/Cookie.h>
+#include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibIPC/Transport.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/Bindings/CSS.h>
+#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
-#include <LibWeb/CSS/StyleValues/StyleValue.h>
-#include <LibWeb/Cookie/Cookie.h>
-#include <LibWeb/Cookie/ParsedCookie.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentObserver.h>
@@ -42,11 +58,15 @@
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigationObserver.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/SelectedFile.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/WindowProxy.h>
+#include <LibWeb/HTML/XMLSerializer.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/Timer.h>
@@ -55,12 +75,13 @@
 #include <LibWeb/WebDriver/Actions.h>
 #include <LibWeb/WebDriver/Contexts.h>
 #include <LibWeb/WebDriver/ElementReference.h>
-#include <LibWeb/WebDriver/HeapTimer.h>
 #include <LibWeb/WebDriver/InputState.h>
 #include <LibWeb/WebDriver/JSON.h>
 #include <LibWeb/WebDriver/Properties.h>
 #include <LibWeb/WebDriver/Screenshot.h>
 #include <LibWeb/WebDriver/UserPrompt.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
+#include <WebContent/PageClient.h>
 #include <WebContent/WebDriverConnection.h>
 
 namespace WebContent {
@@ -73,14 +94,14 @@ namespace WebContent {
         static_assert(!::AK::Detail::IsLvalueReference<decltype(_temporary_result.release_value())>, \
             "Do not return a reference from a fallible expression");                                 \
         if (_temporary_result.is_error()) [[unlikely]] {                                             \
-            async_driver_execution_complete({ _temporary_result.release_error() });                  \
+            driver_execution_complete({ _temporary_result.release_error() });                        \
             return;                                                                                  \
         }                                                                                            \
         _temporary_result.release_value();                                                           \
     })
 
 // https://w3c.github.io/webdriver/#dfn-serialized-cookie
-static JsonValue serialize_cookie(Web::Cookie::Cookie const& cookie)
+static JsonValue serialize_cookie(HTTP::Cookie::Cookie const& cookie)
 {
     JsonObject serialized_cookie;
     serialized_cookie.set("name"sv, cookie.name);
@@ -91,7 +112,7 @@ static JsonValue serialize_cookie(Web::Cookie::Cookie const& cookie)
     serialized_cookie.set("httpOnly"sv, cookie.http_only);
     if (cookie.persistent)
         serialized_cookie.set("expiry"sv, cookie.expiry_time.seconds_since_epoch()); // Must not be set if omitted when adding a cookie.
-    serialized_cookie.set("sameSite"sv, Web::Cookie::same_site_to_string(cookie.same_site));
+    serialized_cookie.set("sameSite"sv, HTTP::Cookie::same_site_to_string(cookie.same_site));
 
     return serialized_cookie;
 }
@@ -121,19 +142,19 @@ static Gfx::IntRect compute_window_rect(Web::Page const& page)
 static void scroll_element_into_view(Web::DOM::Element& element)
 {
     // 1. Let options be the following ScrollIntoViewOptions:
-    Web::DOM::ScrollIntoViewOptions options {};
+    Web::DOM::Element::ScrollIntoViewOptions options {};
     // "behavior"
     //     "instant"
-    options.behavior = Web::Bindings::ScrollBehavior::Instant;
+    options.behavior = Web::DOM::Element::ScrollBehavior::Instant;
     // Logical scroll position "block"
     //     "end"
-    options.block = Web::Bindings::ScrollLogicalPosition::End;
+    options.block = Web::DOM::Element::ScrollLogicalPosition::End;
     // Logical scroll position "inline"
     //     "nearest"
-    options.inline_ = Web::Bindings::ScrollLogicalPosition::Nearest;
+    options.inline_ = Web::DOM::Element::ScrollLogicalPosition::Nearest;
 
     // 2. Run Function.[[Call]](scrollIntoView, options) with element as the this value.
-    (void)element.scroll_into_view(options);
+    element.scroll_into_view(options, nullptr);
 }
 
 // https://w3c.github.io/webdriver/#dfn-container
@@ -178,7 +199,7 @@ static Optional<Web::DOM::Element&> container_for_element(Web::DOM::Element& ele
 }
 
 template<typename T>
-static bool fire_an_event(FlyString const& name, Optional<Web::DOM::Element&> target)
+static bool fire_an_event(Utf16FlyString const& name, Optional<Web::DOM::Element&> target)
 {
     // FIXME: This is supposed to call the https://dom.spec.whatwg.org/#concept-event-fire DOM algorithm,
     //        but that doesn't seem to be implemented elsewhere. So, we'll ad-hack it for now. :^)
@@ -186,35 +207,218 @@ static bool fire_an_event(FlyString const& name, Optional<Web::DOM::Element&> ta
     if (!target.has_value())
         return false;
 
-    auto event = T::create(target->realm(), name);
+    GC::Ref<T> event = [&] {
+        if constexpr (IsSame<T, Web::UIEvents::MouseEvent>)
+            return T::create(name, {}, 0, 0, 0, 0, Web::HighResolutionTime::unsafe_shared_current_time());
+        else
+            return T::create(Web::HTML::relevant_global_object(*target), name);
+    }();
     return target->dispatch_event(event);
 }
 
-ErrorOr<NonnullRefPtr<WebDriverConnection>> WebDriverConnection::connect(Web::PageClient& page_client, ByteString const& webdriver_ipc_path)
+NonnullRefPtr<WebDriverConnection> WebDriverConnection::create(PageClient& page_client)
 {
-    // TODO: Mach IPC and Windows IPC
-
-    dbgln_if(WEBDRIVER_DEBUG, "Trying to connect to {}", webdriver_ipc_path);
-    auto socket = TRY(Core::LocalSocket::connect(webdriver_ipc_path));
-
     // Allow pop-ups, or otherwise /window/new won't be able to open a new tab.
     page_client.page().set_should_block_pop_ups(false);
 
-    dbgln_if(WEBDRIVER_DEBUG, "Connected to WebDriver");
-    return adopt_nonnull_ref_or_enomem(new (nothrow) WebDriverConnection(make<IPC::Transport>(move(socket)), page_client));
+    return adopt_ref(*new WebDriverConnection(page_client));
 }
 
-WebDriverConnection::WebDriverConnection(NonnullOwnPtr<IPC::Transport> transport, Web::PageClient& page_client)
-    : IPC::ConnectionToServer<WebDriverClientEndpoint, WebDriverServerEndpoint>(*this, move(transport))
+WebDriverConnection::WebDriverConnection(PageClient& page_client)
+    : m_page_client(page_client)
 {
-    set_current_top_level_browsing_context(page_client.page().top_level_browsing_context());
+    page_client.page().set_window_rect_observer(GC::create_function(GC::Heap::the(), [this](Web::DevicePixelRect rect, u64 request_id) {
+        if (m_pending_window_rect_requests.remove(request_id) && m_pending_window_rect_requests.is_empty())
+            driver_execution_complete(serialize_rect(rect.to_type<int>()));
+    }));
+    page_client.page().set_is_webdriver_active(true);
+}
+
+void WebDriverConnection::driver_execution_complete(Web::WebDriver::Response response)
+{
+    if (!m_current_command_id.has_value())
+        return;
+
+    m_pending_window_rect_requests.clear();
+
+    auto command_id = m_current_command_id.release_value();
+    m_page_client->webdriver_command_complete(command_id, move(response));
+}
+
+void WebDriverConnection::run_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments)
+{
+    VERIFY(!m_current_command_id.has_value());
+    m_current_command_id = command_id;
+
+    auto& page = m_page_client->page();
+    GC::Ptr<Web::HTML::Navigable> navigable = navigable_id.has_value() ? page.navigable_with_id(*navigable_id) : GC::Ptr { page.top_level_traversable() };
+    auto* local_navigable = as_if<Web::HTML::LocalNavigable>(navigable.ptr());
+    m_current_browsing_context = local_navigable ? local_navigable->active_browsing_context() : nullptr;
+
+    // https://w3c.github.io/webdriver/#dfn-no-longer-open
+    // A browsing context is said to be no longer open if its navigable has been destroyed.
+    if (!m_current_browsing_context) {
+        // https://w3c.github.io/webdriver/#dfn-wait-for-navigation-to-complete
+        // 2. If the current browsing context is no longer open, return success with data null.
+        if (name == "wait_for_navigation"sv) {
+            driver_execution_complete(JsonValue {});
+            return;
+        }
+
+        driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv));
+        return;
+    }
+
+    auto argument = [&](size_t index) {
+        return index < arguments.size() ? arguments[index] : String {};
+    };
+
+    struct Dispatch {
+        enum class Completes : u8 {
+            Now,
+            Later,
+        };
+        Completes completes;
+        Web::WebDriver::Response response;
+    };
+
+    auto asynchronous = [](Web::WebDriver::Response response) -> Dispatch {
+        if (response.is_error())
+            return { Dispatch::Completes::Now, move(response) };
+        return { Dispatch::Completes::Later, JsonValue {} };
+    };
+    auto synchronous = [](Web::WebDriver::Response response) -> Dispatch {
+        return { Dispatch::Completes::Now, move(response) };
+    };
+
+    auto result = [&]() -> Dispatch {
+        if (name == "get_current_url"sv)
+            return asynchronous(get_current_url());
+        if (name == "get_title"sv)
+            return asynchronous(get_title());
+        if (name == "close_window"sv)
+            return asynchronous(close_window());
+        if (name == "new_window"sv)
+            return asynchronous(new_window(move(payload)));
+        if (name == "switch_to_frame"sv)
+            return asynchronous(switch_to_frame(move(payload)));
+        if (name == "get_window_rect"sv)
+            return asynchronous(get_window_rect());
+        if (name == "set_window_rect"sv)
+            return asynchronous(set_window_rect(move(payload)));
+        if (name == "maximize_window"sv)
+            return asynchronous(maximize_window());
+        if (name == "minimize_window"sv)
+            return asynchronous(minimize_window());
+        if (name == "fullscreen_window"sv)
+            return asynchronous(fullscreen_window());
+        if (name == "consume_user_activation"sv)
+            return synchronous(consume_user_activation());
+        if (name == "crash_current_page"sv) {
+            crash_current_page();
+            return synchronous(JsonValue {});
+        }
+        if (name == "find_element"sv)
+            return asynchronous(find_element(move(payload)));
+        if (name == "find_elements"sv)
+            return asynchronous(find_elements(move(payload)));
+        if (name == "find_element_from_element"sv)
+            return asynchronous(find_element_from_element(move(payload), argument(0)));
+        if (name == "find_elements_from_element"sv)
+            return asynchronous(find_elements_from_element(move(payload), argument(0)));
+        if (name == "find_element_from_shadow_root"sv)
+            return asynchronous(find_element_from_shadow_root(move(payload), argument(0)));
+        if (name == "find_elements_from_shadow_root"sv)
+            return asynchronous(find_elements_from_shadow_root(move(payload), argument(0)));
+        if (name == "get_active_element"sv)
+            return asynchronous(get_active_element());
+        if (name == "get_element_shadow_root"sv)
+            return asynchronous(get_element_shadow_root(argument(0)));
+        if (name == "is_element_selected"sv)
+            return asynchronous(is_element_selected(argument(0)));
+        if (name == "get_element_attribute"sv)
+            return asynchronous(get_element_attribute(argument(0), argument(1)));
+        if (name == "get_element_property"sv)
+            return asynchronous(get_element_property(argument(0), argument(1)));
+        if (name == "get_element_css_value"sv)
+            return asynchronous(get_element_css_value(argument(0), argument(1)));
+        if (name == "get_element_text"sv)
+            return asynchronous(get_element_text(argument(0)));
+        if (name == "get_element_tag_name"sv)
+            return asynchronous(get_element_tag_name(argument(0)));
+        if (name == "get_element_rect"sv)
+            return asynchronous(get_element_rect(argument(0)));
+        if (name == "is_element_enabled"sv)
+            return asynchronous(is_element_enabled(argument(0)));
+        if (name == "get_computed_role"sv)
+            return asynchronous(get_computed_role(argument(0)));
+        if (name == "get_computed_label"sv)
+            return asynchronous(get_computed_label(argument(0)));
+        if (name == "element_click"sv)
+            return asynchronous(element_click(argument(0)));
+        if (name == "element_clear"sv)
+            return asynchronous(element_clear(argument(0)));
+        if (name == "element_send_keys"sv)
+            return asynchronous(element_send_keys(argument(0), move(payload)));
+        if (name == "get_source"sv)
+            return asynchronous(get_source());
+        if (name == "execute_script"sv)
+            return asynchronous(execute_script(move(payload)));
+        if (name == "execute_async_script"sv)
+            return asynchronous(execute_async_script(move(payload)));
+        if (name == "get_all_cookies"sv)
+            return asynchronous(get_all_cookies());
+        if (name == "get_named_cookie"sv)
+            return asynchronous(get_named_cookie(argument(0)));
+        if (name == "add_cookie"sv)
+            return asynchronous(add_cookie(move(payload)));
+        if (name == "delete_cookie"sv)
+            return asynchronous(delete_cookie(argument(0)));
+        if (name == "delete_all_cookies"sv)
+            return asynchronous(delete_all_cookies());
+        if (name == "perform_actions"sv)
+            return asynchronous(perform_actions(move(payload)));
+        if (name == "release_actions"sv)
+            return asynchronous(release_actions());
+        if (name == "dismiss_alert"sv)
+            return asynchronous(dismiss_alert());
+        if (name == "accept_alert"sv)
+            return asynchronous(accept_alert());
+        if (name == "get_alert_text"sv)
+            return synchronous(get_alert_text());
+        if (name == "send_alert_text"sv)
+            return synchronous(send_alert_text(move(payload)));
+        if (name == "take_screenshot"sv)
+            return asynchronous(take_screenshot());
+        if (name == "take_element_screenshot"sv)
+            return asynchronous(take_element_screenshot(argument(0)));
+        if (name == "print_page"sv)
+            return synchronous(print_page(move(payload)));
+        if (name == "ensure_top_level_browsing_context_is_open"sv)
+            return synchronous(ensure_top_level_browsing_context_is_open());
+        if (name == "wait_for_navigation"sv)
+            return asynchronous(wait_for_navigation());
+        return synchronous(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownCommand, "Unknown WebDriver command"sv));
+    }();
+
+    if (result.completes == Dispatch::Completes::Now)
+        driver_execution_complete(move(result.response));
+}
+
+void WebDriverConnection::set_session_config(Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue const& timeouts)
+{
+    m_page_load_strategy = page_load_strategy;
+    m_strict_file_interactability = strict_file_interactability;
+
+    m_timeouts_configuration = {};
+    if (timeouts.is_object())
+        MUST(Web::WebDriver::json_deserialize_as_a_timeouts_configuration_into(timeouts, m_timeouts_configuration));
 }
 
 void WebDriverConnection::visit_edges(JS::Cell::Visitor& visitor)
 {
+    visitor.visit(m_page_client);
     visitor.visit(m_current_browsing_context);
-    visitor.visit(m_current_parent_browsing_context);
-    visitor.visit(m_current_top_level_browsing_context);
     visitor.visit(m_element_locator);
     visitor.visit(m_action_executor);
     visitor.visit(m_document_observer);
@@ -222,120 +426,8 @@ void WebDriverConnection::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_navigation_timer);
 }
 
-// https://w3c.github.io/webdriver/#dfn-close-the-session
-void WebDriverConnection::close_session()
-{
-    // 1. Set the webdriver-active flag to false.
-    set_is_webdriver_active(false);
-
-    // 5. Optionally, close all top-level browsing contexts, without prompting to unload.
-    for (auto navigable : Web::HTML::all_navigables()) {
-        if (auto traversable = navigable->top_level_traversable())
-            traversable->close_top_level_traversable();
-    }
-}
-
-void WebDriverConnection::set_page_load_strategy(Web::WebDriver::PageLoadStrategy page_load_strategy)
-{
-    m_page_load_strategy = page_load_strategy;
-}
-
-void WebDriverConnection::set_user_prompt_handler(Web::WebDriver::UserPromptHandler user_prompt_handler)
-{
-    Web::WebDriver::set_user_prompt_handler(move(user_prompt_handler));
-}
-
-void WebDriverConnection::set_strict_file_interactability(bool strict_file_interactability)
-{
-    m_strict_file_interactability = strict_file_interactability;
-}
-
-void WebDriverConnection::set_is_webdriver_active(bool is_webdriver_active)
-{
-    current_browsing_context().page().set_is_webdriver_active(is_webdriver_active);
-}
-
-// 9.1 Get Timeouts, https://w3c.github.io/webdriver/#dfn-get-timeouts
-Messages::WebDriverClient::GetTimeoutsResponse WebDriverConnection::get_timeouts()
-{
-    // 1. Let timeouts be the timeouts object for session’s timeouts configuration
-    auto timeouts = Web::WebDriver::timeouts_object(m_timeouts_configuration);
-
-    // 2. Return success with data timeouts.
-    return timeouts;
-}
-
-// 9.2 Set Timeouts, https://w3c.github.io/webdriver/#dfn-set-timeouts
-Messages::WebDriverClient::SetTimeoutsResponse WebDriverConnection::set_timeouts(JsonValue payload)
-{
-    // FIXME: Spec issue: As written, the spec replaces the timeouts configuration with the newly provided values. But
-    //        all other implementations update the existing configuration with any new values instead. WPT relies on
-    //        this behavior, and sends us one timeout value at time.
-    //        https://github.com/w3c/webdriver/issues/1596
-
-    // 1. Let timeouts be the result of trying to JSON deserialize as a timeouts configuration the request’s parameters.
-    TRY(Web::WebDriver::json_deserialize_as_a_timeouts_configuration_into(payload, m_timeouts_configuration));
-
-    // 2. Make the session timeouts the new timeouts.
-
-    // 3. Return success with data null.
-    // NOTE: We return the current timeouts configuration so the client may store them for new sessions.
-    return Web::WebDriver::timeouts_object(m_timeouts_configuration);
-}
-
-// 10.1 Navigate To, https://w3c.github.io/webdriver/#navigate-to
-Messages::WebDriverClient::NavigateToResponse WebDriverConnection::navigate_to(JsonValue payload)
-{
-    // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
-
-    // 2. Let url be the result of getting the property url from the parameters argument.
-    if (!payload.is_object() || !payload.as_object().has_string("url"sv))
-        return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload doesn't have a string `url`"sv);
-    auto url = URL::Parser::basic_parse(payload.as_object().get_string("url"sv).value());
-
-    // FIXME: 3. If url is not an absolute URL or is not an absolute URL with fragment or not a local scheme, return error with error code invalid argument.
-
-    // 4. Handle any user prompts and return its value if it is an error.
-    handle_any_user_prompts([this, url = move(url)]() {
-        // 5. Let current URL be the current top-level browsing context’s active document’s URL.
-        auto const& current_url = current_top_level_browsing_context()->active_document()->url();
-
-        // FIXME: 6. If current URL and url do not have the same absolute URL:
-        // FIXME:     a. If timer has not been started, start a timer. If this algorithm has not completed before timer reaches the session’s session page load timeout in milliseconds, return an error with error code timeout.
-
-        // 7. Navigate the current top-level browsing context to url.
-        current_top_level_browsing_context()->page().load(url.value());
-
-        auto navigation_complete = GC::create_function(current_top_level_browsing_context()->heap(), [this](Web::WebDriver::Response result) {
-            // 9. Set the current browsing context with the current top-level browsing context.
-            set_current_browsing_context(*current_top_level_browsing_context());
-
-            // FIXME: 10. If the current top-level browsing context contains a refresh state pragma directive of time 1 second or less, wait until the refresh timeout has elapsed, a new navigate has begun, and return to the first step of this algorithm.
-
-            async_driver_execution_complete(move(result));
-        });
-
-        // 8. If url is special except for file and current URL and URL do not have the same absolute URL:
-        // AD-HOC: We wait for the navigation to complete regardless of whether the current URL differs from the provided
-        //         URL. Even if they're the same, the navigation queues a tasks that we must await, otherwise subsequent
-        //         endpoint invocations will attempt to operate on the wrong page.
-        if (url->is_special() && url->scheme() != "file"sv) {
-            // a. Try to wait for navigation to complete.
-            wait_for_navigation_to_complete(navigation_complete);
-
-            // FIXME: b. Try to run the post-navigation checks.
-        } else {
-            navigation_complete->function()(JsonValue {});
-        }
-    });
-
-    // 11. Return success with data null.
-    return JsonValue {};
-}
-
 // 10.2 Get Current URL, https://w3c.github.io/webdriver/#get-current-url
-Messages::WebDriverClient::GetCurrentUrlResponse WebDriverConnection::get_current_url()
+Web::WebDriver::Response WebDriverConnection::get_current_url()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -346,179 +438,21 @@ Messages::WebDriverClient::GetCurrentUrlResponse WebDriverConnection::get_curren
         auto url = current_top_level_browsing_context()->active_document()->url();
 
         // 4. Return success with data url.
-        async_driver_execution_complete({ url.to_string() });
+        driver_execution_complete({ url.to_string() });
     });
 
     return JsonValue {};
 }
 
-// 10.3 Back, https://w3c.github.io/webdriver/#dfn-back
-Messages::WebDriverClient::BackResponse WebDriverConnection::back()
+void WebDriverConnection::crash_current_page()
 {
-    // 1. If session's current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
-
-    // 2. Try to handle any user prompts with session.
-    handle_any_user_prompts([this]() {
-        auto& realm = current_top_level_browsing_context()->active_document()->realm();
-
-        // 3. Let timeout be session' session timeouts page load timeout.
-        auto timeout = m_timeouts_configuration.page_load_timeout;
-
-        // 4. Let timer be a new timer.
-        auto timer = realm.create<Web::WebDriver::HeapTimer>();
-
-        auto on_complete = GC::create_function(realm.heap(), [this, timer]() {
-            timer->stop();
-
-            if (m_document_observer) {
-                m_document_observer->set_document_page_showing_observer({});
-                m_document_observer = nullptr;
-            }
-
-            // 8. If timer' timeout fired flag is set:
-            if (timer->is_timed_out()) {
-                // 1. Handle any user prompts.
-                handle_any_user_prompts([this]() {
-                    // 2. Return error with error code timeout.
-                    async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::Timeout, "Navigation timed out"sv));
-                });
-
-                return;
-            }
-
-            // 9. Return success with data null.
-            async_driver_execution_complete(JsonValue {});
-        });
-
-        // 5. If timeout is not null:
-        if (timeout.has_value()) {
-            // 1. Start the timer with timer and timeout.
-            timer->start(*timeout, on_complete);
-        }
-
-        // 6. Traverse the history by a delta –1 for session's current browsing context.
-        current_top_level_browsing_context()->top_level_traversable()->traverse_the_history_by_delta(-1);
-
-        // 7. If the previous step completed results in a pageHide event firing, wait until pageShow event fires or
-        //    timer' timeout fired flag to be set, whichever occurs first.
-        current_top_level_browsing_context()->top_level_traversable()->append_session_history_traversal_steps(GC::create_function(realm.heap(), [this, timer, on_complete]() {
-            if (timer->is_timed_out())
-                return;
-
-            if (auto* document = current_top_level_browsing_context()->active_document(); document->page_showing()) {
-                on_complete->function()();
-            } else {
-                auto& realm = document->realm();
-
-                m_document_observer = realm.create<Web::DOM::DocumentObserver>(realm, *document);
-                m_document_observer->set_document_page_showing_observer([on_complete](auto) {
-                    on_complete->function()();
-                });
-            }
-        }));
+    Core::deferred_invoke([] {
+        VERIFY_NOT_REACHED();
     });
-
-    return JsonValue {};
-}
-
-// 10.4 Forward, https://w3c.github.io/webdriver/#dfn-forward
-Messages::WebDriverClient::ForwardResponse WebDriverConnection::forward()
-{
-    // 1. If session's current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
-
-    // 2. Try to handle any user prompts with session.
-    handle_any_user_prompts([this]() {
-        auto& realm = current_top_level_browsing_context()->active_document()->realm();
-
-        // 3. Let timeout be session' session timeouts page load timeout.
-        auto timeout = m_timeouts_configuration.page_load_timeout;
-
-        // 4. Let timer be a new timer.
-        auto timer = realm.create<Web::WebDriver::HeapTimer>();
-
-        auto on_complete = GC::create_function(realm.heap(), [this, timer]() {
-            timer->stop();
-
-            if (m_document_observer) {
-                m_document_observer->set_document_page_showing_observer({});
-                m_document_observer = nullptr;
-            }
-
-            // 8. If timer' timeout fired flag is set:
-            if (timer->is_timed_out()) {
-                // 1. Handle any user prompts.
-                handle_any_user_prompts([this]() {
-                    // 2. Return error with error code timeout.
-                    async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::Timeout, "Navigation timed out"sv));
-                });
-
-                return;
-            }
-
-            // 9. Return success with data null.
-            async_driver_execution_complete(JsonValue {});
-        });
-
-        // 5. If timeout is not null:
-        if (timeout.has_value()) {
-            // 1. Start the timer with timer and timeout.
-            timer->start(*timeout, on_complete);
-        }
-
-        // 6. Traverse the history by a delta 1 for session's current browsing context.
-        current_top_level_browsing_context()->top_level_traversable()->traverse_the_history_by_delta(1);
-
-        // 7. If the previous step completed results in a pageHide event firing, wait until pageShow event fires or
-        //    timer' timeout fired flag to be set, whichever occurs first.
-        current_top_level_browsing_context()->top_level_traversable()->append_session_history_traversal_steps(GC::create_function(realm.heap(), [this, timer, on_complete]() {
-            if (timer->is_timed_out())
-                return;
-
-            if (auto* document = current_top_level_browsing_context()->active_document(); document->page_showing()) {
-                on_complete->function()();
-            } else {
-                auto& realm = document->realm();
-
-                m_document_observer = realm.create<Web::DOM::DocumentObserver>(realm, *document);
-                m_document_observer->set_document_page_showing_observer([on_complete](auto) {
-                    on_complete->function()();
-                });
-            }
-        }));
-    });
-
-    return JsonValue {};
-}
-
-// 10.5 Refresh, https://w3c.github.io/webdriver/#dfn-refresh
-Messages::WebDriverClient::RefreshResponse WebDriverConnection::refresh()
-{
-    // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
-
-    // 2. Handle any user prompts and return its value if it is an error.
-    handle_any_user_prompts([this]() {
-        // 3. Initiate an overridden reload of the current top-level browsing context’s active document.
-        current_top_level_browsing_context()->page().client().page_did_request_refresh();
-
-        // FIXME: 4. If url is special except for file:
-        // FIXME:     1. Try to wait for navigation to complete.
-        // FIXME:     2. Try to run the post-navigation checks.
-
-        // 5. Set the current browsing context with current top-level browsing context.
-        set_current_browsing_context(*current_top_level_browsing_context());
-
-        // 6. Return success with data null.
-        async_driver_execution_complete(JsonValue {});
-    });
-
-    return JsonValue {};
 }
 
 // 10.6 Get Title, https://w3c.github.io/webdriver/#dfn-get-title
-Messages::WebDriverClient::GetTitleResponse WebDriverConnection::get_title()
+Web::WebDriver::Response WebDriverConnection::get_title()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -529,24 +463,14 @@ Messages::WebDriverClient::GetTitleResponse WebDriverConnection::get_title()
         auto title = current_top_level_browsing_context()->active_document()->title().to_utf8();
 
         // 4. Return success with data title.
-        async_driver_execution_complete({ move(title) });
+        driver_execution_complete({ move(title) });
     });
 
     return JsonValue {};
 }
 
-// 11.1 Get Window Handle, https://w3c.github.io/webdriver/#get-window-handle
-Messages::WebDriverClient::GetWindowHandleResponse WebDriverConnection::get_window_handle()
-{
-    // 1. If session's current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
-
-    // 2. Return success with data being the window handle associated with session's current top-level browsing context.
-    return JsonValue { current_top_level_browsing_context()->top_level_traversable()->window_handle() };
-}
-
 // 11.2 Close Window, https://w3c.github.io/webdriver/#dfn-close-window
-Messages::WebDriverClient::CloseWindowResponse WebDriverConnection::close_window()
+Web::WebDriver::Response WebDriverConnection::close_window()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -559,47 +483,21 @@ Messages::WebDriverClient::CloseWindowResponse WebDriverConnection::close_window
         //        steps. If a user dialog is open in another window within this agent, the event loop will be paused, and
         //        those spins will hang. So we must return control to the client, who can deal with the dialog.
         Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(current_top_level_browsing_context()->heap(), [this]() {
-            current_top_level_browsing_context()->top_level_traversable()->close_top_level_traversable();
+            // The page can close this window on its own before this task runs, and a closed
+            // context has no document or navigable left to reach its traversable through.
+            if (ensure_current_top_level_browsing_context_is_open().is_error())
+                return;
+            as<Web::HTML::LocalTraversableNavigable>(*m_page_client->page().top_level_traversable()).close_top_level_traversable(Web::HTML::LocalTraversableNavigable::PromptToUnload::No);
         }));
 
-        async_driver_execution_complete(JsonValue {});
+        driver_execution_complete(JsonValue {});
     });
 
     return JsonValue {};
 }
 
-// 11.3 Switch to Window, https://w3c.github.io/webdriver/#dfn-switch-to-window
-Messages::WebDriverClient::SwitchToWindowResponse WebDriverConnection::switch_to_window(String handle)
-{
-    // 4. If handle is equal to the associated window handle for some top-level browsing context, let context be the that
-    //    browsing context, and set the current top-level browsing context with session and context.
-    //    Otherwise, return error with error code no such window.
-    bool found_matching_context = false;
-
-    for (auto navigable : Web::HTML::all_navigables()) {
-        auto traversable = navigable->top_level_traversable();
-        if (!traversable || !traversable->active_browsing_context())
-            continue;
-
-        if (handle == traversable->window_handle()) {
-            set_current_top_level_browsing_context(*traversable->active_browsing_context());
-            found_matching_context = true;
-            break;
-        }
-    }
-
-    if (!found_matching_context)
-        return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv);
-
-    // 5. Update any implementation-specific state that would result from the user selecting the current
-    //    browsing context for interaction, without altering OS-level focus.
-    current_browsing_context().page().client().page_did_request_activate_tab();
-
-    return JsonValue {};
-}
-
 // 11.5 New Window, https://w3c.github.io/webdriver/#dfn-new-window
-Messages::WebDriverClient::NewWindowResponse WebDriverConnection::new_window(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::new_window(JsonValue payload)
 {
     // 1. If the implementation does not support creating new top-level browsing contexts, return error with error code unsupported operation.
 
@@ -610,14 +508,14 @@ Messages::WebDriverClient::NewWindowResponse WebDriverConnection::new_window(Jso
     handle_any_user_prompts([this, payload = move(payload)]() {
         // 4. Let type hint be the result of getting the property "type" from the parameters argument.
         if (!payload.is_object()) {
-            async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload is not a JSON object"sv));
+            driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload is not a JSON object"sv));
             return;
         }
 
         // FIXME: Actually use this value to decide between an OS window or tab.
         auto type_hint = payload.as_object().get("type"sv);
         if (type_hint.has_value() && !type_hint->is_null() && !type_hint->is_string()) {
-            async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload property `type` is not null or a string"sv));
+            driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload property `type` is not null or a string"sv));
             return;
         }
 
@@ -632,11 +530,11 @@ Messages::WebDriverClient::NewWindowResponse WebDriverConnection::new_window(Jso
         auto* active_window = current_browsing_context().active_window();
         VERIFY(active_window);
 
-        Web::HTML::TemporaryExecutionContext execution_context { active_window->document()->realm() };
+        Web::HTML::TemporaryExecutionContext execution_context { active_window->document()->relevant_settings_object() };
         auto [target_navigable, no_opener, window_type] = MUST(active_window->window_open_steps_internal("about:blank"sv, ""sv, "noopener"sv));
 
         // 6. Let handle be the associated window handle of the newly created window.
-        auto handle = target_navigable->traversable_navigable()->window_handle();
+        auto handle = as<Web::HTML::LocalTraversableNavigable>(*target_navigable->traversable_navigable()).window_handle().to_utf8();
 
         // 7. Let type be "tab" if the newly created window shares an OS-level window with the current browsing context, or "window" otherwise.
         auto type = "tab"sv;
@@ -647,14 +545,14 @@ Messages::WebDriverClient::NewWindowResponse WebDriverConnection::new_window(Jso
         result.set("type"sv, JsonValue { type });
 
         // 9. Return success with data result.
-        async_driver_execution_complete({ move(result) });
+        driver_execution_complete({ move(result) });
     });
 
     return JsonValue {};
 }
 
 // 11.6 Switch To Frame, https://w3c.github.io/webdriver/#dfn-switch-to-frame
-Messages::WebDriverClient::SwitchToFrameResponse WebDriverConnection::switch_to_frame(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::switch_to_frame(JsonValue payload)
 {
     // 1. Let id be the result of getting the property "id" from parameters.
     if (!payload.is_object() || !payload.as_object().has("id"sv))
@@ -676,9 +574,9 @@ Messages::WebDriverClient::SwitchToFrameResponse WebDriverConnection::switch_to_
         // 2. Try to handle any user prompts with session.
         handle_any_user_prompts([this]() {
             // 3. Set the current browsing context with session and session's current top-level browsing context.
-            set_current_browsing_context(*current_top_level_browsing_context());
+            set_current_browsing_context(m_page_client->page().top_level_traversable());
 
-            async_driver_execution_complete(JsonValue {});
+            driver_execution_complete(JsonValue {});
         });
     }
 
@@ -695,26 +593,31 @@ Messages::WebDriverClient::SwitchToFrameResponse WebDriverConnection::switch_to_
 
         // 3. Try to handle any user prompts with session.
         handle_any_user_prompts([this, id = *id_value]() {
-            Web::HTML::TemporaryExecutionContext execution_context { current_browsing_context().active_document()->realm() };
+            Web::HTML::TemporaryExecutionContext execution_context { current_browsing_context().active_document()->relevant_settings_object() };
 
             // 4. Let window be the associated window of session's current browsing context's active document.
             auto window = current_browsing_context().active_document()->window()->window();
 
             // 5. If id is not a supported property index of window, return error with error code no such frame.
-            auto property = window->get(id);
+            auto property = window->object().get(id);
 
-            if (property.is_error() || !property.value().is_object() || !is<Web::HTML::WindowProxy>(property.value().as_object())) {
-                async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, MUST(String::formatted("Frame ID {} not found", id))));
+            if (property.is_error() || !property.value().is_object() || !Web::HTML::WindowProxy::from_object(property.value().as_object())) {
+                driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, MUST(String::formatted("Frame ID {} not found", id))));
                 return;
             }
 
             // 6. Let child window be the WindowProxy object obtained by calling window.[[GetOwnProperty]] (id).
-            auto const& child_window = static_cast<Web::HTML::WindowProxy const&>(property.value().as_object());
+            auto const& child_window = *Web::HTML::WindowProxy::from_object(property.value().as_object());
 
             // 7. Set the current browsing context with session and child window's browsing context.
-            set_current_browsing_context(child_window.associated_browsing_context());
+            auto child_navigable = child_window.navigable();
+            if (!child_navigable) {
+                driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, MUST(String::formatted("Frame ID {} not found", id))));
+                return;
+            }
+            set_current_browsing_context(*child_navigable);
 
-            async_driver_execution_complete(JsonValue {});
+            driver_execution_complete(JsonValue {});
         });
     }
 
@@ -732,15 +635,20 @@ Messages::WebDriverClient::SwitchToFrameResponse WebDriverConnection::switch_to_
 
             // 4. If element is not a frame or iframe element, return error with error code no such frame.
             if (!is<Web::HTML::HTMLFrameElement>(*element) && !is<Web::HTML::HTMLIFrameElement>(*element)) {
-                async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, "element is not a frame"sv));
+                driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, "element is not a frame"sv));
                 return;
             }
 
             // 5. Set the current browsing context with session and element's content navigable's active browsing context.
             auto& navigable_container = static_cast<Web::HTML::NavigableContainer&>(*element);
-            set_current_browsing_context(*navigable_container.content_navigable()->active_browsing_context());
+            auto content_navigable = navigable_container.content_navigable();
+            if (!content_navigable) {
+                driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, "element has no content navigable"sv));
+                return;
+            }
+            set_current_browsing_context(*content_navigable);
 
-            async_driver_execution_complete(JsonValue {});
+            driver_execution_complete(JsonValue {});
         });
     }
 
@@ -750,40 +658,8 @@ Messages::WebDriverClient::SwitchToFrameResponse WebDriverConnection::switch_to_
     return JsonValue {};
 }
 
-// 11.7 Switch To Parent Frame, https://w3c.github.io/webdriver/#dfn-switch-to-parent-frame
-Messages::WebDriverClient::SwitchToParentFrameResponse WebDriverConnection::switch_to_parent_frame(JsonValue)
-{
-    // 1. If session's current browsing context is already the top-level browsing context:
-    if (&current_browsing_context() == current_top_level_browsing_context()) {
-        // 1. If session's current browsing context is no longer open, return error with error code no such window.
-        TRY(ensure_current_browsing_context_is_open());
-
-        // 2. Return success with data null.
-        async_driver_execution_complete(JsonValue {});
-        return JsonValue {};
-    }
-
-    // 2. If session's current parent browsing context is no longer open, return error with error code no such window.
-    TRY(Web::WebDriver::ensure_browsing_context_is_open(current_parent_browsing_context()));
-
-    // 3. Try to handle any user prompts with session.
-    handle_any_user_prompts([this]() {
-        // 4. If session's current parent browsing context is not null, set the current browsing context with session and
-        //    current parent browsing context.
-        if (auto parent_browsing_context = current_parent_browsing_context())
-            set_current_browsing_context(*parent_browsing_context);
-
-        // FIXME: 5. Update any implementation-specific state that would result from the user selecting session's current browsing context for interaction, without altering OS-level focus.
-
-        // 6. Return success with data null.
-        async_driver_execution_complete(JsonValue {});
-    });
-
-    return JsonValue {};
-}
-
 // 11.8.1 Get Window Rect, https://w3c.github.io/webdriver/#dfn-get-window-rect
-Messages::WebDriverClient::GetWindowRectResponse WebDriverConnection::get_window_rect()
+Web::WebDriver::Response WebDriverConnection::get_window_rect()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -792,14 +668,14 @@ Messages::WebDriverClient::GetWindowRectResponse WebDriverConnection::get_window
     handle_any_user_prompts([this]() {
         // 3. Return success with data set to the WindowRect object for the current top-level browsing context.
         auto serialized_rect = serialize_rect(compute_window_rect(current_top_level_browsing_context()->page()));
-        async_driver_execution_complete(move(serialized_rect));
+        driver_execution_complete(move(serialized_rect));
     });
 
     return JsonValue {};
 }
 
 // 11.8.2 Set Window Rect, https://w3c.github.io/webdriver/#dfn-set-window-rect
-Messages::WebDriverClient::SetWindowRectResponse WebDriverConnection::set_window_rect(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::set_window_rect(JsonValue payload)
 {
     if (!payload.is_object())
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload is not a JSON object"sv);
@@ -848,7 +724,8 @@ Messages::WebDriverClient::SetWindowRectResponse WebDriverConnection::set_window
 
     // 9. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this, x, y, width, height]() {
-        // FIXME: 10. Fully exit fullscreen.
+        // 10. Fully exit fullscreen.
+        current_top_level_browsing_context()->active_document()->fully_exit_fullscreen();
 
         // 11. Restore the window.
         restore_the_window(GC::create_function(current_top_level_browsing_context()->heap(), [this, x, y, width, height]() {
@@ -858,19 +735,19 @@ Messages::WebDriverClient::SetWindowRectResponse WebDriverConnection::set_window
             if (width.has_value() && height.has_value()) {
                 // a. Set the width, in CSS pixels, of the operating system window containing the current top-level browsing context, including any browser chrome and externally drawn window decorations to a value that is as close as possible to width.
                 // b. Set the height, in CSS pixels, of the operating system window containing the current top-level browsing context, including any browser chrome and externally drawn window decorations to a value that is as close as possible to height.
-                page.client().page_did_request_resize_window({ *width, *height });
-                ++m_pending_window_rect_requests;
+                auto request_id = register_window_rect_request();
+                page.client().page_did_request_resize_window({ *width, *height }, request_id);
             }
 
             // 12. If x and y are not null:
             if (x.has_value() && y.has_value()) {
                 // a. Run the implementation-specific steps to set the position of the operating system level window containing the current top-level browsing context to the position given by the x and y coordinates.
-                page.client().page_did_request_reposition_window({ *x, *y });
-                ++m_pending_window_rect_requests;
+                auto request_id = register_window_rect_request();
+                page.client().page_did_request_reposition_window({ *x, *y }, request_id);
             }
 
-            if (m_pending_window_rect_requests == 0)
-                async_driver_execution_complete(serialize_rect(compute_window_rect(page)));
+            if (m_pending_window_rect_requests.is_empty())
+                driver_execution_complete(serialize_rect(compute_window_rect(page)));
         }));
     });
 
@@ -879,7 +756,7 @@ Messages::WebDriverClient::SetWindowRectResponse WebDriverConnection::set_window
 }
 
 // 11.8.3 Maximize Window, https://w3c.github.io/webdriver/#dfn-maximize-window
-Messages::WebDriverClient::MaximizeWindowResponse WebDriverConnection::maximize_window()
+Web::WebDriver::Response WebDriverConnection::maximize_window()
 {
     // 1. If the remote end does not support the Maximize Window command for the current top-level browsing context for any reason, return error with error code unsupported operation.
 
@@ -888,7 +765,8 @@ Messages::WebDriverClient::MaximizeWindowResponse WebDriverConnection::maximize_
 
     // 3. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this]() {
-        // FIXME: 4. Fully exit fullscreen.
+        // 4. Fully exit fullscreen.
+        current_top_level_browsing_context()->active_document()->fully_exit_fullscreen();
 
         // 5. Restore the window.
         restore_the_window(GC::create_function(current_top_level_browsing_context()->heap(), [this]() {
@@ -902,7 +780,7 @@ Messages::WebDriverClient::MaximizeWindowResponse WebDriverConnection::maximize_
 }
 
 // 11.8.4 Minimize Window, https://w3c.github.io/webdriver/#minimize-window
-Messages::WebDriverClient::MinimizeWindowResponse WebDriverConnection::minimize_window()
+Web::WebDriver::Response WebDriverConnection::minimize_window()
 {
     // 1. If the remote end does not support the Minimize Window command for the current top-level browsing context for any reason, return error with error code unsupported operation.
 
@@ -911,12 +789,13 @@ Messages::WebDriverClient::MinimizeWindowResponse WebDriverConnection::minimize_
 
     // 3. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this]() {
-        // FIXME: 4. Fully exit fullscreen.
+        // 4. Fully exit fullscreen.
+        current_top_level_browsing_context()->active_document()->fully_exit_fullscreen();
 
         // 5. Iconify the window.
         iconify_the_window(GC::create_function(current_top_level_browsing_context()->heap(), [this]() {
             auto& page = current_top_level_browsing_context()->page();
-            async_driver_execution_complete(serialize_rect(compute_window_rect(page)));
+            driver_execution_complete(serialize_rect(compute_window_rect(page)));
         }));
     });
 
@@ -925,7 +804,7 @@ Messages::WebDriverClient::MinimizeWindowResponse WebDriverConnection::minimize_
 }
 
 // 11.8.5 Fullscreen Window, https://w3c.github.io/webdriver/#dfn-fullscreen-window
-Messages::WebDriverClient::FullscreenWindowResponse WebDriverConnection::fullscreen_window()
+Web::WebDriver::Response WebDriverConnection::fullscreen_window()
 {
     // 1. If the remote end does not support fullscreen return error with error code unsupported operation.
 
@@ -936,11 +815,29 @@ Messages::WebDriverClient::FullscreenWindowResponse WebDriverConnection::fullscr
     handle_any_user_prompts([this]() {
         // 4. Restore the window.
         restore_the_window(GC::create_function(current_top_level_browsing_context()->heap(), [this]() {
-            // 5. FIXME: Call fullscreen an element with the current top-level browsing context’s active document’s document element.
-            //           As described in https://fullscreen.spec.whatwg.org/#fullscreen-an-element
-            //    NOTE: What we do here is basically `requestFullscreen(options)` with options["navigationUI"]="show"
-            current_top_level_browsing_context()->page().client().page_did_request_fullscreen_window();
-            ++m_pending_window_rect_requests;
+            auto* document = current_top_level_browsing_context()->active_document();
+
+            Web::HTML::TemporaryExecutionContext execution_context { document->relevant_settings_object(), Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+            // 5. Call fullscreen an element with session's current top-level browsing context's active document's
+            //    document element.
+            // FIXME: Spec issue: invoking "fullscreen an element" would not actually fullscreen the document.
+            //        https://github.com/w3c/webdriver/issues/1888
+            auto& realm = document->relevant_settings_object().realm();
+            auto promise = Web::WebIDL::create_promise(realm);
+            document->document_element()->request_fullscreen(promise, Web::DOM::Element::FullscreenRequester::WebDriver);
+
+            Web::WebIDL::upon_fulfillment(promise, GC::create_function(GC::Heap::the(), [this, document](JS::Value) -> Web::WebIDL::ExceptionOr<JS::Value> {
+                driver_execution_complete(serialize_rect(compute_window_rect(document->page())));
+
+                return JS::js_undefined();
+            }));
+
+            Web::WebIDL::upon_rejection(promise, GC::create_function(GC::Heap::the(), [this, document](JS::Value) -> Web::WebIDL::ExceptionOr<JS::Value> {
+                driver_execution_complete(serialize_rect(compute_window_rect(document->page())));
+
+                return JS::js_undefined();
+            }));
         }));
     });
 
@@ -949,11 +846,11 @@ Messages::WebDriverClient::FullscreenWindowResponse WebDriverConnection::fullscr
 }
 
 // Extension Consume User Activation, https://html.spec.whatwg.org/multipage/interaction.html#user-activation-user-agent-automation
-Messages::WebDriverClient::ConsumeUserActivationResponse WebDriverConnection::consume_user_activation()
+Web::WebDriver::Response WebDriverConnection::consume_user_activation()
 {
     // FIXME: This should probably be in the spec steps
-    // If the current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
+    // If the current browsing context is no longer open, return error with error code no such window.
+    TRY(ensure_current_browsing_context_is_open());
 
     // 1. Let window be the current browsing context's active window.
     auto* window = current_browsing_context().active_window();
@@ -966,7 +863,7 @@ Messages::WebDriverClient::ConsumeUserActivationResponse WebDriverConnection::co
         window->consume_user_activation();
 
     // 4. Return success with data consume.
-    return consume;
+    return JsonValue { consume };
 }
 
 static Web::WebDriver::Response extract_first_element(Web::WebDriver::Response result)
@@ -981,7 +878,7 @@ static Web::WebDriver::Response extract_first_element(Web::WebDriver::Response r
 }
 
 // 12.3.2 Find Element, https://w3c.github.io/webdriver/#dfn-find-element
-Messages::WebDriverClient::FindElementResponse WebDriverConnection::find_element(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::find_element(JsonValue payload)
 {
     // 1. Let location strategy be the result of getting a property named "using" from parameters.
     auto location_strategy_string = TRY(Web::WebDriver::get_property(payload, "using"sv));
@@ -1001,7 +898,7 @@ Messages::WebDriverClient::FindElementResponse WebDriverConnection::find_element
 
     // 6. Try to handle any user prompts with session.
     handle_any_user_prompts([this, location_strategy, selector = move(selector)]() mutable {
-        auto get_start_node = GC::create_function(current_browsing_context().heap(), [this]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
+        auto get_start_node = GC::create_function(GC::Heap::the(), [this]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
             // 7. Let start node be session's current browsing context's document element.
             auto* start_node = current_browsing_context().active_document();
 
@@ -1013,9 +910,9 @@ Messages::WebDriverClient::FindElementResponse WebDriverConnection::find_element
         });
 
         // 9. Let result be the result of trying to Find with session, start node, location strategy, and selector.
-        find(*location_strategy, move(selector), get_start_node, GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
+        find(*location_strategy, move(selector), get_start_node, GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
             // 10. If result is empty, return error with error code no such element. Otherwise, return the first element of result.
-            async_driver_execution_complete(extract_first_element(move(result)));
+            driver_execution_complete(extract_first_element(move(result)));
         }));
     });
 
@@ -1023,7 +920,7 @@ Messages::WebDriverClient::FindElementResponse WebDriverConnection::find_element
 }
 
 // 12.3.3 Find Elements, https://w3c.github.io/webdriver/#dfn-find-elements
-Messages::WebDriverClient::FindElementsResponse WebDriverConnection::find_elements(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::find_elements(JsonValue payload)
 {
     // 1. Let location strategy be the result of getting a property named "using" from parameters.
     auto location_strategy_string = TRY(Web::WebDriver::get_property(payload, "using"sv));
@@ -1043,7 +940,7 @@ Messages::WebDriverClient::FindElementsResponse WebDriverConnection::find_elemen
 
     // 6. Try to handle any user prompts with session.
     handle_any_user_prompts([this, location_strategy, selector = move(selector)]() mutable {
-        auto get_start_node = GC::create_function(current_browsing_context().heap(), [this]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
+        auto get_start_node = GC::create_function(GC::Heap::the(), [this]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
             // 7. Let start node be session's current browsing context's document element.
             auto* start_node = current_browsing_context().active_document();
 
@@ -1055,8 +952,8 @@ Messages::WebDriverClient::FindElementsResponse WebDriverConnection::find_elemen
         });
 
         // 9. Return the result of trying to Find with session, start node, location strategy, and selector.
-        find(*location_strategy, move(selector), get_start_node, GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
-            async_driver_execution_complete(move(result));
+        find(*location_strategy, move(selector), get_start_node, GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
+            driver_execution_complete(move(result));
         }));
     });
 
@@ -1064,7 +961,7 @@ Messages::WebDriverClient::FindElementsResponse WebDriverConnection::find_elemen
 }
 
 // 12.3.4 Find Element From Element, https://w3c.github.io/webdriver/#dfn-find-element-from-element
-Messages::WebDriverClient::FindElementFromElementResponse WebDriverConnection::find_element_from_element(JsonValue payload, String element_id)
+Web::WebDriver::Response WebDriverConnection::find_element_from_element(JsonValue payload, String element_id)
 {
     // 1. Let location strategy be the result of getting a property named "using" from parameters.
     auto location_strategy_string = TRY(Web::WebDriver::get_property(payload, "using"sv));
@@ -1083,15 +980,15 @@ Messages::WebDriverClient::FindElementFromElementResponse WebDriverConnection::f
 
     // 6. Try to handle any user prompts with session.
     handle_any_user_prompts([this, element_id, location_strategy, selector = move(selector)]() mutable {
-        auto get_start_node = GC::create_function(current_browsing_context().heap(), [this, element_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
+        auto get_start_node = GC::create_function(GC::Heap::the(), [this, element_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
             // 7. Let start node be the result of trying to get a known element with session and URL variables["element id"].
             return Web::WebDriver::get_known_element(current_browsing_context(), element_id);
         });
 
         // 8. Let result be the value of trying to Find with session, start node, location strategy, and selector.
-        find(*location_strategy, move(selector), get_start_node, GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
+        find(*location_strategy, move(selector), get_start_node, GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
             // 9. If result is empty, return error with error code no such element. Otherwise, return the first element of result.
-            async_driver_execution_complete(extract_first_element(move(result)));
+            driver_execution_complete(extract_first_element(move(result)));
         }));
     });
 
@@ -1099,7 +996,7 @@ Messages::WebDriverClient::FindElementFromElementResponse WebDriverConnection::f
 }
 
 // 12.3.5 Find Elements From Element, https://w3c.github.io/webdriver/#dfn-find-elements-from-element
-Messages::WebDriverClient::FindElementsFromElementResponse WebDriverConnection::find_elements_from_element(JsonValue payload, String element_id)
+Web::WebDriver::Response WebDriverConnection::find_elements_from_element(JsonValue payload, String element_id)
 {
     // 1. Let location strategy be the result of getting a property named "using" from parameters.
     auto location_strategy_string = TRY(Web::WebDriver::get_property(payload, "using"sv));
@@ -1118,14 +1015,14 @@ Messages::WebDriverClient::FindElementsFromElementResponse WebDriverConnection::
 
     // 6. Try to handle any user prompts with session.
     handle_any_user_prompts([this, element_id, location_strategy, selector = move(selector)]() mutable {
-        auto get_start_node = GC::create_function(current_browsing_context().heap(), [this, element_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
+        auto get_start_node = GC::create_function(GC::Heap::the(), [this, element_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
             // 7. Let start node be the result of trying to get a known element with session and URL variables["element id"].
             return Web::WebDriver::get_known_element(current_browsing_context(), element_id);
         });
 
         // 8. Return the result of trying to Find with session, start node, location strategy, and selector.
-        find(*location_strategy, move(selector), get_start_node, GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
-            async_driver_execution_complete(move(result));
+        find(*location_strategy, move(selector), get_start_node, GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
+            driver_execution_complete(move(result));
         }));
     });
 
@@ -1133,7 +1030,7 @@ Messages::WebDriverClient::FindElementsFromElementResponse WebDriverConnection::
 }
 
 // 12.3.6 Find Element From Shadow Root, https://w3c.github.io/webdriver/#find-element-from-shadow-root
-Messages::WebDriverClient::FindElementFromShadowRootResponse WebDriverConnection::find_element_from_shadow_root(JsonValue payload, String shadow_id)
+Web::WebDriver::Response WebDriverConnection::find_element_from_shadow_root(JsonValue payload, String shadow_id)
 {
     // 1. Let location strategy be the result of getting a property called "using".
     auto location_strategy_string = TRY(Web::WebDriver::get_property(payload, "using"sv));
@@ -1152,15 +1049,15 @@ Messages::WebDriverClient::FindElementFromShadowRootResponse WebDriverConnection
 
     // 6. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this, shadow_id, location_strategy, selector = move(selector)]() mutable {
-        auto get_start_node = GC::create_function(current_browsing_context().heap(), [this, shadow_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
+        auto get_start_node = GC::create_function(GC::Heap::the(), [this, shadow_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
             // 7. Let start node be the result of trying to get a known shadow root with session and URL variables["shadow id"].
             return Web::WebDriver::get_known_shadow_root(current_browsing_context(), shadow_id);
         });
 
         // 8. Let result be the value of trying to Find with session, start node, location strategy, and selector.
-        find(*location_strategy, move(selector), get_start_node, GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
+        find(*location_strategy, move(selector), get_start_node, GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
             // 9. If result is empty, return error with error code no such element. Otherwise, return the first element of result.
-            async_driver_execution_complete(extract_first_element(move(result)));
+            driver_execution_complete(extract_first_element(move(result)));
         }));
     });
 
@@ -1168,7 +1065,7 @@ Messages::WebDriverClient::FindElementFromShadowRootResponse WebDriverConnection
 }
 
 // 12.3.7 Find Elements From Shadow Root, https://w3c.github.io/webdriver/#find-elements-from-shadow-root
-Messages::WebDriverClient::FindElementsFromShadowRootResponse WebDriverConnection::find_elements_from_shadow_root(JsonValue payload, String shadow_id)
+Web::WebDriver::Response WebDriverConnection::find_elements_from_shadow_root(JsonValue payload, String shadow_id)
 {
     // 1. Let location strategy be the result of getting a property called "using".
     auto location_strategy_string = TRY(Web::WebDriver::get_property(payload, "using"sv));
@@ -1187,14 +1084,14 @@ Messages::WebDriverClient::FindElementsFromShadowRootResponse WebDriverConnectio
 
     // 6. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this, shadow_id, location_strategy, selector = move(selector)]() mutable {
-        auto get_start_node = GC::create_function(current_browsing_context().heap(), [this, shadow_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
+        auto get_start_node = GC::create_function(GC::Heap::the(), [this, shadow_id]() -> ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error> {
             // 7. Let start node be the result of trying to get a known shadow root with session and URL variables["shadow id"].
             return Web::WebDriver::get_known_shadow_root(current_browsing_context(), shadow_id);
         });
 
         // 8. Return the result of trying to Find with session, start node, location strategy, and selector.
-        find(*location_strategy, move(selector), get_start_node, GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
-            async_driver_execution_complete(move(result));
+        find(*location_strategy, move(selector), get_start_node, GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
+            driver_execution_complete(move(result));
         }));
     });
 
@@ -1202,7 +1099,7 @@ Messages::WebDriverClient::FindElementsFromShadowRootResponse WebDriverConnectio
 }
 
 // 12.3.8 Get Active Element, https://w3c.github.io/webdriver/#get-active-element
-Messages::WebDriverClient::GetActiveElementResponse WebDriverConnection::get_active_element()
+Web::WebDriver::Response WebDriverConnection::get_active_element()
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1216,18 +1113,18 @@ Messages::WebDriverClient::GetActiveElementResponse WebDriverConnection::get_act
         //    Otherwise, return error with error code no such element.
         if (active_element) {
             auto serialized = Web::WebDriver::web_element_reference_object(current_browsing_context(), *active_element);
-            async_driver_execution_complete({ move(serialized) });
+            driver_execution_complete({ move(serialized) });
             return;
         }
 
-        async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchElement, "The current document does not have an active element"sv));
+        driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchElement, "The current document does not have an active element"sv));
     });
 
     return JsonValue {};
 }
 
 // 12.3.9 Get Element Shadow Root, https://w3c.github.io/webdriver/#get-element-shadow-root
-Messages::WebDriverClient::GetElementShadowRootResponse WebDriverConnection::get_element_shadow_root(String element_id)
+Web::WebDriver::Response WebDriverConnection::get_element_shadow_root(String element_id)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1242,7 +1139,7 @@ Messages::WebDriverClient::GetElementShadowRootResponse WebDriverConnection::get
 
         // 5. If shadow root is null, return error with error code no such shadow root.
         if (!shadow_root) {
-            async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchShadowRoot, MUST(String::formatted("Element with ID '{}' does not have a shadow root", element_id))));
+            driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchShadowRoot, MUST(String::formatted("Element with ID '{}' does not have a shadow root", element_id))));
             return;
         }
 
@@ -1250,14 +1147,14 @@ Messages::WebDriverClient::GetElementShadowRootResponse WebDriverConnection::get
         auto serialized = Web::WebDriver::shadow_root_reference_object(current_browsing_context(), *shadow_root);
 
         // 7. Return success with data serialized.
-        async_driver_execution_complete({ move(serialized) });
+        driver_execution_complete({ move(serialized) });
     });
 
     return JsonValue {};
 }
 
 // 12.4.1 Is Element Selected, https://w3c.github.io/webdriver/#dfn-is-element-selected
-Messages::WebDriverClient::IsElementSelectedResponse WebDriverConnection::is_element_selected(String element_id)
+Web::WebDriver::Response WebDriverConnection::is_element_selected(String element_id)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1288,14 +1185,14 @@ Messages::WebDriverClient::IsElementSelectedResponse WebDriverConnection::is_ele
         //   -> False.
 
         // 5. Return success with data selected.
-        async_driver_execution_complete({ selected });
+        driver_execution_complete({ selected });
     });
 
     return JsonValue {};
 }
 
 // 12.4.2 Get Element Attribute, https://w3c.github.io/webdriver/#dfn-get-element-attribute
-Messages::WebDriverClient::GetElementAttributeResponse WebDriverConnection::get_element_attribute(String element_id, String name)
+Web::WebDriver::Response WebDriverConnection::get_element_attribute(String element_id, String name)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1309,28 +1206,30 @@ Messages::WebDriverClient::GetElementAttributeResponse WebDriverConnection::get_
         // 5. Let result be the result of the first matching condition:
         String result {};
 
+        auto const utf16_name = Utf16FlyString::from_utf8(name);
+
         // -> If name is a boolean attribute
-        if (Web::HTML::is_boolean_attribute(name)) {
+        if (Web::HTML::is_boolean_attribute(utf16_name)) {
             // "true" (string) if the element hasAttribute() with name, otherwise null.
-            if (element->has_attribute(name))
+            if (element->has_attribute(utf16_name))
                 result = "true"_string;
         }
         // -> Otherwise
         else {
             // The result of getting an attribute by name name.
-            if (auto attr = element->get_attribute(name); attr.has_value())
-                result = attr.release_value();
+            if (auto attr = element->get_attribute(utf16_name); attr.has_value())
+                result = attr.release_value().to_utf8();
         }
 
         // 5. Return success with data result.
-        async_driver_execution_complete({ move(result) });
+        driver_execution_complete({ move(result) });
     });
 
     return JsonValue {};
 }
 
 // 12.4.3 Get Element Property, https://w3c.github.io/webdriver/#dfn-get-element-property
-Messages::WebDriverClient::GetElementPropertyResponse WebDriverConnection::get_element_property(String element_id, String name)
+Web::WebDriver::Response WebDriverConnection::get_element_property(String element_id, String name)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1344,9 +1243,11 @@ Messages::WebDriverClient::GetElementPropertyResponse WebDriverConnection::get_e
 
         // 4. Let name URL variables["name"].
         // 5. Let property be the result of calling the Object.[[GetProperty]](name) on element.
-        Web::HTML::TemporaryExecutionContext execution_context { current_browsing_context().active_document()->realm() };
+        Web::HTML::TemporaryExecutionContext execution_context { current_browsing_context().active_document()->relevant_settings_object() };
 
-        if (auto property_or_error = element->get(Utf16FlyString::from_utf8(name)); !property_or_error.is_throw_completion()) {
+        auto& realm = Web::HTML::relevant_realm(*current_browsing_context().active_document());
+        auto wrapped_element = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, element);
+        if (auto property_or_error = wrapped_element->get(Utf16FlyString::from_utf8(name)); !property_or_error.is_throw_completion()) {
             auto property = property_or_error.release_value();
 
             // 6. Let result be the value of property if not undefined, or null.
@@ -1355,14 +1256,14 @@ Messages::WebDriverClient::GetElementPropertyResponse WebDriverConnection::get_e
         }
 
         // 7. Return success with data result.
-        async_driver_execution_complete(move(result));
+        driver_execution_complete(move(result));
     });
 
     return JsonValue {};
 }
 
 // 12.4.4 Get Element CSS Value, https://w3c.github.io/webdriver/#dfn-get-element-css-value
-Messages::WebDriverClient::GetElementCssValueResponse WebDriverConnection::get_element_css_value(String element_id, String name)
+Web::WebDriver::Response WebDriverConnection::get_element_css_value(String element_id, String name)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1380,12 +1281,14 @@ Messages::WebDriverClient::GetElementCssValueResponse WebDriverConnection::get_e
             document->update_style();
 
             // computed value of parameter URL variables["property name"] from element's style declarations.
-            if (auto property = Web::CSS::PropertyNameAndID::from_name(name); property.has_value()) {
+            if (auto property = Web::CSS::PropertyNameAndID::from_name(Utf16FlyString::from_utf8(name)); property.has_value()) {
                 if (property->is_custom_property()) {
-                    if (auto style_property = element->custom_properties({}).get(property->name()); style_property.has_value())
-                        computed_value = style_property->value->to_string(Web::CSS::SerializationMode::Normal);
-                } else if (auto computed_properties = element->computed_properties()) {
-                    computed_value = computed_properties->property(property->id()).to_string(Web::CSS::SerializationMode::Normal);
+                    if (auto data = element->custom_property_data({}); data) {
+                        if (auto const* style_property = data->get(property->name()))
+                            computed_value = style_property->value->to_string(Web::CSS::SerializationMode::Normal);
+                    }
+                } else if (auto computed_values = element->computed_style()) {
+                    computed_value = computed_values->computed_style_value(property->id())->to_string(Web::CSS::SerializationMode::Normal);
                 }
             }
         }
@@ -1393,14 +1296,14 @@ Messages::WebDriverClient::GetElementCssValueResponse WebDriverConnection::get_e
         //     "" (empty string)
 
         // 5. Return success with data computed value.
-        async_driver_execution_complete({ move(computed_value) });
+        driver_execution_complete({ move(computed_value) });
     });
 
     return JsonValue {};
 }
 
 // 12.4.5 Get Element Text, https://w3c.github.io/webdriver/#dfn-get-element-text
-Messages::WebDriverClient::GetElementTextResponse WebDriverConnection::get_element_text(String element_id)
+Web::WebDriver::Response WebDriverConnection::get_element_text(String element_id)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1415,14 +1318,14 @@ Messages::WebDriverClient::GetElementTextResponse WebDriverConnection::get_eleme
         auto rendered_text = Web::WebDriver::element_rendered_text(element);
 
         // 5. Return success with data rendered text.
-        async_driver_execution_complete({ move(rendered_text) });
+        driver_execution_complete({ move(rendered_text) });
     });
 
     return JsonValue {};
 }
 
 // 12.4.6 Get Element Tag Name, https://w3c.github.io/webdriver/#dfn-get-element-tag-name
-Messages::WebDriverClient::GetElementTagNameResponse WebDriverConnection::get_element_tag_name(String element_id)
+Web::WebDriver::Response WebDriverConnection::get_element_tag_name(String element_id)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1438,14 +1341,14 @@ Messages::WebDriverClient::GetElementTagNameResponse WebDriverConnection::get_el
         auto qualified_name = element->local_name();
 
         // 5. Return success with data qualified name.
-        async_driver_execution_complete({ qualified_name.to_string() });
+        driver_execution_complete({ qualified_name.view().to_utf8_but_should_be_ported_to_utf16() });
     });
 
     return JsonValue {};
 }
 
 // 12.4.7 Get Element Rect, https://w3c.github.io/webdriver/#dfn-get-element-rect
-Messages::WebDriverClient::GetElementRectResponse WebDriverConnection::get_element_rect(String element_id)
+Web::WebDriver::Response WebDriverConnection::get_element_rect(String element_id)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1471,14 +1374,14 @@ Messages::WebDriverClient::GetElementRectResponse WebDriverConnection::get_eleme
         auto body = serialize_rect(rect);
 
         // 7. Return success with data body.
-        async_driver_execution_complete(move(body));
+        driver_execution_complete(move(body));
     });
 
     return JsonValue {};
 }
 
 // 12.4.8 Is Element Enabled, https://w3c.github.io/webdriver/#dfn-is-element-enabled
-Messages::WebDriverClient::IsElementEnabledResponse WebDriverConnection::is_element_enabled(String element_id)
+Web::WebDriver::Response WebDriverConnection::is_element_enabled(String element_id)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1498,17 +1401,17 @@ Messages::WebDriverClient::IsElementEnabledResponse WebDriverConnection::is_elem
         }
 
         // 7. Return success with data enabled.
-        async_driver_execution_complete({ enabled });
+        driver_execution_complete({ enabled });
     });
 
     return JsonValue {};
 }
 
 // 12.4.9 Get Computed Role, https://w3c.github.io/webdriver/#dfn-get-computed-role
-Messages::WebDriverClient::GetComputedRoleResponse WebDriverConnection::get_computed_role(String element_id)
+Web::WebDriver::Response WebDriverConnection::get_computed_role(String element_id)
 {
-    // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
-    TRY(ensure_current_top_level_browsing_context_is_open());
+    // 1. If session's current browsing context is no longer open, return error with error code no such window.
+    TRY(ensure_current_browsing_context_is_open());
 
     // 2. Handle any user prompts and return its value if it is an error.
     handle_any_user_prompts([this, element_id = move(element_id)]() {
@@ -1520,17 +1423,17 @@ Messages::WebDriverClient::GetComputedRoleResponse WebDriverConnection::get_comp
 
         // 5. Return success with data role.
         if (role.has_value()) {
-            async_driver_execution_complete({ Web::ARIA::role_name(*role) });
+            driver_execution_complete({ Web::ARIA::role_name(*role).to_utf8() });
             return;
         }
-        async_driver_execution_complete(JsonValue {});
+        driver_execution_complete(JsonValue {});
     });
 
     return JsonValue {};
 }
 
 // 12.4.10 Get Computed Label, https://w3c.github.io/webdriver/#get-computed-label
-Messages::WebDriverClient::GetComputedLabelResponse WebDriverConnection::get_computed_label(String element_id)
+Web::WebDriver::Response WebDriverConnection::get_computed_label(String element_id)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1544,14 +1447,14 @@ Messages::WebDriverClient::GetComputedLabelResponse WebDriverConnection::get_com
         auto label = element->accessible_name(element->document()).release_value_but_fixme_should_propagate_errors();
 
         // 5. Return success with data label.
-        async_driver_execution_complete({ move(label) });
+        driver_execution_complete({ label.to_utf8() });
     });
 
     return JsonValue {};
 }
 
 // 12.5.1 Element Click, https://w3c.github.io/webdriver/#element-click
-Messages::WebDriverClient::ElementClickResponse WebDriverConnection::element_click(String element_id)
+Web::WebDriver::Response WebDriverConnection::element_click(String element_id)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -1593,7 +1496,7 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
     if (Web::WebDriver::is_element_obscured(paint_tree, *element_container))
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::ElementClickIntercepted, "Element is obscured by another element"sv);
 
-    auto on_complete = GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
+    auto on_complete = GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
         // 9. Wait until the user agent event loop has spun enough times to process the DOM events generated by the
         //    previous step.
         m_action_executor = nullptr;
@@ -1601,12 +1504,12 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
         // FIXME: 10. Perform implementation-defined steps to allow any navigations triggered by the click to start.
 
         // 11. Try to wait for navigation to complete.
-        wait_for_navigation_to_complete(GC::create_function(current_browsing_context().heap(), [this, result = move(result)](Web::WebDriver::Response navigation_result) mutable {
+        wait_for_navigation_to_complete(GC::create_function(GC::Heap::the(), [this, result = move(result)](Web::WebDriver::Response navigation_result) mutable {
             WEBDRIVER_TRY(navigation_result);
 
             // FIXME: 12. Try to run the post-navigation checks.
 
-            async_driver_execution_complete(move(result));
+            driver_execution_complete(move(result));
         }));
     });
 
@@ -1660,7 +1563,7 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
         // 8. Fire a click event at parent node.
         fire_an_event<Web::UIEvents::MouseEvent>(Web::UIEvents::EventNames::click, parent_node);
 
-        Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(current_browsing_context().heap(), [on_complete]() {
+        Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(GC::Heap::the(), [on_complete]() {
             on_complete->function()(JsonValue {});
         }));
     }
@@ -1668,7 +1571,7 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
     else {
         // 1. Let input state be the result of get the input state given current session and current top-level
         //    browsing context.
-        auto& input_state = Web::WebDriver::get_input_state(*current_top_level_browsing_context());
+        auto& input_state = Web::WebDriver::get_input_state(m_page_client->page().top_level_traversable());
 
         // 2. Let actions options be a new actions options with the is element origin steps set to represents a web
         //    element, and the get element origin steps set to get a WebElement origin.
@@ -1678,7 +1581,7 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
         };
 
         // 3. Let input id be a the result of generating a UUID.
-        auto input_id = MUST(Web::Crypto::generate_random_uuid());
+        auto input_id = Web::Crypto::generate_random_uuid();
 
         // 4. Let source be the result of create an input source with input state, and "pointer".
         auto source = Web::WebDriver::create_input_source(input_state, Web::WebDriver::InputSourceType::Pointer, Web::WebDriver::PointerInputSource::Subtype::Mouse);
@@ -1718,7 +1621,7 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
         Vector actions { move(pointer_move_action), move(pointer_down_action), move(pointer_up_action) };
 
         // 16. Dispatch a list of actions with input state, actions, current browsing context, and actions options.
-        m_action_executor = Web::WebDriver::dispatch_list_of_actions(input_state, move(actions), current_browsing_context(), move(actions_options), GC::create_function(current_browsing_context().heap(), [on_complete, &input_state, input_id = move(input_id)](Web::WebDriver::Response result) {
+        m_action_executor = Web::WebDriver::dispatch_list_of_actions(input_state, move(actions), current_browsing_context(), move(actions_options), GC::create_function(GC::Heap::the(), [on_complete, &input_state, input_id = move(input_id)](Web::WebDriver::Response result) {
             // 17. Remove an input source with input state and input id.
             Web::WebDriver::remove_input_source(input_state, input_id);
 
@@ -1731,14 +1634,14 @@ Web::WebDriver::Response WebDriverConnection::element_click_impl(StringView elem
 }
 
 // 12.5.2 Element Clear, https://w3c.github.io/webdriver/#dfn-element-clear
-Messages::WebDriverClient::ElementClearResponse WebDriverConnection::element_clear(String element_id)
+Web::WebDriver::Response WebDriverConnection::element_clear(String element_id)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
 
     // 2. Try to handle any user prompts with session.
     handle_any_user_prompts([this, element_id = move(element_id)]() {
-        async_driver_execution_complete(element_clear_impl(element_id));
+        driver_execution_complete(element_clear_impl(element_id));
     });
 
     return JsonValue {};
@@ -1756,7 +1659,7 @@ Web::WebDriver::Response WebDriverConnection::element_clear_impl(StringView elem
         Web::HTML::run_focusing_steps(&element);
 
         // 3. Set element's innerHTML IDL attribute to an empty string.
-        (void)element.set_inner_html({});
+        (void)element.set_inner_html(""_utf16);
 
         // 4. Run the unfocusing steps for the element.
         Web::HTML::run_unfocusing_steps(&element);
@@ -1779,7 +1682,7 @@ Web::WebDriver::Response WebDriverConnection::element_clear_impl(StringView elem
 
             // -> otherwise
             //    True if its value IDL attribute is an empty string, and false otherwise.
-            return form_associated_element.value().is_empty();
+            return form_associated_element.form_value().is_empty();
         }();
 
         // 2. If element is a candidate for constraint validation it satisfies its constraints, and empty is true,
@@ -1842,7 +1745,7 @@ Web::WebDriver::Response WebDriverConnection::element_clear_impl(StringView elem
 }
 
 // 12.5.3 Element Send Keys, https://w3c.github.io/webdriver/#dfn-element-send-keys
-Messages::WebDriverClient::ElementSendKeysResponse WebDriverConnection::element_send_keys(String element_id, JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::element_send_keys(String element_id, JsonValue payload)
 {
     // 1. Let text be the result of getting a property named "text" from parameters.
     // 2. If text is not a String, return an error with error code invalid argument.
@@ -1885,7 +1788,7 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
             return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::ElementNotInteractable, "Element is not keyboard-interactable"sv);
 
         // 7. If element is not the active element run the focusing steps for the element.
-        if (!element->is_active())
+        if (!element->is_the_active_element())
             Web::HTML::run_focusing_steps(element);
     }
 
@@ -1912,34 +1815,43 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
         // 5. Verify that each file given by the user exists. If any do not, return error with error code invalid argument.
         // 6. Complete implementation specific steps equivalent to setting the selected files on the input element. If
         //    multiple is true files are be appended to element's selected files.
-        auto create_selected_file = [](auto const& path) -> ErrorOr<Web::HTML::SelectedFile> {
-            auto file = TRY(Core::File::open(path, Core::File::OpenMode::Read));
-            auto contents = TRY(file->read_until_eof());
+        // NB: Each file is opened in the unsandboxed UI process, because the WebContent sandbox blocks this
+        //     process from opening arbitrary paths.
+        auto read_files_and_apply_selection = [connection = this, input_element = GC::make_root(input_element)](this auto const& self, Vector<String> paths, size_t index, Vector<Web::HTML::SelectedFile> selected_files) -> void {
+            if (index < paths.size()) {
+                auto path = paths[index].to_byte_string();
 
-            return Web::HTML::SelectedFile { LexicalPath::basename(path), move(contents) };
+                Web::FileRequest file_request(path, [connection, self, paths = move(paths), index, selected_files = move(selected_files), path](ErrorOr<i32> file_descriptor_or_error) mutable {
+                    auto contents_or_error = [&]() -> ErrorOr<ByteBuffer> {
+                        auto opened_file = TRY(Core::File::adopt_fd(TRY(file_descriptor_or_error), Core::File::OpenMode::Read));
+                        return opened_file->read_until_eof();
+                    }();
+
+                    if (contents_or_error.is_error()) {
+                        connection->driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, MUST(String::formatted("'{}' does not exist", path))));
+                        return;
+                    }
+
+                    selected_files.append(Web::HTML::SelectedFile {
+                        Utf16String::from_utf8(LexicalPath::basename(path)),
+                        contents_or_error.release_value() });
+                    self(move(paths), index + 1, move(selected_files));
+                });
+
+                connection->current_browsing_context().page().client().request_file(move(file_request));
+                return;
+            }
+
+            input_element->did_select_files(selected_files, Web::HTML::HTMLInputElement::MultipleHandling::Append);
+
+            // 7. Fire these events in order on element:
+            //     1. input
+            //     2. change
+            // NOTE: These events are fired synchronously by `did_select_files`.
+            connection->driver_execution_complete(JsonValue {});
         };
 
-        Vector<Web::HTML::SelectedFile> selected_files;
-        selected_files.ensure_capacity(files.size());
-
-        for (auto const& path : files) {
-            auto selected_file = create_selected_file(path.bytes_as_string_view());
-            if (selected_file.is_error())
-                return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, MUST(String::formatted("'{}' does not exist", path)));
-
-            selected_files.unchecked_append(selected_file.release_value());
-        }
-
-        input_element.did_select_files(selected_files, Web::HTML::HTMLInputElement::MultipleHandling::Append);
-
-        // 7. Fire these events in order on element:
-        //     1. input
-        //     2. change
-        // NOTE: These events are fired by `did_select_files` as an element task. So instead of firing them here, we spin
-        //       the event loop once before informing the client that the action is complete.
-        Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(current_browsing_context().heap(), [this]() {
-            async_driver_execution_complete(JsonValue {});
-        }));
+        read_files_and_apply_selection(move(files), 0, {});
 
         // 8. Return success with data null.
         return JsonValue {};
@@ -1953,7 +1865,7 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
         auto& input_element = static_cast<Web::HTML::HTMLInputElement&>(*element);
 
         // 2. If element is not mutable return an error with error code element not interactable.
-        if (input_element.is_mutable())
+        if (!input_element.is_mutable())
             return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::ElementNotInteractable, "Element is immutable"sv);
 
         // 3. Set a property value to text on element.
@@ -1962,7 +1874,7 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
         // FIXME: 4. If element is suffering from bad input return an error with error code invalid argument.
 
         // 5. Return success with data null.
-        async_driver_execution_complete(JsonValue {});
+        driver_execution_complete(JsonValue {});
         return JsonValue {};
     }
     // -> element is content editable
@@ -1994,10 +1906,10 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
     }
 
     // 9. Let input state be the result of get the input state with session and session's current top-level browsing context.
-    auto& input_state = Web::WebDriver::get_input_state(*current_top_level_browsing_context());
+    auto& input_state = Web::WebDriver::get_input_state(m_page_client->page().top_level_traversable());
 
     // 10. Let input id be a the result of generating a UUID.
-    auto input_id = MUST(Web::Crypto::generate_random_uuid());
+    auto input_id = Web::Crypto::generate_random_uuid();
 
     // 11. Let source be the result of create an input source with input state, and "key".
     auto source = Web::WebDriver::create_input_source(input_state, Web::WebDriver::InputSourceType::Key, {});
@@ -2006,13 +1918,13 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
     Web::WebDriver::add_input_source(input_state, input_id, move(source));
 
     // 13. Dispatch actions for a string with arguments input state, input id, and source, text, and session's current browsing context.
-    m_action_executor = Web::WebDriver::dispatch_actions_for_a_string(input_state, input_id, source, text, current_browsing_context(), GC::create_function(current_browsing_context().heap(), [this, &input_state, input_id](Web::WebDriver::Response result) {
+    m_action_executor = Web::WebDriver::dispatch_actions_for_a_string(input_state, input_id, source, text, current_browsing_context(), GC::create_function(GC::Heap::the(), [this, &input_state, input_id](Web::WebDriver::Response result) {
         m_action_executor = nullptr;
 
         // 14. Remove an input source with input state and input id.
         Web::WebDriver::remove_input_source(input_state, input_id);
 
-        async_driver_execution_complete(move(result));
+        driver_execution_complete(move(result));
     }));
 
     // 15. Return success with data null.
@@ -2020,7 +1932,7 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
 }
 
 // 13.1 Get Page Source, https://w3c.github.io/webdriver/#dfn-get-page-source
-Messages::WebDriverClient::GetSourceResponse WebDriverConnection::get_source()
+Web::WebDriver::Response WebDriverConnection::get_source()
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2028,7 +1940,7 @@ Messages::WebDriverClient::GetSourceResponse WebDriverConnection::get_source()
     // 2. Try to handle any user prompts with session.
     handle_any_user_prompts([this]() {
         auto* document = current_browsing_context().active_document();
-        Optional<String> source;
+        Optional<Utf16String> source;
 
         // 3. Let source be the result of invoking the fragment serializing algorithm on a fictional node whose only
         //    child is the document element providing true for the require well-formed flag. If this causes an exception
@@ -2042,20 +1954,17 @@ Messages::WebDriverClient::GetSourceResponse WebDriverConnection::get_source()
             source = MUST(document->serialize_fragment(Web::HTML::RequireWellFormed::No));
 
         // 5. Return success with data source.
-        async_driver_execution_complete({ source.release_value() });
+        driver_execution_complete({ source.release_value().to_utf8_but_should_be_ported_to_utf16() });
     });
 
     return JsonValue {};
 }
 
 // 13.2.1 Execute Script, https://w3c.github.io/webdriver/#dfn-execute-script
-Messages::WebDriverClient::ExecuteScriptResponse WebDriverConnection::execute_script(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::execute_script(JsonValue payload)
 {
-    auto* window = current_browsing_context().active_window();
-    auto& vm = window->vm();
-
     // 1. Let body and arguments be the result of trying to extract the script arguments from a request with argument parameters.
-    auto [body, arguments] = TRY(extract_the_script_arguments_from_a_request(vm, payload));
+    auto [body, arguments] = TRY(extract_the_script_arguments_from_a_request(payload));
 
     // 2. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2069,7 +1978,7 @@ Messages::WebDriverClient::ExecuteScriptResponse WebDriverConnection::execute_sc
         auto timeout_ms = m_timeouts_configuration.script_timeout;
 
         // This handles steps 5 to 9 and produces the appropriate result type for the following steps.
-        Web::WebDriver::execute_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(current_browsing_context().heap(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
+        Web::WebDriver::execute_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(GC::Heap::the(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
             dbgln_if(WEBDRIVER_DEBUG, "Executing script returned: {}", result.value);
             handle_script_response(result, script_execution_id);
         }));
@@ -2079,13 +1988,10 @@ Messages::WebDriverClient::ExecuteScriptResponse WebDriverConnection::execute_sc
 }
 
 // 13.2.2 Execute Async Script, https://w3c.github.io/webdriver/#dfn-execute-async-script
-Messages::WebDriverClient::ExecuteAsyncScriptResponse WebDriverConnection::execute_async_script(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::execute_async_script(JsonValue payload)
 {
-    auto* window = current_browsing_context().active_window();
-    auto& vm = window->vm();
-
     // 1. Let body and arguments by the result of trying to extract the script arguments from a request with argument parameters.
-    auto [body, arguments] = TRY(extract_the_script_arguments_from_a_request(vm, payload));
+    auto [body, arguments] = TRY(extract_the_script_arguments_from_a_request(payload));
 
     // 2. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2099,7 +2005,7 @@ Messages::WebDriverClient::ExecuteAsyncScriptResponse WebDriverConnection::execu
         auto timeout_ms = m_timeouts_configuration.script_timeout;
 
         // This handles steps 5 to 9 and produces the appropriate result type for the following steps.
-        Web::WebDriver::execute_async_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(current_browsing_context().heap(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
+        Web::WebDriver::execute_async_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(GC::Heap::the(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
             dbgln_if(WEBDRIVER_DEBUG, "Executing async script returned: {}", result.value);
             handle_script_response(result, script_execution_id);
         }));
@@ -2137,11 +2043,11 @@ void WebDriverConnection::handle_script_response(Web::WebDriver::ExecutionResult
         VERIFY_NOT_REACHED();
     }();
 
-    async_driver_execution_complete(move(response));
+    driver_execution_complete(move(response));
 }
 
 // 14.1 Get All Cookies, https://w3c.github.io/webdriver/#dfn-get-all-cookies
-Messages::WebDriverClient::GetAllCookiesResponse WebDriverConnection::get_all_cookies()
+Web::WebDriver::Response WebDriverConnection::get_all_cookies()
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2163,14 +2069,14 @@ Messages::WebDriverClient::GetAllCookiesResponse WebDriverConnection::get_all_co
         }
 
         // 5. Return success with data cookies.
-        async_driver_execution_complete({ move(cookies) });
+        driver_execution_complete({ move(cookies) });
     });
 
     return JsonValue {};
 }
 
 // 14.2 Get Named Cookie, https://w3c.github.io/webdriver/#dfn-get-named-cookie
-Messages::WebDriverClient::GetNamedCookieResponse WebDriverConnection::get_named_cookie(String name)
+Web::WebDriver::Response WebDriverConnection::get_named_cookie(String name)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2182,19 +2088,19 @@ Messages::WebDriverClient::GetNamedCookieResponse WebDriverConnection::get_named
 
         if (auto cookie = current_browsing_context().page().client().page_did_request_named_cookie(document->url(), name); cookie.has_value()) {
             auto serialized_cookie = serialize_cookie(*cookie);
-            async_driver_execution_complete(move(serialized_cookie));
+            driver_execution_complete(move(serialized_cookie));
             return;
         }
 
         // 4. Otherwise, return error with error code no such cookie.
-        async_driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchCookie, MUST(String::formatted("Cookie '{}' not found", name))));
+        driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchCookie, MUST(String::formatted("Cookie '{}' not found", name))));
     });
 
     return JsonValue {};
 }
 
 // 14.3 Add Cookie, https://w3c.github.io/webdriver/#dfn-adding-a-cookie
-Messages::WebDriverClient::AddCookieResponse WebDriverConnection::add_cookie(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::add_cookie(JsonValue payload)
 {
     // 1. Let data be the result of getting a property named cookie from the parameters argument.
     auto const& data = *TRY(Web::WebDriver::get_property<JsonObject const*>(payload, "cookie"sv));
@@ -2207,7 +2113,7 @@ Messages::WebDriverClient::AddCookieResponse WebDriverConnection::add_cookie(Jso
 
     // 4. Handle any user prompts, and return its value if it is an error.
     handle_any_user_prompts([this, data = move(const_cast<JsonObject&>(data))]() {
-        async_driver_execution_complete(add_cookie_impl(data));
+        driver_execution_complete(add_cookie_impl(data));
     });
 
     return JsonValue {};
@@ -2229,7 +2135,7 @@ Web::WebDriver::Response WebDriverConnection::add_cookie_impl(JsonObject const& 
     // NOTE: This validation is either performed in subsequent steps.
 
     // 7. Create a cookie in the cookie store associated with the active document’s address using cookie name name, cookie value value, and an attribute-value list of the following cookie concepts listed in the table for cookie conversion from data:
-    Web::Cookie::ParsedCookie cookie {};
+    HTTP::Cookie::ParsedCookie cookie {};
     cookie.name = TRY(Web::WebDriver::get_property(data, "name"sv));
     cookie.value = TRY(Web::WebDriver::get_property(data, "value"sv));
 
@@ -2244,12 +2150,20 @@ Web::WebDriver::Response WebDriverConnection::add_cookie_impl(JsonObject const& 
     //     The value if the entry exists, otherwise the current browsing context’s active document’s URL domain.
     // NOTE: The otherwise case is handled by the CookieJar
     if (data.has("domain"sv)) {
-        cookie.domain = TRY(Web::WebDriver::get_property(data, "domain"sv));
+        auto domain = TRY(Web::WebDriver::get_property(data, "domain"sv));
+
+        // NB: Clients conventionally send parent-domain cookies with a leading '.', which the Set-Cookie parser
+        //     would strip. Strip it here as well, since the cookie store never sees a leading dot.
+        if (domain.starts_with_bytes("."sv))
+            domain = MUST(domain.substring_from_byte_offset(1));
 
         // FIXME: Spec issue: We must return InvalidCookieDomain for invalid domains, rather than InvalidArgument.
         // https://github.com/w3c/webdriver/issues/1570
-        if (!Web::Cookie::domain_matches(*cookie.domain, document->domain()))
+        auto document_domain = document->domain().to_utf8();
+        if (!HTTP::Cookie::domain_matches(document_domain, domain))
             return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidCookieDomain, "Cookie domain does not match document domain"sv);
+
+        cookie.domain = move(domain);
     }
 
     // Cookie secure only
@@ -2273,13 +2187,13 @@ Web::WebDriver::Response WebDriverConnection::add_cookie_impl(JsonObject const& 
     //     The value if the entry exists, otherwise leave unset to indicate that no same site policy is defined.
     if (data.has("sameSite"sv)) {
         auto same_site = TRY(Web::WebDriver::get_property(data, "sameSite"sv));
-        cookie.same_site_attribute = Web::Cookie::same_site_from_string(same_site);
+        cookie.same_site_attribute = HTTP::Cookie::same_site_from_string(same_site);
 
-        if (cookie.same_site_attribute == Web::Cookie::SameSite::Default)
+        if (cookie.same_site_attribute == HTTP::Cookie::SameSite::Default)
             return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Invalid same-site attribute"sv);
     }
 
-    current_browsing_context().page().client().page_did_set_cookie(document->url(), cookie, Web::Cookie::Source::Http);
+    current_browsing_context().page().client().page_did_set_cookie({}, document->url(), cookie, HTTP::Cookie::Source::Http);
 
     // If there is an error during this step, return error with error code unable to set cookie.
     // NOTE: This probably should only apply to the actual setting of the cookie in the Browser, which cannot fail in our case.
@@ -2289,7 +2203,7 @@ Web::WebDriver::Response WebDriverConnection::add_cookie_impl(JsonObject const& 
 }
 
 // 14.4 Delete Cookie, https://w3c.github.io/webdriver/#dfn-delete-cookie
-Messages::WebDriverClient::DeleteCookieResponse WebDriverConnection::delete_cookie(String name)
+Web::WebDriver::Response WebDriverConnection::delete_cookie(String name)
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2300,14 +2214,14 @@ Messages::WebDriverClient::DeleteCookieResponse WebDriverConnection::delete_cook
         delete_cookies(name);
 
         // 4. Return success with data null.
-        async_driver_execution_complete(JsonValue {});
+        driver_execution_complete(JsonValue {});
     });
 
     return JsonValue {};
 }
 
 // 14.5 Delete All Cookies, https://w3c.github.io/webdriver/#dfn-delete-all-cookies
-Messages::WebDriverClient::DeleteAllCookiesResponse WebDriverConnection::delete_all_cookies()
+Web::WebDriver::Response WebDriverConnection::delete_all_cookies()
 {
     // 1. If the current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2318,14 +2232,14 @@ Messages::WebDriverClient::DeleteAllCookiesResponse WebDriverConnection::delete_
         delete_cookies();
 
         // 4. Return success with data null.
-        async_driver_execution_complete(JsonValue {});
+        driver_execution_complete(JsonValue {});
     });
 
     return JsonValue {};
 }
 
 // 15.7 Perform Actions, https://w3c.github.io/webdriver/#perform-actions
-Messages::WebDriverClient::PerformActionsResponse WebDriverConnection::perform_actions(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::perform_actions(JsonValue payload)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2333,7 +2247,7 @@ Messages::WebDriverClient::PerformActionsResponse WebDriverConnection::perform_a
     // 2. Try to handle any user prompts with session.
     handle_any_user_prompts([this, payload = move(payload)]() {
         // 3. Let input state be the result of get the input state with session and session's current top-level browsing context.
-        auto& input_state = Web::WebDriver::get_input_state(*current_top_level_browsing_context());
+        auto& input_state = Web::WebDriver::get_input_state(m_page_client->page().top_level_traversable());
 
         // 4. Let actions options be a new actions options with the is element origin steps set to represents a web element,
         //    and the get element origin steps set to get a WebElement origin.
@@ -2348,9 +2262,9 @@ Messages::WebDriverClient::PerformActionsResponse WebDriverConnection::perform_a
 
         // 6. Dispatch actions with input state, actions by tick, current browsing context, and actions options. If this
         //    results in an error return that error.
-        auto on_complete = GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
+        auto on_complete = GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
             m_action_executor = nullptr;
-            async_driver_execution_complete(move(result));
+            driver_execution_complete(move(result));
         });
 
         m_action_executor = Web::WebDriver::dispatch_actions(input_state, move(actions_by_tick), current_browsing_context(), move(actions_options), on_complete);
@@ -2361,7 +2275,7 @@ Messages::WebDriverClient::PerformActionsResponse WebDriverConnection::perform_a
 }
 
 // 15.8 Release Actions, https://w3c.github.io/webdriver/#release-actions
-Messages::WebDriverClient::ReleaseActionsResponse WebDriverConnection::release_actions()
+Web::WebDriver::Response WebDriverConnection::release_actions()
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2369,7 +2283,7 @@ Messages::WebDriverClient::ReleaseActionsResponse WebDriverConnection::release_a
     // 2. Try to handle any user prompts with session.
     handle_any_user_prompts([this]() {
         // 3. Let input state be the result of get the input state with session and current top-level browsing context.
-        auto& input_state = Web::WebDriver::get_input_state(*current_top_level_browsing_context());
+        auto& input_state = Web::WebDriver::get_input_state(m_page_client->page().top_level_traversable());
 
         // 4. Let actions options be a new actions options with the is element origin steps set to represents a web element,
         //    and the get element origin steps set to get a WebElement origin.
@@ -2391,13 +2305,13 @@ Messages::WebDriverClient::ReleaseActionsResponse WebDriverConnection::release_a
         undo_actions.reverse();
 
         // 7. Try to dispatch actions with input state, undo actions, current browsing context, and actions options.
-        auto on_complete = GC::create_function(current_browsing_context().heap(), [this](Web::WebDriver::Response result) {
+        auto on_complete = GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response result) {
             m_action_executor = nullptr;
 
             // 8. Reset the input state with session and session's current top-level browsing context.
-            Web::WebDriver::reset_input_state(*current_top_level_browsing_context());
+            Web::WebDriver::reset_input_state(m_page_client->page().top_level_traversable());
 
-            async_driver_execution_complete(move(result));
+            driver_execution_complete(move(result));
         });
 
         m_action_executor = Web::WebDriver::dispatch_actions(input_state, { move(undo_actions) }, current_browsing_context(), move(actions_options), on_complete);
@@ -2408,7 +2322,7 @@ Messages::WebDriverClient::ReleaseActionsResponse WebDriverConnection::release_a
 }
 
 // 16.1 Dismiss Alert, https://w3c.github.io/webdriver/#dismiss-alert
-Messages::WebDriverClient::DismissAlertResponse WebDriverConnection::dismiss_alert()
+Web::WebDriver::Response WebDriverConnection::dismiss_alert()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -2418,8 +2332,8 @@ Messages::WebDriverClient::DismissAlertResponse WebDriverConnection::dismiss_ale
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchAlert, "No user dialog is currently open"sv);
 
     // 3. Dismiss the current user prompt.
-    current_browsing_context().page().dismiss_dialog(GC::create_function(current_browsing_context().heap(), [this]() {
-        async_driver_execution_complete(JsonValue {});
+    current_browsing_context().page().dismiss_dialog(GC::create_function(GC::Heap::the(), [this]() {
+        driver_execution_complete(JsonValue {});
     }));
 
     // 4. Return success with data null.
@@ -2427,7 +2341,7 @@ Messages::WebDriverClient::DismissAlertResponse WebDriverConnection::dismiss_ale
 }
 
 // 16.2 Accept Alert, https://w3c.github.io/webdriver/#accept-alert
-Messages::WebDriverClient::AcceptAlertResponse WebDriverConnection::accept_alert()
+Web::WebDriver::Response WebDriverConnection::accept_alert()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -2437,8 +2351,8 @@ Messages::WebDriverClient::AcceptAlertResponse WebDriverConnection::accept_alert
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchAlert, "No user dialog is currently open"sv);
 
     // 3. Accept the current user prompt.
-    current_browsing_context().page().accept_dialog(GC::create_function(current_browsing_context().heap(), [this]() {
-        async_driver_execution_complete(JsonValue {});
+    current_browsing_context().page().accept_dialog(GC::create_function(GC::Heap::the(), [this]() {
+        driver_execution_complete(JsonValue {});
     }));
 
     // 4. Return success with data null.
@@ -2446,7 +2360,7 @@ Messages::WebDriverClient::AcceptAlertResponse WebDriverConnection::accept_alert
 }
 
 // 16.3 Get Alert Text, https://w3c.github.io/webdriver/#get-alert-text
-Messages::WebDriverClient::GetAlertTextResponse WebDriverConnection::get_alert_text()
+Web::WebDriver::Response WebDriverConnection::get_alert_text()
 {
     // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -2460,12 +2374,12 @@ Messages::WebDriverClient::GetAlertTextResponse WebDriverConnection::get_alert_t
 
     // 4. Return success with data message.
     if (message.has_value())
-        return message.value();
+        return JsonValue { message->to_utf8() };
     return JsonValue {};
 }
 
 // 16.4 Send Alert Text, https://w3c.github.io/webdriver/#send-alert-text
-Messages::WebDriverClient::SendAlertTextResponse WebDriverConnection::send_alert_text(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::send_alert_text(JsonValue payload)
 {
     // 1. Let text be the result of getting the property "text" from parameters.
     // 2. If text is not a String, return error with error code invalid argument.
@@ -2499,14 +2413,14 @@ Messages::WebDriverClient::SendAlertTextResponse WebDriverConnection::send_alert
     }
 
     // 6. Perform user agent dependent steps to set the value of current user prompt’s text field to text.
-    current_browsing_context().page().client().page_did_request_set_prompt_text(text);
+    current_browsing_context().page().client().page_did_request_set_prompt_text(Utf16String::from_utf8(text));
 
     // 7. Return success with data null.
     return JsonValue {};
 }
 
 // 17.1 Take Screenshot, https://w3c.github.io/webdriver/#take-screenshot
-Messages::WebDriverClient::TakeScreenshotResponse WebDriverConnection::take_screenshot()
+Web::WebDriver::Response WebDriverConnection::take_screenshot()
 {
     // 1. If session's current top-level browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_top_level_browsing_context_is_open());
@@ -2518,28 +2432,36 @@ Messages::WebDriverClient::TakeScreenshotResponse WebDriverConnection::take_scre
         auto window = document->window();
 
         // 2. When the user agent is next to run the animation frame callbacks:
-        (void)window->animation_frame_callback_driver().add(GC::create_function(document->heap(), [this, document](double) mutable {
+        (void)window->animation_frame_callback_driver().add(GC::create_function(GC::Heap::the(), [this, document](double) mutable {
             // a. Let root rect be session's current top-level browsing context's document element's rectangle.
             auto root_rect = calculate_absolute_rect_of_element(*document->document_element());
 
             // b. Let screenshot result be the result of trying to call draw a bounding box from the framebuffer, given root rect as an argument.
-            // c. Let canvas be a canvas element of screenshot result's data.
-            auto canvas = WEBDRIVER_TRY(Web::WebDriver::draw_bounding_box_from_the_framebuffer(*current_top_level_browsing_context(), *document->document_element(), root_rect));
+            Web::WebDriver::draw_bounding_box_from_the_framebuffer(*current_top_level_browsing_context(), *document->document_element(), root_rect, [this](auto canvas_or_error) mutable {
+                if (canvas_or_error.is_error()) {
+                    driver_execution_complete(canvas_or_error.release_error());
+                    return;
+                }
 
-            // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
-            // e. Let encoded string be encoding result's data.
-            auto encoded_string = Web::WebDriver::encode_canvas_element(canvas);
+                // c. Let canvas be a canvas element of screenshot result's data.
+                auto canvas = canvas_or_error.release_value();
 
-            // 3. Return success with data encoded string.
-            async_driver_execution_complete(move(encoded_string));
+                // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
+                // e. Let encoded string be encoding result's data.
+                auto encoded_string = Web::WebDriver::encode_canvas_element(*canvas);
+
+                // 3. Return success with data encoded string.
+                driver_execution_complete(move(encoded_string));
+            });
         }));
+        document->page().client().request_frame();
     });
 
     return JsonValue {};
 }
 
 // 17.2 Take Element Screenshot, https://w3c.github.io/webdriver/#dfn-take-element-screenshot
-Messages::WebDriverClient::TakeElementScreenshotResponse WebDriverConnection::take_element_screenshot(String element_id)
+Web::WebDriver::Response WebDriverConnection::take_element_screenshot(String element_id)
 {
     // 1. If session's current browsing context is no longer open, return error with error code no such window.
     TRY(ensure_current_browsing_context_is_open());
@@ -2556,71 +2478,57 @@ Messages::WebDriverClient::TakeElementScreenshotResponse WebDriverConnection::ta
         scroll_element_into_view(element);
 
         // 5. When the user agent is next to run the animation frame callbacks:
-        (void)window->animation_frame_callback_driver().add(GC::create_function(document->heap(), [this, element](double) {
+        (void)window->animation_frame_callback_driver().add(GC::create_function(GC::Heap::the(), [this, element](double) {
             // a. Let element rect be element's rectangle.
             auto element_rect = calculate_absolute_rect_of_element(element);
 
             // b. Let screenshot result be the result of trying to call draw a bounding box from the framebuffer, given element rect as an argument.
-            // c. Let canvas be a canvas element of screenshot result's data.
-            auto canvas = WEBDRIVER_TRY(Web::WebDriver::draw_bounding_box_from_the_framebuffer(current_browsing_context(), element, element_rect));
+            Web::WebDriver::draw_bounding_box_from_the_framebuffer(current_browsing_context(), element, element_rect, [this](auto canvas_or_error) mutable {
+                if (canvas_or_error.is_error()) {
+                    driver_execution_complete(canvas_or_error.release_error());
+                    return;
+                }
 
-            // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
-            // e. Let encoded string be encoding result's data.
-            auto encoded_string = Web::WebDriver::encode_canvas_element(canvas);
+                // c. Let canvas be a canvas element of screenshot result's data.
+                auto canvas = canvas_or_error.release_value();
 
-            // 6. Return success with data encoded string.
-            async_driver_execution_complete(move(encoded_string));
+                // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
+                // e. Let encoded string be encoding result's data.
+                auto encoded_string = Web::WebDriver::encode_canvas_element(*canvas);
+
+                // 6. Return success with data encoded string.
+                driver_execution_complete(move(encoded_string));
+            });
         }));
+        document->page().client().request_frame();
     });
 
     return JsonValue {};
 }
 
 // 18.1 Print Page, https://w3c.github.io/webdriver/#dfn-print-page
-Messages::WebDriverClient::PrintPageResponse WebDriverConnection::print_page(JsonValue payload)
+Web::WebDriver::Response WebDriverConnection::print_page(JsonValue payload)
 {
     dbgln("FIXME: WebDriverConnection::print_page({})", payload);
     return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnsupportedOperation, "Print not implemented"sv);
 }
 
 // https://w3c.github.io/webdriver/#dfn-set-the-current-browsing-context
-void WebDriverConnection::set_current_browsing_context(Web::HTML::BrowsingContext& browsing_context)
+void WebDriverConnection::set_current_browsing_context(Web::HTML::Navigable const& navigable)
 {
-    // 1. Set session's current browsing context to context.
-    m_current_browsing_context = browsing_context;
-
-    // 2. Set the session's current parent browsing context to the parent browsing context of context, if that context
-    //    exists, or null otherwise.
-    if (auto navigable = browsing_context.active_document()->navigable(); navigable && navigable->parent())
-        m_current_parent_browsing_context = navigable->parent()->active_browsing_context();
-    else
-        m_current_parent_browsing_context = nullptr;
+    // NB: The UI process holds the session's current browsing context and current parent browsing context, as the
+    //     navigable may be hosted by another process.
+    m_page_client->webdriver_did_set_current_browsing_context(*m_current_command_id, navigable.id());
 }
 
-// https://w3c.github.io/webdriver/#dfn-set-the-current-browsing-context
-void WebDriverConnection::set_current_top_level_browsing_context(Web::HTML::BrowsingContext& browsing_context)
+// https://w3c.github.io/webdriver/#dfn-current-top-level-browsing-context
+GC::Ptr<Web::HTML::BrowsingContext> WebDriverConnection::current_top_level_browsing_context()
 {
-    // 1. Assert: context is a top-level browsing context.
-    VERIFY(browsing_context.is_top_level());
-
-    if (m_current_top_level_browsing_context)
-        m_current_top_level_browsing_context->page().set_window_rect_observer({});
-
-    // 2. Set session's current top-level browsing context to context.
-    m_current_top_level_browsing_context = browsing_context;
-
-    if (m_current_top_level_browsing_context) {
-        m_current_top_level_browsing_context->page().set_window_rect_observer(GC::create_function(m_current_top_level_browsing_context->heap(), [this](Web::DevicePixelRect rect) {
-            if (m_pending_window_rect_requests > 0 && --m_pending_window_rect_requests == 0)
-                async_driver_execution_complete(serialize_rect(rect.to_type<int>()));
-        }));
-    }
-
-    // 3. Set the current browsing context with session and context.
-    set_current_browsing_context(browsing_context);
+    auto* traversable = as_if<Web::HTML::LocalNavigable>(*m_page_client->page().top_level_traversable());
+    return traversable ? traversable->active_browsing_context() : nullptr;
 }
 
-Messages::WebDriverClient::EnsureTopLevelBrowsingContextIsOpenResponse WebDriverConnection::ensure_top_level_browsing_context_is_open()
+Web::WebDriver::Response WebDriverConnection::ensure_top_level_browsing_context_is_open()
 {
     TRY(ensure_current_top_level_browsing_context_is_open());
     return JsonValue {};
@@ -2636,116 +2544,28 @@ ErrorOr<void, Web::WebDriver::Error> WebDriverConnection::ensure_current_top_lev
     return Web::WebDriver::ensure_browsing_context_is_open(current_top_level_browsing_context());
 }
 
-// https://w3c.github.io/webdriver/#dfn-get-the-prompt-handler
-Web::WebDriver::PromptHandlerConfiguration WebDriverConnection::get_the_prompt_handler(Web::WebDriver::PromptType type) const
-{
-    static Web::WebDriver::UserPromptHandler::ValueType empty_user_prompt_handler;
-    auto const& user_prompt_handler = Web::WebDriver::user_prompt_handler();
-
-    // 1. If the user prompt handler is null, let handlers be an empty map. Otherwise let handlers be user prompt handler.
-    auto const& handlers = user_prompt_handler.has_value() ? *user_prompt_handler : empty_user_prompt_handler;
-
-    // 2. If handlers contains type return handlers[type].
-    if (auto handler = handlers.get(type); handler.has_value())
-        return *handler;
-
-    // 3. If handlers contains "default" return handlers["default"].
-    if (auto handler = handlers.get(Web::WebDriver::PromptType::Default); handler.has_value())
-        return *handler;
-
-    // 4. If type is "beforeUnload", return a prompt handler configuration with handler "accept" and notify false.
-    if (type == Web::WebDriver::PromptType::BeforeUnload)
-        return { .handler = Web::WebDriver::PromptHandler::Accept, .notify = Web::WebDriver::PromptHandlerConfiguration::Notify::No };
-
-    // 5. If handlers contains "fallbackDefault" return handlers["fallbackDefault"].
-    if (auto handler = handlers.get(Web::WebDriver::PromptType::FallbackDefault); handler.has_value())
-        return *handler;
-
-    // 6. Return a prompt handler configuration with handler "dismiss" and notify true.
-    return { .handler = Web::WebDriver::PromptHandler::Dismiss, .notify = Web::WebDriver::PromptHandlerConfiguration::Notify::Yes };
-}
-
-// https://w3c.github.io/webdriver/#dfn-annotated-unexpected-alert-open-error
-static Web::WebDriver::Error create_annotated_unexpected_alert_open_error(Optional<String> const& text)
-{
-    // An annotated unexpected alert open error is an error with error code unexpected alert open and an optional error
-    // data dictionary with the following entries:
-    //     "text"
-    //         The current user prompt's message.
-    auto data = text.map([&](auto const& text) -> JsonValue {
-        JsonObject data;
-        data.set("text"sv, text);
-        return data;
-    });
-
-    return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnexpectedAlertOpen, "A user prompt is open"sv, move(data));
-}
-
 // https://w3c.github.io/webdriver/#dfn-handle-any-user-prompts
 void WebDriverConnection::handle_any_user_prompts(Function<void()> on_dialog_closed)
 {
-    auto& page = current_browsing_context().page();
-    auto& heap = current_browsing_context().heap();
+    Web::WebDriver::handle_any_user_prompts(m_page_client->page(),
+        GC::create_function(GC::Heap::the(), [this, on_dialog_closed = GC::create_function(GC::Heap::the(), move(on_dialog_closed))](Optional<Web::WebDriver::Error> error) {
+            if (error.has_value()) {
+                driver_execution_complete(error.release_value());
+                return;
+            }
 
-    // 1. If the current browsing context is not blocked by a dialog return success.
-    if (!page.has_pending_dialog()) {
-        on_dialog_closed();
-        return;
-    }
+            on_dialog_closed->function()();
+        }));
+}
 
-    // 2. Let type be "default".
-    auto type = Web::WebDriver::PromptType::Default;
+// The step left of a command whose page was taken away by the navigation it started.
+Web::WebDriver::Response WebDriverConnection::wait_for_navigation()
+{
+    wait_for_navigation_to_complete(GC::create_function(GC::Heap::the(), [this](Web::WebDriver::Response response) {
+        driver_execution_complete(move(response));
+    }));
 
-    // 3. If the current user prompt is an alert dialog, set type to "alert". Otherwise, if the current user prompt is a
-    //    beforeunload dialog, set type to "beforeUnload". Otherwise, if the current user prompt is a confirm dialog,
-    //    set type to "confirm". Otherwise, if the current user prompt is a prompt dialog, set type to "prompt".
-    // FIXME: Handle beforeunload dialogs when they are implemented.
-    switch (page.pending_dialog()) {
-    case Web::Page::PendingDialog::Alert:
-        type = Web::WebDriver::PromptType::Alert;
-        break;
-    case Web::Page::PendingDialog::Confirm:
-        type = Web::WebDriver::PromptType::Confirm;
-        break;
-    case Web::Page::PendingDialog::Prompt:
-        type = Web::WebDriver::PromptType::Prompt;
-        break;
-    case Web::Page::PendingDialog::None:
-        VERIFY_NOT_REACHED();
-    }
-
-    // 3. Let handler be get the prompt handler with type.
-    auto handler = get_the_prompt_handler(type);
-
-    auto on_complete = GC::create_function(heap, [this, notify = handler.notify, pending_dialog_text = page.pending_dialog_text(), on_dialog_closed = GC::create_function(heap, move(on_dialog_closed))]() {
-        // 5. If handler's notify is true, return annotated unexpected alert open error.
-        if (notify == Web::WebDriver::PromptHandlerConfiguration::Notify::Yes) {
-            async_driver_execution_complete(create_annotated_unexpected_alert_open_error(pending_dialog_text));
-            return;
-        }
-
-        // 6. Return success.
-        on_dialog_closed->function()();
-    });
-
-    // 4. Perform the following substeps based on handler's handler:
-    switch (handler.handler) {
-    // -> "accept"
-    case Web::WebDriver::PromptHandler::Accept:
-        // Accept the current user prompt.
-        page.accept_dialog(on_complete);
-        break;
-    // -> "dismiss"
-    case Web::WebDriver::PromptHandler::Dismiss:
-        // Dismiss the current user prompt.
-        page.dismiss_dialog(on_complete);
-        break;
-    // -> "ignore"
-    case Web::WebDriver::PromptHandler::Ignore:
-        // Do nothing.
-        on_complete->function()();
-        break;
-    }
+    return JsonValue {};
 }
 
 // https://w3c.github.io/webdriver/#dfn-wait-for-navigation-to-complete
@@ -2764,10 +2584,9 @@ void WebDriverConnection::wait_for_navigation_to_complete(OnNavigationComplete o
         return;
     }
 
-    auto& realm = current_browsing_context().active_document()->realm();
     auto navigable = current_browsing_context().active_document()->navigable();
 
-    if (!navigable || navigable->ongoing_navigation().has<Empty>()) {
+    if (!navigable) {
         on_complete->function()(JsonValue {});
         return;
     }
@@ -2783,45 +2602,43 @@ void WebDriverConnection::wait_for_navigation_to_complete(OnNavigationComplete o
         }
     };
 
-    // 3. Start a timer. If this algorithm has not completed before timer reaches the session’s session page load timeout
-    //    in milliseconds, return an error with error code timeout.
-    m_navigation_timer = realm.create<Web::WebDriver::HeapTimer>();
+    // 5. Let readiness target be the document readiness state associated with the current session’s page loading
+    //    strategy, which can be found in the table of page load strategies.
+    auto readiness_target = [this]() {
+        switch (m_page_load_strategy) {
+        case Web::WebDriver::PageLoadStrategy::Normal:
+            return Web::HTML::DocumentReadyState::Complete;
+        case Web::WebDriver::PageLoadStrategy::Eager:
+            return Web::HTML::DocumentReadyState::Interactive;
+        default:
+            VERIFY_NOT_REACHED();
+        };
+    }();
 
-    // 4. If there is an ongoing attempt to navigate the current browsing context that has not yet matured, wait for
-    //    navigation to mature.
-    m_navigation_observer = realm.create<Web::HTML::NavigationObserver>(realm, *navigable);
-
-    m_navigation_observer->set_navigation_complete([this, &realm, reset_observers]() {
+    // 6. Wait for the current browsing context’s document readiness state to reach readiness target,
+    //    or for the session page load timeout to pass, whichever occurs sooner.
+    auto wait_for_document_readiness = [this, readiness_target, reset_observers]() {
         reset_observers(*this);
 
-        // 5. Let readiness target be the document readiness state associated with the current session’s page loading
-        //    strategy, which can be found in the table of page load strategies.
-        auto readiness_target = [this]() {
-            switch (m_page_load_strategy) {
-            case Web::WebDriver::PageLoadStrategy::Normal:
-                return Web::HTML::DocumentReadyState::Complete;
-            case Web::WebDriver::PageLoadStrategy::Eager:
-                return Web::HTML::DocumentReadyState::Interactive;
-            default:
-                VERIFY_NOT_REACHED();
-            };
-        }();
-
-        // 6. Wait for the current browsing context’s document readiness state to reach readiness target,
-        //    or for the session page load timeout to pass, whichever occurs sooner.
-        if (auto* document = current_browsing_context().active_document(); document->readiness() != readiness_target) {
-            m_document_observer = realm.create<Web::DOM::DocumentObserver>(realm, *document);
-
-            m_document_observer->set_document_readiness_observer([this, readiness_target](Web::HTML::DocumentReadyState readiness) {
-                if (readiness == readiness_target)
-                    m_navigation_timer->stop_and_fire_timeout_handler();
-            });
-        } else {
+        auto* document = current_browsing_context().active_document();
+        if (!document || document->readiness() == readiness_target) {
             m_navigation_timer->stop_and_fire_timeout_handler();
+            return;
         }
-    });
 
-    m_navigation_timer->start(m_timeouts_configuration.page_load_timeout.value_or(300'000), GC::create_function(realm.heap(), [this, on_complete, reset_observers]() {
+        m_document_observer = Web::DOM::DocumentObserver::create(*document);
+        m_document_observer->set_document_readiness_observer([this, readiness_target](Web::HTML::DocumentReadyState readiness) {
+            if (readiness == readiness_target)
+                m_navigation_timer->stop_and_fire_timeout_handler();
+        });
+    };
+
+    // 3. Start a timer. If this algorithm has not completed before timer reaches the session’s session page load timeout
+    //    in milliseconds, return an error with error code timeout.
+    // NB: The waits below complete by firing this timer's handler early, so it is started before either is armed.
+    m_navigation_timer = GC::Heap::the().allocate<GC::Timer>();
+
+    m_navigation_timer->start(m_timeouts_configuration.page_load_timeout.value_or(300'000), GC::create_function(GC::Heap::the(), [this, on_complete, reset_observers]() {
         reset_observers(*this);
 
         auto did_time_out = m_navigation_timer->is_timed_out();
@@ -2837,6 +2654,20 @@ void WebDriverConnection::wait_for_navigation_to_complete(OnNavigationComplete o
         // 8. Return success with data null.
         on_complete->function()(JsonValue {});
     }));
+
+    // 4. If there is an ongoing attempt to navigate the current browsing context that has not yet matured, wait for
+    //    navigation to mature.
+    // NB: A navigation matures when its document is activated, which is before that document is ready, so step 6
+    //     stands on its own once there is nothing left to mature.
+    if (navigable->ongoing_navigation().has<Empty>()) {
+        wait_for_document_readiness();
+        return;
+    }
+
+    m_navigation_observer = Web::HTML::NavigationObserver::create(*navigable);
+    m_navigation_observer->set_navigation_complete([wait_for_document_readiness]() {
+        wait_for_document_readiness();
+    });
 }
 
 void WebDriverConnection::page_did_open_dialog(Badge<PageClient>)
@@ -2853,7 +2684,7 @@ void WebDriverConnection::page_did_open_dialog(Badge<PageClient>)
     // [[Value]]: null, [[Target]]: empty }, but continue to run the other steps of this algorithm in parallel.
     if (m_current_script_execution_id.has_value()) {
         m_current_script_execution_id.clear();
-        async_driver_execution_complete(JsonValue {});
+        driver_execution_complete(JsonValue {});
     }
 }
 
@@ -2863,8 +2694,15 @@ void WebDriverConnection::maximize_the_window()
     // To maximize the window, given an operating system level window with an associated top-level browsing context, run
     // the implementation-specific steps to transition the operating system level window into the maximized window state.
     // Return when the window has completed the transition, or within an implementation-defined timeout.
-    current_top_level_browsing_context()->page().client().page_did_request_maximize_window();
-    ++m_pending_window_rect_requests;
+    auto request_id = register_window_rect_request();
+    current_top_level_browsing_context()->page().client().page_did_request_maximize_window(request_id);
+}
+
+u64 WebDriverConnection::register_window_rect_request()
+{
+    auto request_id = m_next_window_rect_request_id++;
+    m_pending_window_rect_requests.set(request_id);
+    return request_id;
 }
 
 // https://w3c.github.io/webdriver/#dfn-iconify-the-window
@@ -2896,22 +2734,21 @@ void WebDriverConnection::wait_for_visibility_state(GC::Ref<GC::Function<void()>
     static constexpr auto VISIBILITY_STATE_TIMEOUT_MS = 5'000;
 
     auto* document = current_top_level_browsing_context()->active_document();
-    auto& realm = document->realm();
 
-    if (document->visibility_state_value() == target_visibility_state) {
+    if (document->visibility_state() == target_visibility_state) {
         on_complete->function()();
         return;
     }
 
-    auto timer = realm.create<Web::WebDriver::HeapTimer>();
-    m_document_observer = realm.create<Web::DOM::DocumentObserver>(realm, *document);
+    auto timer = GC::Heap::the().allocate<GC::Timer>();
+    m_document_observer = Web::DOM::DocumentObserver::create(*document);
 
     m_document_observer->set_document_visibility_state_observer([timer, target_visibility_state](Web::HTML::VisibilityState visibility_state) {
         if (visibility_state == target_visibility_state)
             timer->stop_and_fire_timeout_handler();
     });
 
-    timer->start(VISIBILITY_STATE_TIMEOUT_MS, GC::create_function(realm.heap(), [this, on_complete]() {
+    timer->start(VISIBILITY_STATE_TIMEOUT_MS, GC::create_function(GC::Heap::the(), [this, on_complete]() {
         m_document_observer->set_document_visibility_state_observer({});
         m_document_observer = nullptr;
 
@@ -2930,10 +2767,12 @@ public:
         String selector,
         WebDriverConnection::GetStartNode get_start_node,
         WebDriverConnection::OnFindComplete on_complete,
-        GC::Ref<Web::WebDriver::HeapTimer> timer)
+        GC::Ref<GC::Timer> timer)
         : m_browsing_context(browsing_context)
         , m_location_strategy(location_strategy)
-        , m_selector(move(selector))
+        , m_selector(location_strategy == Web::WebDriver::LocationStrategy::TagName
+                  ? Variant<String, Utf16FlyString> { Utf16FlyString::from_utf8(selector) }
+                  : Variant<String, Utf16FlyString> { move(selector) })
         , m_get_start_node(get_start_node)
         , m_on_complete(on_complete)
         , m_timer(timer)
@@ -2950,7 +2789,7 @@ public:
         if (m_timer->is_timed_out())
             return;
 
-        Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(heap(), [this]() {
+        Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this]() {
             search_for_element();
         }));
     }
@@ -2996,12 +2835,12 @@ private:
     GC::Ref<Web::HTML::BrowsingContext const> m_browsing_context;
 
     Web::WebDriver::LocationStrategy m_location_strategy;
-    String m_selector;
+    Variant<String, Utf16FlyString> m_selector;
 
     WebDriverConnection::GetStartNode m_get_start_node;
     WebDriverConnection::OnFindComplete m_on_complete;
 
-    GC::Ref<Web::WebDriver::HeapTimer> m_timer;
+    GC::Ref<GC::Timer> m_timer;
 };
 
 GC_DEFINE_ALLOCATOR(ElementLocator);
@@ -3009,8 +2848,6 @@ GC_DEFINE_ALLOCATOR(ElementLocator);
 // https://w3c.github.io/webdriver/#dfn-find
 void WebDriverConnection::find(Web::WebDriver::LocationStrategy location_strategy, String selector, GetStartNode get_start_node, OnFindComplete on_complete)
 {
-    auto& realm = current_browsing_context().active_document()->realm();
-
     // 1. Let location strategy be equal to using.
     // 2. Let selector be equal to value.
 
@@ -3018,9 +2855,9 @@ void WebDriverConnection::find(Web::WebDriver::LocationStrategy location_strateg
     auto timeout = m_timeouts_configuration.implicit_wait_timeout;
 
     // 4. Let timer be a new timer.
-    auto timer = realm.create<Web::WebDriver::HeapTimer>();
+    auto timer = GC::Heap::the().allocate<GC::Timer>();
 
-    auto wrapped_on_complete = GC::create_function(realm.heap(), [this, on_complete, timer](Web::WebDriver::Response result) {
+    auto wrapped_on_complete = GC::create_function(GC::Heap::the(), [this, on_complete, timer](Web::WebDriver::Response result) {
         m_element_locator = nullptr;
         timer->stop();
 
@@ -3030,22 +2867,22 @@ void WebDriverConnection::find(Web::WebDriver::LocationStrategy location_strateg
     // 5. If timeout is not null:
     if (timeout.has_value()) {
         // 1. Start the timer with timer and timeout.
-        timer->start(*timeout, GC::create_function(realm.heap(), [wrapped_on_complete]() {
+        timer->start(*timeout, GC::create_function(GC::Heap::the(), [wrapped_on_complete]() {
             wrapped_on_complete->function()({ JsonArray {} });
         }));
     }
 
     // 6. Let elements returned be an empty List.
     // 7. While elements returned is empty and timer's timeout fired flag is not set:
-    m_element_locator = realm.create<ElementLocator>(current_browsing_context(), location_strategy, move(selector), get_start_node, wrapped_on_complete, timer);
+    m_element_locator = GC::Heap::the().allocate<ElementLocator>(current_browsing_context(), location_strategy, move(selector), get_start_node, wrapped_on_complete, timer);
     m_element_locator->search_for_element();
 }
 
 // https://w3c.github.io/webdriver/#dfn-extract-the-script-arguments-from-a-request
-ErrorOr<WebDriverConnection::ScriptArguments, Web::WebDriver::Error> WebDriverConnection::extract_the_script_arguments_from_a_request(JS::VM& vm, JsonValue const& payload)
+ErrorOr<WebDriverConnection::ScriptArguments, Web::WebDriver::Error> WebDriverConnection::extract_the_script_arguments_from_a_request(JsonValue const& payload)
 {
     // Creating JSON objects below requires an execution context.
-    Web::HTML::TemporaryExecutionContext execution_context { current_browsing_context().active_document()->realm() };
+    Web::HTML::TemporaryExecutionContext execution_context { current_browsing_context().active_document()->relevant_settings_object() };
 
     // 1. Let script be the result of getting a property named script from the parameters.
     // 2. If script is not a String, return error with error code invalid argument.
@@ -3056,7 +2893,7 @@ ErrorOr<WebDriverConnection::ScriptArguments, Web::WebDriver::Error> WebDriverCo
     auto const& args = *TRY(Web::WebDriver::get_property<JsonArray const*>(payload, "args"sv));
 
     // 5. Let arguments be the result of calling the JSON deserialize algorithm with arguments args.
-    GC::RootVector<JS::Value> arguments { vm.heap() };
+    GC::RootVector<JS::Value> arguments;
     auto& browsing_context = current_browsing_context();
 
     TRY(args.try_for_each([&](JsonValue const& arg) -> ErrorOr<void, Web::WebDriver::Error> {
@@ -3095,7 +2932,9 @@ Gfx::IntPoint WebDriverConnection::calculate_absolute_position_of_element(Web::C
     // 1. Let rect be the value returned by calling getBoundingClientRect().
 
     // 2. Let window be the associated window of current top-level browsing context.
-    auto const* window = current_top_level_browsing_context()->active_window();
+    // AD-HOC: The window of the current browsing context, whose viewport rect is relative to. The top-level browsing
+    //         context's window is in another process when the current one is in an isolated frame.
+    auto const* window = current_browsing_context().active_window();
 
     // 3. Let x be (scrollX of window + rect’s x coordinate).
     auto x = (window ? static_cast<int>(window->scroll_x()) : 0) + static_cast<int>(rect.x());

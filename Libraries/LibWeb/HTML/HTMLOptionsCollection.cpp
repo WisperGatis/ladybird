@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLOptionsCollectionPrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/HTML/HTMLOptGroupElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
@@ -20,23 +19,15 @@ GC_DEFINE_ALLOCATOR(HTMLOptionsCollection);
 
 GC::Ref<HTMLOptionsCollection> HTMLOptionsCollection::create(DOM::ParentNode& root, Function<bool(DOM::Element const&)> filter)
 {
-    return root.realm().create<HTMLOptionsCollection>(root, move(filter));
+    return GC::Heap::the().allocate<HTMLOptionsCollection>(root, move(filter));
 }
 
 HTMLOptionsCollection::HTMLOptionsCollection(DOM::ParentNode& root, Function<bool(DOM::Element const&)> filter)
-    : DOM::HTMLCollection(root, Scope::Descendants, move(filter))
+    : DOM::HTMLCollection(root, Scope::Descendants, move(filter), AttributeInvalidationType::None)
 {
-    m_legacy_platform_object_flags->has_indexed_property_setter = true;
-    m_legacy_platform_object_flags->indexed_property_setter_has_identifier = true;
 }
 
 HTMLOptionsCollection::~HTMLOptionsCollection() = default;
-
-void HTMLOptionsCollection::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLOptionsCollection);
-    Base::initialize(realm);
-}
 
 // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
 WebIDL::ExceptionOr<void> HTMLOptionsCollection::set_length(WebIDL::UnsignedLong value)
@@ -74,7 +65,7 @@ WebIDL::ExceptionOr<void> HTMLOptionsCollection::set_length(WebIDL::UnsignedLong
 }
 
 // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-setter
-WebIDL::ExceptionOr<void> HTMLOptionsCollection::set_value_of_indexed_property(u32 index, JS::Value unconverted_option)
+WebIDL::ExceptionOr<void> HTMLOptionsCollection::set_value_of_indexed_property(u32 index, Optional<GC::Ref<DOM::Element>> option)
 {
     // The spec doesn't seem to require this, but it's consistent with length handling and other browsers
     if (index >= 100'000) {
@@ -82,62 +73,57 @@ WebIDL::ExceptionOr<void> HTMLOptionsCollection::set_value_of_indexed_property(u
     }
 
     // 1. If value is null, invoke the steps for the remove method with index as the argument, and return.
-    if (unconverted_option.is_null()) {
+    if (!option.has_value()) {
         remove(static_cast<WebIDL::Long>(index));
         return {};
     }
-
-    if (!unconverted_option.is_object() || !is<HTMLOptionElement>(unconverted_option.as_object())) {
-        return WebIDL::TypeMismatchError::create(realm(), "The value provided is not an HTMLOptionElement"_utf16);
-    }
-
-    auto& option = static_cast<HTMLOptionElement&>(unconverted_option.as_object());
 
     // 2. Let length be the number of nodes represented by the collection.
     auto length = this->length();
 
     auto root_element = root();
 
-    if (index >= length) {
-        // 3. Let n be index minus length.
-        auto n = index - length;
+    // 3. Let delta be index minus length
+    auto delta = static_cast<i64>(index) - static_cast<i64>(length);
 
-        // 4. If n is greater than zero, then append a DocumentFragment consisting of n-1 new option elements with no attributes and no child nodes to the select element on which the HTMLOptionsCollection is rooted.
-        if (n > 0) {
-            for (WebIDL::UnsignedLong i = 0; i < n - 1; i++) {
-                TRY(root_element->append_child(TRY(DOM::create_element(root_element->document(), HTML::TagNames::option, Namespace::HTML))));
-            }
+    // 4. If delta is greater than zero, then append a DocumentFragment consisting of delta new option elements with
+    //    no attributes and no child nodes to the select element on which the HTMLOptionsCollection is rooted.
+    if (delta > 0) {
+        for (auto i = 0; i < delta; i++) {
+            TRY(root_element->append_child(TRY(DOM::create_element(root_element->document(), HTML::TagNames::option, Namespace::HTML))));
         }
+    }
 
-        // 5. If n is greater than or equal to zero, append value to the select element.
-        TRY(root_element->append_child(option));
+    // 5. If delta is greater than or equal to zero, append value to the select element. Otherwise, replace the indexth
+    //    element in the collection by value.
+    if (delta >= 0) {
+        TRY(root_element->append_child(*option.value()));
     } else {
-        // 5 (cont). Otherwise, replace the indexth element in the collection by value.
-        TRY(root_element->replace_child(option, *item(index)));
+        TRY(root_element->replace_child(*option.value(), *item(index)));
     }
 
     return {};
 }
 
 // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-add
-WebIDL::ExceptionOr<void> HTMLOptionsCollection::add(HTMLOptionOrOptGroupElement element, Optional<HTMLElementOrElementIndex> before)
+WebIDL::ExceptionOr<void> HTMLOptionsCollection::add(HTMLOptionOrOptGroupElement element, NullableHTMLElementOrElementIndex before)
 {
     auto resolved_element = element.visit(
-        [](auto& e) -> GC::Root<HTMLElement> {
-            return GC::make_root(static_cast<HTML::HTMLElement&>(*e));
+        [](auto& e) -> GC::Ref<HTMLElement> {
+            return static_cast<HTML::HTMLElement&>(*e);
         });
 
     GC::Ptr<DOM::Node> before_element;
-    if (before.has_value() && before->has<GC::Root<HTMLElement>>())
-        before_element = before->get<GC::Root<HTMLElement>>().ptr();
+    if (before.has<GC::Ref<HTMLElement>>())
+        before_element = before.get<GC::Ref<HTMLElement>>().ptr();
 
     // 1. If element is an ancestor of the select element on which the HTMLOptionsCollection is rooted, then throw a "HierarchyRequestError" DOMException.
     if (resolved_element->is_ancestor_of(root()))
-        return WebIDL::HierarchyRequestError::create(realm(), "The provided element is an ancestor of the root select element."_utf16);
+        return WebIDL::HierarchyRequestError::create("The provided element is an ancestor of the root select element."_utf16);
 
     // 2. If before is an element, but that element isn't a descendant of the select element on which the HTMLOptionsCollection is rooted, then throw a "NotFoundError" DOMException.
     if (before_element && !before_element->is_descendant_of(root()))
-        return WebIDL::NotFoundError::create(realm(), "The 'before' element is not a descendant of the root select element."_utf16);
+        return WebIDL::NotFoundError::create("The 'before' element is not a descendant of the root select element."_utf16);
 
     // 3. If element and before are the same element, then return.
     if (before_element && (resolved_element.ptr() == before_element.ptr()))
@@ -148,8 +134,8 @@ WebIDL::ExceptionOr<void> HTMLOptionsCollection::add(HTMLOptionOrOptGroupElement
 
     if (before_element)
         reference = move(before_element);
-    else if (before.has_value() && before->has<i32>())
-        reference = item(before->get<i32>());
+    else if (before.has<i32>())
+        reference = item(before.get<i32>());
 
     // 5. If reference is not null, let parent be the parent node of reference. Otherwise, let parent be the select element on which the HTMLOptionsCollection is rooted.
     DOM::Node* parent = reference ? reference->parent() : root().ptr();
@@ -186,9 +172,9 @@ WebIDL::Long HTMLOptionsCollection::selected_index() const
     return as<HTMLSelectElement>(*root()).selected_index();
 }
 
-void HTMLOptionsCollection::set_selected_index(WebIDL::Long index)
+WebIDL::ExceptionOr<void> HTMLOptionsCollection::set_selected_index(WebIDL::Long index)
 {
-    as<HTMLSelectElement>(*root()).set_selected_index(index);
+    return as<HTMLSelectElement>(*root()).set_selected_index(index);
 }
 
 }

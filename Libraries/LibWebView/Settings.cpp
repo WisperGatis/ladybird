@@ -1,106 +1,278 @@
 /*
- * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ * Copyright (c) 2025-2026, Tim Flynn <trflynn89@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <AK/ByteString.h>
-#include <AK/Find.h>
+#include <AK/CharacterTypes.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
-#include <AK/LexicalPath.h>
-#include <AK/StringBuilder.h>
-#include <LibCore/Directory.h>
-#include <LibCore/File.h>
+#include <AK/Random.h>
+#include <AK/Utf16String.h>
+#include <LibCore/GeolocationProvider.h>
 #include <LibCore/StandardPaths.h>
+#include <LibURL/InternalURLs.h>
 #include <LibURL/Parser.h>
 #include <LibUnicode/Locale.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Settings.h>
+#include <LibWebView/UserAgent.h>
+#include <LibWebView/Utilities.h>
 
 namespace WebView {
 
-static constexpr auto new_tab_page_url_key = "newTabPageURL"sv;
+static constexpr auto FIRST_RUN_COMPLETE_KEY = "firstRunComplete"sv;
+static constexpr auto NEW_TAB_PAGE_URL_KEY = "newTabPageURL"sv;
 
-static constexpr auto default_zoom_level_factor_key = "defaultZoomLevelFactor"sv;
-static constexpr double initial_zoom_level_factor = 1.0;
+static constexpr auto LANGUAGES_KEY = "languages"sv;
+static auto DEFAULT_LANGUAGE = "en"_string;
 
-static constexpr auto languages_key = "languages"sv;
-static auto default_language = "en"_string;
+static constexpr auto APPEARANCE_KEY = "appearance"sv;
+static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
+static constexpr auto SHOW_BOOKMARKS_BAR_KEY = "showBookmarksBar"sv;
 
-static constexpr auto search_engine_key = "searchEngine"sv;
-static constexpr auto search_engine_custom_key = "custom"sv;
-static constexpr auto search_engine_name_key = "name"sv;
-static constexpr auto search_engine_url_key = "url"sv;
+static constexpr auto CONTENT_SETTINGS_KEY = "content"sv;
+static constexpr auto DEFAULT_ZOOM_LEVEL_FACTOR_KEY = "defaultZoomLevelFactor"sv;
+static constexpr auto ZOOM_PER_HOST_KEY = "zoomPerHost"sv;
+static constexpr auto ENABLE_FORCE_DARK_KEY = "enableForceDark"sv;
 
-static constexpr auto autocomplete_engine_key = "autocompleteEngine"sv;
-static constexpr auto autocomplete_engine_name_key = "name"sv;
+static constexpr auto TAB_SETTINGS_KEY = "tabs"sv;
+static constexpr auto VERTICAL_TABS_ENABLED_KEY = "verticalTabsEnabled"sv;
+static constexpr auto VERTICAL_TABS_EXPANDED_KEY = "verticalTabsExpanded"sv;
+static constexpr auto VERTICAL_TABS_EXPAND_ON_HOVER_KEY = "verticalTabsExpandOnHover"sv;
+static constexpr auto VERTICAL_TABS_POSITION_KEY = "verticalTabsPosition"sv;
+static constexpr auto VERTICAL_TABS_EXPANDED_WIDTH_KEY = "verticalTabsExpandedWidth"sv;
 
-static constexpr auto site_setting_enabled_globally_key = "enabledGlobally"sv;
-static constexpr auto site_setting_site_filters_key = "siteFilters"sv;
+static constexpr auto BROWSING_BEHAVIOR_KEY = "browsingBehavior"sv;
+static constexpr auto ENABLE_AUTOSCROLL_KEY = "enableAutoscroll"sv;
+static constexpr auto ENABLE_PRIMARY_PASTE_KEY = "enablePrimaryPaste"sv;
 
-static constexpr auto autoplay_key = "autoplay"sv;
+static constexpr auto SEARCH_ENGINE_KEY = "searchEngine"sv;
+static constexpr auto SEARCH_ENGINE_CUSTOM_KEY = "custom"sv;
+static constexpr auto SEARCH_ENGINE_NAME_KEY = "name"sv;
+static constexpr auto SEARCH_ENGINE_URL_KEY = "url"sv;
 
-static constexpr auto global_privacy_control_key = "globalPrivacyControl"sv;
+static constexpr auto SEARCH_ENGINE_SELECTION_KEY = "engine"sv;
+static constexpr auto SEARCH_SUGGESTIONS_ENABLED_KEY = "suggestions"sv;
+static constexpr auto SEARCH_SUGGESTIONS_URL_KEY = "suggestionsUrl"sv;
 
-static constexpr auto dns_settings_key = "dnsSettings"sv;
+static constexpr auto SITE_SETTING_POLICY_KEY = "policy"sv;
+static constexpr auto SITE_SETTING_SITE_FILTERS_KEY = "siteFilters"sv;
 
-static ErrorOr<JsonObject> read_settings_file(StringView settings_path)
+static constexpr auto AUTOPLAY_KEY = "autoplay"sv;
+static constexpr auto GEOLOCATION_ENABLED_KEY = "geolocationEnabled"sv;
+
+static constexpr auto BROWSING_DATA_KEY = "browsingData"sv;
+static constexpr auto DISK_CACHE_KEY = "diskCache"sv;
+static constexpr auto DISK_CACHE_MAXIMUM_SIZE_KEY = "maxSize"sv;
+
+static constexpr auto GLOBAL_PRIVACY_CONTROL_KEY = "globalPrivacyControl"sv;
+
+static constexpr auto USER_AGENT_PRESET_KEY = "userAgentPreset"sv;
+static constexpr auto NAVIGATOR_COMPATIBILITY_MODE_KEY = "navigatorCompatibilityMode"sv;
+
+static constexpr auto BACKGROUND_NETWORKING_KEY = "backgroundNetworking"sv;
+static constexpr auto BACKGROUND_NETWORKING_ENABLED_KEY = "enabled"sv;
+static constexpr auto BACKGROUND_NETWORKING_FEATURES_KEY = "features"sv;
+
+static constexpr auto CONTENT_BLOCKERS_KEY = "contentBlockers"sv;
+static constexpr auto CONTENT_BLOCKER_BUILT_IN_LISTS_KEY = "builtInLists"sv;
+static constexpr auto CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY = "customSubscriptions"sv;
+static constexpr auto CONTENT_BLOCKER_LOCAL_LISTS_KEY = "localLists"sv;
+static constexpr auto CONTENT_BLOCKER_CUSTOM_FILTERS_KEY = "customFilters"sv;
+static constexpr auto CONTENT_BLOCKER_IDENTIFIER_KEY = "identifier"sv;
+static constexpr auto CONTENT_BLOCKER_URL_KEY = "url"sv;
+static constexpr auto CONTENT_BLOCKER_NAME_KEY = "name"sv;
+static constexpr auto CONTENT_BLOCKER_ENABLED_KEY = "enabled"sv;
+
+static constexpr auto DNS_SETTINGS_KEY = "dnsSettings"sv;
+
+static constexpr auto CONFIG_VARIABLES_KEY = "configVariables"sv;
+
+static bool is_valid_content_blocker_list_identifier(StringView identifier)
 {
-    auto settings_file = Core::File::open(settings_path, Core::File::OpenMode::Read);
-    if (settings_file.is_error()) {
-        if (settings_file.error().is_errno() && settings_file.error().code() == ENOENT)
-            return JsonObject {};
-        return settings_file.release_error();
-    }
-
-    auto settings_contents = TRY(settings_file.value()->read_until_eof());
-    auto settings_json = TRY(JsonValue::from_string(settings_contents));
-
-    if (!settings_json.is_object())
-        return Error::from_string_literal("Expected Ladybird settings to be a JSON object");
-    return move(settings_json.as_object());
+    return !identifier.is_empty() && identifier.length() <= 128
+        && all_of(identifier.bytes(), [](u8 byte) { return is_ascii_alphanumeric(byte) || byte == '-'; });
 }
 
-static ErrorOr<void> write_settings_file(StringView settings_path, JsonValue const& contents)
-{
-    auto settings_directory = LexicalPath { settings_path }.parent();
-    TRY(Core::Directory::create(settings_directory, Core::Directory::CreateDirectories::Yes));
+static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefinition, static_cast<size_t>(ConfigVariableID::Count)> { {
+    {
+        .id = ConfigVariableID::ShowWebContentProcessIDInTabTitle,
+        .name = "debug.process.show_web_content_process_id"sv,
+        .title = "Show WebContent process ID in tab titles"sv,
+        .description = "Append the active WebContent process ID to each tab title and tooltip."sv,
+        .default_value = false,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::ShowAdvancedDebugMenu,
+        .name = "debug.ui.show_advanced_debug_menu"sv,
+        .title = "Show Advanced Debug Menu"sv,
+        .description = "Show the advanced Debug menu in the application menu."sv,
+        .default_value = false,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::ShowTabPerformanceMonitor,
+        .name = "debug.ui.show_tab_performance_monitor"sv,
+        .title = "Show tab performance monitor"sv,
+        .description = "Show per-tab CPU, estimated owned memory, network rates and compositor frame rate in the toolbar."sv,
+        .default_value = false,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::UseClientSideWindowDecorations,
+        .name = "ui.window.use_client_side_decorations"sv,
+        .title = "Use client-side window decorations"sv,
+        .description = "Use custom title bar and window controls instead of the system window frame."sv,
+        .default_value = true,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::MaximumConnectionsPerDownload,
+        .name = "downloads.maximum_connections_per_download"sv,
+        .title = "Maximum connections per download"sv,
+        .description = "Download a file over up to this many parallel connections when the server supports byte ranges. Set to 1 to always download over a single connection."sv,
+        .default_value = 4,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::SplitDownloadsWithoutValidators,
+        .name = "downloads.split_without_validators"sv,
+        .title = "Split downloads without server validators"sv,
+        .description = "Allow multi-connection downloads even when the server sends no ETag or Last-Modified header, without which the browser cannot verify that every connection is being served the same file."sv,
+        .default_value = false,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::RestartStalledConnections,
+        .name = "downloads.restart_stalled_connections"sv,
+        .title = "Restart stalled download connections"sv,
+        .description = "When one connection of a multi-connection download stops receiving data, drop it and request the rest of its byte range over a new connection."sv,
+        .default_value = true,
+        .array_element_type = {},
+    },
+} };
 
-    auto settings_file = TRY(Core::File::open(settings_path, Core::File::OpenMode::Write));
-    TRY(settings_file->write_until_depleted(contents.serialized()));
+ReadonlySpan<ConfigVariableDefinition const> config_variable_definitions()
+{
+    return CONFIG_VARIABLE_DEFINITIONS;
+}
+
+static StringView vertical_tabs_position_to_string(VerticalTabsPosition position)
+{
+    switch (position) {
+    case VerticalTabsPosition::Left:
+        return "left"sv;
+    case VerticalTabsPosition::Right:
+        return "right"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static Optional<VerticalTabsPosition> vertical_tabs_position_from_string(StringView position)
+{
+    if (position == "left"sv)
+        return VerticalTabsPosition::Left;
+    if (position == "right"sv)
+        return VerticalTabsPosition::Right;
+    return {};
+}
+
+Optional<ConfigVariableID> config_variable_id_from_name(StringView name)
+{
+    for (auto const& variable : config_variable_definitions()) {
+        if (variable.name == name)
+            return variable.id;
+    }
 
     return {};
 }
 
-Settings Settings::create(Badge<Application>)
+static ConfigVariableDefinition const& config_variable_definition(ConfigVariableID id)
 {
-    // FIXME: Move this to a generic "Ladybird config directory" helper.
-    auto settings_directory = ByteString::formatted("{}/Ladybird", Core::StandardPaths::config_directory());
-    auto settings_path = ByteString::formatted("{}/Settings.json", settings_directory);
+    return config_variable_definitions()[static_cast<size_t>(id)];
+}
 
+static bool json_value_matches_type(JsonValue const& value, JsonValue::Type type)
+{
+    switch (type) {
+    case JsonValue::Type::Null:
+        return value.is_null();
+    case JsonValue::Type::Bool:
+        return value.is_bool();
+    case JsonValue::Type::Number:
+        return value.is_number();
+    case JsonValue::Type::String:
+        return value.is_string();
+    case JsonValue::Type::Array:
+        return value.is_array();
+    case JsonValue::Type::Object:
+        return value.is_object();
+    }
+
+    VERIFY_NOT_REACHED();
+}
+
+static bool json_array_contains_only_type(JsonArray const& array, JsonValue::Type type)
+{
+    bool contains_only_type = true;
+
+    array.for_each([&](JsonValue const& value) {
+        if (!json_value_matches_type(value, type))
+            contains_only_type = false;
+    });
+
+    return contains_only_type;
+}
+
+static bool config_variable_value_is_valid(ConfigVariableDefinition const& variable, JsonValue const& value)
+{
+    if (!json_value_matches_type(value, variable.default_value.type()))
+        return false;
+
+    if (variable.default_value.is_array() && variable.array_element_type.has_value())
+        return json_array_contains_only_type(value.as_array(), *variable.array_element_type);
+
+    return true;
+}
+
+Settings Settings::create(ByteString settings_path)
+{
     Settings settings { move(settings_path) };
 
-    auto settings_json = read_settings_file(settings.m_settings_path);
+    auto settings_json = read_json_file(settings.m_settings_path);
     if (settings_json.is_error()) {
         warnln("Unable to read Ladybird settings: {}", settings_json.error());
         return settings;
     }
 
-    if (auto new_tab_page_url = settings_json.value().get_string(new_tab_page_url_key); new_tab_page_url.has_value()) {
+    settings.m_first_run_complete = settings_json.value().get_bool(FIRST_RUN_COMPLETE_KEY).value_or(false);
+
+    if (auto new_tab_page_url = settings_json.value().get_string(NEW_TAB_PAGE_URL_KEY); new_tab_page_url.has_value()) {
         if (auto parsed_new_tab_page_url = URL::Parser::basic_parse(*new_tab_page_url); parsed_new_tab_page_url.has_value())
             settings.m_new_tab_page_url = parsed_new_tab_page_url.release_value();
     }
 
-    if (auto factor = settings_json.value().get_double_with_precision_loss(default_zoom_level_factor_key); factor.has_value())
-        settings.m_default_zoom_level_factor = factor.release_value();
-
-    if (auto languages = settings_json.value().get(languages_key); languages.has_value())
+    if (auto languages = settings_json.value().get(LANGUAGES_KEY); languages.has_value())
         settings.m_languages = parse_json_languages(*languages);
 
-    if (auto search_engine = settings_json.value().get_object(search_engine_key); search_engine.has_value()) {
-        if (auto custom_engines = search_engine->get_array(search_engine_custom_key); custom_engines.has_value()) {
+    if (auto appearance = settings_json.value().get(APPEARANCE_KEY); appearance.has_value())
+        settings.m_appearance = parse_appearance(*appearance);
+
+    if (auto content_settings = settings_json.value().get(CONTENT_SETTINGS_KEY); content_settings.has_value())
+        settings.m_content_settings = parse_content_settings(*content_settings);
+
+    if (auto tab_settings = settings_json.value().get(TAB_SETTINGS_KEY); tab_settings.has_value())
+        settings.m_tab_settings = parse_tab_settings(*tab_settings);
+
+    if (auto browsing_behavior = settings_json.value().get(BROWSING_BEHAVIOR_KEY); browsing_behavior.has_value())
+        settings.m_browsing_behavior = parse_browsing_behavior(*browsing_behavior);
+
+    if (auto search_engine = settings_json.value().get_object(SEARCH_ENGINE_KEY); search_engine.has_value()) {
+        if (auto custom_engines = search_engine->get_array(SEARCH_ENGINE_CUSTOM_KEY); custom_engines.has_value()) {
             custom_engines->for_each([&](JsonValue const& engine) {
                 auto custom_engine = parse_custom_search_engine(engine);
                 if (!custom_engine.has_value() || settings.find_search_engine_by_name(custom_engine->name).has_value())
@@ -110,26 +282,39 @@ Settings Settings::create(Badge<Application>)
             });
         }
 
-        if (auto search_engine_name = search_engine->get_string(search_engine_name_key); search_engine_name.has_value())
-            settings.m_search_engine = settings.find_search_engine_by_name(*search_engine_name);
-    }
+        auto selected_engine = search_engine->get(SEARCH_ENGINE_SELECTION_KEY);
+        auto search_engine_name = selected_engine.has_value()
+            ? search_engine->get_string(SEARCH_ENGINE_SELECTION_KEY)
+            : search_engine->get_string(SEARCH_ENGINE_NAME_KEY);
+        if (search_engine_name.has_value())
+            settings.m_search_engine_settings.engine = settings.find_search_engine_by_name(*search_engine_name);
 
-    if (settings.m_search_engine.has_value()) {
-        if (auto autocomplete_engine = settings_json.value().get_object(autocomplete_engine_key); autocomplete_engine.has_value()) {
-            if (auto autocomplete_engine_name = autocomplete_engine->get_string(autocomplete_engine_name_key); autocomplete_engine_name.has_value())
-                settings.m_autocomplete_engine = find_autocomplete_engine_by_name(*autocomplete_engine_name);
+        if (auto enabled = search_engine->get(SEARCH_SUGGESTIONS_ENABLED_KEY); enabled.has_value()) {
+            settings.m_search_engine_settings.suggestions = enabled->is_bool() && enabled->as_bool();
+        } else if (settings.m_search_engine_settings.engine.has_value() && settings.m_search_engine_settings.engine->suggestions.has_value()) {
+            // NB: Only migrate suggestions when the old provider matches the selected search engine, so typed text
+            //     does not start going to a different provider without the user's consent.
+            if (auto legacy_engine = settings_json.value().get_object("autocompleteEngine"sv); legacy_engine.has_value()) {
+                auto legacy_name = legacy_engine->get_string("name"sv);
+                settings.m_search_engine_settings.suggestions = legacy_name.has_value()
+                    && legacy_name->is_one_of("DuckDuckGo"sv, "Google"sv, "Kagi"sv, "Yahoo"sv)
+                    && *legacy_name == settings.m_search_engine_settings.engine->name;
+            }
         }
     }
 
-    auto load_site_setting = [&](SiteSetting& site_setting, StringView key) {
+    auto load_site_setting = [&](AutoplaySiteSetting& site_setting, StringView key) {
         auto saved_settings = settings_json.value().get_object(key);
         if (!saved_settings.has_value())
             return;
 
-        if (auto enabled_globally = saved_settings->get_bool(site_setting_enabled_globally_key); enabled_globally.has_value())
-            site_setting.enabled_globally = *enabled_globally;
+        if (auto policy = saved_settings->get_string(SITE_SETTING_POLICY_KEY); policy.has_value()) {
+            auto policy_utf16 = Utf16String::from_utf8_without_validation(*policy);
+            if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16.utf16_view()); parsed.has_value())
+                site_setting.policy = *parsed;
+        }
 
-        if (auto site_filters = saved_settings->get_array(site_setting_site_filters_key); site_filters.has_value()) {
+        if (auto site_filters = saved_settings->get_array(SITE_SETTING_SITE_FILTERS_KEY); site_filters.has_value()) {
             site_setting.site_filters.clear();
 
             site_filters->for_each([&](auto const& site_filter) {
@@ -139,13 +324,78 @@ Settings Settings::create(Badge<Application>)
         }
     };
 
-    load_site_setting(settings.m_autoplay, autoplay_key);
+    load_site_setting(settings.m_autoplay, AUTOPLAY_KEY);
 
-    if (auto global_privacy_control = settings_json.value().get_bool(global_privacy_control_key); global_privacy_control.has_value())
+    if (auto geolocation_enabled = settings_json.value().get_bool(GEOLOCATION_ENABLED_KEY); geolocation_enabled.has_value())
+        settings.m_geolocation_enabled = *geolocation_enabled && Core::GeolocationProvider::is_available();
+
+    if (auto browsing_data_settings = settings_json.value().get(BROWSING_DATA_KEY); browsing_data_settings.has_value())
+        settings.m_browsing_data_settings = parse_browsing_data_settings(*browsing_data_settings);
+
+    if (auto global_privacy_control = settings_json.value().get_bool(GLOBAL_PRIVACY_CONTROL_KEY); global_privacy_control.has_value())
         settings.m_global_privacy_control = *global_privacy_control ? GlobalPrivacyControl::Yes : GlobalPrivacyControl::No;
 
-    if (auto dns_settings = settings_json.value().get(dns_settings_key); dns_settings.has_value())
+    // A preset that's since been dropped or renamed falls back to the default User-Agent.
+    if (auto user_agent_preset = settings_json.value().get_string(USER_AGENT_PRESET_KEY); user_agent_preset.has_value())
+        settings.m_user_agent_preset = normalize_user_agent_name(*user_agent_preset);
+
+    if (auto mode = settings_json.value().get_string(NAVIGATOR_COMPATIBILITY_MODE_KEY); mode.has_value()) {
+        if (auto parsed_mode = navigator_compatibility_mode_from_string(*mode); parsed_mode.has_value())
+            settings.m_navigator_compatibility_mode = *parsed_mode;
+    }
+
+    if (auto background_networking = settings_json.value().get_object(BACKGROUND_NETWORKING_KEY); background_networking.has_value()) {
+        if (auto enabled = background_networking->get_bool(BACKGROUND_NETWORKING_ENABLED_KEY); enabled.has_value())
+            settings.m_background_networking_enabled = *enabled;
+
+        if (auto features = background_networking->get_object(BACKGROUND_NETWORKING_FEATURES_KEY); features.has_value())
+            settings.m_filter_list_updates_enabled = features->get_bool("contentBlockerSubscriptionUpdates"sv).value_or(false);
+    }
+
+    if (auto content_blockers = settings_json.value().get_object(CONTENT_BLOCKERS_KEY); content_blockers.has_value()) {
+        settings.m_content_blocker_enabled = content_blockers->get_bool(CONTENT_BLOCKER_ENABLED_KEY).value_or(false);
+        if (auto built_in_lists = content_blockers->get_object(CONTENT_BLOCKER_BUILT_IN_LISTS_KEY); built_in_lists.has_value()) {
+            for (auto& list : settings.m_content_blocker_lists)
+                list.enabled = built_in_lists->get_bool(list.identifier).value_or(list.enabled);
+        }
+
+        for (auto key : { CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY, CONTENT_BLOCKER_LOCAL_LISTS_KEY }) {
+            auto lists = content_blockers->get_array(key);
+            if (!lists.has_value())
+                continue;
+            for (auto const& value : lists->values()) {
+                if (!value.is_object())
+                    continue;
+                auto identifier = value.as_object().get_string(CONTENT_BLOCKER_IDENTIFIER_KEY);
+                auto enabled = value.as_object().get_bool(CONTENT_BLOCKER_ENABLED_KEY);
+                auto source = value.as_object().get_string(key == CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY ? CONTENT_BLOCKER_URL_KEY : CONTENT_BLOCKER_NAME_KEY);
+                if (!identifier.has_value() || !is_valid_content_blocker_list_identifier(*identifier) || !enabled.has_value() || !source.has_value() || settings.content_blocker_list(*identifier).has_value())
+                    continue;
+                Optional<URL::URL> url;
+                if (key == CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY) {
+                    url = URL::Parser::basic_parse(*source);
+                    if (!url.has_value() || !(url->scheme() == "http"sv || url->scheme() == "https"sv))
+                        continue;
+                }
+                settings.m_content_blocker_lists.append({ *identifier, *source, move(url), *enabled });
+            }
+        }
+
+        if (auto filters = content_blockers->get_string(CONTENT_BLOCKER_CUSTOM_FILTERS_KEY); filters.has_value())
+            settings.m_custom_content_blocker_filters = *filters;
+    }
+
+    if (auto dns_settings = settings_json.value().get(DNS_SETTINGS_KEY); dns_settings.has_value())
         settings.m_dns_settings = parse_dns_settings(*dns_settings);
+
+    if (auto config_variables = settings_json.value().get_object(CONFIG_VARIABLES_KEY); config_variables.has_value()) {
+        for (auto const& variable : config_variable_definitions()) {
+            if (auto value = config_variables->get(variable.name); value.has_value()) {
+                if (config_variable_value_is_valid(variable, *value))
+                    settings.m_config_variables[static_cast<size_t>(variable.id)] = *value;
+            }
+        }
+    }
 
     return settings;
 }
@@ -153,53 +403,112 @@ Settings Settings::create(Badge<Application>)
 Settings::Settings(ByteString settings_path)
     : m_settings_path(move(settings_path))
     , m_new_tab_page_url(URL::about_newtab())
-    , m_default_zoom_level_factor(initial_zoom_level_factor)
-    , m_languages({ default_language })
+    , m_languages({ DEFAULT_LANGUAGE })
 {
+    for (auto const& variable : config_variable_definitions()) {
+        m_config_variables[static_cast<size_t>(variable.id)] = variable.default_value;
+    }
+
+    enum class ListCategory {
+        General,
+        Language,
+    };
+    auto add_list = [&](StringView identifier, StringView name, StringView description, StringView url, ListCategory category = ListCategory::General) {
+        m_content_blocker_lists.append({ MUST(String::from_utf8(identifier)), MUST(String::from_utf8(name)),
+            URL::Parser::basic_parse(url), false, true, category == ListCategory::Language, MUST(String::from_utf8(description)) });
+    };
+    add_list("easyList"sv, "EasyList"sv, "Blocks advertising on English-language websites."sv, "https://easylist.to/easylist/easylist.txt"sv);
+    add_list("easyPrivacy"sv, "EasyPrivacy"sv, "Blocks tracking scripts, pixels, and other tracking requests."sv, "https://easylist.to/easylist/easyprivacy.txt"sv);
+    add_list("easyListCookie"sv, "EasyList Cookie List"sv, "Blocks cookie banners and other cookie notices."sv, "https://secure.fanboy.co.nz/fanboy-cookiemonster.txt"sv);
+    add_list("fanboyAnnoyances"sv, "Fanboy's Annoyance List"sv, "Blocks pop-ups, social widgets, newsletters, and other annoyances."sv, "https://secure.fanboy.co.nz/fanboy-annoyance.txt"sv);
+    add_list("fanboySocial"sv, "Fanboy's Social Blocking List"sv, "Blocks social media widgets and other social content."sv, "https://easylist.to/easylist/fanboy-social.txt"sv);
+    add_list("adblockWarningRemoval"sv, "Adblock Warning Removal List"sv, "Blocks warnings aimed at people who use a content blocker."sv, "https://easylist-downloads.adblockplus.org/antiadblockfilters.txt"sv);
+    add_list("abpindo"sv, "ABPindo"sv, "Blocks advertising on Indonesian and Malaysian websites."sv, "https://raw.githubusercontent.com/heradhis/indonesianadblockrules/master/subscriptions/abpindo.txt"sv, ListCategory::Language);
+    add_list("abpvn"sv, "ABPVN List"sv, "Blocks advertising on Vietnamese websites."sv, "https://abpvn.com/filter/abpvn-IPl6HE.txt"sv, ListCategory::Language);
+    add_list("bulgarianList"sv, "Bulgarian list"sv, "Blocks advertising on Bulgarian websites."sv, "https://stanev.org/abp/adblock_bg.txt"sv, ListCategory::Language);
+    add_list("nordicFilters"sv, "Dandelion Sprout's Nordic Filters"sv, "Blocks advertising on Nordic-language websites."sv, "https://raw.githubusercontent.com/DandelionSprout/adfilt/master/NorwegianExperimentalList%20alternate%20versions/NordicFiltersABP-Inclusion.txt"sv, ListCategory::Language);
+    add_list("easyListChina"sv, "EasyList China"sv, "Blocks advertising on Chinese websites."sv, "https://easylist-downloads.adblockplus.org/easylistchina.txt"sv, ListCategory::Language);
+    add_list("easyListCzechAndSlovak"sv, "EasyList Czech and Slovak"sv, "Blocks advertising on Czech and Slovak websites."sv, "https://raw.githubusercontent.com/tomasko126/easylistczechandslovak/master/filters.txt"sv, ListCategory::Language);
+    add_list("easyListDutch"sv, "EasyList Dutch"sv, "Blocks advertising on Dutch websites."sv, "https://easylist-downloads.adblockplus.org/easylistdutch.txt"sv, ListCategory::Language);
+    add_list("easyListGermany"sv, "EasyList Germany"sv, "Blocks advertising on German websites."sv, "https://easylist.to/easylistgermany/easylistgermany.txt"sv, ListCategory::Language);
+    add_list("easyListHebrew"sv, "EasyList Hebrew"sv, "Blocks advertising on Hebrew-language websites."sv, "https://raw.githubusercontent.com/easylist/EasyListHebrew/master/EasyListHebrew.txt"sv, ListCategory::Language);
+    add_list("easyListItaly"sv, "EasyList Italy"sv, "Blocks advertising on Italian websites."sv, "https://easylist-downloads.adblockplus.org/easylistitaly.txt"sv, ListCategory::Language);
+    add_list("easyListLithuania"sv, "EasyList Lithuania"sv, "Blocks advertising on Lithuanian websites."sv, "https://raw.githubusercontent.com/EasyList-Lithuania/easylist_lithuania/master/easylistlithuania.txt"sv, ListCategory::Language);
+    add_list("easyListPolish"sv, "EasyList Polish"sv, "Blocks advertising on Polish websites."sv, "https://easylist-downloads.adblockplus.org/easylistpolish.txt"sv, ListCategory::Language);
+    add_list("easyListPortuguese"sv, "EasyList Portuguese"sv, "Blocks advertising on Portuguese-language websites."sv, "https://easylist-downloads.adblockplus.org/easylistportuguese.txt"sv, ListCategory::Language);
+    add_list("easyListSpanish"sv, "EasyList Spanish"sv, "Blocks advertising on Spanish-language websites."sv, "https://easylist-downloads.adblockplus.org/easylistspanish.txt"sv, ListCategory::Language);
+    add_list("indianList"sv, "IndianList"sv, "Blocks advertising on websites in languages of India and Sri Lanka."sv, "https://easylist-downloads.adblockplus.org/indianlist.txt"sv, ListCategory::Language);
+    add_list("koreanList"sv, "KoreanList"sv, "Blocks advertising on Korean websites."sv, "https://easylist-downloads.adblockplus.org/koreanlist.txt"sv, ListCategory::Language);
+    add_list("latvianList"sv, "Latvian List"sv, "Blocks advertising on Latvian websites."sv, "https://raw.githubusercontent.com/Latvian-List/adblock-latvian/master/lists/latvian-list.txt"sv, ListCategory::Language);
+    add_list("listeAR"sv, "Liste AR"sv, "Blocks advertising on Arabic websites."sv, "https://easylist-downloads.adblockplus.org/liste_ar.txt"sv, ListCategory::Language);
+    add_list("listeFR"sv, "Liste FR"sv, "Blocks advertising on French websites."sv, "https://easylist-downloads.adblockplus.org/liste_fr.txt"sv, ListCategory::Language);
+    add_list("roList"sv, "ROList"sv, "Blocks advertising on Romanian websites."sv, "https://zoso.ro/pages/rolist.txt"sv, ListCategory::Language);
+    add_list("ruAdList"sv, "RU AdList"sv, "Blocks advertising on Russian and Ukrainian websites."sv, "https://easylist-downloads.adblockplus.org/ruadlist.txt"sv, ListCategory::Language);
 }
 
 JsonValue Settings::serialize_json() const
 {
     JsonObject settings;
-    settings.set(new_tab_page_url_key, m_new_tab_page_url.serialize());
-    settings.set(default_zoom_level_factor_key, m_default_zoom_level_factor);
+    settings.set(FIRST_RUN_COMPLETE_KEY, m_first_run_complete);
+    settings.set(NEW_TAB_PAGE_URL_KEY, m_new_tab_page_url.serialize());
 
     JsonArray languages;
     languages.ensure_capacity(m_languages.size());
-
     for (auto const& language : m_languages)
         languages.must_append(language);
+    settings.set(LANGUAGES_KEY, move(languages));
 
-    settings.set(languages_key, move(languages));
+    JsonObject appearance;
+    appearance.set(SHOW_MENU_BAR_KEY, m_appearance.show_menu_bar);
+    appearance.set(SHOW_BOOKMARKS_BAR_KEY, m_appearance.show_bookmarks_bar);
+    settings.set(APPEARANCE_KEY, move(appearance));
+
+    JsonObject zoom_per_host;
+    for (auto const& [host, zoom_level] : m_content_settings.zoom_per_host)
+        zoom_per_host.set(host, zoom_level);
+
+    JsonObject content_settings;
+    content_settings.set(DEFAULT_ZOOM_LEVEL_FACTOR_KEY, m_content_settings.default_zoom_level_factor);
+    content_settings.set(ZOOM_PER_HOST_KEY, move(zoom_per_host));
+    content_settings.set(ENABLE_FORCE_DARK_KEY, m_content_settings.enable_force_dark);
+    settings.set(CONTENT_SETTINGS_KEY, move(content_settings));
+
+    JsonObject tab_settings;
+    tab_settings.set(VERTICAL_TABS_ENABLED_KEY, m_tab_settings.vertical_tabs_enabled);
+    tab_settings.set(VERTICAL_TABS_EXPANDED_KEY, m_tab_settings.vertical_tabs_expanded);
+    tab_settings.set(VERTICAL_TABS_EXPAND_ON_HOVER_KEY, m_tab_settings.vertical_tabs_expand_on_hover);
+    tab_settings.set(VERTICAL_TABS_POSITION_KEY, vertical_tabs_position_to_string(m_tab_settings.vertical_tabs_position));
+    if (m_tab_settings.vertical_tabs_expanded_width.has_value())
+        tab_settings.set(VERTICAL_TABS_EXPANDED_WIDTH_KEY, *m_tab_settings.vertical_tabs_expanded_width);
+    settings.set(TAB_SETTINGS_KEY, move(tab_settings));
+
+    JsonObject browsing_behavior;
+    browsing_behavior.set(ENABLE_AUTOSCROLL_KEY, m_browsing_behavior.enable_autoscroll);
+    browsing_behavior.set(ENABLE_PRIMARY_PASTE_KEY, m_browsing_behavior.enable_primary_paste);
+    settings.set(BROWSING_BEHAVIOR_KEY, move(browsing_behavior));
 
     JsonArray custom_search_engines;
     custom_search_engines.ensure_capacity(m_custom_search_engines.size());
 
     for (auto const& engine : m_custom_search_engines) {
         JsonObject search_engine;
-        search_engine.set(search_engine_name_key, engine.name);
-        search_engine.set(search_engine_url_key, engine.query_url);
+        search_engine.set(SEARCH_ENGINE_NAME_KEY, engine.name);
+        search_engine.set(SEARCH_ENGINE_URL_KEY, engine.query_url);
+        if (engine.suggestions.has_value())
+            search_engine.set(SEARCH_SUGGESTIONS_URL_KEY, engine.suggestions->query_url);
 
         custom_search_engines.must_append(move(search_engine));
     }
 
     JsonObject search_engine;
     if (!custom_search_engines.is_empty())
-        search_engine.set(search_engine_custom_key, move(custom_search_engines));
-    if (m_search_engine.has_value())
-        search_engine.set(search_engine_name_key, m_search_engine->name);
+        search_engine.set(SEARCH_ENGINE_CUSTOM_KEY, move(custom_search_engines));
+    search_engine.set(SEARCH_ENGINE_SELECTION_KEY, m_search_engine_settings.engine.has_value() ? JsonValue(m_search_engine_settings.engine->name) : JsonValue {});
 
-    if (!search_engine.is_empty())
-        settings.set(search_engine_key, move(search_engine));
+    search_engine.set(SEARCH_SUGGESTIONS_ENABLED_KEY, m_search_engine_settings.suggestions);
+    settings.set(SEARCH_ENGINE_KEY, move(search_engine));
 
-    if (m_autocomplete_engine.has_value()) {
-        JsonObject autocomplete_engine;
-        autocomplete_engine.set(autocomplete_engine_name_key, m_autocomplete_engine->name);
-
-        settings.set(autocomplete_engine_key, move(autocomplete_engine));
-    }
-
-    auto save_site_setting = [&](SiteSetting const& site_setting, StringView key) {
+    auto save_site_setting = [&](AutoplaySiteSetting const& site_setting, StringView key) {
         JsonArray site_filters;
         site_filters.ensure_capacity(site_setting.site_filters.size());
 
@@ -207,15 +516,64 @@ JsonValue Settings::serialize_json() const
             site_filters.must_append(site_filter);
 
         JsonObject setting;
-        setting.set("enabledGlobally"sv, site_setting.enabled_globally);
-        setting.set("siteFilters"sv, move(site_filters));
+        setting.set(SITE_SETTING_POLICY_KEY, MUST(Web::HTML::autoplay_policy_to_string(site_setting.policy).to_utf8()));
+        setting.set(SITE_SETTING_SITE_FILTERS_KEY, move(site_filters));
 
         settings.set(key, move(setting));
     };
 
-    save_site_setting(m_autoplay, autoplay_key);
+    save_site_setting(m_autoplay, AUTOPLAY_KEY);
 
-    settings.set(global_privacy_control_key, m_global_privacy_control == GlobalPrivacyControl::Yes);
+    settings.set(GEOLOCATION_ENABLED_KEY, m_geolocation_enabled);
+
+    JsonObject disk_cache_settings;
+    disk_cache_settings.set(DISK_CACHE_MAXIMUM_SIZE_KEY, m_browsing_data_settings.disk_cache_settings.maximum_size);
+
+    JsonObject browsing_data;
+    browsing_data.set(DISK_CACHE_KEY, move(disk_cache_settings));
+    settings.set(BROWSING_DATA_KEY, move(browsing_data));
+
+    settings.set(GLOBAL_PRIVACY_CONTROL_KEY, m_global_privacy_control == GlobalPrivacyControl::Yes);
+
+    if (m_user_agent_preset.has_value())
+        settings.set(USER_AGENT_PRESET_KEY, *m_user_agent_preset);
+    settings.set(NAVIGATOR_COMPATIBILITY_MODE_KEY, navigator_compatibility_mode_to_string(m_navigator_compatibility_mode));
+
+    JsonObject background_network_features;
+    background_network_features.set("contentBlockerSubscriptionUpdates"sv, m_filter_list_updates_enabled);
+
+    JsonObject background_networking;
+    background_networking.set(BACKGROUND_NETWORKING_ENABLED_KEY, m_background_networking_enabled);
+    background_networking.set(BACKGROUND_NETWORKING_FEATURES_KEY, move(background_network_features));
+    settings.set(BACKGROUND_NETWORKING_KEY, move(background_networking));
+
+    JsonObject built_in_content_blocker_lists;
+    JsonArray custom_content_blocker_subscriptions;
+    JsonArray local_content_blocker_lists;
+    for (auto const& list : m_content_blocker_lists) {
+        if (list.built_in) {
+            built_in_content_blocker_lists.set(list.identifier, list.enabled);
+            continue;
+        }
+        JsonObject object;
+        object.set(CONTENT_BLOCKER_IDENTIFIER_KEY, list.identifier);
+        object.set(CONTENT_BLOCKER_ENABLED_KEY, list.enabled);
+        if (list.url.has_value()) {
+            object.set(CONTENT_BLOCKER_URL_KEY, list.url->serialize());
+            custom_content_blocker_subscriptions.must_append(move(object));
+        } else {
+            object.set(CONTENT_BLOCKER_NAME_KEY, list.name);
+            local_content_blocker_lists.must_append(move(object));
+        }
+    }
+
+    JsonObject content_blockers;
+    content_blockers.set(CONTENT_BLOCKER_ENABLED_KEY, m_content_blocker_enabled);
+    content_blockers.set(CONTENT_BLOCKER_BUILT_IN_LISTS_KEY, move(built_in_content_blocker_lists));
+    content_blockers.set(CONTENT_BLOCKER_CUSTOM_SUBSCRIPTIONS_KEY, move(custom_content_blocker_subscriptions));
+    content_blockers.set(CONTENT_BLOCKER_LOCAL_LISTS_KEY, move(local_content_blocker_lists));
+    content_blockers.set(CONTENT_BLOCKER_CUSTOM_FILTERS_KEY, m_custom_content_blocker_filters);
+    settings.set(CONTENT_BLOCKERS_KEY, move(content_blockers));
 
     // dnsSettings :: { mode: "system" } | { mode: "custom", server: string, port: u16, type: "udp" | "tls", forciblyEnabled: bool, dnssec: bool }
     JsonObject dns_settings;
@@ -239,35 +597,26 @@ JsonValue Settings::serialize_json() const
             dns_settings.set("dnssec"sv, dns.validate_dnssec_locally);
             dns_settings.set("forciblyEnabled"sv, m_dns_override_by_command_line);
         });
-    settings.set(dns_settings_key, move(dns_settings));
+    settings.set(DNS_SETTINGS_KEY, move(dns_settings));
+
+    JsonObject config_variables;
+    for (auto const& variable : config_variable_definitions())
+        config_variables.set(variable.name, m_config_variables[static_cast<size_t>(variable.id)]);
+    settings.set(CONFIG_VARIABLES_KEY, move(config_variables));
 
     return settings;
 }
 
-void Settings::restore_defaults()
+ErrorOr<void> Settings::complete_first_run()
 {
-    m_new_tab_page_url = URL::about_newtab();
-    m_default_zoom_level_factor = initial_zoom_level_factor;
-    m_languages = { default_language };
-    m_search_engine.clear();
-    m_custom_search_engines.clear();
-    m_autocomplete_engine.clear();
-    m_autoplay = SiteSetting {};
-    m_global_privacy_control = GlobalPrivacyControl::No;
-    m_dns_settings = SystemDNS {};
-
-    persist_settings();
-
-    for (auto& observer : m_observers) {
-        observer.new_tab_page_url_changed();
-        observer.default_zoom_level_factor_changed();
-        observer.languages_changed();
-        observer.search_engine_changed();
-        observer.autocomplete_engine_changed();
-        observer.autoplay_settings_changed();
-        observer.global_privacy_control_changed();
-        observer.dns_settings_changed();
+    auto was_complete = m_first_run_complete;
+    m_first_run_complete = true;
+    auto result = write_json_file(m_settings_path, serialize_json());
+    if (result.is_error()) {
+        m_first_run_complete = was_complete;
+        return result.release_error();
     }
+    return {};
 }
 
 void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
@@ -279,19 +628,10 @@ void Settings::set_new_tab_page_url(URL::URL new_tab_page_url)
         observer.new_tab_page_url_changed();
 }
 
-void Settings::set_default_zoom_level_factor(double const zoom_level)
-{
-    m_default_zoom_level_factor = zoom_level;
-    persist_settings();
-
-    for (auto& observer : m_observers)
-        observer.default_zoom_level_factor_changed();
-}
-
 Vector<String> Settings::parse_json_languages(JsonValue const& languages)
 {
     if (!languages.is_array())
-        return { default_language };
+        return { DEFAULT_LANGUAGE };
 
     Vector<String> parsed_languages;
     parsed_languages.ensure_capacity(languages.as_array().size());
@@ -302,7 +642,7 @@ Vector<String> Settings::parse_json_languages(JsonValue const& languages)
     });
 
     if (parsed_languages.is_empty())
-        return { default_language };
+        return { DEFAULT_LANGUAGE };
 
     return parsed_languages;
 }
@@ -316,17 +656,163 @@ void Settings::set_languages(Vector<String> languages)
         observer.languages_changed();
 }
 
-void Settings::set_search_engine(Optional<StringView> search_engine_name)
+Appearance Settings::parse_appearance(JsonValue const& settings)
 {
-    if (search_engine_name.has_value())
-        m_search_engine = find_search_engine_by_name(*search_engine_name);
-    else
-        m_search_engine.clear();
+    if (!settings.is_object())
+        return {};
+
+    Appearance appearance;
+
+    if (auto show_menu_bar = settings.as_object().get_bool(SHOW_MENU_BAR_KEY); show_menu_bar.has_value())
+        appearance.show_menu_bar = *show_menu_bar;
+    if (auto show_bookmarks_bar = settings.as_object().get_bool(SHOW_BOOKMARKS_BAR_KEY); show_bookmarks_bar.has_value())
+        appearance.show_bookmarks_bar = *show_bookmarks_bar;
+
+    return appearance;
+}
+
+void Settings::set_appearance(Appearance appearance)
+{
+    m_appearance = appearance;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.appearance_changed();
+}
+
+ContentSettings Settings::parse_content_settings(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    ContentSettings content_settings;
+
+    if (auto default_zoom_level_factor = settings.as_object().get_double_with_precision_loss(DEFAULT_ZOOM_LEVEL_FACTOR_KEY); default_zoom_level_factor.has_value())
+        content_settings.default_zoom_level_factor = *default_zoom_level_factor;
+    if (auto zoom_per_host = settings.as_object().get_object(ZOOM_PER_HOST_KEY); zoom_per_host.has_value()) {
+        zoom_per_host->for_each_member([&](auto const& host, JsonValue const& value) {
+            if (auto zoom_level = value.get_double_with_precision_loss(); zoom_level.has_value())
+                content_settings.zoom_per_host.set(host, *zoom_level);
+        });
+    }
+    if (auto enable_force_dark = settings.as_object().get_bool(ENABLE_FORCE_DARK_KEY); enable_force_dark.has_value())
+        content_settings.enable_force_dark = *enable_force_dark;
+
+    return content_settings;
+}
+
+void Settings::set_content_settings(ContentSettings content_settings)
+{
+    m_content_settings = move(content_settings);
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.content_settings_changed();
+}
+
+double Settings::zoom_for_host(StringView host) const
+{
+    auto default_zoom_level_factor = m_content_settings.default_zoom_level_factor;
+    if (host.is_empty())
+        return default_zoom_level_factor;
+    return m_content_settings.zoom_per_host.get(host).value_or(default_zoom_level_factor);
+}
+
+void Settings::set_zoom_for_host(String const& host, double zoom_level)
+{
+    if (host.is_empty())
+        return;
+
+    if (zoom_level == m_content_settings.default_zoom_level_factor) {
+        if (!m_content_settings.zoom_per_host.remove(host))
+            return;
+    } else {
+        if (m_content_settings.zoom_per_host.get(host) == zoom_level)
+            return;
+        m_content_settings.zoom_per_host.set(host, zoom_level);
+    }
 
     persist_settings();
 
     for (auto& observer : m_observers)
-        observer.search_engine_changed();
+        observer.content_settings_changed();
+}
+
+TabSettings Settings::parse_tab_settings(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    TabSettings tab_settings;
+
+    if (auto vertical_tabs_enabled = settings.as_object().get_bool(VERTICAL_TABS_ENABLED_KEY); vertical_tabs_enabled.has_value())
+        tab_settings.vertical_tabs_enabled = *vertical_tabs_enabled;
+    if (auto vertical_tabs_expanded = settings.as_object().get_bool(VERTICAL_TABS_EXPANDED_KEY); vertical_tabs_expanded.has_value())
+        tab_settings.vertical_tabs_expanded = *vertical_tabs_expanded;
+    if (auto vertical_tabs_expand_on_hover = settings.as_object().get_bool(VERTICAL_TABS_EXPAND_ON_HOVER_KEY); vertical_tabs_expand_on_hover.has_value())
+        tab_settings.vertical_tabs_expand_on_hover = *vertical_tabs_expand_on_hover;
+    if (auto vertical_tabs_position = settings.as_object().get_string(VERTICAL_TABS_POSITION_KEY); vertical_tabs_position.has_value()) {
+        if (auto parsed_position = vertical_tabs_position_from_string(*vertical_tabs_position); parsed_position.has_value())
+            tab_settings.vertical_tabs_position = *parsed_position;
+    }
+    if (auto vertical_tabs_expanded_width = settings.as_object().get_integer<u16>(VERTICAL_TABS_EXPANDED_WIDTH_KEY); vertical_tabs_expanded_width.has_value())
+        tab_settings.vertical_tabs_expanded_width = *vertical_tabs_expanded_width;
+
+    return tab_settings;
+}
+
+void Settings::set_tab_settings(TabSettings tab_settings)
+{
+    m_tab_settings = tab_settings;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.tab_settings_changed();
+}
+
+BrowsingBehavior Settings::parse_browsing_behavior(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    BrowsingBehavior browsing_behavior;
+
+    if (auto enable_autoscroll = settings.as_object().get_bool(ENABLE_AUTOSCROLL_KEY); enable_autoscroll.has_value())
+        browsing_behavior.enable_autoscroll = *enable_autoscroll;
+    if (auto enable_primary_paste = settings.as_object().get_bool(ENABLE_PRIMARY_PASTE_KEY); enable_primary_paste.has_value())
+        browsing_behavior.enable_primary_paste = *enable_primary_paste;
+
+    return browsing_behavior;
+}
+
+BrowsingBehavior Settings::browsing_behavior() const
+{
+    auto browsing_behavior = m_browsing_behavior;
+
+    // Override browsing behaviors depending on what the system supports. We do this here, rather than persisting the
+    // setting override, so that we don't persist unsupported behavior when headless mode is used.
+    browsing_behavior.enable_primary_paste &= Application::the().supports_clipboard_type(Application::ClipboardType::Selection);
+
+    return browsing_behavior;
+}
+
+void Settings::set_browsing_behavior(BrowsingBehavior browsing_behavior)
+{
+    m_browsing_behavior = browsing_behavior;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.browsing_behavior_changed();
+}
+
+void Settings::set_search_engine_settings(SearchEngineSettings search_engine_settings)
+{
+    m_search_engine_settings = move(search_engine_settings);
+
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.search_engine_settings_changed();
 }
 
 Optional<SearchEngine> Settings::parse_custom_search_engine(JsonValue const& search_engine)
@@ -334,8 +820,8 @@ Optional<SearchEngine> Settings::parse_custom_search_engine(JsonValue const& sea
     if (!search_engine.is_object())
         return {};
 
-    auto name = search_engine.as_object().get_string(search_engine_name_key);
-    auto url = search_engine.as_object().get_string(search_engine_url_key);
+    auto name = search_engine.as_object().get_string(SEARCH_ENGINE_NAME_KEY);
+    auto url = search_engine.as_object().get_string(SEARCH_ENGINE_URL_KEY);
     if (!name.has_value() || !url.has_value())
         return {};
 
@@ -343,7 +829,16 @@ Optional<SearchEngine> Settings::parse_custom_search_engine(JsonValue const& sea
     if (!parsed_url.has_value())
         return {};
 
-    return SearchEngine { .name = name.release_value(), .query_url = url.release_value() };
+    Optional<SearchSuggestions> suggestions;
+    if (auto suggestions_url = search_engine.as_object().get_string(SEARCH_SUGGESTIONS_URL_KEY); suggestions_url.has_value() && !suggestions_url->is_empty()) {
+        auto parsed_suggestions_url = URL::Parser::basic_parse(*suggestions_url);
+        if (!parsed_suggestions_url.has_value() || !parsed_suggestions_url->scheme().is_one_of("http"sv, "https"sv)
+            || !suggestions_url->contains("%s"sv))
+            return {};
+        suggestions = SearchSuggestions { suggestions_url.release_value() };
+    }
+
+    return SearchEngine { .name = name.release_value(), .query_url = url.release_value(), .suggestions = move(suggestions) };
 }
 
 void Settings::add_custom_search_engine(SearchEngine search_engine)
@@ -357,9 +852,9 @@ void Settings::add_custom_search_engine(SearchEngine search_engine)
 
 void Settings::remove_custom_search_engine(SearchEngine const& search_engine)
 {
-    auto reset_default_search_engine = m_search_engine.has_value() && m_search_engine->name == search_engine.name;
+    auto reset_default_search_engine = m_search_engine_settings.engine.has_value() && m_search_engine_settings.engine->name == search_engine.name;
     if (reset_default_search_engine)
-        m_search_engine.clear();
+        m_search_engine_settings.engine.clear();
 
     m_custom_search_engines.remove_all_matching([&](auto const& engine) {
         return engine.name == search_engine.name;
@@ -369,11 +864,11 @@ void Settings::remove_custom_search_engine(SearchEngine const& search_engine)
 
     if (reset_default_search_engine) {
         for (auto& observer : m_observers)
-            observer.search_engine_changed();
+            observer.search_engine_settings_changed();
     }
 }
 
-Optional<SearchEngine> Settings::find_search_engine_by_name(StringView name)
+Optional<SearchEngine> Settings::find_search_engine_by_name(StringView name) const
 {
     auto comparator = [&](auto const& engine) { return engine.name == name; };
 
@@ -385,22 +880,9 @@ Optional<SearchEngine> Settings::find_search_engine_by_name(StringView name)
     return {};
 }
 
-void Settings::set_autocomplete_engine(Optional<StringView> autocomplete_engine_name)
+void Settings::set_autoplay_policy(Web::HTML::AutoplayPolicy policy)
 {
-    if (autocomplete_engine_name.has_value())
-        m_autocomplete_engine = find_autocomplete_engine_by_name(*autocomplete_engine_name);
-    else
-        m_autocomplete_engine.clear();
-
-    persist_settings();
-
-    for (auto& observer : m_observers)
-        observer.autocomplete_engine_changed();
-}
-
-void Settings::set_autoplay_enabled_globally(bool enabled_globally)
-{
-    m_autoplay.enabled_globally = enabled_globally;
+    m_autoplay.policy = policy;
     persist_settings();
 
     for (auto& observer : m_observers)
@@ -438,6 +920,39 @@ void Settings::remove_all_autoplay_site_filters()
         observer.autoplay_settings_changed();
 }
 
+void Settings::set_geolocation_enabled(bool enabled)
+{
+    m_geolocation_enabled = enabled && Core::GeolocationProvider::is_available();
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.geolocation_settings_changed();
+}
+
+BrowsingDataSettings Settings::parse_browsing_data_settings(JsonValue const& settings)
+{
+    if (!settings.is_object())
+        return {};
+
+    BrowsingDataSettings browsing_data_settings;
+
+    if (auto disk_cache_settings = settings.as_object().get_object(DISK_CACHE_KEY); disk_cache_settings.has_value()) {
+        if (auto maximum_size = disk_cache_settings->get_integer<u64>(DISK_CACHE_MAXIMUM_SIZE_KEY); maximum_size.has_value())
+            browsing_data_settings.disk_cache_settings.maximum_size = *maximum_size;
+    }
+
+    return browsing_data_settings;
+}
+
+void Settings::set_browsing_data_settings(BrowsingDataSettings browsing_data_settings)
+{
+    m_browsing_data_settings = browsing_data_settings;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.browsing_data_settings_changed();
+}
+
 void Settings::set_global_privacy_control(GlobalPrivacyControl global_privacy_control)
 {
     m_global_privacy_control = global_privacy_control;
@@ -445,6 +960,18 @@ void Settings::set_global_privacy_control(GlobalPrivacyControl global_privacy_co
 
     for (auto& observer : m_observers)
         observer.global_privacy_control_changed();
+}
+
+void Settings::set_user_agent_preset(Optional<StringView> user_agent_preset_name)
+{
+    m_user_agent_preset = user_agent_preset_name.has_value() ? normalize_user_agent_name(*user_agent_preset_name) : OptionalNone {};
+    persist_settings();
+}
+
+void Settings::set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode navigator_compatibility_mode)
+{
+    m_navigator_compatibility_mode = navigator_compatibility_mode;
+    persist_settings();
 }
 
 DNSSettings Settings::parse_dns_settings(JsonValue const& dns_settings)
@@ -477,6 +1004,96 @@ DNSSettings Settings::parse_dns_settings(JsonValue const& dns_settings)
     return SystemDNS {};
 }
 
+void Settings::set_background_networking_enabled(bool enabled)
+{
+    if (m_background_networking_enabled == enabled)
+        return;
+
+    m_background_networking_enabled = enabled;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.background_networking_settings_changed();
+}
+
+void Settings::set_filter_list_updates_enabled(bool enabled)
+{
+    if (m_filter_list_updates_enabled == enabled)
+        return;
+
+    m_filter_list_updates_enabled = enabled;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.background_networking_settings_changed();
+}
+
+Optional<ContentBlockerList const&> Settings::content_blocker_list(StringView identifier) const
+{
+    for (auto const& list : m_content_blocker_lists) {
+        if (list.identifier == identifier)
+            return list;
+    }
+    return {};
+}
+
+void Settings::set_content_blocker_enabled(bool enabled)
+{
+    if (m_content_blocker_enabled == enabled)
+        return;
+    m_content_blocker_enabled = enabled;
+    persist_settings();
+    for (auto& observer : m_observers)
+        observer.content_blocker_settings_changed();
+}
+
+void Settings::set_content_blocker_list_enabled(StringView identifier, bool enabled)
+{
+    for (auto& list : m_content_blocker_lists) {
+        if (list.identifier != identifier || list.enabled == enabled)
+            continue;
+        list.enabled = enabled;
+        persist_settings();
+        for (auto& observer : m_observers)
+            observer.content_blocker_settings_changed();
+        return;
+    }
+}
+
+String Settings::add_content_blocker_list(String name, Optional<URL::URL> url)
+{
+    String identifier;
+    do {
+        identifier = MUST(String::formatted("list-{:016x}", get_random<u64>()));
+    } while (content_blocker_list(identifier).has_value());
+    m_content_blocker_lists.append({ identifier, move(name), move(url) });
+    persist_settings();
+    for (auto& observer : m_observers)
+        observer.content_blocker_settings_changed();
+    return identifier;
+}
+
+bool Settings::remove_content_blocker_list(StringView identifier)
+{
+    auto removed = m_content_blocker_lists.remove_all_matching([&](auto const& list) { return !list.built_in && list.identifier == identifier; });
+    if (!removed)
+        return false;
+    persist_settings();
+    for (auto& observer : m_observers)
+        observer.content_blocker_settings_changed();
+    return true;
+}
+
+void Settings::set_custom_content_blocker_filters(String filters)
+{
+    if (m_custom_content_blocker_filters == filters)
+        return;
+    m_custom_content_blocker_filters = move(filters);
+    persist_settings();
+    for (auto& observer : m_observers)
+        observer.content_blocker_settings_changed();
+}
+
 void Settings::set_dns_settings(DNSSettings const& dns_settings, bool override_by_command_line)
 {
     m_dns_settings = dns_settings;
@@ -489,11 +1106,60 @@ void Settings::set_dns_settings(DNSSettings const& dns_settings, bool override_b
         observer.dns_settings_changed();
 }
 
+JsonValue const& Settings::config_variable(ConfigVariableID id) const
+{
+    return m_config_variables[static_cast<size_t>(id)];
+}
+
+bool Settings::config_variable_as_bool(ConfigVariableID id) const
+{
+    auto const& variable = config_variable_definition(id);
+    VERIFY(variable.default_value.is_bool());
+
+    auto value = config_variable(id).get_bool();
+    VERIFY(value.has_value());
+    return *value;
+}
+
+u32 Settings::config_variable_as_u32(ConfigVariableID id) const
+{
+    auto const& variable = config_variable_definition(id);
+    VERIFY(variable.default_value.is_number());
+
+    auto value = config_variable(id).get_u32();
+    return value.value_or_lazy_evaluated([&] { return variable.default_value.get_u32().value(); });
+}
+
+void Settings::set_config_variable(ConfigVariableID id, JsonValue value)
+{
+    auto const& variable = config_variable_definition(id);
+    if (!config_variable_value_is_valid(variable, value))
+        return;
+
+    if (m_config_variables[static_cast<size_t>(id)].equals(value))
+        return;
+
+    m_config_variables[static_cast<size_t>(id)] = move(value);
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.config_variable_changed(id);
+}
+
+void Settings::set_config_variable(StringView name, JsonValue const& value)
+{
+    auto id = config_variable_id_from_name(name);
+    if (!id.has_value())
+        return;
+
+    set_config_variable(*id, value);
+}
+
 void Settings::persist_settings()
 {
     auto settings = serialize_json();
 
-    if (auto result = write_settings_file(m_settings_path, settings); result.is_error())
+    if (auto result = write_json_file(m_settings_path, settings); result.is_error())
         warnln("Unable to persist Ladybird settings: {}", result.error());
 }
 
@@ -518,11 +1184,6 @@ SettingsObserver::SettingsObserver()
 SettingsObserver::~SettingsObserver()
 {
     Settings::remove_observer({}, *this);
-}
-
-SiteSetting::SiteSetting()
-{
-    site_filters.set("file://"_string);
 }
 
 }

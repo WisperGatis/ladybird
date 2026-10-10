@@ -5,7 +5,7 @@ set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # shellcheck source=/dev/null
-. "${DIR}/shell_include.sh"
+. "${DIR}/Utils/shell_include.sh"
 
 ensure_ladybird_source_dir
 
@@ -18,19 +18,20 @@ BUILD_DIR=$(get_build_dir "$BUILD_PRESET")
 
 TMPDIR=${TMPDIR:-/tmp}
 
-: "${TRY_SHOW_LOGFILES_IN_TMUX:=false}"
-: "${SHOW_LOGFILES:=true}"
-: "${SHOW_PROGRESS:=true}"
 : "${PARALLEL_INSTANCES:=1}"
-
-if "$SHOW_PROGRESS"; then
-    SHOW_LOGFILES=true
-    TRY_SHOW_LOGFILES_IN_TMUX=false
-fi
+: "${BUILD_LADYBIRD:=true}"
+: "${WPT_DURATIONS_FILE:=}"
+: "${WPT_PROCESSES_PER_INSTANCE:=4}"
+: "${WPT_SCHEDULER_ARGS:=}"
 
 sudo_and_ask() {
     local prompt
     prompt="$1"; shift
+    # Running as root is only possible when the CI environment variable is set to true.
+    if [ "$(id -u)" -eq 0 ]; then
+        "${@}"
+        return
+    fi
     if [ -z "$prompt" ]; then
         prompt="Running '${*}' as root, please enter password for %p: "
     else
@@ -60,6 +61,21 @@ run_dir_path() {
     echo "$runpath"
 }
 
+# Chunked instances share $HOME, so each wptrunner installing Ahem into ~/.fonts makes them race: the first
+# instance to finish removes the font while the others are still running. Install it once up front instead, and
+# let the instances run with --no-install-fonts.
+ensure_ahem_font() {
+    local font_dir="${HOME}/.fonts"
+    if [ -f "${font_dir}/Ahem.ttf" ]; then
+        return
+    fi
+
+    echo "Installing Ahem into ${font_dir}"
+    mkdir -p "${font_dir}"
+    cp "${WPT_SOURCE_DIR}/fonts/Ahem.ttf" "${font_dir}"
+    fc-cache
+}
+
 ensure_run_dir() {
     i="$1"; shift
     local runpath
@@ -80,18 +96,30 @@ WPT_PROCESSES=${WPT_PROCESSES:-$(get_number_of_processing_units)}
 WPT_CERTIFICATES=(
     "tools/certs/cacert.pem"
 )
+WPT_TEST_TYPE_ARGS=(
+    "--test-types"
+    "testharness"
+    "reftest"
+    "wdspec"
+    "crashtest"
+    "test262"
+)
 WPT_ARGS=(
     "--binary=${LADYBIRD_BINARY}"
     "--webdriver-binary=${WEBDRIVER_BINARY}"
     "--install-webdriver"
     "--webdriver-arg=--force-cpu-painting"
     "--webdriver-arg=--default-time-zone=UTC"
+    "--webdriver-arg=--expose-experimental-interfaces"
     "--no-pause-after-test"
-    "--install-fonts"
+    "--no-restart-on-new-group"
+    # Every failure is "unexpected" since there's no expectation metadata, no need to restart for that.
+    "--no-restart-on-unexpected"
     "${EXTRA_WPT_ARGS[@]}"
 )
 IMPORT_ARGS=()
 WPT_LOG_ARGS=()
+TESTS_FROM_FILE=()
 
 ARG0=$0
 print_help() {
@@ -109,16 +137,18 @@ print_help() {
       list-tests: $NAME list-tests [PATHS..]
                       List the tests in the given PATHS.
       clean:      $NAME clean
-                      Clean up the extra resources and directories (if any leftover) created by this script.
+                      Clean up the extra resources and directories (if any leftover) created by this script (Linux only).
       bisect:     $NAME bisect BAD_COMMIT GOOD_COMMIT [TESTS...]
                       Find the first commit where a given set of tests produce unexpected results.
 
     Env vars:
+      BUILD_LADYBIRD:             Whether to build Ladybird and WebDriver before running tests; true or false, default true
       EXTRA_WPT_ARGS:             Extra arguments for the wpt command, placed at the end; array, default empty
-      TRY_SHOW_LOGFILES_IN_TMUX:  Whether to show split logs in tmux; true or false, default false
-      SHOW_LOGFILES:              Whether to show logs at all; true or false, default true
-      SHOW_PROGRESS:              Whether to show the progress of the tests, default true
-                                    implies SHOW_LOGFILES=true and TRY_SHOW_LOGFILES_IN_TMUX=false
+      WPT_DURATIONS_FILE:         Per-test durations used to order and size batches in parallel mode; default the
+                                    newest durations.json in \$BUILD_DIR/wpt-run-*.
+      WPT_PROCESSES_PER_INSTANCE: Test runners per instance in parallel mode; default 4
+      WPT_SCHEDULER_ARGS:         Extra arguments for Meta/wpt_scheduler.py in parallel mode, e.g.
+                                    "--max-cpu-pressure 10"; default empty
 
     Options for this script:
       --show-window
@@ -126,12 +156,16 @@ print_help() {
       --debug-process PROC_NAME
           Enable debugging for the PROC_NAME ladybird process
       --parallel-instances N
-          Enable running in chunked mode with N parallel instances
-              N=0 to auto-enable if possible
-              N=1 to disable chunked mode (default)
-              N>1 to enable chunked mode with explicit process count
+          Run tests in batches across up to N instances, each in its own network namespace. More instances are
+          started while the machine has spare CPU, and fewer when it doesn't.
+              N=0 to auto-enable if possible, with up to one instance per processor
+              N=1 to disable parallel mode (default)
+              N>1 to allow at most N instances
       --log PATH
           Alias for --log-raw PATH
+      --test-list PATH
+          Read tests to run from the given file, one test path per line
+              Empty lines and lines starting with '#' are ignored
       --log-(raw|unittest|xunit|html|mach|tbpl|grouped|chromium|wptreport|wptscreenshot) PATH
           Enable the given wpt log option with the given PATH
 
@@ -188,10 +222,17 @@ set_logging_flags()
 
 headless=1
 ARG=$1
-while [[ "$ARG" =~ ^(--show-window|--debug-process|--parallel-instances|(--log(-(raw|unittest|xunit|html|mach|tbpl|grouped|chromium|wptreport|wptscreenshot))?))$ ]]; do
+while [[ "$ARG" =~ ^(--show-window|--debug-process|--parallel-instances|--test-list|(--log(-(raw|unittest|xunit|html|mach|tbpl|grouped|chromium|wptreport|wptscreenshot))?))$ ]]; do
     case "$ARG" in
         --show-window)
             headless=0
+            ;;
+        --test-list)
+            [ -f "${2}" ] || die "No such test list file: '${2}'"
+            while IFS= read -r test_path; do
+                TESTS_FROM_FILE+=("$test_path")
+            done < <(grep -v -e '^#' -e '^[[:space:]]*$' "${2}")
+            shift
             ;;
         --debug-process)
             process_name="${2}"
@@ -220,10 +261,12 @@ if [ $headless -eq 1 ]; then
     WPT_ARGS+=( "--webdriver-arg=--headless" )
 fi
 
-exit_if_running_as_root "Do not run WPT.sh as root"
+if [ "${CI:-false}" != "true" ]; then
+    exit_if_running_as_root "Do not run WPT.sh as root"
+fi
 
 construct_test_list() {
-    TEST_LIST=( "$@" )
+    TEST_LIST=( "$@" "${TESTS_FROM_FILE[@]}" )
 
     for i in "${!TEST_LIST[@]}"; do
         item="${TEST_LIST[i]}"
@@ -245,6 +288,9 @@ ensure_wpt_repository() {
 }
 
 build_ladybird_and_webdriver() {
+    if ! "$BUILD_LADYBIRD"; then
+        return
+    fi
     "${LADYBIRD_SOURCE_DIR}"/Meta/ladybird.py build WebDriver
 }
 
@@ -284,6 +330,36 @@ cleanup_run_infra() {
     done
 }
 
+clear_processes_using_path() {
+    local path="$1"
+    local signal="$2"
+    local action="$3"
+    local timeout_seconds="$4"
+    local deadline=$((SECONDS + timeout_seconds))
+    local pids_in_use
+
+    readarray -t pids_in_use < <(sudo_and_ask "" lsof -t "$path" 2>/dev/null | sort -nu)
+    if [ "${#pids_in_use[@]}" = 0 ]; then
+        return 0
+    fi
+
+    echo "Trying to $action procs holding $path: ${pids_in_use[*]}"
+    kill "-$signal" "${pids_in_use[@]}" 2>/dev/null || true
+    while true; do
+        readarray -t pids_in_use < <(sudo_and_ask "" lsof -t "$path" 2>/dev/null | sort -nu)
+        if [ "${#pids_in_use[@]}" = 0 ]; then
+            return 0
+        fi
+
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Timed out waiting for procs holding $path to exit: ${pids_in_use[*]}"
+            return 1
+        fi
+
+        sleep 0.1
+    done
+}
+
 cleanup_run_dirs() {
     readarray -t dirs < <(ls "${BUILD_DIR}/wpt" 2>/dev/null)
     if [ "${#dirs}" = 0 ]; then
@@ -293,24 +369,65 @@ cleanup_run_dirs() {
     echo "Cleaning run dirs: ${dirs[*]}"
     for dir in "${dirs[@]}"; do
         mount_path="${BUILD_DIR}/wpt/$dir/merged"
-        for _ in $(seq 1 5); do
-            readarray -t pids_in_use < <(sudo_and_ask "" lsof "$mount_path" 2>/dev/null | cut -f2 -d' ')
-            [ "${#pids_in_use[@]}" = 0 ] && break
-                echo Trying to kill procs: "${pids_in_use[@]}"
-                kill -INT "${pids_in_use[@]}" 2>/dev/null || true
-            done
-            sudo_and_ask "" umount "$mount_path" || true
-        done
-        rm -fr "${BUILD_DIR}/wpt"
-    }
+        if ! mountpoint -q "$mount_path"; then
+            continue
+        fi
+
+        clear_processes_using_path "$mount_path" TERM terminate 5 \
+            || clear_processes_using_path "$mount_path" KILL kill 5 \
+            || true
+
+        sudo_and_ask "" umount "$mount_path" || echo "Failed to unmount $mount_path"
+    done
+    # Overlayfs can leave root-owned internal state in the workdir because we mount it via sudo.
+    sudo_and_ask "" rm -fr "${BUILD_DIR}/wpt"
+}
+
+WPT_PROFILES_PARENT="${BUILD_DIR}/wpt-profiles"
+WPT_PROFILES_ROOT="${WPT_PROFILES_PARENT}/run-$$"
+
+# Each WebDriver instance creates its browser profile under this run's profile root. The root is
+# removed when this script exits; roots leaked by previous unclean exits are swept before running.
+ensure_profiles_root() {
+    local stale pid
+    for stale in "${WPT_PROFILES_PARENT}"/run-*; do
+        [ -d "$stale" ] || continue
+        pid="${stale##*/run-}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$stale"
+        fi
+    done
+    mkdir -p "${WPT_PROFILES_ROOT}"
+    WPT_ARGS+=( "--webdriver-arg=--profiles-directory=${WPT_PROFILES_ROOT}" )
+}
+
+cleanup_profiles_root() {
+    rm -rf "${WPT_PROFILES_ROOT}"
+}
+
+SCHEDULER_PID=""
+
+stop_scheduler() {
+    if [ -z "$SCHEDULER_PID" ] || ! kill -0 "$SCHEDULER_PID" 2>/dev/null; then
+        return
+    fi
+    # Let it shut its instances down (and not mistake them dying for crashes) before the rug is pulled out.
+    kill -TERM "$SCHEDULER_PID" 2>/dev/null || true
+    local deadline=$((SECONDS + 30))
+    while kill -0 "$SCHEDULER_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 0.2
+    done
+}
+
 cleanup_merge_dirs_and_infra() {
     # Cleanup is only needed on Linux
     if [[ $OSTYPE == 'linux'* ]]; then
+        stop_scheduler
         cleanup_run_dirs
         cleanup_run_infra
     fi
 }
-trap cleanup_merge_dirs_and_infra EXIT INT TERM
+trap 'cleanup_merge_dirs_and_infra; cleanup_profiles_root' EXIT INT TERM
 
 make_instances() {
     if [ "${PARALLEL_INSTANCES}" = 1 ]; then
@@ -335,7 +452,7 @@ make_instances() {
 
     local total_cores count ns
     total_cores=$(nproc)
-    count=$(( total_cores / 2 ))
+    count=$total_cores
     (( count < 1 )) && count=1
 
     if (( explicit_count > 0 )); then
@@ -357,170 +474,85 @@ make_instances() {
     echo "$count"
 }
 
-instance_run() {
-    local idx="$1"; shift
-    local rundir="$1"; shift
-    local ns="wptns$idx"
-    if sudo_and_ask "" ip netns list | grep -qw "$ns"; then
-        (
-            cd "$rundir"
-            sudo_and_ask "" ip netns exec "$ns" sudo -u "$USER" -- env "PATH=$PATH" "$@"
-        )
-    else
-        echo "  netns $ns not found, running in the host namespace"
-        (
-            cd "${WPT_SOURCE_DIR}"
-            "$@"
-        )
-    fi
+run_wpt_single() {
+    command=(./wpt run -f --browser-version="1.0-$(ladybird_git_hash)" --processes="${WPT_PROCESSES}" --install-fonts \
+        "${WPT_ARGS[@]}" "${WPT_LOG_ARGS[@]}" ladybird "${TEST_LIST[@]}" "${WPT_TEST_TYPE_ARGS[@]}")
+    echo "${command[@]}"
+    "${command[@]}"
 }
 
-show_files() {
-    if ! "$SHOW_LOGFILES"; then
-        return
+# run_wpt_scheduled <#instances>
+# Hands the tests out in batches to up to N instances, one per network namespace; see Meta/wpt_scheduler.py.
+run_wpt_scheduled() {
+    local slots="$1"
+    local base_venv="${BUILD_DIR}/wpt-prep/_venv"
+    local durations_file="$WPT_DURATIONS_FILE"
+    if [ -z "$durations_file" ]; then
+        durations_file=$(find "${BUILD_DIR}" -maxdepth 2 -path "${BUILD_DIR}/wpt-run-*/durations.json" -printf '%T@ %p\n' 2>/dev/null \
+            | sort -n | tail -n 1 | cut -d' ' -f2-)
     fi
-    local files=("$@")
-    if ! command -v tmux &>/dev/null || ! "$TRY_SHOW_LOGFILES_IN_TMUX"; then
-        if "$TRY_SHOW_LOGFILES_IN_TMUX"; then
-            echo "tmux is not available, falling back to tail"
-        fi
-        if "$SHOW_PROGRESS"; then
-            bash "${DIR}/watch_wpt_progress.sh" "${files[@]}" &
-        else
-            tail -f "${files[@]}" &
-        fi
-        PID=$!
-        for pid in $(jobs -p | grep -v $PID); do
-            # shellcheck disable=SC2009
-            ps | grep -q "$pid" && wait "$pid"
-        done
-        kill -HUP $PID
-    else
-        tmux new-session -d
+    local run_dir
+    run_dir="${BUILD_DIR}/wpt-run-$(date +"%Y%m%d%H%M%S")"
+    mkdir -p "$run_dir"
 
-        tmux send-keys "less +F ${files[0]}" C-m
-
-        for ((i = 1; i < ${#files[@]}; i++)); do
-            if (( i % 2 == 1 )); then
-                tmux split-window -h "less +F ${files[i]}"
-            else
-                tmux split-window -v "less +F ${files[i]}"
-            fi
-            tmux select-layout tiled > /dev/null
-        done
-
-        tmux attach
+    # Ensure open files limit is at least 1024 per instance, so the WPT runners do not run out of descriptors
+    if [ "$(ulimit -n)" -lt $((1024 * slots)) ]; then
+        ulimit -S -n $((1024 * slots))
     fi
-}
 
-copy_results_to() {
-    local target="$1"; shift
-    local runcount="$1"; shift
-    mkdir -p "$target"
-    for i in $(seq 0 $((runcount - 1))); do
-        for f in "$(run_dir_path "$i")/upper"/*; do
-            cp -r "$f" "$target/$(basename "$f").run_$i"
-        done
+    ensure_ahem_font
+
+    # This also brings the manifest up to date once, so the instances can skip that.
+    echo "Preparing the venv and listing tests..."
+    local listing="${run_dir}/list-tests.out"
+    if ! ./wpt --venv "$base_venv" run "${WPT_ARGS[@]}" --list-tests ladybird "${TEST_LIST[@]}" "${WPT_TEST_TYPE_ARGS[@]}" > "$listing"; then
+        echo "Listing the tests to run failed" >&2
+        return 1
+    fi
+    grep '^/' "$listing" > "${run_dir}/tests.txt" || true
+    rm -f "$listing"
+    if [ ! -s "${run_dir}/tests.txt" ]; then
+        echo "No tests to run" >&2
+        return 1
+    fi
+
+    local scheduler_args=()
+    for i in $(seq 0 $((slots - 1))); do
+        scheduler_args+=( "--slot=wptns$i:$(ensure_run_dir "$i")" )
     done
-}
-
-show_summary() {
-    local logs=("$@")
-    local total_tests=0
-    local expected=0
-    local skipped=0
-    local errored=0
-    local subtest_issues=0
-    local max_time=0
-
-    for out_file in "${logs[@]}"; do
-        # wpt puts random garbage in the output, strip those (as they're all nonprint)
-        mapfile -t lines < <(grep -A4 -aE 'Ran [0-9]+ tests finished in' "$out_file" \
-                             | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
-                             | sed 's/[^[:print:]]//g')
-
-        for line in "${lines[@]}"; do
-            if [[ $line =~ Ran[[:space:]]([0-9]+)[[:space:]]tests[[:space:]]finished[[:space:]]in[[:space:]]([0-9.]+) ]]; then
-                (( total_tests += BASH_REMATCH[1] ))
-                time=${BASH_REMATCH[2]}
-                [[ $(echo "$time > $max_time" | bc -l) == 1 ]] && max_time=$time
-            elif [[ $line =~ ([0-9]+)[[:space:]]ran[[:space:]]as[[:space:]]expected ]]; then
-                (( expected += BASH_REMATCH[1] ))
-            elif [[ $line =~ ([0-9]+)[[:space:]]tests[[:space:]]skipped ]]; then
-                (( skipped += BASH_REMATCH[1] ))
-            elif [[ $line =~ ([0-9]+)[[:space:]]tests[[:space:]](crashed|timed[[:space:]]out|had[[:space:]]errors)[[:space:]]unexpectedly ]]; then
-                (( errored += BASH_REMATCH[1] ))
-            elif [[ $line =~ ([0-9]+)[[:space:]]tests[[:space:]]had[[:space:]]unexpected[[:space:]]subtest[[:space:]]results ]]; then
-                (( subtest_issues += BASH_REMATCH[1] ))
-            fi
-        done
+    for ((i = 0; i < ${#WPT_LOG_ARGS[@]}; i += 2)); do
+        scheduler_args+=( "--log=${WPT_LOG_ARGS[i]}=${WPT_LOG_ARGS[i + 1]}" )
     done
+    if [ -n "$durations_file" ]; then
+        echo "Using test durations from ${durations_file}"
+        scheduler_args+=( "--durations" "$durations_file" )
+    fi
+    local extra_scheduler_args=()
+    read -ra extra_scheduler_args <<< "$WPT_SCHEDULER_ARGS"
+    scheduler_args+=( "${extra_scheduler_args[@]}" )
 
-    echo "Total tests run: $total_tests"
-    echo "Ran as expected: $expected"
-    echo "Skipped: $skipped"
-    echo "Errored unexpectedly: $errored"
-    echo "Unexpected subtest results: $subtest_issues"
-    echo "Longest run time: ${max_time}s"
-}
+    local webdriver_wrapper="${run_dir}/webdriver"
+    cat > "$webdriver_wrapper" <<EOF2
+#!/bin/sh
+echo 1000 > /proc/self/oom_score_adj
+exec "${WEBDRIVER_BINARY}" "\$@"
+EOF2
+    chmod +x "$webdriver_wrapper"
 
-# run_wpt_chunked <#processes> <wpt args...>
-run_wpt_chunked() {
-    local procs concurrency
-    procs="$1"; shift
-
-    # Ensure open files limit is at least 1024, so the WPT runner does not run out of descriptors
-    if [ "$(ulimit -n)" -lt $((1024 * procs)) ]; then
-        ulimit -S -n $((1024 * procs))
+    # The scheduler starts its instances with sudo -n (and keeps the credentials fresh), so authenticate once up front.
+    if [ "$(id -u)" -ne 0 ]; then
+        sudo_and_ask "Authenticating for the parallel run" -v
     fi
 
-    if [ "$procs" -le 1 ]; then
-        command=(./wpt run -f --browser-version="1.0-$(ladybird_git_hash)" --processes="${WPT_PROCESSES}" "$@")
-        echo "${command[@]}"
-        "${command[@]}"
-        return
-    fi
-
-    concurrency=$(( $(nproc) * 2 / procs ))
-
-    echo "Preparing the venv setup..."
-    base_venv="${BUILD_DIR}/wpt-prep/_venv"
-    ./wpt --venv "$base_venv" run "${WPT_ARGS[@]}" ladybird THIS_TEST_CANNOT_POSSIBLY_EXIST || true
-
-    echo "Launching $procs chunked instances (concurrency=$concurrency each)"
-    local logs=()
-    local run_start_time
-    run_start_time=$(date +"%Y%m%d%H%M%S")
-
-    for i in $(seq 0 $((procs - 1))); do
-        local rundir runpath logpath
-        rundir="$(ensure_run_dir "$i")"
-        runpath="$(run_dir_path "$i")"
-        logpath="$runpath/upper/run.logs"
-        echo "rundir at $rundir, logs in $logpath"
-        touch "$logpath"
-        logs+=("$logpath")
-
-        cp -r "$base_venv" "${runpath}/_venv"
-
-        command=(./wpt --venv "${runpath}/_venv" \
-            run \
-            --this-chunk="$((i + 1))" \
-            --total-chunks="$procs" \
-            --chunk-type=hash \
-            -f \
-            --browser-version="1.0-$(ladybird_git_hash)"
-            --processes="$concurrency" \
-            "$@")
-        echo "[INSTANCE $i / ns wptns$i] ${command[*]}"
-        instance_run "$i" "$rundir" script -q "$logpath" -c "$(printf "%q " "${command[@]}")" &>/dev/null &
-    done
-
-    show_files "${logs[@]}"
-    wait
-
-    copy_results_to "${BUILD_DIR}/wpt-run-${run_start_time}" "$procs"
-    show_summary "${logs[@]}"
+    python3 "${DIR}/wpt_scheduler.py" run "${scheduler_args[@]}" \
+        --venv "$base_venv" \
+        --tests "${run_dir}/tests.txt" \
+        --processes "$WPT_PROCESSES_PER_INSTANCE" \
+        --out "$run_dir" \
+        -- --browser-version="1.0-$(ladybird_git_hash)" "${WPT_ARGS[@]}" --webdriver-binary="$webdriver_wrapper" \
+            ladybird "${WPT_TEST_TYPE_ARGS[@]}" &
+    SCHEDULER_PID=$!
+    wait "$SCHEDULER_PID"
 }
 
 absolutize_log_args() {
@@ -540,6 +572,8 @@ update_hosts_file_if_needed() {
 execute_wpt() {
     local procs
 
+    ensure_profiles_root
+
     procs=$(make_instances)
     if [[ "$procs" -le 1 ]]; then
         absolutize_log_args
@@ -554,7 +588,11 @@ execute_wpt() {
             WPT_ARGS+=( "--webdriver-arg=--certificate=${certificate_path}" )
         done
         construct_test_list "${@}"
-        run_wpt_chunked "$procs" "${WPT_ARGS[@]}" "${WPT_LOG_ARGS[@]}" ladybird "${TEST_LIST[@]}"
+        if [[ "$procs" -le 1 ]]; then
+            run_wpt_single
+        else
+            run_wpt_scheduled "$procs"
+        fi
     popd > /dev/null
 }
 
@@ -672,7 +710,7 @@ list_tests_wpt()
     construct_test_list "${@}"
 
     pushd "${WPT_SOURCE_DIR}" > /dev/null
-        ./wpt run --list-tests ladybird "${TEST_LIST[@]}"
+        ./wpt run --list-tests ladybird "${TEST_LIST[@]}" "${WPT_TEST_TYPE_ARGS[@]}"
     popd > /dev/null
 }
 
@@ -755,8 +793,11 @@ if [[ "$CMD" =~ ^(update|clean|run|serve|bisect|compare|import|list-tests)$ ]]; 
             run_wpt "${@}"
             ;;
         clean)
-            cleanup_run_infra
-            cleanup_run_dirs true
+            rm -rf "${WPT_PROFILES_PARENT}"
+            if [[ $OSTYPE == 'linux'* ]]; then
+                cleanup_run_infra
+                cleanup_run_dirs true
+            fi
             ;;
         serve)
             serve_wpt

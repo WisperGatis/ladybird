@@ -1,23 +1,27 @@
-#import <TrustedTypes/TrustedTypePolicy.idl>
+// https://w3c.github.io/trusted-types/dist/spec/#extensions-to-the-windoworworkerglobalscope-interface
+partial interface mixin WindowOrWorkerGlobalScope {
+    readonly attribute TrustedTypePolicyFactory trustedTypes;
+};
 
 // https://w3c.github.io/trusted-types/dist/spec/#trustedtypepolicyfactory
 [Exposed=(Window,Worker)]
 interface TrustedTypePolicyFactory {
+    [NeedsCallerRealm]
     TrustedTypePolicy createPolicy(
-        Utf16DOMString policyName, optional TrustedTypePolicyOptions policyOptions = {});
+        DOMString policyName, optional TrustedTypePolicyOptions policyOptions = {});
     boolean isHTML(any value);
     boolean isScript(any value);
     boolean isScriptURL(any value);
     readonly attribute TrustedHTML emptyHTML;
     readonly attribute TrustedScript emptyScript;
-    Utf16DOMString? getAttributeType(
-        Utf16DOMString tagName,
-        Utf16DOMString attribute,
-        optional Utf16DOMString? elementNs = "",
-        optional Utf16DOMString? attrNs = "");
-    Utf16DOMString? getPropertyType(
-        Utf16DOMString tagName,
-        Utf16DOMString property,
-        optional Utf16DOMString? elementNs = "");
-    readonly attribute TrustedTypePolicy? defaultPolicy;
+    DOMString? getAttributeType(
+        [FlyString] DOMString tagName,
+        [FlyString] DOMString attribute,
+        optional [FlyString] DOMString? elementNs = "",
+        optional [FlyString] DOMString? attrNs = "");
+    DOMString? getPropertyType(
+        [FlyString] DOMString tagName,
+        [FlyString] DOMString property,
+        optional [FlyString] DOMString? elementNs = "");
+    [DirectGetter] readonly attribute TrustedTypePolicy? defaultPolicy;
 };

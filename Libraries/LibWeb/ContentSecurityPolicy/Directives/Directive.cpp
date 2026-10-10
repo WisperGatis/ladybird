@@ -4,16 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/Realm.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/DirectiveFactory.h>
-#include <LibWeb/ContentSecurityPolicy/Directives/SerializedDirective.h>
+#include <LibWebCommon/ContentSecurityPolicy/Directives/SerializedDirective.h>
 
 namespace Web::ContentSecurityPolicy::Directives {
 
 GC_DEFINE_ALLOCATOR(Directive);
 
-Directive::Directive(String name, Vector<String> value)
+Directive::Directive(Utf16FlyString name, Vector<Utf16String> value)
     : m_name(move(name))
     , m_value(move(value))
 {

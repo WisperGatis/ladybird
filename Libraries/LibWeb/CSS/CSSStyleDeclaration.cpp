@@ -5,11 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/CSSStyleDeclarationPrototype.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 
@@ -17,20 +15,26 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSStyleDeclaration);
 
-CSSStyleDeclaration::CSSStyleDeclaration(JS::Realm& realm, Computed computed, Readonly readonly)
-    : PlatformObject(realm)
-    , m_computed(computed == Computed::Yes)
+CSSStyleDeclaration::CSSStyleDeclaration(Computed computed, Readonly readonly)
+    : m_computed(computed == Computed::Yes)
     , m_readonly(readonly == Readonly::Yes)
 {
-    m_legacy_platform_object_flags = LegacyPlatformObjectFlags {
-        .supports_indexed_properties = true,
-    };
 }
 
-void CSSStyleDeclaration::initialize(JS::Realm& realm)
+void CSSStyleDeclaration::prepare_to_update_style_attribute()
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(CSSStyleDeclaration);
-    Base::initialize(realm);
+    VERIFY(!is_computed());
+    if (!owner_node().has_value()) {
+        if (auto rule = parent_rule())
+            flush_deferred_style_change_events_for_rule(*rule);
+        return;
+    }
+
+    // OPTIMIZATION: A geometry read can leave paint-only selector facts pending. An inline
+    //               declaration is not a replayable fact, so consume the boundary while the old
+    //               declaration block is still authoritative.
+    owner_node()->element().document().flush_deferred_style_change_event();
+    owner_node()->element().prepare_for_inline_style_change();
 }
 
 // https://drafts.csswg.org/cssom/#update-style-attribute-for
@@ -44,18 +48,26 @@ void CSSStyleDeclaration::update_style_attribute()
     if (!owner_node().has_value())
         return;
 
+    auto& element = owner_node()->element();
+    // OPTIMIZATION: Keep the parsed declaration block authoritative and serialize it only when
+    //               something observes the textual attribute value.
+    if (element.can_defer_inline_style_attribute_update()) {
+        element.did_update_inline_style();
+        return;
+    }
+
     // 4. Set declaration block’s updating flag.
     set_is_updating(true);
 
     // 5. Set an attribute value for owner node using "style" and the result of serializing declaration block.
-    MUST(owner_node()->element().set_attribute(HTML::AttributeNames::style, serialized()));
+    element.set_attribute_value(HTML::AttributeNames::style, serialized());
 
     // 6. Unset declaration block’s updating flag.
     set_is_updating(false);
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-csstext
-String CSSStyleDeclaration::css_text() const
+Utf16String CSSStyleDeclaration::css_text() const
 {
     // 1. If the computed flag is set, then return the empty string.
     if (is_computed())
@@ -65,16 +77,7 @@ String CSSStyleDeclaration::css_text() const
     return serialized();
 }
 
-Optional<JS::Value> CSSStyleDeclaration::item_value(size_t index) const
-{
-    auto value = item(index);
-    if (value.is_empty())
-        return {};
-
-    return JS::PrimitiveString::create(vm(), value);
-}
-
-void CSSStyleDeclaration::visit_edges(Visitor& visitor)
+void CSSStyleDeclaration::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_parent_rule);

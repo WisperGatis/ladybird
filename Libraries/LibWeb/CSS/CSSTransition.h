@@ -8,31 +8,44 @@
 #pragma once
 
 #include <LibWeb/Animations/Animation.h>
-#include <LibWeb/CSS/Interpolation.h>
-#include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/CSS/PseudoElement.h>
+#include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
-#include <LibWeb/CSS/Time.h>
 
 namespace Web::CSS {
 
 class CSSTransition : public Animations::Animation {
-    WEB_PLATFORM_OBJECT(CSSTransition, Animations::Animation);
+    WEB_WRAPPABLE(CSSTransition, Animations::Animation);
     GC_DECLARE_ALLOCATOR(CSSTransition);
 
 public:
-    static GC::Ref<CSSTransition> start_a_transition(DOM::AbstractElement, PropertyID,
-        size_t transition_generation, double delay, double start_time, double end_time, NonnullRefPtr<StyleValue const> start_value,
-        NonnullRefPtr<StyleValue const> end_value, NonnullRefPtr<StyleValue const> reversing_adjusted_start_value, double reversing_shortening_factor);
+    // A transition is started provisionally, and associated with its target only once committed.
+    static GC::Ref<CSSTransition> start_a_provisional_transition(
+        DOM::AbstractElement,
+        PropertyID,
+        size_t transition_generation,
+        double delay,
+        double start_time,
+        double end_time,
+        NonnullRefPtr<StyleValue const> start_value,
+        NonnullRefPtr<StyleValue const> end_value,
+        NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
+        double reversing_shortening_factor,
+        EasingFunction timing_function);
 
-    StringView transition_property() const { return string_from_property_id(m_transition_property); }
+    void commit_provisional_transition();
+    void discard_provisional_transition();
+
+    // AD-HOC: Runs the transitions the hover of the document's clock lane left elements running beside a task, which
+    //         the screen showed, in place of those its steps ended, as the rendering update that takes them in begins.
+    static void adopt_lane_transitions(DOM::Document&);
+
+    Utf16FlyString const& transition_property() const;
 
     virtual Animations::AnimationClass animation_class() const override;
-    virtual Optional<int> class_specific_composite_order(GC::Ref<Animations::Animation> other) const override;
+    virtual int class_specific_composite_order(GC::Ref<Animations::Animation> other) const override;
 
     double transition_start_time() const { return m_start_time; }
     double transition_end_time() const { return m_end_time; }
-    NonnullRefPtr<StyleValue const> transition_start_value() const { return m_start_value; }
     NonnullRefPtr<StyleValue const> transition_end_value() const { return m_end_value; }
     NonnullRefPtr<StyleValue const> reversing_adjusted_start_value() const { return m_reversing_adjusted_start_value; }
     double reversing_shortening_factor() const { return m_reversing_shortening_factor; }
@@ -51,11 +64,20 @@ public:
     void set_previous_phase(Phase phase) { m_previous_phase = phase; }
 
 private:
-    CSSTransition(JS::Realm&, DOM::AbstractElement, PropertyID, size_t transition_generation,
-        double delay, double start_time, double end_time, NonnullRefPtr<StyleValue const> start_value, NonnullRefPtr<StyleValue const> end_value,
-        NonnullRefPtr<StyleValue const> reversing_adjusted_start_value, double reversing_shortening_factor);
+    CSSTransition(
+        HTML::EnvironmentSettingsObject&,
+        DOM::AbstractElement,
+        PropertyID,
+        size_t transition_generation,
+        double delay,
+        double start_time,
+        double end_time,
+        NonnullRefPtr<StyleValue const> start_value,
+        NonnullRefPtr<StyleValue const> end_value,
+        NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
+        double reversing_shortening_factor,
+        EasingFunction timing_function);
 
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual bool is_css_transition() const override { return true; }
@@ -86,6 +108,11 @@ private:
     GC::Ref<Animations::KeyframeEffect> m_keyframe_effect;
 
     GC::Ptr<CSS::CSSStyleDeclaration const> m_cached_declaration;
+
+    bool m_is_provisional { true };
+
+    // Whether the transition is one the hover of a clock lane started, which the host took in.
+    bool m_adopted_from_lane { false };
 
     Phase m_previous_phase { Phase::Idle };
 };

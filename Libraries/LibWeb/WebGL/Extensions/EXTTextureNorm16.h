@@ -6,26 +6,25 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Forward.h>
 
-namespace Web::WebGL::Extensions {
+namespace Web::WebGL {
 
-class EXTTextureNorm16 : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(EXTTextureNorm16, Bindings::PlatformObject);
+class EXTTextureNorm16 : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(EXTTextureNorm16, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(EXTTextureNorm16);
 
 public:
-    static JS::ThrowCompletionOr<GC::Ptr<EXTTextureNorm16>> create(JS::Realm&, GC::Ref<WebGL2RenderingContext>);
+    static GC::Ref<Bindings::Wrappable> create(GC::Ref<WebGLRenderingContextBase>);
 
 protected:
-    void initialize(JS::Realm&) override;
     void visit_edges(Visitor&) override;
 
 private:
-    EXTTextureNorm16(JS::Realm&, GC::Ref<WebGL2RenderingContext>);
+    EXTTextureNorm16(JS::Realm&, GC::Ref<WebGLRenderingContextBase>);
 
-    GC::Ref<WebGL2RenderingContext> m_context;
+    GC::Ref<WebGLRenderingContextBase> m_context;
 };
 
 }

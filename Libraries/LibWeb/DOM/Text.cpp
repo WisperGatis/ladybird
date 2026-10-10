@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/Heap.h>
 #include <LibUnicode/CharacterTypes.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/TextPrototype.h>
+#include <LibUnicode/Segmenter.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -15,6 +15,38 @@
 #include <LibWeb/Layout/TextNode.h>
 
 namespace Web::DOM {
+
+struct Text::RareData final
+    : CharacterData::RareData
+    , SlottableMixin::RareData {
+    AK_ALLOC_WITH_KMALLOC;
+
+    virtual void visit_edges(Cell::Visitor& visitor) override
+    {
+        CharacterData::RareData::visit_edges(visitor);
+        SlottableMixin::RareData::visit_edges(visitor);
+    }
+};
+
+OwnPtr<Node::RareData> Text::create_rare_data() const
+{
+    return make<RareData>();
+}
+
+SlottableMixin::RareData* Text::slottable_rare_data()
+{
+    return static_cast<RareData*>(rare_data());
+}
+
+SlottableMixin::RareData const* Text::slottable_rare_data() const
+{
+    return static_cast<RareData const*>(rare_data());
+}
+
+SlottableMixin::RareData& Text::ensure_slottable_rare_data()
+{
+    return static_cast<RareData&>(ensure_rare_data());
+}
 
 GC_DEFINE_ALLOCATOR(Text);
 
@@ -28,24 +60,19 @@ Text::Text(Document& document, NodeType type, Utf16String data)
 {
 }
 
-void Text::initialize(JS::Realm& realm)
+GC::Ref<Text> Text::create(Document& document, Utf16String data)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(Text);
-    Base::initialize(realm);
+    return GC::Heap::the().allocate<Text>(document, move(data));
+}
+
+GC::Ref<Text> Text::create_for_constructor(JS::Object& relevant_global_object, Utf16String data)
+{
+    return create(HTML::relevant_window(relevant_global_object).associated_document(), move(data));
 }
 
 void Text::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    SlottableMixin::visit_edges(visitor);
-}
-
-// https://dom.spec.whatwg.org/#dom-text-text
-WebIDL::ExceptionOr<GC::Ref<Text>> Text::construct_impl(JS::Realm& realm, Utf16String data)
-{
-    // The new Text(data) constructor steps are to set this’s data to data and this’s node document to current global object’s associated Document.
-    auto& window = as<HTML::Window>(HTML::current_principal_global_object());
-    return realm.create<Text>(window.associated_document(), move(data));
 }
 
 // https://dom.spec.whatwg.org/#dom-text-splittext
@@ -57,7 +84,7 @@ WebIDL::ExceptionOr<GC::Ref<Text>> Text::split_text(size_t offset)
 
     // 2. If offset is greater than length, then throw an "IndexSizeError" DOMException.
     if (offset > length)
-        return WebIDL::IndexSizeError::create(realm(), "Split offset is greater than length"_utf16);
+        return WebIDL::IndexSizeError::create("Split offset is greater than length"_utf16);
 
     // 3. Let count be length minus offset.
     auto count = length - offset;
@@ -66,7 +93,7 @@ WebIDL::ExceptionOr<GC::Ref<Text>> Text::split_text(size_t offset)
     auto new_data = TRY(substring_data(offset, count));
 
     // 5. Let new node be a new Text node, with the same node document as node. Set new node’s data to new data.
-    auto new_node = realm().create<Text>(document(), new_data);
+    auto new_node = create(document(), new_data);
 
     // 6. Let parent be node’s parent.
     GC::Ptr<Node> parent = this->parent();
@@ -78,34 +105,27 @@ WebIDL::ExceptionOr<GC::Ref<Text>> Text::split_text(size_t offset)
 
         // 2. For each live range whose start node is node and start offset is greater than offset, set its start node
         //    to new node and decrease its start offset by offset.
-        for (auto* range : Range::live_ranges()) {
-            if (range->start_container() == this && range->start_offset() > offset) {
-                range->set_start_node(*new_node);
-                range->decrease_start_offset(offset);
-            }
-        }
-
         // 3. For each live range whose end node is node and end offset is greater than offset, set its end node to new
         //    node and decrease its end offset by offset.
-        for (auto* range : Range::live_ranges()) {
-            if (range->end_container() == this && range->end_offset() > offset) {
-                range->set_end_node(*new_node);
-                range->decrease_end_offset(offset);
-            }
-        }
-
         // 4. For each live range whose start node is parent and start offset is equal to the index of node plus 1,
         //    increase its start offset by 1.
-        for (auto* range : Range::live_ranges()) {
-            if (range->start_container() == parent.ptr() && range->start_offset() == index() + 1)
-                range->increase_start_offset(1);
-        }
-
         // 5. For each live range whose end node is parent and end offset is equal to the index of node plus 1, increase
         //    its end offset by 1.
-        for (auto* range : Range::live_ranges()) {
-            if (range->end_container() == parent.ptr() && range->end_offset() == index() + 1)
-                range->increase_end_offset(1);
+        // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+        auto node_index = index();
+        for (auto& range : document().live_ranges()) {
+            if (range.start_container().ptr() == this && range.start_offset() > offset) {
+                range.set_start_node(*new_node);
+                range.decrease_start_offset(offset);
+            }
+            if (range.end_container().ptr() == this && range.end_offset() > offset) {
+                range.set_end_node(*new_node);
+                range.decrease_end_offset(offset);
+            }
+            if (range.start_container().ptr() == parent.ptr() && range.start_offset() == node_index + 1)
+                range.increase_start_offset(1);
+            if (range.end_container().ptr() == parent.ptr() && range.end_offset() == node_index + 1)
+                range.increase_end_offset(1);
         }
     }
 
@@ -141,11 +161,20 @@ Utf16String Text::whole_text()
         current_node = current_node->next_sibling();
     }
 
-    StringBuilder builder(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder builder;
     for (auto const& text_node : nodes)
         builder.append(text_node->data());
 
-    return builder.to_utf16_string();
+    return builder.to_string();
+}
+
+void Text::set_style_node_id(CSS::StyleNodeID style_node_id)
+{
+    if (m_style_node_id == style_node_id)
+        return;
+    auto old_style_node_id = m_style_node_id;
+    m_style_node_id = style_node_id;
+    Layout::Node::dom_node_style_node_changed(*this, old_style_node_id);
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#text-node-directionality

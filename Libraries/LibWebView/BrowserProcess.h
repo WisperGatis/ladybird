@@ -9,10 +9,11 @@
 #include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
 #include <AK/Types.h>
+#include <LibCore/LocalServer.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/Forward.h>
-#include <LibIPC/MultiServer.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Options.h>
 #include <LibWebView/UIProcessClientEndpoint.h>
@@ -31,12 +32,14 @@ public:
 
     Function<void(Vector<URL::URL> const&)> on_new_tab;
     Function<void(Vector<URL::URL> const&)> on_new_window;
+    Function<void(Vector<URL::URL> const&)> on_open_urls;
 
 private:
     UIProcessConnectionFromClient(NonnullOwnPtr<IPC::Transport>, int client_id);
 
     virtual void create_new_tab(Vector<ByteString> urls) override;
     virtual void create_new_window(Vector<ByteString> urls) override;
+    virtual void open_urls(Vector<ByteString> urls) override;
 };
 
 class WEBVIEW_API BrowserProcess {
@@ -44,6 +47,8 @@ class WEBVIEW_API BrowserProcess {
     AK_MAKE_DEFAULT_MOVABLE(BrowserProcess);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     enum class ProcessDisposition : u8 {
         ContinueMainProcess,
         ExitProcess,
@@ -52,19 +57,29 @@ public:
     BrowserProcess() = default;
     ~BrowserProcess();
 
-    ErrorOr<ProcessDisposition> connect(Vector<ByteString> const& raw_urls, NewWindow new_window);
+    ErrorOr<ProcessDisposition> connect(Vector<ByteString> const& raw_urls, NewWindow new_window, StringView runtime_directory, StringView profile_identity);
 
     Function<void(Vector<URL::URL> const&)> on_new_tab;
     Function<void(Vector<URL::URL> const&)> on_new_window;
 
+    // URLs another process was launched by the OS to open; e.g. link clicked in another app. Falls back to on_new_tab.
+    Function<void(Vector<URL::URL> const&)> on_open_urls;
+
 private:
+    void accept_transport(NonnullOwnPtr<IPC::Transport>);
+#if defined(AK_OS_MACOS)
+    ErrorOr<void> connect_as_client(pid_t pid, Vector<ByteString> const& raw_urls, NewWindow new_window, StringView profile_identity);
+    ErrorOr<void> connect_as_server();
+#else
     ErrorOr<void> connect_as_client(ByteString const& socket_path, Vector<ByteString> const& raw_urls, NewWindow new_window);
     ErrorOr<void> connect_as_server(ByteString const& socket_path);
+#endif
 
-    OwnPtr<IPC::MultiServer<UIProcessConnectionFromClient>> m_server_connection;
+    RefPtr<Core::LocalServer> m_local_server;
     OwnPtr<Core::File> m_pid_file;
     ByteString m_pid_path;
     ByteString m_socket_path;
+    int m_next_client_id { 0 };
 };
 
 }

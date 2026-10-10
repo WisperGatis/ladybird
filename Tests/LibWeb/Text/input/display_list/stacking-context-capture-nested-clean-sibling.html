@@ -1,0 +1,254 @@
+<!doctype html>
+<html id="html">
+<script src="../include.js"></script>
+<script src="recording-test.js"></script>
+<style>
+    body { margin: 0; font: 16px/20px monospace; }
+    .context { position: absolute; top: 0; width: 200px; height: 120px; border: 2px solid black; background: #eee; }
+    #a { left: 0; z-index: 0; }
+    #b { left: 240px; z-index: 1; }
+    .label { height: 24px; background: #ddd; border-bottom: 1px solid black; }
+    .underlay { position: absolute; left: 8px; top: 32px; width: 160px; height: 56px; z-index: -1; background: lightblue; }
+    .detail { position: absolute; left: 32px; top: 48px; width: 112px; height: 24px; z-index: 1; background: yellow; transform: translate(4px, 2px); opacity: 0.75; }
+</style>
+<body id="body">
+<!-- Each sibling is a real stacking context with text, borders, and negative/positive nested contexts. -->
+<div class="context" id="a"><div class="label" id="a-label">A label</div><div class="underlay" id="a-underlay">A underlay</div><div class="detail" id="a-detail">A detail</div></div>
+<div class="context" id="b"><div class="label" id="b-label">B label</div><div class="underlay" id="b-underlay">B underlay</div><div class="detail" id="b-detail">B detail</div></div>
+<script>
+function checkHitTargets(equal) {
+    equal(document.elementFromPoint(20, 80).id, "a-underlay", "A negative context hit target");
+    equal(document.elementFromPoint(60, 60).id, "a-detail", "A transformed positive context hit target");
+    equal(document.elementFromPoint(260, 80).id, "b-underlay", "B negative context hit target");
+    equal(document.elementFromPoint(300, 60).id, "b-detail", "B transformed positive context hit target");
+}
+
+displayListTest({
+    setup: removeBodyWhitespace,
+    steps: [
+        {
+            name: "change B positive context and splice all of A",
+            mutate: () => { document.getElementById("b-detail").style.color = "red"; },
+            check: checkHitTargets,
+            // A must be a single reuse leaf, covering both nested contexts and their content.
+            expect: `
+                damage: rows=5 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport ASSEMBLE
+                  @viewport/preamble COPY
+                  @viewport/background/hit-test COPY
+                  @viewport/scroll-metadata COPY
+                  @viewport/background COPY
+                  @viewport/border COPY
+                  BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
+                  @viewport/foreground/hit-test COPY
+                  @viewport/foreground COPY
+                  BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML>#html ASSEMBLE
+                    BlockContainer<HTML>#html/preamble COPY
+                    BlockContainer<HTML>#html/background/hit-test COPY
+                    BlockContainer<HTML>#html/scroll-metadata COPY
+                    BlockContainer<HTML>#html/background COPY
+                    BlockContainer<HTML>#html/border COPY
+                    BlockContainer<BODY>#body/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<BODY>#body/background/hit-test COPY
+                      BlockContainer<BODY>#body/scroll-metadata COPY
+                      BlockContainer<BODY>#body/background COPY
+                      BlockContainer<BODY>#body/border COPY
+                      BlockContainer<DIV>#a.context/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#b.context/descendants(background-and-borders) ASSEMBLE
+                    BlockContainer<HTML>#html/foreground/hit-test COPY
+                    BlockContainer<HTML>#html/foreground COPY
+                    BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/foreground/hit-test COPY
+                      BlockContainer<BODY>#body/foreground COPY
+                      BlockContainer<DIV>#a.context/descendants(foreground) COPY
+                      BlockContainer<DIV>#b.context/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/outline COPY
+                      BlockContainer<BODY>#body/overlay/hit-test COPY
+                      BlockContainer<BODY>#body/overlay COPY
+                    BlockContainer<DIV>#a.context COPY
+                    BlockContainer<DIV>#b.context ASSEMBLE
+                      BlockContainer<DIV>#b.context/preamble COPY
+                      BlockContainer<DIV>#b.context/background/hit-test COPY
+                      BlockContainer<DIV>#b.context/scroll-metadata COPY
+                      BlockContainer<DIV>#b.context/background COPY
+                      BlockContainer<DIV>#b.context/border COPY
+                      BlockContainer<DIV>#b-underlay.underlay COPY
+                      BlockContainer<DIV>#b-label.label/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#b-underlay.underlay/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#b-detail.detail/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<DIV>#b.context/foreground/hit-test COPY
+                      BlockContainer<DIV>#b.context/foreground COPY
+                      BlockContainer<DIV>#b-label.label/descendants(foreground) COPY
+                      BlockContainer<DIV>#b-underlay.underlay/descendants(foreground) COPY
+                      BlockContainer<DIV>#b-detail.detail/descendants(foreground) ASSEMBLE
+                      BlockContainer<DIV>#b-detail.detail ASSEMBLE
+                        BlockContainer<DIV>#b-detail.detail/preamble RECORD (empty)
+                        BlockContainer<DIV>#b-detail.detail/background/hit-test COPY
+                        BlockContainer<DIV>#b-detail.detail/scroll-metadata COPY
+                        BlockContainer<DIV>#b-detail.detail/background RECORD
+                        BlockContainer<DIV>#b-detail.detail/border SKIP
+                        BlockContainer<DIV>#b-detail.detail/foreground/hit-test COPY
+                        BlockContainer<DIV>#b-detail.detail/foreground RECORD
+                        BlockContainer<DIV>#b-detail.detail/outline SKIP
+                      BlockContainer<DIV>#b.context/outline COPY
+                    BlockContainer<HTML>#html/outline COPY
+                  @viewport/outline COPY
+            `
+        },
+        {
+            name: "quiet recording covers both contexts",
+            check: checkHitTargets,
+            expect: `
+                damage: rows=0 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport COPY
+            `
+        },
+        {
+            name: "change A background and splice all of B after a quiet recording",
+            mutate: () => { document.getElementById("a-label").style.background = "linear-gradient(red, blue)"; },
+            check: checkHitTargets,
+            // Changing the command size before B also tests relocation of B's complete capture.
+            expect: `
+                damage: rows=5 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport ASSEMBLE
+                  @viewport/preamble COPY
+                  @viewport/background/hit-test COPY
+                  @viewport/scroll-metadata COPY
+                  @viewport/background COPY
+                  @viewport/border COPY
+                  BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
+                  @viewport/foreground/hit-test COPY
+                  @viewport/foreground COPY
+                  BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML>#html ASSEMBLE
+                    BlockContainer<HTML>#html/preamble COPY
+                    BlockContainer<HTML>#html/background/hit-test COPY
+                    BlockContainer<HTML>#html/scroll-metadata COPY
+                    BlockContainer<HTML>#html/background COPY
+                    BlockContainer<HTML>#html/border COPY
+                    BlockContainer<BODY>#body/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<BODY>#body/background/hit-test COPY
+                      BlockContainer<BODY>#body/scroll-metadata COPY
+                      BlockContainer<BODY>#body/background COPY
+                      BlockContainer<BODY>#body/border COPY
+                      BlockContainer<DIV>#a.context/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<DIV>#b.context/descendants(background-and-borders) COPY
+                    BlockContainer<HTML>#html/foreground/hit-test COPY
+                    BlockContainer<HTML>#html/foreground COPY
+                    BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/foreground/hit-test COPY
+                      BlockContainer<BODY>#body/foreground COPY
+                      BlockContainer<DIV>#a.context/descendants(foreground) ASSEMBLE
+                      BlockContainer<DIV>#b.context/descendants(foreground) COPY
+                      BlockContainer<BODY>#body/outline COPY
+                      BlockContainer<BODY>#body/overlay/hit-test COPY
+                      BlockContainer<BODY>#body/overlay COPY
+                    BlockContainer<DIV>#a.context ASSEMBLE
+                      BlockContainer<DIV>#a.context/preamble COPY
+                      BlockContainer<DIV>#a.context/background/hit-test COPY
+                      BlockContainer<DIV>#a.context/scroll-metadata COPY
+                      BlockContainer<DIV>#a.context/background COPY
+                      BlockContainer<DIV>#a.context/border COPY
+                      BlockContainer<DIV>#a-underlay.underlay COPY
+                      BlockContainer<DIV>#a-label.label/descendants(background-and-borders) ASSEMBLE
+                        BlockContainer<DIV>#a-label.label/background/hit-test COPY
+                        BlockContainer<DIV>#a-label.label/scroll-metadata COPY
+                        BlockContainer<DIV>#a-label.label/background RECORD
+                        BlockContainer<DIV>#a-label.label/border RECORD
+                      BlockContainer<DIV>#a-underlay.underlay/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#a-detail.detail/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#a.context/foreground/hit-test COPY
+                      BlockContainer<DIV>#a.context/foreground COPY
+                      BlockContainer<DIV>#a-label.label/descendants(foreground) ASSEMBLE
+                        BlockContainer<DIV>#a-label.label/foreground/hit-test COPY
+                        BlockContainer<DIV>#a-label.label/foreground RECORD
+                        BlockContainer<DIV>#a-label.label/outline SKIP
+                        BlockContainer<DIV>#a-label.label/overlay/hit-test COPY
+                        BlockContainer<DIV>#a-label.label/overlay SKIP
+                      BlockContainer<DIV>#a-underlay.underlay/descendants(foreground) COPY
+                      BlockContainer<DIV>#a-detail.detail/descendants(foreground) COPY
+                      BlockContainer<DIV>#a-detail.detail COPY
+                      BlockContainer<DIV>#a.context/outline COPY
+                    BlockContainer<DIV>#b.context COPY
+                    BlockContainer<HTML>#html/outline COPY
+                  @viewport/outline COPY
+            `
+        },
+        {
+            name: "change B negative context after its parent was spliced",
+            mutate: () => { document.getElementById("b-underlay").style.color = "blue"; },
+            check: checkHitTargets,
+            // Descend into the previously spliced B, reusing its positive context from the first step.
+            expect: `
+                damage: rows=5 moved=0 order=0 eligibility=0 all=false
+                @canvas RECORD (empty)
+                @viewport ASSEMBLE
+                  @viewport/preamble COPY
+                  @viewport/background/hit-test COPY
+                  @viewport/scroll-metadata COPY
+                  @viewport/background COPY
+                  @viewport/border COPY
+                  BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
+                  @viewport/foreground/hit-test COPY
+                  @viewport/foreground COPY
+                  BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML>#html ASSEMBLE
+                    BlockContainer<HTML>#html/preamble COPY
+                    BlockContainer<HTML>#html/background/hit-test COPY
+                    BlockContainer<HTML>#html/scroll-metadata COPY
+                    BlockContainer<HTML>#html/background COPY
+                    BlockContainer<HTML>#html/border COPY
+                    BlockContainer<BODY>#body/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<BODY>#body/background/hit-test COPY
+                      BlockContainer<BODY>#body/scroll-metadata COPY
+                      BlockContainer<BODY>#body/background COPY
+                      BlockContainer<BODY>#body/border COPY
+                      BlockContainer<DIV>#a.context/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#b.context/descendants(background-and-borders) ASSEMBLE
+                    BlockContainer<HTML>#html/foreground/hit-test COPY
+                    BlockContainer<HTML>#html/foreground COPY
+                    BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/foreground/hit-test COPY
+                      BlockContainer<BODY>#body/foreground COPY
+                      BlockContainer<DIV>#a.context/descendants(foreground) COPY
+                      BlockContainer<DIV>#b.context/descendants(foreground) ASSEMBLE
+                      BlockContainer<BODY>#body/outline COPY
+                      BlockContainer<BODY>#body/overlay/hit-test COPY
+                      BlockContainer<BODY>#body/overlay COPY
+                    BlockContainer<DIV>#a.context COPY
+                    BlockContainer<DIV>#b.context ASSEMBLE
+                      BlockContainer<DIV>#b.context/preamble COPY
+                      BlockContainer<DIV>#b.context/background/hit-test COPY
+                      BlockContainer<DIV>#b.context/scroll-metadata COPY
+                      BlockContainer<DIV>#b.context/background COPY
+                      BlockContainer<DIV>#b.context/border COPY
+                      BlockContainer<DIV>#b-underlay.underlay ASSEMBLE
+                        BlockContainer<DIV>#b-underlay.underlay/preamble RECORD (empty)
+                        BlockContainer<DIV>#b-underlay.underlay/background/hit-test COPY
+                        BlockContainer<DIV>#b-underlay.underlay/scroll-metadata COPY
+                        BlockContainer<DIV>#b-underlay.underlay/background RECORD
+                        BlockContainer<DIV>#b-underlay.underlay/border SKIP
+                        BlockContainer<DIV>#b-underlay.underlay/foreground/hit-test COPY
+                        BlockContainer<DIV>#b-underlay.underlay/foreground RECORD
+                        BlockContainer<DIV>#b-underlay.underlay/outline SKIP
+                      BlockContainer<DIV>#b-label.label/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#b-underlay.underlay/descendants(background-and-borders) ASSEMBLE
+                      BlockContainer<DIV>#b-detail.detail/descendants(background-and-borders) COPY
+                      BlockContainer<DIV>#b.context/foreground/hit-test COPY
+                      BlockContainer<DIV>#b.context/foreground COPY
+                      BlockContainer<DIV>#b-label.label/descendants(foreground) COPY
+                      BlockContainer<DIV>#b-underlay.underlay/descendants(foreground) ASSEMBLE
+                      BlockContainer<DIV>#b-detail.detail/descendants(foreground) COPY
+                      BlockContainer<DIV>#b-detail.detail COPY
+                      BlockContainer<DIV>#b.context/outline COPY
+                    BlockContainer<HTML>#html/outline COPY
+                  @viewport/outline COPY
+            `
+        }
+    ]
+});
+</script>

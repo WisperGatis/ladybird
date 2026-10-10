@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteBuffer.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Vector.h>
 #include <LibGfx/Bitmap.h>
@@ -13,6 +14,8 @@
 namespace Gfx {
 
 struct WriterContext {
+    AK_ALLOC_WITH_KMALLOC;
+
     Vector<u8*> row_pointers;
     ByteBuffer png_data;
 };

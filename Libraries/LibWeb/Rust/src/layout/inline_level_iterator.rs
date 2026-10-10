@@ -1,0 +1,992 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use super::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ItemType {
+    Text,
+    Element,
+    BlockLevelBox,
+    ForcedBreak,
+    AbsolutelyPositionedElement,
+    FloatingElement,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Item {
+    pub(crate) type_: ItemType,
+    pub(crate) node: Node,
+    pub(crate) glyphs: Option<line_box_fragment::GlyphData>,
+    pub(crate) offset_in_node: usize,
+    pub(crate) length_in_node: usize,
+    pub(crate) inline_size: CssPixels,
+    pub(crate) min_content_inline_size: Option<CssPixels>,
+    pub(crate) padding_start: CssPixels,
+    pub(crate) padding_end: CssPixels,
+    pub(crate) border_start: CssPixels,
+    pub(crate) border_end: CssPixels,
+    pub(crate) margin_start: CssPixels,
+    pub(crate) margin_end: CssPixels,
+    pub(crate) is_collapsible_whitespace: bool,
+    pub(crate) can_break_before: bool,
+    pub(crate) preceded_by_unattached_inline_start_edges: bool,
+    pub(crate) content_baselines: DerivedBaselines,
+    pub(crate) trailing_whitespace: line_box_fragment::TrailingWhitespace,
+}
+
+fn shape_glyph_data(
+    text: &[u16],
+    font: libgfx_rust::font::FontHandle,
+    text_type: u8,
+    baseline_start_x: f32,
+    letter_spacing: f32,
+    word_spacing: f32,
+) -> (line_box_fragment::GlyphData, line_box_fragment::TrailingWhitespace) {
+    let shaped_text_type =
+        libgfx_rust::text_layout::TextType::try_from(text_type).expect("invalid Gfx::GlyphRun::TextType");
+    let shaped = libgfx_rust::text_layout::shape_text(
+        &font,
+        text,
+        shaped_text_type,
+        baseline_start_x,
+        letter_spacing,
+        word_spacing,
+    );
+    let trailing_whitespace = line_box_fragment::TrailingWhitespace {
+        length_in_code_units: shaped.trailing_whitespace_length_in_code_units(),
+        inline_size: CssPixels::nearest_value_for_f32(shaped.trailing_whitespace_advance()),
+    };
+    let glyph_data = line_box_fragment::GlyphData {
+        width: shaped.width(),
+        glyphs: shaped.into_glyphs(),
+        font,
+        text_type,
+    };
+    (glyph_data, trailing_whitespace)
+}
+
+impl Item {
+    fn new(type_: ItemType, node: Node) -> Self {
+        Self {
+            type_,
+            node,
+            glyphs: None,
+            offset_in_node: 0,
+            length_in_node: 0,
+            inline_size: CssPixels::default(),
+            min_content_inline_size: None,
+            padding_start: CssPixels::default(),
+            padding_end: CssPixels::default(),
+            border_start: CssPixels::default(),
+            border_end: CssPixels::default(),
+            margin_start: CssPixels::default(),
+            margin_end: CssPixels::default(),
+            is_collapsible_whitespace: false,
+            can_break_before: false,
+            preceded_by_unattached_inline_start_edges: false,
+            content_baselines: DerivedBaselines::default(),
+            trailing_whitespace: line_box_fragment::TrailingWhitespace::default(),
+        }
+    }
+
+    pub(crate) fn border_box_inline_size(&self) -> CssPixels {
+        self.border_start + self.padding_start + self.inline_size + self.padding_end + self.border_end
+    }
+
+    pub(crate) fn is_ascii_whitespace(&self, context: &inline_formatting_context::InlineFormattingContext<'_>) -> bool {
+        assert_eq!(self.type_, ItemType::Text);
+        let text = &context.callbacks.text_content(self.node).text;
+        text[self.offset_in_node..self.offset_in_node + self.length_in_node]
+            .iter()
+            .all(|unit| *unit <= 0x7f && (*unit as u8).is_ascii_whitespace())
+    }
+
+    pub(crate) fn ends_in_ascii_space(&self, context: &inline_formatting_context::InlineFormattingContext<'_>) -> bool {
+        assert_eq!(self.type_, ItemType::Text);
+        let text = &context.callbacks.text_content(self.node).text;
+        text[self.offset_in_node..self.offset_in_node + self.length_in_node]
+            .last()
+            .is_some_and(|unit| line_box_fragment::is_ascii_space(*unit))
+    }
+
+    pub(crate) fn allows_overflow_break(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> bool {
+        self.type_ == ItemType::Text
+            && !self.is_collapsible_whitespace
+            && !self.is_ascii_whitespace(context)
+            && context.overflow_break_applies(self.node)
+    }
+
+    pub(crate) fn split_for_overflow_break(
+        &mut self,
+        text: &[u16],
+        segmenter: &text_chunker::GraphemeSegmenter,
+        letter_spacing: f32,
+        word_spacing: f32,
+        max_border_box_inline_size: CssPixels,
+        take_first_grapheme_when_none_fits: bool,
+    ) -> Option<Item> {
+        assert_eq!(self.type_, ItemType::Text);
+        self.split_at_shaped_glyph(
+            segmenter,
+            max_border_box_inline_size,
+            take_first_grapheme_when_none_fits,
+        )
+        .or_else(|| {
+            self.split_by_reshaping(
+                text,
+                segmenter,
+                letter_spacing,
+                word_spacing,
+                max_border_box_inline_size,
+                take_first_grapheme_when_none_fits,
+            )
+        })
+    }
+
+    fn take_prefix_before(
+        &mut self,
+        split_offset_in_node: usize,
+        prefix_glyphs: line_box_fragment::GlyphData,
+        remainder_glyphs: line_box_fragment::GlyphData,
+    ) -> Item {
+        let mut prefix = Item::new(ItemType::Text, self.node);
+        prefix.offset_in_node = self.offset_in_node;
+        prefix.length_in_node = split_offset_in_node - self.offset_in_node;
+        prefix.inline_size = CssPixels::nearest_value_for_f32(prefix_glyphs.width);
+        prefix.margin_start = self.margin_start;
+        prefix.border_start = self.border_start;
+        prefix.padding_start = self.padding_start;
+        prefix.can_break_before = self.can_break_before;
+        prefix.glyphs = Some(prefix_glyphs);
+
+        self.length_in_node -= prefix.length_in_node;
+        self.offset_in_node = split_offset_in_node;
+        self.inline_size = CssPixels::nearest_value_for_f32(remainder_glyphs.width);
+        self.glyphs = Some(remainder_glyphs);
+        self.margin_start = CssPixels::default();
+        self.border_start = CssPixels::default();
+        self.padding_start = CssPixels::default();
+        self.can_break_before = false;
+
+        prefix
+    }
+
+    fn split_at_shaped_glyph(
+        &mut self,
+        segmenter: &text_chunker::GraphemeSegmenter,
+        max_border_box_inline_size: CssPixels,
+        take_first_grapheme_when_none_fits: bool,
+    ) -> Option<Item> {
+        let glyph_data = self.glyphs.as_ref()?;
+        if glyph_data.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL || glyph_data.glyphs.len() < 2 {
+            return None;
+        }
+        let shaped_length_in_code_units: usize = glyph_data.glyphs.iter().map(|glyph| glyph.length_in_code_units).sum();
+        if shaped_length_in_code_units != self.length_in_node {
+            return None;
+        }
+
+        let leading_edge_inline_size = self.margin_start + self.border_start + self.padding_start;
+        let mut split: Option<(usize, usize)> = None;
+        let mut code_units = glyph_data.glyphs[0].length_in_code_units;
+        for (glyph_index, glyph) in glyph_data.glyphs.iter().enumerate().skip(1) {
+            if glyph.length_in_code_units == 0 {
+                continue;
+            }
+            let offset = self.offset_in_node + code_units;
+            if segmenter.next_boundary(offset, true) == Some(offset) {
+                let prefix_inline_size = CssPixels::nearest_value_for_f32(glyph.x);
+                if leading_edge_inline_size + prefix_inline_size > max_border_box_inline_size {
+                    if split.is_none() && take_first_grapheme_when_none_fits {
+                        split = Some((glyph_index, code_units));
+                    }
+                    break;
+                }
+                split = Some((glyph_index, code_units));
+            }
+            code_units += glyph.length_in_code_units;
+        }
+        let (split_glyph_index, split_code_units) = split?;
+
+        let mut prefix = self.glyphs.take().unwrap();
+        let split_x = prefix.glyphs[split_glyph_index].x;
+        let mut remainder_glyphs = prefix.glyphs.to_mut().split_off(split_glyph_index);
+        for glyph in &mut remainder_glyphs {
+            glyph.x -= split_x;
+        }
+        let remainder = line_box_fragment::GlyphData {
+            glyphs: remainder_glyphs.into(),
+            font: prefix.font.clone(),
+            text_type: prefix.text_type,
+            width: prefix.width - split_x,
+        };
+        prefix.width = split_x;
+
+        Some(self.take_prefix_before(self.offset_in_node + split_code_units, prefix, remainder))
+    }
+
+    fn split_by_reshaping(
+        &mut self,
+        text: &[u16],
+        segmenter: &text_chunker::GraphemeSegmenter,
+        letter_spacing: f32,
+        word_spacing: f32,
+        max_border_box_inline_size: CssPixels,
+        take_first_grapheme_when_none_fits: bool,
+    ) -> Option<Item> {
+        let glyph_data = self.glyphs.as_ref()?;
+        if glyph_data.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL {
+            return None;
+        }
+        let font = glyph_data.font.clone();
+        let text_type = glyph_data.text_type;
+        let start = self.offset_in_node;
+        let end = start + self.length_in_node;
+
+        let mut boundaries = Vec::with_capacity(end - start);
+        let mut boundary = segmenter.next_boundary(start, false)?;
+        while boundary < end {
+            boundaries.push(boundary);
+            let Some(next) = segmenter.next_boundary(boundary, false) else {
+                break;
+            };
+            boundary = next;
+        }
+        if boundaries.is_empty() {
+            return None;
+        }
+
+        let shape = |text_range: &[u16]| {
+            shape_glyph_data(text_range, font.clone(), text_type, 0.0, letter_spacing, word_spacing).0
+        };
+
+        let leading_edge_inline_size = self.margin_start + self.border_start + self.padding_start;
+        let prefix_fits = |boundary: usize| {
+            let shaped = shape(&text[start..boundary]);
+            leading_edge_inline_size + CssPixels::nearest_value_for_f32(shaped.width) <= max_border_box_inline_size
+        };
+        let mut fitting_count = boundaries.partition_point(|boundary| prefix_fits(*boundary));
+        if fitting_count == 0 {
+            if !take_first_grapheme_when_none_fits {
+                return None;
+            }
+            fitting_count = 1;
+        }
+        let split = boundaries[fitting_count - 1];
+
+        Some(self.take_prefix_before(split, shape(&text[start..split]), shape(&text[split..end])))
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ExtraBoxMetrics {
+    margin: CssPixels,
+    border: CssPixels,
+    padding: CssPixels,
+}
+
+struct TextNodeContext<'pass> {
+    chunks: std::sync::Arc<super::rendered_text::CachedTextChunks>,
+    text: &'pass [u16],
+    next_chunk_index: usize,
+    should_collapse_whitespace: bool,
+    should_respect_linebreaks: bool,
+    last_known_direction: Option<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicInlineSizing {
+    Layout,
+    InlineSize,
+}
+
+struct InlineLevelIteratorGenerator<'iterator, 'context> {
+    context: &'iterator mut inline_formatting_context::InlineFormattingContext<'context>,
+    atomic_sizing: AtomicInlineSizing,
+    current_node: Node,
+    next_node: Node,
+    text_node_context: Option<TextNodeContext<'context>>,
+    is_unidirectional_left_to_right: bool,
+    extra_leading_metrics: Option<ExtraBoxMetrics>,
+    extra_trailing_metrics: Option<ExtraBoxMetrics>,
+    box_model_node_stack: Vec<Node>,
+    entered_box_model_nodes: Vec<Node>,
+    items: Vec<Item>,
+    accumulated_inline_size_for_tabs: CssPixels,
+    previous_chunk_can_break_after: bool,
+}
+
+impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
+    fn generate(
+        context: &'iterator mut inline_formatting_context::InlineFormattingContext<'context>,
+        atomic_sizing: AtomicInlineSizing,
+    ) -> Option<InlineLevelIterator> {
+        let containing_block = context.containing_block;
+        let next_node = context.first_child(containing_block);
+        let mut iterator = Self {
+            context,
+            atomic_sizing,
+            next_node,
+            current_node: NodeSlotId::INVALID,
+            text_node_context: None,
+            is_unidirectional_left_to_right: false,
+            extra_leading_metrics: None,
+            extra_trailing_metrics: None,
+            box_model_node_stack: Vec::new(),
+            entered_box_model_nodes: Vec::new(),
+            items: Vec::new(),
+            accumulated_inline_size_for_tabs: CssPixels::default(),
+            previous_chunk_can_break_after: false,
+        };
+        iterator.is_unidirectional_left_to_right = iterator.compute_is_unidirectional_left_to_right()?;
+        iterator.skip_to_next();
+        iterator.generate_all_items();
+        Some(InlineLevelIterator {
+            entered_box_model_nodes: iterator.entered_box_model_nodes,
+            items: iterator.items.into_iter(),
+        })
+    }
+
+    fn context(&self) -> &inline_formatting_context::InlineFormattingContext<'context> {
+        self.context
+    }
+
+    fn context_mut(&mut self) -> &mut inline_formatting_context::InlineFormattingContext<'context> {
+        self.context
+    }
+
+    fn is_out_of_flow(&self, node: Node) -> bool {
+        self.context().facts(node).is_floating_or_absolutely_positioned()
+    }
+
+    fn compute_is_unidirectional_left_to_right(&mut self) -> Option<bool> {
+        let containing_block = self.context().containing_block;
+        let intrinsic_inline_sizing = self.atomic_sizing == AtomicInlineSizing::InlineSize;
+        let mut is_unidirectional_left_to_right = self.context().style(containing_block).direction() != direction::RTL;
+        if !intrinsic_inline_sizing && !is_unidirectional_left_to_right {
+            return Some(false);
+        }
+
+        let mut node = self.context().first_child(containing_block);
+        while !node.is_invalid() {
+            let facts = self.context().facts(node);
+            // NB: The width query cannot derive float interactions or block interruptions from inline items.
+            //     Reject them during this existing traversal, before shaping text or sizing atomic children.
+            if intrinsic_inline_sizing && (facts.is_floating() || facts.is_inline_flow_interrupting_block()) {
+                return None;
+            }
+            if !facts.is_text_node() {
+                let style = self.context().style(node);
+                if style.direction() == direction::RTL || style.unicode_bidi() != unicode_bidi::NORMAL {
+                    is_unidirectional_left_to_right = false;
+                }
+            } else if self.context().text_may_require_bidi_processing(node) {
+                is_unidirectional_left_to_right = false;
+            }
+
+            if !intrinsic_inline_sizing && !is_unidirectional_left_to_right {
+                return Some(false);
+            }
+            loop {
+                node = self.next_inline_node_in_pre_order(node, containing_block);
+                if !node.is_invalid() && self.context().facts(node).is_svg_mask_box() {
+                    node = self.context().next_sibling(node);
+                }
+                if node.is_invalid() {
+                    break;
+                }
+                let facts = self.context().facts(node);
+                if facts.is_inline() || self.is_out_of_flow(node) || facts.is_inline_flow_interrupting_block() {
+                    break;
+                }
+            }
+        }
+        Some(is_unidirectional_left_to_right)
+    }
+
+    fn generate_all_items(&mut self) {
+        while let Some(item) = self.generate_next_item() {
+            if matches!(item.type_, ItemType::ForcedBreak | ItemType::BlockLevelBox) {
+                self.accumulated_inline_size_for_tabs = CssPixels::default();
+            } else {
+                self.accumulated_inline_size_for_tabs += item.border_box_inline_size();
+            }
+            self.items.push(item);
+        }
+    }
+
+    fn enter_node_with_box_model_metrics(&mut self, node: Node) {
+        self.entered_box_model_nodes.push(node);
+        let used = record_entered_inline_box(self.context, node);
+        let leading = self.extra_leading_metrics.get_or_insert_default();
+        leading.margin += used.margin_left.get();
+        leading.border += used.border_left.get();
+        leading.padding += used.padding_left.get();
+        self.box_model_node_stack.push(node);
+    }
+
+    fn exit_node_with_box_model_metrics(&mut self) {
+        let node = self.box_model_node_stack.pop().unwrap();
+        let used = self.context().used(node);
+        let margin = used.margin_right.get();
+        let border = used.border_right.get();
+        let padding = used.padding_right.get();
+        let trailing = self.extra_trailing_metrics.get_or_insert_default();
+        trailing.margin += margin;
+        trailing.border += border;
+        trailing.padding += padding;
+    }
+
+    fn next_inline_node_in_pre_order(&mut self, current: Node, stay_within: Node) -> Node {
+        let first_child = self.context().first_child(current);
+        let current_facts = self.context().facts(current);
+        if !first_child.is_invalid() {
+            let child_facts = self.context().facts(first_child);
+            let current_style = self.context().style(current);
+            if (child_facts.is_inline()
+                || child_facts.is_inline_flow_interrupting_block()
+                || self.is_out_of_flow(first_child))
+                && current_style.display().is_flow_inside()
+                && !current_facts.is_inline_flow_interrupting_block()
+                && !current_facts.is_atomic_inline()
+                && (!current_facts.is_box() || !self.is_out_of_flow(current))
+            {
+                return first_child;
+            }
+        }
+
+        let mut node = current;
+        loop {
+            let next = self.context().next_sibling(node);
+            if !next.is_invalid() {
+                if self.box_model_node_stack.last().copied() == Some(node) {
+                    self.exit_node_with_box_model_metrics();
+                }
+                return next;
+            }
+            node = self.context().parent_node(node);
+            if self.box_model_node_stack.last().copied() == Some(node) {
+                self.exit_node_with_box_model_metrics();
+            }
+            if node.is_invalid() || node == stay_within {
+                return NodeSlotId::INVALID;
+            }
+        }
+    }
+
+    fn compute_next(&mut self) {
+        if self.next_node.is_invalid() {
+            return;
+        }
+        loop {
+            self.next_node = self.next_inline_node_in_pre_order(self.next_node, self.context().containing_block);
+            if !self.next_node.is_invalid() && self.context().facts(self.next_node).is_svg_mask_box() {
+                self.next_node = self.context().next_sibling(self.next_node);
+            }
+            if self.next_node.is_invalid() {
+                break;
+            }
+            let facts = self.context().facts(self.next_node);
+            if facts.is_inline() || self.is_out_of_flow(self.next_node) || facts.is_inline_flow_interrupting_block() {
+                break;
+            }
+        }
+    }
+
+    fn skip_to_next(&mut self) {
+        if !self.next_node.is_invalid() {
+            let facts = self.context().facts(self.next_node);
+            if facts.is_inline()
+                && facts.has_box_model_metrics()
+                && !facts.is_break_node()
+                && self.context().style(self.next_node).display().is_flow_inside()
+                && !self.is_out_of_flow(self.next_node)
+                && !facts.is_atomic_inline()
+            {
+                self.enter_node_with_box_model_metrics(self.next_node);
+            }
+        }
+        self.current_node = self.next_node;
+        self.compute_next();
+    }
+
+    fn enter_text_node(&mut self, text_node: Node) {
+        let style = self.context().style(self.context().parent_node(text_node));
+        let should_wrap_lines = style.text_wrap_mode() == text_wrap_mode::WRAP;
+        let should_respect_linebreaks = matches!(
+            style.white_space_collapse(),
+            white_space_collapse::PRESERVE | white_space_collapse::PRESERVE_BREAKS | white_space_collapse::BREAK_SPACES
+        );
+        let should_collapse_whitespace = matches!(
+            style.white_space_collapse(),
+            white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
+        );
+        let callbacks = self.context().callbacks;
+        let chunks = text_chunker::text_chunks(
+            &callbacks,
+            text_node,
+            should_wrap_lines,
+            should_respect_linebreaks,
+            self.is_unidirectional_left_to_right,
+        );
+        self.text_node_context = Some(TextNodeContext {
+            chunks,
+            text: &callbacks.text_content(text_node).text,
+            next_chunk_index: 0,
+            should_collapse_whitespace,
+            should_respect_linebreaks,
+            last_known_direction: None,
+        });
+    }
+
+    fn resolve_text_direction_from_context(&self, context: &TextNodeContext<'_>) -> u8 {
+        let next_known_direction = context.chunks[context.next_chunk_index..].iter().find_map(|chunk| {
+            matches!(
+                chunk.text_type,
+                line_box_fragment::GLYPH_TEXT_TYPE_LTR | line_box_fragment::GLYPH_TEXT_TYPE_RTL
+            )
+            .then_some(chunk.text_type)
+        });
+        if let (Some(last), Some(next)) = (context.last_known_direction, next_known_direction)
+            && last != next
+        {
+            return match self.context().style(self.context().containing_block).direction() {
+                direction::LTR => line_box_fragment::GLYPH_TEXT_TYPE_LTR,
+                direction::RTL => line_box_fragment::GLYPH_TEXT_TYPE_RTL,
+                _ => unreachable!(),
+            };
+        }
+        context
+            .last_known_direction
+            .or(next_known_direction)
+            .unwrap_or(line_box_fragment::GLYPH_TEXT_TYPE_CONTEXT_DEPENDENT)
+    }
+
+    fn add_extra_box_model_metrics_to_item(
+        &mut self,
+        item: &mut Item,
+        add_leading_metrics: bool,
+        add_trailing_metrics: bool,
+    ) {
+        if add_leading_metrics && let Some(extra) = self.extra_leading_metrics.take() {
+            item.margin_start += extra.margin;
+            item.border_start += extra.border;
+            item.padding_start += extra.padding;
+        }
+        if add_trailing_metrics && let Some(extra) = self.extra_trailing_metrics.take() {
+            item.margin_end += extra.margin;
+            item.border_end += extra.border;
+            item.padding_end += extra.padding;
+        }
+    }
+
+    /// The text node's next item, or none once it has no more and the iterator has moved past it.
+    fn generate_text_item(&mut self, text_node: Node) -> Option<Item> {
+        if self.text_node_context.is_none() {
+            self.enter_text_node(text_node);
+        }
+        let mut text_context = self.text_node_context.take().unwrap();
+        let chunks = &text_context.chunks;
+        let is_first_chunk = text_context.next_chunk_index == 0;
+        let chunk = chunks.get(text_context.next_chunk_index).cloned();
+        if chunk.is_some() {
+            text_context.next_chunk_index += 1;
+        }
+        let mut is_last_chunk = text_context.next_chunk_index >= chunks.len();
+        let synthesize_zero_length_chunk = chunk.is_none()
+            && is_first_chunk
+            && is_last_chunk
+            && text_context.text.is_empty()
+            && self.context().facts(text_node).produces_line_box_fragment_when_empty();
+        let chunk = if let Some(chunk) = chunk {
+            chunk
+        } else if synthesize_zero_length_chunk {
+            text_context.next_chunk_index = 1;
+            let parent_style = self.context().style(self.context().parent_node(text_node));
+            text_chunker::TextChunk {
+                start: 0,
+                length: 0,
+                font: parent_style.first_available_font(),
+                has_breaking_newline: false,
+                has_breaking_tab: false,
+                is_all_whitespace: true,
+                can_break_after: false,
+                text_type: line_box_fragment::GLYPH_TEXT_TYPE_COMMON,
+            }
+        } else {
+            self.text_node_context = None;
+            self.previous_chunk_can_break_after = false;
+            self.skip_to_next();
+            return None;
+        };
+
+        let mut text_type = chunk.text_type;
+        if matches!(
+            text_type,
+            line_box_fragment::GLYPH_TEXT_TYPE_LTR | line_box_fragment::GLYPH_TEXT_TYPE_RTL
+        ) {
+            text_context.last_known_direction = Some(text_type);
+        }
+        if text_context.should_respect_linebreaks && chunk.has_breaking_newline {
+            is_last_chunk = true;
+            if chunk.is_all_whitespace {
+                text_type = line_box_fragment::GLYPH_TEXT_TYPE_END_PADDING;
+            }
+        }
+        if text_type == line_box_fragment::GLYPH_TEXT_TYPE_CONTEXT_DEPENDENT {
+            text_type = self.resolve_text_direction_from_context(&text_context);
+        }
+        if text_context.should_respect_linebreaks && chunk.has_breaking_newline {
+            self.text_node_context = Some(text_context);
+            return Some(Item::new(ItemType::ForcedBreak, NodeSlotId::INVALID));
+        }
+
+        let style = self.context().style(self.context().parent_node(text_node));
+        let mut inline_offset = 0.0f32;
+        let full_text = text_context.text;
+        let mut shaped_start = chunk.start;
+        let mut shaped_length = chunk.length;
+        let word_spacing = style.word_spacing();
+        if chunk.has_breaking_tab {
+            let tab_inline_size = if style.tab_size_is_number() {
+                let space = chunk.font.glyph_width(b' ' as u32);
+                CssPixels::nearest_value_for(
+                    style.tab_size_number()
+                        * (space + word_spacing.to_double() as f32 + style.letter_spacing().to_double() as f32) as f64,
+                )
+            } else {
+                style.tab_size()
+            };
+            let accumulated = self.accumulated_inline_size_for_tabs;
+            let mut tab_stop_distance = if accumulated > CssPixels::default() {
+                accumulated.div_as_fraction(tab_inline_size).ceil() * tab_inline_size - accumulated
+            } else {
+                tab_inline_size
+            };
+            let zero_width = chunk.font.glyph_width(b'0' as u32);
+            if tab_stop_distance.to_double() < f64::from(zero_width) * 0.5 {
+                tab_stop_distance += tab_inline_size;
+            }
+            let tab_count = full_text[chunk.start..chunk.start + chunk.length]
+                .iter()
+                .take_while(|unit| **unit == b'\t' as u16)
+                .count();
+            tab_stop_distance = tab_stop_distance * tab_count;
+            shaped_start += tab_count;
+            shaped_length -= tab_count;
+            inline_offset = tab_stop_distance.to_double() as f32;
+        }
+        let shaped_text = &full_text[shaped_start..shaped_start + shaped_length];
+        let (glyphs, shaped_trailing_whitespace) = shape_glyph_data(
+            shaped_text,
+            chunk.font.clone(),
+            text_type,
+            inline_offset,
+            style.letter_spacing().to_double() as f32,
+            word_spacing.to_double() as f32,
+        );
+        let chunk_inline_size = CssPixels::nearest_value_for_f32(glyphs.width + inline_offset);
+        let generated_empty = synthesize_zero_length_chunk
+            || (self.context().facts(text_node).is_generated_for_pseudo_element() && chunk.length == 0);
+        let mut item = Item::new(ItemType::Text, text_node);
+        item.glyphs = Some(glyphs);
+        item.offset_in_node = chunk.start;
+        item.length_in_node = chunk.length;
+        item.inline_size = chunk_inline_size;
+        item.trailing_whitespace = if chunk.is_all_whitespace {
+            line_box_fragment::TrailingWhitespace {
+                length_in_code_units: chunk.length,
+                inline_size: chunk_inline_size,
+            }
+        } else {
+            shaped_trailing_whitespace
+        };
+        item.is_collapsible_whitespace =
+            text_context.should_collapse_whitespace && chunk.is_all_whitespace && !generated_empty;
+        item.can_break_before = self.previous_chunk_can_break_after;
+        self.previous_chunk_can_break_after = chunk.can_break_after;
+        self.add_extra_box_model_metrics_to_item(&mut item, is_first_chunk, is_last_chunk);
+        self.text_node_context = Some(text_context);
+        Some(item)
+    }
+
+    fn generate_next_item(&mut self) -> Option<Item> {
+        // A node that produces no item moves on to the next one in this loop rather than in a call: a line of ten
+        // thousand empty spans would otherwise take ten thousand frames of the stack.
+        loop {
+            if self.current_node.is_invalid() {
+                return None;
+            }
+            let node = self.current_node;
+            let facts = self.context().facts(node);
+            if facts.is_text_node() {
+                match self.generate_text_item(node) {
+                    Some(item) => return Some(item),
+                    None => continue,
+                }
+            }
+            if facts.is_absolutely_positioned() {
+                let preceded = self.extra_leading_metrics.is_some_and(|extra| {
+                    extra.margin != CssPixels::default()
+                        || extra.border != CssPixels::default()
+                        || extra.padding != CssPixels::default()
+                });
+                self.skip_to_next();
+                let mut item = Item::new(ItemType::AbsolutelyPositionedElement, node);
+                item.preceded_by_unattached_inline_start_edges = preceded;
+                return Some(item);
+            }
+            if facts.is_floating() {
+                self.skip_to_next();
+                return Some(Item::new(ItemType::FloatingElement, node));
+            }
+            if facts.is_break_node() {
+                self.skip_to_next();
+                return Some(Item::new(ItemType::ForcedBreak, node));
+            }
+            if facts.is_fragmented_inline() {
+                self.skip_to_next();
+                continue;
+            }
+            if facts.is_list_item_marker_box() && !facts.list_marker_is_inside() {
+                let parent = self.context().parent_node(node);
+                if parent.is_invalid()
+                    || !self.context().facts(parent).is_list_item_box()
+                    || !self.context().facts(parent).is_fragmented_inline()
+                {
+                    self.skip_to_next();
+                    continue;
+                }
+            }
+            if !facts.is_box() {
+                self.skip_to_next();
+                continue;
+            }
+            if facts.is_inline_flow_interrupting_block() {
+                self.skip_to_next();
+                return Some(Item::new(ItemType::BlockLevelBox, node));
+            }
+            return Some(self.generate_element_item(node));
+        }
+    }
+
+    fn generate_element_item(&mut self, node: Node) -> Item {
+        let mut item = Item::new(ItemType::Element, node);
+        if self.atomic_sizing == AtomicInlineSizing::InlineSize
+            && self.context().sizing().atomic_inline_size_follows_from_style(node)
+        {
+            let context = self.context();
+            let sizing = context.sizing();
+            let available_space = context.input.available_space;
+            let constraints = context.input.containing_block_constraints;
+            // NB: Content-box inline sizing does not read used geometry. Border-box sizing still needs
+            //     a record for the shared resolver's padding adjustment.
+            if context.style(node).box_sizing() == box_sizing::BORDER_BOX {
+                context.create_used_values(node, constraints);
+                sizing
+                    .resolve_box_model_metrics_against_inline_basis(node, available_space.inline_size.to_px_or_zero());
+            }
+            let contribution = sizing.atomic_inline_contribution(node, available_space, constraints);
+            item.inline_size = contribution.content_inline_size;
+            item.min_content_inline_size = contribution.min_content_inline_size;
+            item.padding_start = contribution.padding_start;
+            item.padding_end = contribution.padding_end;
+            item.border_start = contribution.border_start;
+            item.border_end = contribution.border_end;
+            item.margin_start = contribution.margin_start;
+            item.margin_end = contribution.margin_end;
+        } else {
+            let used = if self.box_model_node_stack.last().copied() == Some(node) {
+                self.context().used(node)
+            } else {
+                self.context()
+                    .create_used_values(node, self.context().input.containing_block_constraints)
+            };
+            item.content_baselines = self.context_mut().dimension_box_on_line(node);
+            item.min_content_inline_size = self.context().paired_min_content_inline_size_for_atomic_root(node);
+            item.inline_size = used.content_inline_size.get();
+            item.padding_start = used.padding_left.get();
+            item.padding_end = used.padding_right.get();
+            item.border_start = used.border_left.get();
+            item.border_end = used.border_right.get();
+            item.margin_start = used.margin_left.get();
+            item.margin_end = used.margin_right.get();
+        }
+        self.add_extra_box_model_metrics_to_item(&mut item, true, true);
+        self.skip_to_next();
+        item
+    }
+}
+
+fn record_entered_inline_box<'context>(
+    context: &inline_formatting_context::InlineFormattingContext<'context>,
+    node: Node,
+) -> &'context UsedValues {
+    let constraints = context.input.containing_block_constraints;
+    let used = context.create_used_values(node, constraints);
+    let style = context.style(node);
+    let basis = constraints.inline_basis();
+    used.resolve_box_model(&style, basis);
+    context.compute_inset(node);
+    if context.run.fragments.is_some() {
+        formatting_context::place_child(context.run, node, FfiCssPixelPoint::default(), None);
+    }
+    used
+}
+
+pub(crate) struct StashedInlineItems {
+    items: Vec<Item>,
+    entered_box_model_nodes: Vec<Node>,
+}
+
+pub(crate) struct InlineLevelIterator {
+    entered_box_model_nodes: Vec<Node>,
+    items: std::vec::IntoIter<Item>,
+}
+
+impl InlineLevelIterator {
+    pub(crate) fn new(context: &mut inline_formatting_context::InlineFormattingContext<'_>) -> Self {
+        Self::reuse_or_generate(context, AtomicInlineSizing::Layout)
+            .expect("normal inline item generation always succeeds")
+    }
+
+    pub(crate) fn for_intrinsic_inline_size(
+        context: &mut inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> Option<Self> {
+        Self::reuse_or_generate(context, AtomicInlineSizing::InlineSize)
+    }
+
+    fn reuse_or_generate(
+        context: &mut inline_formatting_context::InlineFormattingContext<'_>,
+        atomic_sizing: AtomicInlineSizing,
+    ) -> Option<Self> {
+        let callbacks = context.callbacks;
+        match callbacks.scratch().take_inline_item_stash(context.containing_block) {
+            Some(stash) => Some(Self::from_stash(context, stash)),
+            None => InlineLevelIteratorGenerator::generate(context, atomic_sizing),
+        }
+    }
+
+    fn from_stash(context: &inline_formatting_context::InlineFormattingContext<'_>, stash: StashedInlineItems) -> Self {
+        for node in &stash.entered_box_model_nodes {
+            record_entered_inline_box(context, *node);
+        }
+        Self {
+            entered_box_model_nodes: stash.entered_box_model_nodes,
+            items: stash.items.into_iter(),
+        }
+    }
+
+    /// Element items and percentage inline-box margins and paddings depend on the run's available space.
+    pub(crate) fn stash_for_reuse(self, context: &inline_formatting_context::InlineFormattingContext<'_>) {
+        if self
+            .items
+            .as_slice()
+            .iter()
+            .any(|item| !matches!(item.type_, ItemType::Text | ItemType::ForcedBreak))
+        {
+            return;
+        }
+        for node in &self.entered_box_model_nodes {
+            let style = context.style(*node);
+            if style.margin_left().contains_percentage()
+                || style.margin_right().contains_percentage()
+                || style.padding_left().contains_percentage()
+                || style.padding_right().contains_percentage()
+            {
+                return;
+            }
+        }
+        context.callbacks.scratch().store_inline_item_stash(
+            context.containing_block,
+            StashedInlineItems {
+                items: self.items.collect(),
+                entered_box_model_nodes: self.entered_box_model_nodes,
+            },
+        );
+    }
+
+    pub(crate) fn next(&mut self) -> Option<Item> {
+        self.items.next()
+    }
+
+    pub(crate) fn items(&self) -> &[Item] {
+        self.items.as_slice()
+    }
+
+    pub(crate) fn skip_items(&mut self, count: usize) {
+        assert!(count <= self.items.len());
+        self.items.by_ref().take(count).for_each(drop);
+    }
+
+    pub(crate) fn next_inline_run_size(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> Option<CssPixels> {
+        sequence_inline_size(context, self.items(), false)
+    }
+
+    pub(crate) fn next_unbreakable_run_inline_size(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> CssPixels {
+        sequence_inline_size(context, self.items(), true).unwrap_or_default()
+    }
+
+    pub(crate) fn next_non_whitespace_text_allows_overflow_break(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> bool {
+        self.items
+            .as_slice()
+            .first()
+            .is_some_and(|item| item.allows_overflow_break(context))
+    }
+
+    pub(crate) fn fragmented_inlines_in_pre_order(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> Vec<Node> {
+        self.entered_box_model_nodes
+            .iter()
+            .copied()
+            .filter(|node| context.facts(*node).is_fragmented_inline())
+            .collect()
+    }
+}
+
+pub(crate) fn sequence_inline_size(
+    context: &inline_formatting_context::InlineFormattingContext<'_>,
+    items: &[Item],
+    stop_at_overflow_breakable_text: bool,
+) -> Option<CssPixels> {
+    let mut size = CssPixels::default();
+    for item in items {
+        match item.type_ {
+            ItemType::ForcedBreak => return Some(CssPixels::default()),
+            ItemType::BlockLevelBox => break,
+            _ => {}
+        }
+        let style = context.style(context.style_source(item.node));
+        if style.text_wrap_mode() == text_wrap_mode::WRAP {
+            if item.type_ != ItemType::Text || item.is_collapsible_whitespace {
+                break;
+            }
+            if item.is_ascii_whitespace(context) {
+                break;
+            }
+            if stop_at_overflow_breakable_text && context.overflow_break_applies(item.node) {
+                break;
+            }
+        }
+        size += item.border_box_inline_size();
+    }
+    (size > CssPixels::default()).then_some(size)
+}

@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Bindings/SharedWorker.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/AbstractWorker.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
@@ -19,30 +21,41 @@ namespace Web::HTML {
 class SharedWorker final
     : public DOM::EventTarget
     , public HTML::AbstractWorker {
-    WEB_PLATFORM_OBJECT(SharedWorker, DOM::EventTarget);
+    WEB_WRAPPABLE(SharedWorker, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(SharedWorker);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<SharedWorker>> construct_impl(JS::Realm&, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<String, WorkerOptions>& options);
+    static WebIDL::ExceptionOr<GC::Ref<SharedWorker>> create_for_constructor(JS::Object&, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<Utf16String, Bindings::SharedWorkerOptions> options);
+    static WebIDL::ExceptionOr<GC::Ref<SharedWorker>> create(WindowOrWorkerGlobalScopeMixin&, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<Utf16String, Bindings::SharedWorkerOptions> options);
 
     virtual ~SharedWorker();
 
-    GC::Ref<MessagePort> port() { return m_port; }
+    // https://html.spec.whatwg.org/multipage/workers.html#dom-sharedworker-port
+    GC::Ref<MessagePort> port()
+    {
+        // The port getter steps are to return this's port.
+        return m_port;
+    }
 
     void set_agent(WorkerAgentParent& agent) { m_agent = agent; }
 
 private:
-    SharedWorker(JS::Realm&, URL::URL script_url, WorkerOptions, MessagePort&);
+    SharedWorker(GC::Ref<DOM::EventTarget> relevant_global_object, URL::URL script_url, Bindings::SharedWorkerOptions, MessagePort&);
+
+    JS::Object& relevant_global_object() const;
 
     // ^AbstractWorker
     virtual DOM::EventTarget& this_event_target() override { return *this; }
-
-    virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     URL::URL m_script_url;
-    WorkerOptions m_options;
+    Bindings::SharedWorkerOptions m_options;
+
+    // Each SharedWorker has a port, a MessagePort set when the object is created.
+    // https://html.spec.whatwg.org/multipage/workers.html#concept-sharedworker-port
     GC::Ref<MessagePort> m_port;
+    GC::Ref<DOM::EventTarget> m_global_object;
+
     GC::Ptr<WorkerAgentParent> m_agent;
 };
 

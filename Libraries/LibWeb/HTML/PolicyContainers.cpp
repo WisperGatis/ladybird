@@ -5,14 +5,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibJS/Runtime/Realm.h>
+#include <LibGC/Heap.h>
 #include <LibURL/URL.h>
 #include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/PolicyContainers.h>
-#include <LibWeb/HTML/SerializedPolicyContainer.h>
+#include <LibWeb/ReferrerPolicy/AbstractOperations.h>
+#include <LibWebCommon/HTML/SerializedPolicyContainer.h>
 
 namespace Web::HTML {
 
@@ -36,8 +37,10 @@ bool url_requires_storing_the_policy_container_in_history(URL::URL const& url)
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#creating-a-policy-container-from-a-fetch-response
-GC::Ref<PolicyContainer> create_a_policy_container_from_a_fetch_response(GC::Heap& heap, GC::Ref<Fetch::Infrastructure::Response const> response, GC::Ptr<Environment>)
+GC::Ref<PolicyContainer> create_a_policy_container_from_a_fetch_response(GC::Ref<Fetch::Infrastructure::Response const> response, GC::Ptr<Environment>)
 {
+    auto& heap = GC::Heap::the();
+
     // FIXME: 1. If response's URL's scheme is "blob", then return a clone of response's URL's blob URL entry's
     //           environment's policy container.
 
@@ -50,9 +53,11 @@ GC::Ref<PolicyContainer> create_a_policy_container_from_a_fetch_response(GC::Hea
     // FIXME: 4. If environment is non-null, then set result's embedder policy to the result of obtaining an embedder
     //           policy given response and environment. Otherwise, set it to "unsafe-none".
 
-    // FIXME: 5. Set result's referrer policy to the result of parsing the `Referrer-Policy` header given response.
-    //           [REFERRERPOLICY]
-    //        Doing this currently makes Fetch fail the policy != ReferrerPolicy::EmptyString verification.
+    // 5. Set result's referrer policy to the result of parsing the `Referrer-Policy` header given response.
+    //    [REFERRERPOLICY]
+    auto parsed_referrer_policy = ReferrerPolicy::parse_a_referrer_policy_from_a_referrer_policy_header(response);
+    if (parsed_referrer_policy != ReferrerPolicy::ReferrerPolicy::EmptyString)
+        result->referrer_policy = parsed_referrer_policy;
 
     // FIXME: 6. Parse Integrity-Policy headers with response and result.
 
@@ -60,8 +65,10 @@ GC::Ref<PolicyContainer> create_a_policy_container_from_a_fetch_response(GC::Hea
     return result;
 }
 
-GC::Ref<PolicyContainer> create_a_policy_container_from_serialized_policy_container(GC::Heap& heap, SerializedPolicyContainer const& serialized_policy_container)
+GC::Ref<PolicyContainer> create_a_policy_container_from_serialized_policy_container(SerializedPolicyContainer const& serialized_policy_container)
 {
+    auto& heap = GC::Heap::the();
+
     GC::Ref<PolicyContainer> result = heap.allocate<PolicyContainer>(heap);
     result->csp_list = ContentSecurityPolicy::PolicyList::create(heap, serialized_policy_container.csp_list);
     result->embedder_policy = serialized_policy_container.embedder_policy;
@@ -85,7 +92,10 @@ GC::Ref<PolicyContainer> PolicyContainer::clone(GC::Heap& heap) const
     // 4. Set clone's referrer policy to policyContainer's referrer policy.
     clone->referrer_policy = referrer_policy;
 
-    // 5. Return clone.
+    // 5. Set clone's integrity policy to a copy of policyContainer's integrity policy.
+    clone->integrity_policy = integrity_policy;
+
+    // 6. Return clone.
     return clone;
 }
 

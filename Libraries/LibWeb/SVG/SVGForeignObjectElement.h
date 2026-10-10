@@ -12,25 +12,36 @@ namespace Web::SVG {
 
 // https://svgwg.org/svg2-draft/embedded.html#InterfaceSVGForeignObjectElement
 class SVGForeignObjectElement final : public SVGGraphicsElement {
-    WEB_PLATFORM_OBJECT(SVGForeignObjectElement, SVGGraphicsElement);
+    WEB_WRAPPABLE(SVGForeignObjectElement, SVGGraphicsElement);
     GC_DECLARE_ALLOCATOR(SVGForeignObjectElement);
 
 public:
     virtual ~SVGForeignObjectElement() override;
 
-    virtual GC::Ptr<Layout::Node> create_layout_node(GC::Ref<CSS::ComputedProperties>) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
-    GC::Ref<SVG::SVGAnimatedLength> x();
-    GC::Ref<SVG::SVGAnimatedLength> y();
-    GC::Ref<SVG::SVGAnimatedLength> width();
-    GC::Ref<SVG::SVGAnimatedLength> height();
+    // AD-HOC: The spec states that the x, y, width and height IDL attributes reflect the respective computed values and their
+    //         corresponding presentation attributes but other browsers reflect the attribute values instead - see
+    //         https://github.com/w3c/svgwg/issues/1153
+
+    // https://w3c.github.io/svgwg/svg2-draft/embedded.html#__svg__SVGForeignObjectElement__x
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/embedded.html#__svg__SVGForeignObjectElement__y
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/embedded.html#__svg__SVGForeignObjectElement__width
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::number(0));
+
+    // https://w3c.github.io/svgwg/svg2-draft/embedded.html#__svg__SVGForeignObjectElement__height
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::number(0));
 
 private:
     SVGForeignObjectElement(DOM::Document& document, DOM::QualifiedName qualified_name);
 
     virtual bool is_svg_foreign_object_element() const override { return true; }
 
-    virtual void initialize(JS::Realm&) override;
+    virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
     GC::Ptr<SVG::SVGAnimatedLength> m_x;

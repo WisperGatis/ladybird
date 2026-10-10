@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/String.h>
+#include <AK/StringBuilder.h>
 #include <LibWeb/CSS/SerializationMode.h>
 #include <LibWeb/CSS/Units.h>
 #include <LibWeb/Forward.h>
@@ -17,15 +18,13 @@ class Time {
 public:
     Time(double value, TimeUnit unit);
     static Time make_seconds(double);
-    Time percentage_of(Percentage const&) const;
 
-    String to_string(SerializationMode = SerializationMode::Normal) const;
     double to_milliseconds() const;
     double to_seconds() const;
 
     double raw_value() const { return m_value; }
     TimeUnit unit() const { return m_unit; }
-    FlyString unit_name() const { return CSS::to_string(m_unit); }
+    Utf16FlyString unit_name() const { return CSS::to_string(m_unit); }
 
     bool operator==(Time const& other) const
     {
@@ -44,19 +43,9 @@ public:
         return 0;
     }
 
-    static Time resolve_calculated(NonnullRefPtr<CalculatedStyleValue const> const&, Layout::Node const&, Time const& reference_value);
-
 private:
     TimeUnit m_unit;
     double m_value { 0 };
 };
 
 }
-
-template<>
-struct AK::Formatter<Web::CSS::Time> : Formatter<StringView> {
-    ErrorOr<void> format(FormatBuilder& builder, Web::CSS::Time const& time)
-    {
-        return Formatter<StringView>::format(builder, time.to_string());
-    }
-};

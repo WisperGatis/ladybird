@@ -8,67 +8,131 @@
 
 #pragma once
 
+#include <AK/Assertions.h>
+#include <AK/Error.h>
 #include <AK/MemoryStream.h>
+#include <AK/NonnullOwnPtr.h>
+#include <AK/Span.h>
+#include <AK/StringView.h>
+#include <AK/TypeCasts.h>
 #include <AK/Vector.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibCrypto/Forward.h>
+#include <LibGC/RootVector.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Message.h>
 #include <LibJS/Forward.h>
+#include <LibJS/Runtime/Object.h>
+#include <LibWeb/Bindings/IntrinsicDefinitions.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
+namespace JS {
+
+class HostObject;
+
+}
+
 namespace Web::HTML {
 
-class WEB_API TransferDataEncoder {
-public:
-    explicit TransferDataEncoder();
-    explicit TransferDataEncoder(IPC::MessageBuffer&&);
-
-    template<typename T>
-    void encode(T const& value)
-    {
-        MUST(m_encoder.encode(value));
-    }
-
-    void append(SerializationRecord&&);
-    void extend(Vector<TransferDataEncoder>);
-
-    IPC::MessageBuffer const& buffer() const { return m_buffer; }
-    IPC::MessageBuffer take_buffer() { return move(m_buffer); }
-
-private:
-    IPC::MessageBuffer m_buffer;
-    IPC::Encoder m_encoder;
-};
+class StructuredSerializeDataDecoder;
+class StructuredSerializeDataEncoder;
 
 class WEB_API TransferDataDecoder {
 public:
-    explicit TransferDataDecoder(SerializationRecord const&);
+    explicit TransferDataDecoder(IPCSerializationRecord const&);
     explicit TransferDataDecoder(TransferDataEncoder&&);
 
     template<typename T>
-    T decode()
+    ErrorOr<T> decode()
     {
-        static_assert(!IsSame<T, ByteBuffer>, "Use decode_buffer to handle OOM");
-        return MUST(m_decoder.decode<T>());
+        return m_decoder.decode<T>();
     }
 
-    WebIDL::ExceptionOr<ByteBuffer> decode_buffer(JS::Realm&);
+    WebIDL::ExceptionOr<ByteBuffer> decode_buffer();
+    WebIDL::ExceptionOr<::Crypto::UnsignedBigInteger> decode_unsigned_big_integer();
+
+    // The shared memory of the record that this transfer data belongs to, for transfer-receiving steps that map theirs.
+    void set_shared_buffers(Vector<Core::AnonymousBuffer> const& shared_buffers) { m_shared_buffers = &shared_buffers; }
+    Vector<Core::AnonymousBuffer> const* shared_buffers() const { return m_shared_buffers; }
 
 private:
     IPC::MessageBuffer m_buffer;
 
     FixedMemoryStream m_stream;
-    Queue<IPC::File> m_files;
+    Queue<IPC::Attachment> m_attachments;
 
     IPC::Decoder m_decoder;
+
+    Vector<Core::AnonymousBuffer> const* m_shared_buffers { nullptr };
 };
 
-struct SerializedTransferRecord {
-    SerializationRecord serialized;
-    Vector<TransferDataEncoder> transfer_data_holders;
+class WEB_API StructuredSerializeWriter {
+public:
+    static StructuredSerializeWriter create_ipc();
+    static StructuredSerializeWriter create_storage();
+    ~StructuredSerializeWriter();
+
+    SerializationType type() const;
+
+    template<typename T>
+    void encode(T const&);
+
+    void append(IPCSerializationRecord&&);
+
+    u32 add_shared_array_buffer(JS::ArrayBuffer&);
+
+    IPCSerializationRecord take_ipc_record();
+    StorageSerializationRecord take_storage_record();
+
+    // AD-HOC: On the messaging path, a side list carries each SharedArrayBuffer's cross-process shared memory by file
+    //         descriptor — so an agent in another process can share it. enable_shared_buffers() opts a writer in.
+    void enable_shared_buffers() { m_supports_shared_buffers = true; }
+    bool supports_shared_buffers() const { return m_supports_shared_buffers; }
+    Vector<Core::AnonymousBuffer>& shared_buffers() { return m_shared_buffers; }
+    Vector<Core::AnonymousBuffer> take_shared_buffers() { return move(m_shared_buffers); }
+
+private:
+    explicit StructuredSerializeWriter(NonnullOwnPtr<StructuredSerializeDataEncoder>);
+
+    NonnullOwnPtr<StructuredSerializeDataEncoder> m_encoder;
+    Vector<GC::Root<JS::ArrayBuffer>> m_shared_array_buffers;
+    Vector<Core::AnonymousBuffer> m_shared_buffers;
+    bool m_supports_shared_buffers { false };
+};
+
+class WEB_API StructuredSerializeReader {
+public:
+    explicit StructuredSerializeReader(IPCSerializationRecord const&);
+    explicit StructuredSerializeReader(StorageSerializationRecord const&);
+    explicit StructuredSerializeReader(TransferDataEncoder&&);
+    ~StructuredSerializeReader();
+
+    SerializationType type() const;
+    bool is_at_end() const;
+
+    template<typename T>
+    ErrorOr<T> decode();
+
+    // The record's SharedArrayBuffer side table; empty for records that crossed a process boundary
+    // and for the storage and transfer-data paths.
+    ReadonlySpan<GC::Root<JS::ArrayBuffer>> shared_array_buffers() const { return m_shared_array_buffers; }
+
+    // Set on the messaging path so the deserializer can map SharedArrayBuffers back to their cross-process shared memory.
+    void set_shared_buffers(Vector<Core::AnonymousBuffer> const& shared_buffers) { m_shared_buffers = &shared_buffers; }
+    Vector<Core::AnonymousBuffer> const* shared_buffers() const { return m_shared_buffers; }
+
+private:
+    NonnullOwnPtr<StructuredSerializeDataDecoder> m_decoder;
+    Vector<GC::Root<JS::ArrayBuffer>> m_shared_array_buffers;
+    Vector<Core::AnonymousBuffer> const* m_shared_buffers { nullptr };
+};
+
+struct StructuredSerializeOptions {
+    GC::RootVector<GC::Ref<JS::Object>> transfer;
 };
 
 struct DeserializedTransferRecord {
@@ -76,31 +140,107 @@ struct DeserializedTransferRecord {
     Vector<GC::Root<JS::Object>> transferred_values;
 };
 
-WebIDL::ExceptionOr<SerializationRecord> structured_serialize(JS::VM&, JS::Value);
-WebIDL::ExceptionOr<SerializationRecord> structured_serialize_for_storage(JS::VM&, JS::Value);
-WebIDL::ExceptionOr<SerializationRecord> structured_serialize_internal(JS::VM&, JS::Value, bool for_storage, SerializationMemory&);
+// AD-HOC: Serializing a SharedArrayBuffer is normally gated on the current settings object's
+//         cross-origin isolated capability (a Spectre mitigation for data that may reach another
+//         agent). SameAgentAlways bypasses that gate for internal clones that never leave the
+//         surrounding agent, where the gate's threat model does not apply. Web-visible entry points
+//         must use CrossOriginIsolatedOnly.
+enum class AllowSharedArrayBuffers : u8 {
+    CrossOriginIsolatedOnly,
+    SameAgentAlways,
+};
 
-WebIDL::ExceptionOr<JS::Value> structured_deserialize(JS::VM&, SerializationRecord const&, JS::Realm&, Optional<DeserializationMemory> = {});
-WebIDL::ExceptionOr<JS::Value> structured_deserialize_internal(JS::VM&, TransferDataDecoder&, JS::Realm&, DeserializationMemory&);
+// The SharedArrayBuffers that a record produced in this process aliases instead of copying.
+WEB_API ReadonlySpan<GC::Root<JS::ArrayBuffer>> same_process_shared_array_buffers(IPCSerializationRecord const&);
 
-WEB_API WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::VM&, JS::Value, Vector<GC::Root<JS::Object>> const& transfer_list);
-WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_transfer(SerializedTransferRecord&, JS::Realm&);
+WEB_API WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM&, JS::Value);
+WEB_API WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM&, JS::Value, AllowSharedArrayBuffers);
+WEB_API WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM&, JS::Value, Vector<Core::AnonymousBuffer>& shared_buffers);
+WEB_API WebIDL::ExceptionOr<StorageSerializationRecord> structured_serialize_for_storage(JS::VM&, JS::Value);
+WEB_API StorageSerializationRecord structured_serialize_undefined_or_null_for_storage(JS::Value);
+WEB_API WebIDL::ExceptionOr<void> structured_serialize_internal(JS::VM&, StructuredSerializeWriter&, JS::Value, bool for_storage, SerializationMemory&, AllowSharedArrayBuffers = AllowSharedArrayBuffers::CrossOriginIsolatedOnly);
+
+WEB_API WebIDL::ExceptionOr<JS::Value> structured_deserialize(JS::VM&, IPCSerializationRecord const&, JS::Realm&, Optional<DeserializationMemory> = {}, Vector<Core::AnonymousBuffer> const* shared_buffers = nullptr);
+WebIDL::ExceptionOr<JS::Value> structured_deserialize(JS::VM&, StorageSerializationRecord const&, JS::Realm&, Optional<DeserializationMemory> = {});
+WEB_API WebIDL::ExceptionOr<JS::Value> structured_deserialize_internal(JS::VM&, StructuredSerializeReader&, JS::Realm&, DeserializationMemory&, CheckFullyConsumed = CheckFullyConsumed::No);
+
+WEB_API WebIDL::Exception data_clone_error_from_serialization_error(JS::Realm&, AK::Error const&);
+
+void encode_unsigned_big_integer(StructuredSerializeWriter&, ::Crypto::UnsignedBigInteger const&);
+WebIDL::ExceptionOr<::Crypto::UnsignedBigInteger> decode_unsigned_big_integer(StructuredSerializeReader&, JS::Realm&);
+
+void encode_signed_big_integer(StructuredSerializeWriter&, ::Crypto::SignedBigInteger const&);
+WebIDL::ExceptionOr<::Crypto::SignedBigInteger> decode_signed_big_integer(StructuredSerializeReader&, JS::Realm&);
+
+template<typename T>
+WebIDL::ExceptionOr<T> decode_or_throw_data_clone_error(JS::Realm& realm, StructuredSerializeReader& reader)
+{
+    auto result = reader.decode<T>();
+    if (result.is_error())
+        return data_clone_error_from_serialization_error(realm, result.release_error());
+    return result.release_value();
+}
+
+// Decode stored text to UTF-8 and reject lone surrogates as DataCloneError.
+WEB_API WebIDL::ExceptionOr<String> decode_utf8_text_or_throw_data_clone_error(JS::Realm& realm, StructuredSerializeReader& reader);
+
+// Pairs each serializable interface with its storage identifier.
+struct SerializableRegistryEntry {
+    Bindings::InterfaceName interface_name;
+    StringView identifier;
+};
+
+WEB_API ReadonlySpan<SerializableRegistryEntry> serializable_storage_registry();
+
+template<typename T>
+WebIDL::ExceptionOr<GC::Ref<T>> deserialize_nested_as(JS::VM& vm, StructuredSerializeReader& reader, JS::Realm& realm, DeserializationMemory& memory)
+{
+    auto value = TRY(structured_deserialize_internal(vm, reader, realm, memory));
+    auto* object = value.is_object() ? as_if<T>(value.as_object()) : nullptr;
+    if (!object)
+        return data_clone_error_from_serialization_error(realm, AK::Error::from_string_literal("Nested serializable has an unexpected type"));
+    return GC::Ref<T> { *object };
+}
+
+template<typename T>
+WebIDL::ExceptionOr<void> encode_or_throw_data_clone_error(JS::Realm& realm, TransferDataEncoder& encoder, T const& value)
+{
+    auto result = encoder.encode(value);
+    if (result.is_error())
+        return data_clone_error_from_serialization_error(realm, result.release_error());
+    return {};
+}
+
+template<typename T>
+WebIDL::ExceptionOr<T> decode_or_throw_data_clone_error(JS::Realm& realm, TransferDataDecoder& decoder)
+{
+    auto result = decoder.decode<T>();
+    if (result.is_error())
+        return data_clone_error_from_serialization_error(realm, result.release_error());
+    return result.release_value();
+}
+
+WEB_API WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::Realm&, JS::Value, ReadonlySpan<GC::Ref<JS::Object>> transfer_list);
+WEB_API WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_transfer(SerializedTransferRecord&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(TransferDataDecoder&, JS::Realm&);
 
 }
 
-namespace IPC {
+namespace Web::Bindings {
 
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::TransferDataEncoder const&);
+class Serializable;
+class Transferable;
 
-template<>
-WEB_API ErrorOr<Web::HTML::TransferDataEncoder> decode(Decoder&);
+struct SerializablePlatformObject {
+    Serializable* serializable { nullptr };
+    InterfaceName interface_name;
+    GC::Ptr<JS::Realm> realm;
+};
 
-template<>
-ErrorOr<void> encode(Encoder&, Web::HTML::SerializedTransferRecord const&);
-
-template<>
-ErrorOr<Web::HTML::SerializedTransferRecord> decode(Decoder&);
+WEB_API Transferable* transferable_from_object(JS::Object&);
+WEB_API Optional<SerializablePlatformObject> serializable_from_object(JS::Object&);
+WEB_API bool is_platform_object(JS::Object const&);
+WEB_API GC::Ref<JS::HostObject> create_serialized_platform_object(InterfaceName, JS::Realm&);
+WEB_API WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> create_transferred_platform_object(HTML::TransferType, JS::Realm&, HTML::TransferDataDecoder&);
 
 }

@@ -7,25 +7,29 @@
 
 #pragma once
 
-#include <LibWeb/Bindings/GamepadPrototype.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Gamepad/SDLGamepadForward.h>
-#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
+#include <LibWeb/Bindings/Gamepad.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWebCommon/Gamepad/GamepadSnapshot.h>
+#include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
 
 namespace Web::Gamepad {
 
+using GamepadMappingType = Bindings::GamepadMappingType;
+
 // https://w3c.github.io/gamepad/#dom-gamepad
-class Gamepad final : public Bindings::PlatformObject {
-    WEB_PLATFORM_OBJECT(Gamepad, Bindings::PlatformObject);
+class Gamepad final : public Bindings::GCAllocatedWrappable {
+    WEB_WRAPPABLE(Gamepad, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(Gamepad);
 
 public:
-    static GC::Ref<Gamepad> create(JS::Realm&, SDL_JoystickID);
+    static GC::Ref<Gamepad> create(HTML::Window&, GamepadDescription const&);
 
-    SDL_JoystickID sdl_joystick_id() const { return m_sdl_joystick_id; }
-    SDL_Gamepad* sdl_gamepad() const { return m_sdl_gamepad; }
+    GamepadHandle handle() const { return m_description.handle; }
+    GamepadDescription const& description() const { return m_description; }
 
     Utf16String const& id() const { return m_id; }
+
+    HTML::Window& window() const { return m_window; }
 
     size_t index() const { return m_index; }
 
@@ -38,21 +42,20 @@ public:
     bool exposed() const { return m_exposed; }
     void set_exposed(Badge<NavigatorGamepadPartial>, bool);
 
-    Bindings::GamepadMappingType mapping() const { return m_mapping; }
+    GamepadMappingType mapping() const { return m_mapping; }
 
     Vector<double> const& axes() const { return m_axes; }
     Vector<GC::Ref<GamepadButton>> const& buttons() const { return m_buttons; }
 
     GC::Ref<GamepadHapticActuator> vibration_actuator() const;
 
+    void set_latest_state(Badge<NavigatorGamepadPartial>, GamepadState);
     void update_gamepad_state(Badge<NavigatorGamepadPartial>);
 
 private:
-    explicit Gamepad(JS::Realm&, SDL_JoystickID);
+    explicit Gamepad(HTML::Window&, GamepadDescription const&);
 
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
+    virtual void visit_edges(GC::Cell::Visitor&) override;
 
     void select_a_mapping();
     void initialize_axes();
@@ -147,10 +150,11 @@ private:
     // https://w3c.github.io/gamepad/#dom-gamepad-mapping
     // The mapping in use for this device. If the user agent has knowledge of the layout of the device, then it SHOULD
     // indicate that a mapping is in use by setting mapping to the corresponding GamepadMappingType value.
-    Bindings::GamepadMappingType m_mapping { Bindings::GamepadMappingType::Standard };
+    GamepadMappingType m_mapping { GamepadMappingType::Standard };
 
-    SDL_JoystickID m_sdl_joystick_id { 0 };
-    SDL_Gamepad* m_sdl_gamepad { nullptr };
+    GC::Ref<HTML::Window> m_window;
+    GamepadDescription m_description;
+    GamepadState m_latest_state;
 };
 
 }

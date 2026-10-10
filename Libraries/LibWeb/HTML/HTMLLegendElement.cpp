@@ -4,11 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/HTMLLegendElementPrototype.h>
-#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
 #include <LibWeb/HTML/HTMLLegendElement.h>
-#include <LibWeb/Layout/LegendBox.h>
 
 namespace Web::HTML {
 
@@ -20,12 +19,6 @@ HTMLLegendElement::HTMLLegendElement(DOM::Document& document, DOM::QualifiedName
 }
 
 HTMLLegendElement::~HTMLLegendElement() = default;
-
-void HTMLLegendElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLLegendElement);
-    Base::initialize(realm);
-}
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-legend-form
 HTMLFormElement* HTMLLegendElement::form()
@@ -40,19 +33,31 @@ HTMLFormElement* HTMLLegendElement::form()
     return nullptr;
 }
 
-GC::Ptr<Layout::Node> HTMLLegendElement::create_layout_node(GC::Ref<CSS::ComputedProperties> style)
+CSS::ElementBoxKind HTMLLegendElement::box_kind() const
 {
-    return heap().allocate<Layout::LegendBox>(document(), *this, move(style));
+    return CSS::ElementBoxKind::Legend;
 }
 
-Layout::LegendBox* HTMLLegendElement::layout_node()
+static void refresh_disabled_state_of_form_controls_under_disabled_field_set(DOM::Node* node)
 {
-    return static_cast<Layout::LegendBox*>(Node::layout_node());
+    if (auto* field_set = as_if<HTMLFieldSetElement>(node); field_set && field_set->has_attribute(HTML::AttributeNames::disabled))
+        field_set->refresh_disabled_state_of_descendant_form_controls();
 }
 
-Layout::LegendBox const* HTMLLegendElement::layout_node() const
+void HTMLLegendElement::inserted()
 {
-    return static_cast<Layout::LegendBox const*>(Node::layout_node());
+    Base::inserted();
+    refresh_disabled_state_of_form_controls_under_disabled_field_set(parent_element().ptr());
+}
+
+void HTMLLegendElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<DOM::Node> old_ancestor)
+{
+    Base::moved_from(is_subtree_root, old_ancestor);
+    if (is_subtree_root != IsSubtreeRoot::Yes)
+        return;
+    refresh_disabled_state_of_form_controls_under_disabled_field_set(old_ancestor.ptr());
+    if (parent_element().ptr() != old_ancestor.ptr())
+        refresh_disabled_state_of_form_controls_under_disabled_field_set(parent_element().ptr());
 }
 
 }

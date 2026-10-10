@@ -1,0 +1,520 @@
+describe("correct behavior", () => {
+    test("length", () => {
+        expect(JSON.stringify).toHaveLength(3);
+    });
+
+    test("basic functionality", () => {
+        [
+            [5, "5"],
+            [undefined, undefined],
+            [null, "null"],
+            [NaN, "null"],
+            [-NaN, "null"],
+            [Infinity, "null"],
+            [-Infinity, "null"],
+            [true, "true"],
+            [false, "false"],
+            ["test", '"test"'],
+            [new Number(5), "5"],
+            [new Boolean(false), "false"],
+            [new String("test"), '"test"'],
+            [() => {}, undefined],
+            [[1, 2, "foo"], '[1,2,"foo"]'],
+            [{ foo: 1, bar: "baz", qux() {} }, '{"foo":1,"bar":"baz"}'],
+            [
+                {
+                    var1: 1,
+                    var2: 2,
+                    toJSON(key) {
+                        let o = this;
+                        o.var2 = 10;
+                        return o;
+                    },
+                },
+                '{"var1":1,"var2":10}',
+            ],
+        ].forEach(testCase => {
+            expect(JSON.stringify(testCase[0])).toEqual(testCase[1]);
+        });
+    });
+
+    test("serialize BigInt with a toJSON property", () => {
+        Object.defineProperty(BigInt.prototype, "toJSON", {
+            configurable: true, // Allows deleting this property at the end of this test case.
+            get() {
+                "use strict";
+                return () => typeof this;
+            },
+        });
+
+        expect(JSON.stringify(1n)).toBe('"bigint"');
+        delete BigInt.prototype.toJSON;
+    });
+
+    test("ignores non-enumerable properties", () => {
+        let o = { foo: "bar" };
+        Object.defineProperty(o, "baz", { value: "qux", enumerable: false });
+        expect(JSON.stringify(o)).toBe('{"foo":"bar"}');
+    });
+
+    test("ignores symbol properties", () => {
+        let o = { foo: "bar" };
+        let sym = Symbol("baz");
+        o[sym] = "qux";
+        expect(JSON.stringify(o)).toBe('{"foo":"bar"}');
+    });
+
+    test("observes property mutations during serialization", () => {
+        let value = {
+            first: {
+                toJSON() {
+                    value.second = 3;
+                    return 1;
+                },
+            },
+            second: 2,
+        };
+        expect(JSON.stringify(value)).toBe('{"first":1,"second":3}');
+
+        value = {
+            first: {
+                toJSON() {
+                    delete value.second;
+                    return 1;
+                },
+            },
+            second: 2,
+        };
+        expect(JSON.stringify(value)).toBe('{"first":1}');
+
+        value = {
+            first: {
+                toJSON() {
+                    value.third = 3;
+                    return 1;
+                },
+            },
+            second: 2,
+        };
+        expect(JSON.stringify(value)).toBe('{"first":1,"second":2}');
+
+        value = {
+            first: {
+                toJSON() {
+                    delete value.second;
+                    value.second = 3;
+                    return 1;
+                },
+            },
+            second: 2,
+            third: 4,
+        };
+        expect(JSON.stringify(value)).toBe('{"first":1,"second":3,"third":4}');
+
+        value = {
+            first: {
+                toJSON() {
+                    Object.defineProperty(value, "second", {
+                        enumerable: true,
+                        get() {
+                            return 3;
+                        },
+                    });
+                    return 1;
+                },
+            },
+            second: 2,
+        };
+        expect(JSON.stringify(value)).toBe('{"first":1,"second":3}');
+    });
+
+    test("observes packed array mutations during serialization", () => {
+        let array = [
+            {
+                toJSON() {
+                    array[1] = 3;
+                    return 1;
+                },
+            },
+            2,
+        ];
+        expect(JSON.stringify(array)).toBe("[1,3]");
+
+        array = [
+            {
+                toJSON() {
+                    array.length = 1;
+                    return 1;
+                },
+            },
+            2,
+        ];
+        expect(JSON.stringify(array)).toBe("[1,null]");
+
+        array = [
+            {
+                toJSON() {
+                    delete array[1];
+                    Array.prototype[1] = 4;
+                    return 1;
+                },
+            },
+            2,
+        ];
+        try {
+            expect(JSON.stringify(array)).toBe("[1,4]");
+        } finally {
+            delete Array.prototype[1];
+        }
+
+        array = [
+            {
+                toJSON() {
+                    Object.defineProperty(array, "1", {
+                        get() {
+                            return 4;
+                        },
+                    });
+                    return 1;
+                },
+            },
+            2,
+        ];
+        expect(JSON.stringify(array)).toBe("[1,4]");
+
+        array = [
+            {
+                toJSON() {
+                    array.push(3);
+                    return 1;
+                },
+            },
+            2,
+        ];
+        expect(JSON.stringify(array)).toBe("[1,2]");
+    });
+
+    test("invalidates cached toJSON absence when a prototype changes", () => {
+        const first = {};
+        const second = {};
+        Object.defineProperty(first, "value", {
+            enumerable: true,
+            get() {
+                Object.prototype.toJSON = function () {
+                    return this === second ? "second" : this;
+                };
+                return 1;
+            },
+        });
+        Object.defineProperty(second, "value", {
+            enumerable: true,
+            get() {
+                return 2;
+            },
+        });
+
+        try {
+            expect(JSON.stringify([first, second])).toBe('[{"value":1},"second"]');
+        } finally {
+            delete Object.prototype.toJSON;
+        }
+    });
+
+    test("observes cached toJSON changes", () => {
+        let second = {
+            toJSON() {
+                return "old";
+            },
+        };
+        let first = {
+            toJSON() {
+                second.toJSON = () => "new";
+                return 1;
+            },
+        };
+        expect(JSON.stringify([first, second])).toBe('[1,"new"]');
+
+        second = {
+            toJSON() {
+                return "old";
+            },
+        };
+        first = {
+            toJSON() {
+                delete second.toJSON;
+                return 1;
+            },
+        };
+        expect(JSON.stringify([first, second])).toBe("[1,{}]");
+    });
+
+    test("stringifies exotic objects with synthesized own keys", () => {
+        const keys = Array.from({ length: 16 }, (_, index) => `property${index}`);
+        const object = new Proxy(
+            {},
+            {
+                ownKeys() {
+                    return keys;
+                },
+                getOwnPropertyDescriptor() {
+                    return { enumerable: true, configurable: true };
+                },
+                get(_, property) {
+                    return property;
+                },
+            }
+        );
+
+        expect(JSON.parse(JSON.stringify(object))).toEqual(Object.fromEntries(keys.map(key => [key, key])));
+    });
+
+    test("keeps cached shape data stable during recursive serialization", () => {
+        let nested = null;
+        for (let i = 0; i < 80; ++i) nested = { [`property${i}`]: nested };
+        const value = { nested, after: 42 };
+
+        expect(JSON.parse(JSON.stringify(value))).toEqual(value);
+    });
+
+    test("keeps fast-path state alive across garbage collection", () => {
+        const object = {
+            first: {
+                toJSON() {
+                    gc();
+                    object.second = 3;
+                    return 1;
+                },
+            },
+            second: 2,
+        };
+        expect(JSON.stringify(object)).toBe('{"first":1,"second":3}');
+
+        const array = [
+            {
+                toJSON() {
+                    gc();
+                    array[1] = 3;
+                    return 1;
+                },
+            },
+            2,
+        ];
+        expect(JSON.stringify(array)).toBe("[1,3]");
+
+        const cyclic = {};
+        let nested = cyclic;
+        for (let i = 0; i < 64; ++i) nested = nested.child = {};
+        nested.child = {
+            toJSON() {
+                gc();
+                return cyclic;
+            },
+        };
+        expect(() => JSON.stringify(cyclic)).toThrowWithMessage(TypeError, "Cannot stringify circular object");
+    });
+
+    test("detects cycles in deeply nested objects", () => {
+        const value = {};
+        let nested = value;
+        for (let i = 0; i < 64; ++i) nested = nested.child = {};
+        nested.child = value;
+
+        expect(() => JSON.stringify(value)).toThrowWithMessage(TypeError, "Cannot stringify circular object");
+    });
+
+    test("observes toJSON added to a prototype between serializations", () => {
+        class Point {
+            constructor(x) {
+                this.x = x;
+            }
+        }
+        expect(JSON.stringify([new Point(1), new Point(2)])).toBe('[{"x":1},{"x":2}]');
+        Point.prototype.toJSON = function () {
+            return "point " + this.x;
+        };
+        expect(JSON.stringify([new Point(1), new Point(2)])).toBe('["point 1","point 2"]');
+        delete Point.prototype.toJSON;
+        expect(JSON.stringify(new Point(3))).toBe('{"x":3}');
+
+        Object.prototype.toJSON = () => "object";
+        try {
+            expect(JSON.stringify({ x: 1 })).toBe('"object"');
+        } finally {
+            delete Object.prototype.toJSON;
+        }
+        expect(JSON.stringify({ x: 1 })).toBe('{"x":1}');
+
+        const withoutPrototype = Object.create(null);
+        withoutPrototype.x = 1;
+        expect(JSON.stringify([withoutPrototype, withoutPrototype])).toBe('[{"x":1},{"x":1}]');
+    });
+
+    test("serializations nested in toJSON", () => {
+        const inner = { value: 1 };
+        const outer = {
+            inner,
+            nested: {
+                toJSON() {
+                    return JSON.stringify({ inner, outerAgain: JSON.stringify(inner) });
+                },
+            },
+        };
+        expect(JSON.stringify(outer)).toBe(
+            '{"inner":{"value":1},"nested":"{\\"inner\\":{\\"value\\":1},\\"outerAgain\\":\\"{\\\\\\"value\\\\\\":1}\\"}"}'
+        );
+
+        // The object that is being serialized by the outer call is not part of a cycle in the inner one.
+        let depth = 0;
+        const reentered = {
+            a: {
+                toJSON() {
+                    if (depth++ > 0) return "inner";
+                    return JSON.stringify(reentered);
+                },
+            },
+        };
+        expect(JSON.stringify(reentered)).toBe('{"a":"{\\"a\\":\\"inner\\"}"}');
+    });
+
+    test("serializes again after a serialization throws", () => {
+        const cyclic = { a: { b: {} } };
+        cyclic.a.b.c = cyclic;
+        expect(() => JSON.stringify(cyclic)).toThrowWithMessage(TypeError, "Cannot stringify circular object");
+        delete cyclic.a.b.c;
+        expect(JSON.stringify(cyclic)).toBe('{"a":{"b":{}}}');
+
+        const throwing = {
+            a: {
+                get b() {
+                    throw new Error("from a getter");
+                },
+            },
+        };
+        expect(() => JSON.stringify(throwing)).toThrowWithMessage(Error, "from a getter");
+        const shared = { x: 1 };
+        expect(JSON.stringify([throwing.a.c, shared, shared])).toBe('[null,{"x":1},{"x":1}]');
+    });
+
+    test("a replacer function sees the wrapper of the value", () => {
+        const holders = [];
+        const result = JSON.stringify({ a: 1 }, function (key, value) {
+            holders.push([key, this]);
+            return value;
+        });
+        expect(result).toBe('{"a":1}');
+        expect(holders[0][0]).toBe("");
+        expect(Object.getPrototypeOf(holders[0][1])).toBe(Object.prototype);
+        expect(Object.keys(holders[0][1])).toEqual([""]);
+        expect(holders[1][0]).toBe("a");
+    });
+
+    test("escape surrogate codepoints in strings", () => {
+        expect(JSON.stringify("\ud83d\ude04")).toBe('"😄"');
+        expect(JSON.stringify("\ud83d")).toBe('"\\ud83d"');
+        expect(JSON.stringify("\ude04")).toBe('"\\ude04"');
+        expect(JSON.stringify("\ud83d\ud83d\ude04\ud83d\ude04\ude04")).toBe('"\\ud83d😄😄\\ude04"');
+        expect(JSON.stringify("\ude04\ud83d\ude04\ud83d\ude04\ud83d")).toBe('"\\ude04😄😄\\ud83d"');
+    });
+
+    test("special number values", () => {
+        expect(JSON.stringify(-0)).toBe("0");
+        expect(JSON.stringify(1e20)).toBe("100000000000000000000");
+        expect(JSON.stringify(1e21)).toBe("1e+21");
+        expect(JSON.stringify(Number.MAX_VALUE)).toBe("1.7976931348623157e+308");
+        expect(JSON.stringify(Number.MIN_VALUE)).toBe("5e-324");
+    });
+
+    test("string escape sequences", () => {
+        expect(JSON.stringify('"')).toBe('"\\""');
+        expect(JSON.stringify("\\")).toBe('"\\\\"');
+        expect(JSON.stringify("/")).toBe('"/"');
+        expect(JSON.stringify("\b")).toBe('"\\b"');
+        expect(JSON.stringify("\f")).toBe('"\\f"');
+        expect(JSON.stringify("\n")).toBe('"\\n"');
+        expect(JSON.stringify("\r")).toBe('"\\r"');
+        expect(JSON.stringify("\t")).toBe('"\\t"');
+        expect(JSON.stringify("\0")).toBe('"\\u0000"');
+        expect(JSON.stringify("\x1f")).toBe('"\\u001f"');
+    });
+
+    test("undefined and functions in arrays become null", () => {
+        expect(JSON.stringify([undefined])).toBe("[null]");
+        expect(JSON.stringify([function () {}])).toBe("[null]");
+        expect(JSON.stringify([Symbol()])).toBe("[null]");
+        expect(JSON.stringify([1, undefined, 2])).toBe("[1,null,2]");
+    });
+
+    test("undefined and functions in objects are omitted", () => {
+        expect(JSON.stringify({ a: undefined })).toBe("{}");
+        expect(JSON.stringify({ a: function () {} })).toBe("{}");
+        expect(JSON.stringify({ a: Symbol() })).toBe("{}");
+        expect(JSON.stringify({ a: 1, b: undefined, c: 2 })).toBe('{"a":1,"c":2}');
+        expect(JSON.stringify({ a: "é", b: undefined, c: 1 })).toBe('{"a":"é","c":1}');
+    });
+
+    test("array replacer acts as property whitelist", () => {
+        expect(JSON.stringify({ a: 1, b: 2, c: 3 }, ["a", "c"])).toBe('{"a":1,"c":3}');
+        expect(JSON.stringify({ a: { b: 1, c: 2 } }, ["a", "b"])).toBe('{"a":{"b":1}}');
+    });
+
+    test("space parameter formats output", () => {
+        expect(JSON.stringify({ a: 1 }, null, 2)).toBe('{\n  "a": 1\n}');
+        expect(JSON.stringify({ a: 1 }, null, "\t")).toBe('{\n\t"a": 1\n}');
+        expect(JSON.stringify([1, 2], null, 2)).toBe("[\n  1,\n  2\n]");
+        // Space capped at 10
+        expect(JSON.stringify({ a: 1 }, null, 20)).toBe('{\n          "a": 1\n}');
+    });
+
+    test("sparse arrays", () => {
+        expect(JSON.stringify(Array(3))).toBe("[null,null,null]");
+    });
+});
+
+describe("errors", () => {
+    test("cannot serialize BigInt", () => {
+        expect(() => {
+            JSON.stringify(5n);
+        }).toThrow(TypeError, "Cannot serialize BigInt value to JSON");
+    });
+
+    test("cannot serialize circular structures", () => {
+        let bad1 = {};
+        bad1.foo = bad1;
+        let bad2 = [];
+        bad2[5] = [[[bad2]]];
+
+        let bad3a = { foo: "bar" };
+        let bad3b = [1, 2, bad3a];
+        bad3a.bad = bad3b;
+
+        [bad1, bad2, bad3a].forEach(bad => {
+            expect(() => {
+                JSON.stringify(bad);
+            }).toThrow(TypeError, "Cannot stringify circular object");
+        });
+    });
+
+    test("should not crash when serializing deeply nested structures", () => {
+        const deepArray = [];
+        let current = deepArray;
+        for (let i = 0; i < 1_000_000; i++) {
+            current[0] = [];
+            current = current[0];
+        }
+
+        expect(() => {
+            JSON.stringify(deepArray);
+        }).toThrow(InternalError, "Call stack size limit exceeded");
+
+        const deepObject = {};
+        current = deepObject;
+        for (let i = 0; i < 1_000_000; i++) {
+            current.x = {};
+            current = current.x;
+        }
+
+        expect(() => {
+            JSON.stringify(deepObject);
+        }).toThrow(InternalError, "Call stack size limit exceeded");
+    });
+});

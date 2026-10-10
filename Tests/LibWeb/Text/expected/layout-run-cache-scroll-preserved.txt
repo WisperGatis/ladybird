@@ -1,0 +1,1 @@
+PASS: moving a reused scroller preserves scrolling (work + checks)

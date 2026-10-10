@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+    <head>
+        <link
+            id="reference"
+            rel="match"
+            href="../expected/iframe-render-blocked-child-not-painted-ref.html"
+        />
+        <script src="../../Text/input/include.js"></script>
+        <style>
+            body {
+                margin: 0;
+                background: rgb(240, 240, 240);
+            }
+
+            #indicator {
+                width: 240px;
+                height: 24px;
+                margin: 16px;
+                background: rgb(255, 0, 0);
+            }
+
+            iframe {
+                display: block;
+                width: 240px;
+                height: 120px;
+                margin: 16px;
+                border: 4px solid rgb(40, 40, 40);
+                background: white;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="indicator"></div>
+        <iframe
+            srcdoc='<!DOCTYPE html><style>body { margin: 0; }</style><div style="font: 700 64px/1 serif; color: rgb(220, 0, 0);">FAIL</div>'
+        ></iframe>
+        <script>
+            window.addEventListener("load", async () => {
+                // Ensure the iframe's compositor surface contains visible content before navigating it to the
+                // render-blocked document. The embedding paintable must not reuse this stale surface.
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+                const server = httpTestServer();
+                const routeNamespace = location.hostname;
+                const unblockToken = `iframe-render-blocked-child-not-painted-${routeNamespace}`;
+                const stylesheetURL = await server.createEcho("GET", `/iframe-render-blocked-child-not-painted-${routeNamespace}.css`, {
+                    status: 200,
+                    headers: {
+                        "Content-Type": "text/css",
+                    },
+                    body: "body { margin: 0; }",
+                    wait_for_unblock: unblockToken,
+                });
+
+                const childURL = await server.createEcho("GET", `/iframe-render-blocked-child-not-painted-child-${routeNamespace}.html`, {
+                    status: 200,
+                    headers: {
+                        "Content-Type": "text/html",
+                    },
+                    body: `<!DOCTYPE html>
+<html>
+    <head>
+        \x3Cscript>parent.childStarted();\x3C/script>
+        <link rel="stylesheet" href="${stylesheetURL}">
+    </head>
+    <body>
+        <div
+            style="
+                margin: 0;
+                font: 700 64px/1 serif;
+                color: rgb(220, 0, 0);
+            "
+        >
+            FAIL
+        </div>
+    </body>
+</html>`,
+                });
+
+                window.childStarted = () => {
+                    requestAnimationFrame(() => {
+                        document.getElementById("indicator").style.background = "rgb(0, 0, 255)";
+                        requestAnimationFrame(() => {
+                            document.documentElement.className = "";
+                        });
+                    });
+                };
+                // The reference loads after this page is captured and unblocks the stylesheet, preventing the
+                // pending request from leaking into the next test.
+                document.getElementById("reference").href = `../expected/iframe-render-blocked-child-not-painted-ref.html?unblock=${encodeURIComponent(unblockToken)}`;
+                const iframe = document.querySelector("iframe");
+                iframe.removeAttribute("srcdoc");
+                iframe.src = childURL;
+            });
+        </script>
+    </body>
+</html>

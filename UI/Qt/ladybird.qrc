@@ -1,13 +1,9 @@
 <!DOCTYPE RCC><RCC version="1.0">
     <qresource>
         <file>../Icons/ladybird.png</file>
-        <file>../Icons/back.tvg</file>
-        <file>../Icons/close.tvg</file>
-        <file>../Icons/forward.tvg</file>
-        <file>../Icons/hamburger.tvg</file>
-        <file>../Icons/new_tab.tvg</file>
-        <file>../Icons/reload.tvg</file>
-        <file>../Icons/up.tvg</file>
-        <file>../Icons/down.tvg</file>
+        <file>OrcaScripts/Ladybird/__init__.py</file>
+        <file>OrcaScripts/Ladybird/script.py</file>
+        <file>OrcaScripts/Ladybird/script_utilities.py</file>
+        <file>OrcaScripts/orca_customizations_bootstrap.py</file>
     </qresource>
 </RCC>

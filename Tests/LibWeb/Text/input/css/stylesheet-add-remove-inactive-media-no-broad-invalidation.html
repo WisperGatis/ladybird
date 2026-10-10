@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<div id="target">target</div>
+<script>
+    function settleAndReset(triggerElement) {
+        getComputedStyle(triggerElement).color;
+        getComputedStyle(triggerElement).color;
+        internals.resetStyleInvalidationCounters();
+    }
+
+    function verifyNoBroadReactionWasPublished(label) {
+        const reactions = internals.getStyleInvalidationCounters().styleEnginePublishedReactions;
+        if (reactions <= 1)
+            println(`PASS: ${label}`);
+        else
+            println(`FAIL: ${label} (${reactions} reactions)`);
+    }
+
+    test(() => {
+        const target = document.getElementById("target");
+        settleAndReset(target);
+
+        const inactiveStyle = document.createElement("style");
+        // This sheet still contains a non-style rule that would publish broad
+        // reactions if it were active, so keeping the counter at zero proves we
+        // only consider effective rules after media evaluation.
+        inactiveStyle.media = "print";
+        inactiveStyle.textContent = "@layer B, A;";
+        document.head.appendChild(inactiveStyle);
+
+        getComputedStyle(target).color;
+        verifyNoBroadReactionWasPublished("inactive media stylesheet add publishes no broad reactions");
+
+        settleAndReset(target);
+        inactiveStyle.remove();
+
+        getComputedStyle(target).color;
+        verifyNoBroadReactionWasPublished("inactive media stylesheet remove publishes no broad reactions");
+    });
+</script>

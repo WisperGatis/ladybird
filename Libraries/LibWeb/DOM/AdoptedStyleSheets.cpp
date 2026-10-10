@@ -4,50 +4,71 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/Invalidation/AdoptedStyleSheetInvalidator.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/ShadowRoot.h>
 
 namespace Web::DOM {
 
+GC::Ref<WebIDL::ObservableArray> AdoptedStyleSheetsAccess::adopted_style_sheets(Document& document)
+{
+    return document.adopted_style_sheets();
+}
+
+GC::Ref<WebIDL::ObservableArray> AdoptedStyleSheetsAccess::adopted_style_sheets(ShadowRoot& shadow_root)
+{
+    return shadow_root.adopted_style_sheets();
+}
+
 GC::Ref<WebIDL::ObservableArray> create_adopted_style_sheets_list(Node& document_or_shadow_root)
 {
-    auto adopted_style_sheets = WebIDL::ObservableArray::create(document_or_shadow_root.realm());
-    adopted_style_sheets->set_on_set_an_indexed_value_callback([&document_or_shadow_root](JS::Value& value) -> WebIDL::ExceptionOr<void> {
+    auto& realm = document_or_shadow_root.document().relevant_settings_object().realm();
+    auto adopted_style_sheets = WebIDL::ObservableArray::create(realm);
+    adopted_style_sheets->set_on_set_an_indexed_value_callback([&document_or_shadow_root, adopted_style_sheets](u32 index, JS::Value& value) -> WebIDL::ExceptionOr<void> {
         auto& vm = document_or_shadow_root.vm();
-        if (!value.is_object())
+        auto style_sheet = CSS::css_style_sheet_from_value(value);
+        if (!style_sheet)
             return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "CSSStyleSheet");
-        auto& object = value.as_object();
-        if (!is<CSS::CSSStyleSheet>(object))
-            return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "CSSStyleSheet");
-        auto& style_sheet = static_cast<CSS::CSSStyleSheet&>(object);
 
         // The set an indexed value algorithm for adoptedStyleSheets, given value and index, is the following:
         // 1. If value’s constructed flag is not set, or its constructor document is not equal to this
         //    DocumentOrShadowRoot's node document, throw a "NotAllowedError" DOMException.
-        if (!style_sheet.constructed())
-            return WebIDL::NotAllowedError::create(document_or_shadow_root.realm(), "StyleSheet's constructed flag is not set."_utf16);
-        if (!style_sheet.constructed() || style_sheet.constructor_document().ptr() != &document_or_shadow_root.document())
-            return WebIDL::NotAllowedError::create(document_or_shadow_root.realm(), "Sharing a StyleSheet between documents is not allowed."_utf16);
+        if (!style_sheet->constructed())
+            return WebIDL::NotAllowedError::create("StyleSheet's constructed flag is not set."_utf16);
+        if (!style_sheet->constructed() || style_sheet->constructor_document().ptr() != &document_or_shadow_root.document())
+            return WebIDL::NotAllowedError::create("Sharing a StyleSheet between documents is not allowed."_utf16);
 
-        style_sheet.add_owning_document_or_shadow_root(document_or_shadow_root);
-        document_or_shadow_root.document().style_computer().invalidate_rule_cache();
-        document_or_shadow_root.invalidate_style(DOM::StyleInvalidationReason::AdoptedStyleSheetsList);
+        // Adopted sheets are not in any StyleSheetList, so nothing else announces them to the
+        // engine. Observable array operations can write displaced entries before the insertion
+        // point, so preserve their final order by attaching before the entry currently following
+        // this index.
+        CSS::StyleSheetState* before = nullptr;
+        if (auto successor = adopted_style_sheets->element_value(index + 1); successor.has_value())
+            before = CSS::css_style_sheet_from_value(*successor);
+        CSS::record_stylesheet_attached(*style_sheet, document_or_shadow_root, before);
+        CSS::Invalidation::invalidate_style_after_adopting_style_sheet(document_or_shadow_root, *style_sheet);
         return {};
     });
     adopted_style_sheets->set_on_delete_an_indexed_value_callback([&document_or_shadow_root](JS::Value value) -> WebIDL::ExceptionOr<void> {
-        VERIFY(value.is_object());
-        auto& object = value.as_object();
-        VERIFY(is<CSS::CSSStyleSheet>(object));
-        auto& style_sheet = static_cast<CSS::CSSStyleSheet&>(object);
-
-        style_sheet.remove_owning_document_or_shadow_root(document_or_shadow_root);
-        document_or_shadow_root.document().style_computer().invalidate_rule_cache();
-        document_or_shadow_root.invalidate_style(DOM::StyleInvalidationReason::AdoptedStyleSheetsList);
+        auto* style_sheet = CSS::css_style_sheet_from_value(value);
+        VERIFY(style_sheet);
+        CSS::record_stylesheet_detached(*style_sheet, document_or_shadow_root);
+        CSS::Invalidation::invalidate_style_after_removing_adopted_style_sheet(document_or_shadow_root, *style_sheet);
         return {};
     });
 
     return adopted_style_sheets;
+}
+
+void for_each_adopted_style_sheet(WebIDL::ObservableArray& adopted_style_sheets, Function<void(CSS::StyleSheetState&)> const& callback)
+{
+    adopted_style_sheets.for_each_element_value([&](JS::Value value) {
+        if (auto style_sheet = CSS::css_style_sheet_from_value(value))
+            callback(*style_sheet);
+    });
 }
 
 }

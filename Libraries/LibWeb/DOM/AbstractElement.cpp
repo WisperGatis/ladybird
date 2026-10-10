@@ -1,11 +1,17 @@
 /*
- * Copyright (c) 2024-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2024-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/DOM/AbstractElement.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/PseudoElement.h>
+#include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/Layout/Node.h>
 
 namespace Web::DOM {
@@ -16,10 +22,15 @@ AbstractElement::AbstractElement(GC::Ref<Element> element, Optional<CSS::PseudoE
 {
 }
 
+AbstractElement::AbstractElement(Element const& element, Optional<CSS::PseudoElement> pseudo_element)
+    : m_element(const_cast<Element&>(element))
+    , m_pseudo_element(move(pseudo_element))
+{
+}
+
 void AbstractElement::visit(GC::Cell::Visitor& visitor) const
 {
     visitor.visit(m_element);
-    visitor.visit(m_inheritance_override);
 }
 
 Document& AbstractElement::document() const
@@ -63,25 +74,36 @@ AbstractElement::TreeCountingFunctionResolutionContext AbstractElement::tree_cou
     };
 }
 
-GC::Ptr<Layout::NodeWithStyle> AbstractElement::layout_node()
+Layout::NodeWithStyle* AbstractElement::layout_node(Layout::BegunRead const& read)
 {
     if (m_pseudo_element.has_value())
-        return m_element->get_pseudo_element_node(*m_pseudo_element);
-    return m_element->layout_node();
+        return m_element->pseudo_element_layout_node(read, *m_pseudo_element);
+    return m_element->layout_node(read);
+}
+
+Layout::NodeWithStyle* AbstractElement::unsafe_layout_node(Layout::BegunRead const& read)
+{
+    if (m_pseudo_element.has_value())
+        return m_element->pseudo_element_unsafe_layout_node(read, *m_pseudo_element);
+    return m_element->unsafe_layout_node(read);
 }
 
 GC::Ptr<Element const> AbstractElement::parent_element() const
 {
     if (m_pseudo_element.has_value())
-        return m_element;
+        return m_element.ptr();
     return m_element->parent_element();
+}
+
+Element* AbstractElement::flat_tree_parent_element() const
+{
+    if (m_pseudo_element.has_value())
+        return m_element.ptr();
+    return m_element->flat_tree_parent_element();
 }
 
 Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
 {
-    if (m_inheritance_override)
-        return AbstractElement { *m_inheritance_override };
-
     GC::Ptr<Element const> element = m_element->element_to_inherit_style_from(m_pseudo_element);
 
     if (!element)
@@ -90,123 +112,122 @@ Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
     return AbstractElement { const_cast<DOM::Element&>(*element) };
 }
 
-Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_method)
+// https://drafts.csswg.org/css-pseudo-4/#highlight-cascade
+// When any supported property is not given a value by the cascade, or given a value of inherit or unset, its
+// specified value is determined by inheritance from the corresponding highlight pseudo-element of its originating
+// element's parent element.
+Optional<AbstractElement> AbstractElement::highlight_inheritance_parent() const
 {
-    GC::Ptr<Layout::Node> node = layout_node();
-    if (!node)
+    if (!m_pseudo_element.has_value() || !CSS::is_highlight_pseudo_element(*m_pseudo_element))
         return OptionalNone {};
 
-    while (true) {
-        switch (walk_method) {
-        case WalkMethod::Previous:
-            node = node->previous_in_pre_order();
-            break;
-        case WalkMethod::PreviousSibling:
-            node = node->previous_sibling();
-            break;
-        }
-        if (!node)
-            return OptionalNone {};
-
-        if (auto* previous_element = as_if<Element>(node->dom_node()))
-            return AbstractElement { *previous_element };
-
-        if (node->is_generated_for_pseudo_element())
-            return AbstractElement { *node->pseudo_element_generator(), node->generated_for_pseudo_element() };
+    // An ancestor without a record for this pseudo-element has no declarations for it, so the nearest record is
+    // what its own would have inherited anyway.
+    for (auto ancestor = m_element->element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
+        if (!!ancestor->style_record_identity(*m_pseudo_element))
+            return AbstractElement { *ancestor, m_pseudo_element };
     }
+    return OptionalNone {};
 }
 
-bool AbstractElement::is_before(AbstractElement const& other) const
+GC::Ptr<Node> AbstractElement::root()
 {
-    auto this_node = layout_node();
-    auto other_node = other.layout_node();
-    return this_node && other_node && this_node->is_before(*other_node);
-}
-
-GC::Ptr<CSS::ComputedProperties const> AbstractElement::computed_properties() const
-{
-    return m_element->computed_properties(m_pseudo_element);
-}
-
-OrderedHashMap<FlyString, CSS::StyleProperty> const& AbstractElement::custom_properties() const
-{
-    return m_element->custom_properties(m_pseudo_element);
-}
-
-void AbstractElement::set_custom_properties(OrderedHashMap<FlyString, CSS::StyleProperty>&& custom_properties)
-{
-    m_element->set_custom_properties(m_pseudo_element, move(custom_properties));
-}
-
-RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(FlyString const& name) const
-{
-    // FIXME: We should be producing computed values for custom properties, just like regular properties.
     if (m_pseudo_element.has_value()) {
-        auto const& custom_properties = m_element->custom_properties(*m_pseudo_element);
-        if (auto it = custom_properties.find(name); it != custom_properties.end()) {
-            return it->value.value;
-        }
+        if (auto pseudo_element = m_element->get_pseudo_element(*m_pseudo_element); pseudo_element.has_value())
+            return pseudo_element->root();
+
+        return nullptr;
     }
 
-    for (auto const* current_element = m_element.ptr(); current_element; current_element = current_element->parent_or_shadow_host_element()) {
-        auto const& custom_properties = current_element->custom_properties({});
-        if (auto it = custom_properties.find(name); it != custom_properties.end()) {
-            return it->value.value;
-        }
-    }
+    return m_element->root();
+}
+
+CSS::ComputedStyleRecordView AbstractElement::computed_style() const
+{
+    return m_element->computed_style(m_pseudo_element);
+}
+
+CSS::StyleRecordID AbstractElement::style_record_identity() const
+{
+    return m_element->style_record_identity(m_pseudo_element);
+}
+
+CSS::InstalledStyle const& AbstractElement::installed_style() const
+{
+    return m_element->installed_style(m_pseudo_element);
+}
+
+void const* AbstractElement::style_record_payloads() const
+{
+    return m_element->style_record_payloads(m_pseudo_element);
+}
+
+GC::Ptr<CSS::CSSStyleProperties const> AbstractElement::inline_style() const
+{
+    if (!m_pseudo_element.has_value())
+        return m_element->inline_style();
+
+    if (!CSS::is_element_reference_pseudo_element(*m_pseudo_element))
+        return nullptr;
+
+    auto pseudo_element = m_element->get_pseudo_element(*m_pseudo_element);
+
+    if (!pseudo_element.has_value())
+        return nullptr;
+
+    return as<ElementReferencePseudoElement>(*pseudo_element).referenced_element()->inline_style();
+}
+
+RefPtr<CSS::CustomPropertyData const> AbstractElement::custom_property_data() const
+{
+    return m_element->custom_property_data(m_pseudo_element);
+}
+
+void AbstractElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData const> data)
+{
+    m_element->set_custom_property_data(m_pseudo_element, move(data));
+}
+
+void AbstractElement::replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const> data)
+{
+    m_element->replace_custom_property_data(m_pseudo_element, move(data));
+}
+
+RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyString const& name) const
+{
+    auto data = custom_property_data();
+    if (!data)
+        return nullptr;
+    if (auto const* property = data->get(name))
+        return property->value;
     return nullptr;
 }
 
-GC::Ptr<CSS::CascadedProperties> AbstractElement::cascaded_properties() const
-{
-    return m_element->cascaded_properties(m_pseudo_element);
-}
-
-void AbstractElement::set_cascaded_properties(GC::Ptr<CSS::CascadedProperties> cascaded_properties)
-{
-    m_element->set_cascaded_properties(m_pseudo_element, cascaded_properties);
-}
-
-bool AbstractElement::has_non_empty_counters_set() const
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_pseudo_element(*m_pseudo_element)->has_non_empty_counters_set();
-    return m_element->has_non_empty_counters_set();
-}
-
-Optional<CSS::CountersSet const&> AbstractElement::counters_set() const
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_pseudo_element(*m_pseudo_element)->counters_set();
-    return m_element->counters_set();
-}
-
-CSS::CountersSet& AbstractElement::ensure_counters_set()
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_pseudo_element(*m_pseudo_element)->ensure_counters_set();
-    return m_element->ensure_counters_set();
-}
-
-void AbstractElement::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
+Utf16String AbstractElement::debug_description() const
 {
     if (m_pseudo_element.has_value()) {
-        m_element->get_pseudo_element(*m_pseudo_element)->set_counters_set(move(counters_set));
-    } else {
-        m_element->set_counters_set(move(counters_set));
-    }
-}
-
-String AbstractElement::debug_description() const
-{
-    if (m_pseudo_element.has_value()) {
-        StringBuilder builder;
+        Utf16StringBuilder builder;
         builder.append(m_element->debug_description());
-        builder.append("::"sv);
-        builder.append(CSS::pseudo_element_name(*m_pseudo_element));
-        return builder.to_string_without_validation();
+        builder.append_ascii("::"sv);
+        builder.append_ascii(CSS::pseudo_element_name(*m_pseudo_element));
+        return builder.to_string();
     }
     return m_element->debug_description();
+}
+
+CSS::StyleScope const& AbstractElement::style_scope() const
+{
+    return m_element->style_scope();
+}
+
+Vector<GC::Ref<CSS::CSSAnimation>> const* AbstractElement::css_defined_animations() const
+{
+    return m_element->css_defined_animations(m_pseudo_element);
+}
+
+void AbstractElement::set_css_defined_animations(Vector<GC::Ref<CSS::CSSAnimation>>&& animations)
+{
+    m_element->set_css_defined_animations(m_pseudo_element, move(animations));
 }
 
 }

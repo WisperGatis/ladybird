@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2021, Max Wipfli <mail@maxwipfli.ch>
+ * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -7,29 +8,52 @@
 #include <AK/CharacterTypes.h>
 #include <AK/GenericLexer.h>
 #include <AK/StringView.h>
-#include <AK/Utf8View.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibTextCodec/Decoder.h>
+#include <LibURL/URL.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <ctype.h>
+#include <LibWeb/HTML/Parser/RustFFI.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::HTML {
 
-bool prescan_should_abort(ByteBuffer const& input, size_t const& position)
+static Utf16FlyString prescan_attribute_name(Utf16StringBuilder const& attribute_name)
+{
+    return Utf16FlyString::from_utf16(attribute_name.view());
+}
+
+static Utf16String prescan_attribute_value(Utf16StringBuilder& attribute_value)
+{
+    return attribute_value.to_string();
+}
+
+static bool prescan_should_abort(ReadonlyBytes input, size_t const& position)
 {
     return position >= input.size() || position >= 1024;
 }
 
-bool prescan_is_whitespace_or_slash(u8 const& byte)
+static constexpr bool is_whitespace(u8 byte)
 {
-    return byte == '\t' || byte == '\n' || byte == '\f' || byte == '\r' || byte == ' ' || byte == '/';
+    return byte == '\t' || byte == '\n' || byte == '\f' || byte == '\r' || byte == ' ';
 }
 
-bool prescan_skip_whitespace_and_slashes(ByteBuffer const& input, size_t& position)
+static constexpr bool is_whitespace_or_slash(u8 byte)
 {
-    while (!prescan_should_abort(input, position) && (input[position] == '\t' || input[position] == '\n' || input[position] == '\f' || input[position] == '\r' || input[position] == ' ' || input[position] == '/'))
+    return is_whitespace(byte) || byte == '/';
+}
+
+static constexpr bool is_whitespace_or_end_chevron(u8 byte)
+{
+    return is_whitespace(byte) || byte == '>';
+}
+
+static bool prescan_skip_whitespace_and_slashes(ReadonlyBytes input, size_t& position)
+{
+    while (!prescan_should_abort(input, position) && is_whitespace_or_slash(input[position]))
         ++position;
     return !prescan_should_abort(input, position);
 }
@@ -95,7 +119,7 @@ Optional<StringView> extract_character_encoding_from_meta_element(ByteString con
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#concept-get-attributes-when-sniffing
-GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document& document, ByteBuffer const& input, size_t& position)
+GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document& document, ReadonlyBytes input, size_t& position)
 {
     // 1. If the byte at position is one of 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), 0x20 (SP), or 0x2F (/),
     //    then advance position to the next byte and redo this step.
@@ -108,7 +132,7 @@ GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document& document, ByteBuffer con
 
     // 3. Otherwise, the byte at position is the start of the attribute name. Let attribute name and attribute value be the empty string.
     // 4. Process the byte at position as follows:
-    StringBuilder attribute_name;
+    Utf16StringBuilder attribute_name;
     while (true) {
         // -> If it is 0x3D (=), and the attribute name is longer than the empty string
         if (input[position] == '=' && !attribute_name.is_empty()) {
@@ -117,14 +141,14 @@ GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document& document, ByteBuffer con
             goto value;
         }
         // -> If it is 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), or 0x20 (SP)
-        if (input[position] == '\t' || input[position] == '\n' || input[position] == '\f' || input[position] == '\r' || input[position] == ' ') {
+        if (is_whitespace(input[position])) {
             // Jump to the step below labeled spaces.
             goto spaces;
         }
         // -> If it is 0x2F (/) or 0x3E (>)
         if (input[position] == '/' || input[position] == '>') {
             // Abort the get an attribute algorithm. The attribute's name is the value of attribute name, its value is the empty string.
-            return DOM::Attr::create(document, MUST(attribute_name.to_string()), String {});
+            return DOM::Attr::create(document, prescan_attribute_name(attribute_name), Utf16String {});
         }
         // -> If it is in the range 0x41 (A) to 0x5A (Z)
         if (input[position] >= 'A' && input[position] <= 'Z') {
@@ -154,7 +178,7 @@ spaces:
     // 7. If the byte at position is not 0x3D (=), abort the get an attribute algorithm.
     //    The attribute's name is the value of attribute name, its value is the empty string.
     if (input[position] != '=')
-        return DOM::Attr::create(document, MUST(attribute_name.to_string()), String {});
+        return DOM::Attr::create(document, prescan_attribute_name(attribute_name), Utf16String {});
 
     // 8. Advance position past the 0x3D (=) byte.
     ++position;
@@ -165,7 +189,7 @@ value:
     if (!prescan_skip_whitespace_and_slashes(input, position))
         return {};
 
-    StringBuilder attribute_value;
+    Utf16StringBuilder attribute_value;
     // 10. Process the byte at position as follows:
 
     // -> If it is 0x22 (") or 0x27 (')
@@ -180,8 +204,10 @@ value:
             // 3. If the value of the byte at position is the value of b, then advance position to the next byte
             //    and abort the "get an attribute" algorithm.
             //    The attribute's name is the value of attribute name, and its value is the value of attribute value.
-            if (input[position] == quote_character)
-                return DOM::Attr::create(document, MUST(attribute_name.to_string()), MUST(attribute_value.to_string()));
+            if (input[position] == quote_character) {
+                ++position;
+                return DOM::Attr::create(document, prescan_attribute_name(attribute_name), prescan_attribute_value(attribute_value));
+            }
 
             // 4. Otherwise, if the value of the byte at position is in the range 0x41 (A) to 0x5A (Z),
             //    then append a code point to attribute value whose value is 0x20 more than the value of the byte at position.
@@ -201,7 +227,7 @@ value:
     // -> If it is 0x3E (>)
     if (input[position] == '>') {
         // Abort the get an attribute algorithm. The attribute's name is the value of attribute name, its value is the empty string.
-        return DOM::Attr::create(document, MUST(attribute_name.to_string()), String {});
+        return DOM::Attr::create(document, prescan_attribute_name(attribute_name), Utf16String {});
     }
 
     // -> If it is in the range 0x41 (A) to 0x5A (Z)
@@ -225,9 +251,9 @@ value:
     // 11. Process the byte at position as follows:
     for (; !prescan_should_abort(input, position); ++position) {
         // -> If it is 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), 0x20 (SP), or 0x3E (>)
-        if (input[position] == '\t' || input[position] == '\n' || input[position] == '\f' || input[position] == '\r' || input[position] == ' ' || input[position] == '>') {
+        if (is_whitespace_or_end_chevron(input[position])) {
             // Abort the get an attribute algorithm. The attribute's name is the value of attribute name and its value is the value of attribute value.
-            return DOM::Attr::create(document, MUST(attribute_name.to_string()), MUST(attribute_value.to_string()));
+            return DOM::Attr::create(document, prescan_attribute_name(attribute_name), prescan_attribute_value(attribute_value));
         }
 
         // -> If it is in the range 0x41 (A) to 0x5A (Z)
@@ -246,24 +272,130 @@ value:
     return {};
 }
 
-// https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
-Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document& document, ByteBuffer const& input)
+// https://html.spec.whatwg.org/multipage/parsing.html#concept-get-xml-encoding-when-sniffing
+static Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input)
 {
-    // https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
+    // 1. Let encodingPosition be a pointer to the start of the stream.
+    size_t encoding_position = 0;
 
-    // Detects '<?x'
-    if (!prescan_should_abort(input, 5)) {
-        // A sequence of bytes starting with: 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0
-        if (input[0] == 0x3C && input[1] == 0x00 && input[2] == 0x3F && input[3] == 0x00 && input[4] == 0x78 && input[5] == 0x00)
+    // 2. If encodingPosition does not point to the start of a byte sequence 0x3C, 0x3F, 0x78, 0x6D, 0x6C (`<?xml`),
+    //    then return failure.
+    if (input.size() < 5 || input.slice(encoding_position, 5) != Array<u8, 5> { '<', '?', 'x', 'm', 'l' })
+        return {};
+
+    // 3. Let xmlDeclarationEnd be a pointer to the next byte in the input byte stream which is 0x3E (>). If there is no
+    //    such byte, then return failure.
+    auto xml_declaration_end = StringView { input }.find('>');
+    if (!xml_declaration_end.has_value())
+        return {};
+
+    // 4. Set encodingPosition to the position of the first occurrence of the subsequence of bytes 0x65, 0x6E, 0x63,
+    //    0x6F, 0x64, 0x69, 0x6E, 0x67 (`encoding`) at or after the current encodingPosition and before
+    //    xmlDeclarationEnd. If there is no such sequence, then return failure.
+    auto xml_declaration = StringView { input.slice(encoding_position, *xml_declaration_end - encoding_position) };
+    auto encoding_index = xml_declaration.find("encoding"sv);
+    if (!encoding_index.has_value())
+        return {};
+    encoding_position += *encoding_index;
+
+    // 5. Advance encodingPosition past the 0x67 (g) byte.
+    encoding_position += "encoding"sv.length();
+
+    // NB: The remaining steps read the byte at encodingPosition. Running out of bytes means the declaration is
+    //     incomplete, so there is no encoding to be found.
+    auto skip_control_characters_and_spaces = [&] {
+        while (encoding_position < input.size() && input[encoding_position] <= 0x20)
+            ++encoding_position;
+        return encoding_position < input.size();
+    };
+
+    // 6. While the byte at encodingPosition is less than or equal to 0x20 (i.e., it is either an ASCII space or control
+    //    character), advance encodingPosition to the next byte.
+    if (!skip_control_characters_and_spaces())
+        return {};
+
+    // 7. If the byte at encodingPosition is not 0x3D (=), then return failure.
+    if (input[encoding_position] != '=')
+        return {};
+
+    // 8. Advance encodingPosition to the next byte.
+    ++encoding_position;
+
+    // 9. While the byte at encodingPosition is less than or equal to 0x20 (i.e., it is either an ASCII space or control
+    //    character), advance encodingPosition to the next byte.
+    if (!skip_control_characters_and_spaces())
+        return {};
+
+    // 10. Let quoteMark be the byte at encodingPosition.
+    auto quote_mark = input[encoding_position];
+
+    // 11. If quoteMark is not either 0x22 (") or 0x27 ('), then return failure.
+    if (quote_mark != '"' && quote_mark != '\'')
+        return {};
+
+    // 12. Advance encodingPosition to the next byte.
+    ++encoding_position;
+
+    // 13. Let encodingEndPosition be the position of the next occurrence of quoteMark at or after encodingPosition. If
+    //     quoteMark does not occur again, then return failure.
+    auto remainder = StringView { input.slice(encoding_position) };
+    auto encoding_end_index = remainder.find(static_cast<char>(quote_mark));
+    if (!encoding_end_index.has_value())
+        return {};
+
+    // 14. Let potentialEncoding be the sequence of the bytes between encodingPosition (inclusive) and
+    //     encodingEndPosition (exclusive).
+    auto potential_encoding = remainder.substring_view(0, *encoding_end_index);
+
+    // 15. If potentialEncoding contains one or more bytes whose byte value is 0x20 or below, then return failure.
+    for (auto byte : potential_encoding.bytes()) {
+        if (byte <= 0x20)
+            return {};
+    }
+
+    // 16. Let encoding be the result of getting an encoding given potentialEncoding isomorphic decoded.
+    auto encoding = TextCodec::get_standardized_encoding(potential_encoding);
+    if (!encoding.has_value())
+        return {};
+
+    // 17. If the encoding is UTF-16BE/LE, then change it to UTF-8.
+    if (encoding->is_one_of("UTF-16BE"sv, "UTF-16LE"sv))
+        return "UTF-8";
+
+    // 18. Return encoding.
+    return *encoding;
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
+static Optional<ByteString> run_prescan_byte_stream_algorithm_steps(DOM::Document& document, ReadonlyBytes input)
+{
+    // 1. Let position be a pointer to a byte in the input byte stream, initially pointing at the first byte.
+    size_t position = 0;
+
+    // 2. Prescan for UTF-16 XML declarations: If position points to:
+    if (!prescan_should_abort(input, position + 5)) {
+        // * A sequence of bytes starting with: 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 (case-sensitive UTF-16 little-endian '<?x')
+        //       Return UTF-16LE.
+        if (input.slice(position, 6) == Array<u8, 6> { 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 })
             return "utf-16le";
-        // A sequence of bytes starting with: 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78
-        if (input[0] == 0x00 && input[1] == 0x3C && input[2] == 0x00 && input[3] == 0x3F && input[4] == 0x00 && input[5] == 0x78)
+
+        // * A sequence of bytes starting with: 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 (case-sensitive UTF-16 big-endian '<?x')
+        //       Return UTF-16BE.
+        if (input.slice(position, 6) == Array<u8, 6> { 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 })
             return "utf-16be";
     }
 
-    for (size_t position = 0; !prescan_should_abort(input, position); ++position) {
+    // NOTE: For historical reasons, the prefix is two bytes longer than in Appendix F of XML and the encoding name is
+    //       not checked.
+
+    // 3. Loop: If position points to:
+    while (!prescan_should_abort(input, position)) {
+        // * A sequence of bytes starting with: 0x3C 0x21 0x2D 0x2D (`<!--`)
         if (!prescan_should_abort(input, position + 5) && input[position] == '<' && input[position + 1] == '!'
             && input[position + 2] == '-' && input[position + 3] == '-') {
+            // Advance the position pointer so that it points at the first 0x3E byte which is preceded by two 0x2D bytes
+            // (i.e. at the end of an ASCII '-->' sequence) and comes after the 0x3C byte that was found. (The two 0x2D
+            // bytes can be the same as those in the '<!--' sequence.)
             position += 2;
             for (; !prescan_should_abort(input, position + 3); ++position) {
                 if (input[position] == '-' && input[position + 1] == '-' && input[position + 2] == '>') {
@@ -271,75 +403,160 @@ Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document& document, 
                     break;
                 }
             }
-        } else if (!prescan_should_abort(input, position + 6)
+        }
+
+        // * A sequence of bytes starting with: 0x3C, 0x4D or 0x6D, 0x45 or 0x65, 0x54 or 0x74, 0x41 or 0x61, and one of
+        //   0x09, 0x0A, 0x0C, 0x0D, 0x20, 0x2F (case-insensitive ASCII '<meta' followed by a space or slash)
+        else if (!prescan_should_abort(input, position + 6)
             && input[position] == '<'
             && (input[position + 1] == 'M' || input[position + 1] == 'm')
             && (input[position + 2] == 'E' || input[position + 2] == 'e')
             && (input[position + 3] == 'T' || input[position + 3] == 't')
             && (input[position + 4] == 'A' || input[position + 4] == 'a')
-            && prescan_is_whitespace_or_slash(input[position + 5])) {
+            && is_whitespace_or_slash(input[position + 5])) {
+            // 1. Advance the position pointer so that it points at the next 0x09, 0x0A, 0x0C, 0x0D, 0x20, or 0x2F byte
+            //    (the one in sequence of characters matched above).
             position += 6;
-            Vector<FlyString> attribute_list {};
+
+            // 2. Let attribute list be an empty list of strings.
+            Vector<Utf16FlyString> attribute_list {};
+
+            // 3. Let got pragma be false.
             bool got_pragma = false;
+
+            // 4. Let need pragma be null.
             Optional<bool> need_pragma {};
+
+            // 5. Let charset be the null value (which, for the purposes of this algorithm, is distinct from an
+            //    unrecognized encoding or the empty string).
             Optional<ByteString> charset {};
 
             while (true) {
+                // 6. Attributes: Get an attribute and its value. If no attribute was sniffed, then jump to the
+                //    processing step below.
                 auto attribute = prescan_get_attribute(document, input, position);
                 if (!attribute)
                     break;
+
+                // 7. If the attribute's name is already in attribute list, then return to the step labeled attributes.
                 if (attribute_list.contains_slow(attribute->name()))
                     continue;
+
+                // 8. Add the attribute's name to attribute list.
                 auto const& attribute_name = attribute->name();
                 attribute_list.append(attribute->name());
 
-                if (attribute_name == "http-equiv") {
-                    got_pragma = attribute->value() == "content-type";
-                } else if (attribute_name == "content") {
+                // 9. Run the appropriate step from the following list, if one applies:
+                //    * If the attribute's name is "http-equiv"
+                if (attribute_name == AttributeNames::http_equiv) {
+                    // If the attribute's value is "content-type", then set got pragma to true.
+                    got_pragma = attribute->value() == "content-type"sv;
+                }
+
+                //    * If the attribute's name is "content"
+                else if (attribute_name == AttributeNames::content) {
+                    // Apply the algorithm for extracting a character encoding from a meta element, giving the
+                    // attribute's value as the string to parse. If a character encoding is returned, and if charset is
+                    // still set to null, let charset be the encoding returned, and set need pragma to true.
                     auto encoding = extract_character_encoding_from_meta_element(attribute->value().to_byte_string());
                     if (encoding.has_value() && !charset.has_value()) {
                         charset = encoding.value();
                         need_pragma = true;
                     }
-                } else if (attribute_name == "charset") {
+                }
+
+                //    * If the attribute's name is "charset"
+                else if (attribute_name == AttributeNames::charset) {
+                    // Let charset be the result of getting an encoding from the attribute's value, and set need pragma
+                    // to false.
                     auto maybe_charset = TextCodec::get_standardized_encoding(attribute->value());
                     if (maybe_charset.has_value()) {
                         charset = Optional<ByteString> { maybe_charset };
                         need_pragma = { false };
                     }
                 }
+
+                // 10. Return to the step labeled attributes.
             }
 
-            if (!need_pragma.has_value() || (need_pragma.value() && !got_pragma) || !charset.has_value())
+            // 11. Processing: If need pragma is null, then jump to the step below labeled next byte.
+            if (!need_pragma.has_value())
                 continue;
-            // https://encoding.spec.whatwg.org/#common-infrastructure-for-utf-16be-and-utf-16le
+
+            // 12. If need pragma is true but got pragma is false, then jump to the step below labeled next byte.
+            if (need_pragma.value() && !got_pragma)
+                continue;
+
+            // 13. If charset is failure, then jump to the step below labeled next byte.
+            if (!charset.has_value())
+                continue;
+
+            // 14. If charset is UTF-16BE/LE, then set charset to UTF-8.
+            // NB: https://encoding.spec.whatwg.org/#common-infrastructure-for-utf-16be-and-utf-16le
             if (charset.value() == "UTF-16BE" || charset.value() == "UTF-16LE")
                 return "UTF-8";
-            else if (charset.value() == "x-user-defined")
+
+            // 15. If charset is x-user-defined, then set charset to windows-1252.
+            if (charset.value() == "x-user-defined")
                 return "windows-1252";
-            else
-                return charset.value();
-        } else if (!prescan_should_abort(input, position + 3) && input[position] == '<'
-            && ((input[position + 1] == '/' && isalpha(input[position + 2])) || isalpha(input[position + 1]))) {
-            position += 2;
-            prescan_skip_whitespace_and_slashes(input, position);
-            while (prescan_get_attribute(document, input, position)) { };
-        } else if (!prescan_should_abort(input, position + 1) && input[position] == '<' && (input[position + 1] == '!' || input[position + 1] == '/' || input[position + 1] == '?')) {
-            position += 1;
-            do {
-                position += 1;
-                if (prescan_should_abort(input, position))
-                    return {};
-            } while (input[position] != '>');
-        } else {
-            // Do nothing.
+
+            // 16. Return charset.
+            return charset.value();
         }
+
+        // * A sequence of bytes starting with a 0x3C byte (<), optionally a 0x2F byte (/), and finally a byte in the
+        //   range 0x41-0x5A or 0x61-0x7A (A-Z or a-z)
+        else if (!prescan_should_abort(input, position + 3) && input[position] == '<'
+            && ((input[position + 1] == '/' && is_ascii_alpha(input[position + 2])) || is_ascii_alpha(input[position + 1]))) {
+            // 1. Advance the position pointer so that it points at the next 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR),
+            //    0x20 (SP), or 0x3E (>) byte.
+            while (!prescan_should_abort(input, position) && !is_whitespace_or_end_chevron(input[position]))
+                ++position;
+
+            // 2. Repeatedly get an attribute until no further attributes can be found, then jump to the step below
+            //    labeled next byte.
+            while (prescan_get_attribute(document, input, position)) { }
+            continue;
+        }
+
+        // * A sequence of bytes starting with: 0x3C 0x21 (`<!`)
+        // * A sequence of bytes starting with: 0x3C 0x2F (`</`)
+        // * A sequence of bytes starting with: 0x3C 0x3F (`<?`)
+        else if (!prescan_should_abort(input, position + 1) && input[position] == '<'
+            && (input[position + 1] == '!' || input[position + 1] == '/' || input[position + 1] == '?')) {
+            // Advance the position pointer so that it points at the first 0x3E byte (>) that comes after the 0x3C byte
+            // that was found.
+            position += 2;
+            while (!prescan_should_abort(input, position) && input[position] != '>')
+                ++position;
+        }
+
+        // * Any other byte
+        else {
+            // Do nothing with that byte.
+        }
+
+        // 4. Next byte: Move position so it points at the next byte in the input byte stream, and return to the step
+        //    above labeled loop.
+        ++position;
     }
     return {};
 }
 
+// https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
+Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document& document, ReadonlyBytes input)
+{
+    // If at any point during these steps the user agent either runs out of bytes or reaches its end condition, then
+    // abort the prescan a byte stream to determine its encoding algorithm and return the result get an XML encoding
+    // applied to the same bytes that the prescan a byte stream to determine its encoding algorithm was applied to.
+    // Otherwise, these steps will return a character encoding.
+    if (auto encoding = run_prescan_byte_stream_algorithm_steps(document, input); encoding.has_value())
+        return encoding;
+    return get_an_xml_encoding(input);
+}
+
 // https://encoding.spec.whatwg.org/#bom-sniff
-Optional<ByteString> run_bom_sniff(ByteBuffer const& input)
+Optional<ByteString> run_bom_sniff(ReadonlyBytes input)
 {
     if (input.size() >= 3) {
         // 1. Let BOM be the result of peeking 3 bytes from ioQueue, converted to a byte sequence.
@@ -347,7 +564,7 @@ Optional<ByteString> run_bom_sniff(ByteBuffer const& input)
         // Byte order mark  Encoding
         // 0xEF 0xBB 0xBF   UTF-8
         // 0xFE 0xFF        UTF-16BE
-        // 0xFF 0xFE 	    UTF-16LE
+        // 0xFF 0xFE        UTF-16LE
         if (input[0] == 0xEF && input[1] == 0xBB && input[2] == 0xBF) {
             return "UTF-8";
         }
@@ -361,14 +578,30 @@ Optional<ByteString> run_bom_sniff(ByteBuffer const& input)
     return {};
 }
 
+ByteString extract_tld_hint(URL::URL const& url)
+{
+    // Extract the rightmost DNS label from the URL's host as a TLD hint for chardetng.
+    // chardetng uses this to improve detection accuracy for country-code TLDs (.jp, .ru, .cn, …).
+    // Skip IP addresses — only domain names have meaningful TLDs.
+    auto const& maybe_host = url.host();
+    if (!maybe_host.has_value() || !maybe_host->is_domain())
+        return {};
+    auto host_string = maybe_host->serialize();
+    StringView host_view = host_string;
+    auto last_dot = host_view.find_last('.');
+    StringView tld_label = last_dot.has_value()
+        ? host_view.substring_view(*last_dot + 1)
+        : host_view;
+    return tld_label.is_empty() ? ByteString {} : ByteString { tld_label };
+}
+
 // https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
-ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type)
+EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type)
 {
     // 1. If the result of BOM sniffing is an encoding, return that encoding with confidence certain.
-    // FIXME: There is no concept of decoding certainty yet.
     auto bom = run_bom_sniff(input);
     if (bom.has_value())
-        return bom.value();
+        return { bom.release_value(), EncodingConfidence::Certain };
     // 2. FIXME: If the user has explicitly instructed the user agent to override the document's character encoding with a specific encoding,
     //    optionally return that encoding with the confidence certain.
 
@@ -382,7 +615,7 @@ ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ByteBuffer c
         // FIXME: This is awkward because lecacy_extract_an_encoding can not fail
         auto maybe_transport_encoding = Fetch::Infrastructure::legacy_extract_an_encoding(maybe_mime_type, "invalid"sv);
         if (maybe_transport_encoding != "invalid"sv)
-            return maybe_transport_encoding;
+            return { maybe_transport_encoding, EncodingConfidence::Certain };
     }
 
     // 5. Optionally, prescan the byte stream to determine its encoding, with the end condition being when the user agent decides that scanning further bytes would not
@@ -391,7 +624,7 @@ ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ByteBuffer c
     //    The aforementioned algorithm returns either a character encoding or failure. If it returns a character encoding, then return the same encoding, with confidence tentative.
     auto prescan = run_prescan_byte_stream_algorithm(document, input);
     if (prescan.has_value())
-        return prescan.value();
+        return { prescan.release_value(), EncodingConfidence::Tentative };
 
     // 6. FIXME: If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
     // 1. Let parentDocument be d's container document.
@@ -401,18 +634,36 @@ ByteString run_encoding_sniffing_algorithm(DOM::Document& document, ByteBuffer c
     // 7. Otherwise, if the user agent has information on the likely encoding for this page, e.g. based on the encoding of the page when it was last visited, then return
     //    that encoding, with the confidence tentative.
 
-    // 8. FIXME: The user agent may attempt to autodetect the character encoding from applying frequency analysis or other algorithms to the data stream. Such algorithms
-    //    may use information about the resource other than the resource's contents, including the address of the resource. If autodetection succeeds in determining a
-    //    character encoding, and that encoding is a supported encoding, then return that encoding, with the confidence tentative. [UNIVCHARDET]
-    if (!Utf8View(StringView(input)).validate()) {
-        // FIXME: As soon as Locale is supported, this should sometimes return a different encoding based on the locale.
-        return "windows-1252";
+    // 8. The user agent may attempt to autodetect the character encoding from applying frequency analysis
+    //    or other algorithms to the data stream. Such algorithms may use information about the resource
+    //    other than the resource's contents, including the address of the resource.
+    //    If autodetection succeeds in determining a character encoding, and that encoding is a supported encoding,
+    //    then return that encoding, with the confidence tentative. [UNIVCHARDET]
+
+    auto tld_hint = extract_tld_hint(document.url());
+    u8 const* tld_data = tld_hint.is_empty() ? nullptr : reinterpret_cast<u8 const*>(tld_hint.characters());
+    size_t tld_size = tld_hint.length();
+
+    u8 const* encoding_name_ptr = nullptr;
+    size_t encoding_name_len = 0;
+
+    bool allow_utf8_detection = document.url().scheme() == "file"sv;
+
+    if (Parser::rust_detect_encoding(
+            input.data(), input.size(),
+            tld_data, tld_size,
+            allow_utf8_detection,
+            &encoding_name_ptr, &encoding_name_len)) {
+        auto detected = StringView { reinterpret_cast<char const*>(encoding_name_ptr), encoding_name_len };
+        auto standardized = TextCodec::get_standardized_encoding(detected);
+        if (standardized.has_value())
+            return { ByteString { standardized.value() }, EncodingConfidence::Tentative };
     }
 
     // 9. Otherwise, return an implementation-defined or user-specified default character encoding, with the confidence tentative.
     //    In controlled environments or in environments where the encoding of documents can be prescribed (for example, for user agents intended for dedicated use in new
     //    networks), the comprehensive UTF-8 encoding is suggested.
-    return "UTF-8";
+    return { "UTF-8", EncodingConfidence::Tentative };
 }
 
 }

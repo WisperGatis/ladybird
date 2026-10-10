@@ -8,86 +8,72 @@
 #pragma once
 
 #include <AK/Badge.h>
+#include <AK/Function.h>
+#include <AK/HashTable.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/StringView.h>
+#include <AK/Traits.h>
 #include <AK/Weakable.h>
+#include <LibGC/Cell.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Heap.h>
-#include <LibJS/Bytecode/Builtins.h>
+#include <LibJS/Embedding/Layout.h>
 #include <LibJS/Export.h>
+#include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
+#include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Intrinsics.h>
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
 
 // 9.3 Realms, https://tc39.es/ecma262/#realm-record
-class JS_API Realm final : public Cell {
-    GC_CELL(Realm, Cell);
-    GC_DECLARE_ALLOCATOR(Realm);
-
+// The runtime keeps a realm alive only while something references it, and an execution context references its realm
+// only while it is on the execution context stack, so the embedder keeps the realms it creates alive itself, as the
+// settings objects of HTML do.
+class JS_API Realm final : public EngineCell {
 public:
-    struct HostDefined {
-        virtual ~HostDefined() = default;
-
-        virtual void visit_edges(Cell::Visitor&) { }
-
-        template<typename T>
-        bool fast_is() const = delete;
-
-        virtual bool is_principal_host_defined() const { return false; }
-        virtual bool is_synthetic_host_defined() const { return false; }
-    };
-
+    // Creates one of the embedder's own cells, which LibGC's heap allocates, and initializes it in this realm. The
+    // runtime's cells come from the runtime.
     template<typename T, typename... Args>
     GC::Ref<T> create(Args&&... args)
     {
+        static_assert(!IsBaseOf<GC::ForeignCell, T>, "Realm::create() allocates C++ cells; the runtime creates its own");
         auto object = heap().allocate<T>(forward<Args>(args)...);
-        static_cast<Cell*>(object)->initialize(*this);
+        if constexpr (IsBaseOf<Cell, T>)
+            static_cast<Cell*>(object.ptr())->initialize(*this);
         return *object;
     }
 
-    static ThrowCompletionOr<NonnullOwnPtr<ExecutionContext>> initialize_host_defined_realm(VM&, Function<Object*(Realm&)> create_global_object, Function<Object*(Realm&)> create_global_this_value);
+    static ThrowCompletionOr<NonnullOwnPtr<ExecutionContext>> initialize_host_defined_realm(VM&, Function<GC::Ref<Object>(Realm&)> create_global_object, Function<GC::Ref<Object>(Realm&)> create_global_this_value);
 
-    [[nodiscard]] Object& global_object() const { return *m_global_object; }
-    void set_global_object(GC::Ref<Object> global) { m_global_object = global; }
+    [[nodiscard]] Object& global_object() const { return *field_at<Object*>(JS_LAYOUT_REALM_GLOBAL_OBJECT_OFFSET); }
+    [[nodiscard]] GlobalEnvironment& global_environment() const { return *field_at<GlobalEnvironment*>(JS_LAYOUT_REALM_GLOBAL_ENVIRONMENT_OFFSET); }
 
-    [[nodiscard]] GlobalEnvironment& global_environment() const { return *m_global_environment; }
-    void set_global_environment(GC::Ref<GlobalEnvironment> environment) { m_global_environment = environment; }
+    [[nodiscard]] Intrinsics const& intrinsics() const { return *reinterpret_cast<Intrinsics const*>(this); }
+    [[nodiscard]] Intrinsics& intrinsics() { return *reinterpret_cast<Intrinsics*>(this); }
 
-    [[nodiscard]] Intrinsics const& intrinsics() const { return *m_intrinsics; }
-    [[nodiscard]] Intrinsics& intrinsics() { return *m_intrinsics; }
-    void set_intrinsics(Badge<Intrinsics>, Intrinsics& intrinsics)
-    {
-        VERIFY(!m_intrinsics);
-        m_intrinsics = &intrinsics;
-    }
+    GC::Ptr<GC::Cell> host_defined() { return field_at<GC::Cell*>(JS_LAYOUT_REALM_HOST_DEFINED_OFFSET); }
+    GC::Ptr<GC::Cell const> host_defined() const { return field_at<GC::Cell*>(JS_LAYOUT_REALM_HOST_DEFINED_OFFSET); }
 
-    HostDefined* host_defined() { return m_host_defined; }
-    HostDefined const* host_defined() const { return m_host_defined; }
-
-    void set_host_defined(OwnPtr<HostDefined> host_defined) { m_host_defined = move(host_defined); }
-
-    void define_builtin(Bytecode::Builtin builtin, GC::Ref<NativeFunction> value)
-    {
-        m_builtins[to_underlying(builtin)] = value;
-    }
-
-    GC::Ref<NativeFunction> get_builtin_value(Bytecode::Builtin builtin)
-    {
-        return *m_builtins[to_underlying(builtin)];
-    }
+    // The realm keeps the cell alive.
+    void set_host_defined(GC::Ptr<GC::Cell>);
 
 private:
-    Realm() = default;
+    static_assert(JS_LAYOUT_REALM_GLOBAL_OBJECT_SIZE == sizeof(void*));
+    static_assert(JS_LAYOUT_REALM_GLOBAL_ENVIRONMENT_SIZE == sizeof(void*));
+    static_assert(JS_LAYOUT_REALM_HOST_DEFINED_SIZE == sizeof(void*));
 
-    virtual void visit_edges(Visitor&) override;
-
-    GC::Ptr<Intrinsics> m_intrinsics;                // [[Intrinsics]]
-    GC::Ptr<Object> m_global_object;                 // [[GlobalObject]]
-    GC::Ptr<GlobalEnvironment> m_global_environment; // [[GlobalEnv]]
-    OwnPtr<HostDefined> m_host_defined;              // [[HostDefined]]
-    AK::Array<GC::Ptr<NativeFunction>, to_underlying(Bytecode::Builtin::__Count)> m_builtins;
+    template<typename Field>
+    Field field_at(size_t offset) const
+    {
+        static_assert(sizeof(Field) == sizeof(void*));
+        Field field;
+        __builtin_memcpy(&field, reinterpret_cast<u8 const*>(this) + offset, sizeof(field));
+        return field;
+    }
 };
 
 }

@@ -1,14 +1,21 @@
 /*
  * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2023, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Bindings/SVGTextPositioningElementPrototype.h>
+#include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/SVG/AttributeNames.h>
-#include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/AttributeParsing.h>
+#include <LibWeb/SVG/SVGAnimatedLengthList.h>
+#include <LibWeb/SVG/SVGAnimatedNumberList.h>
+#include <LibWeb/SVG/SVGLength.h>
+#include <LibWeb/SVG/SVGLengthList.h>
+#include <LibWeb/SVG/SVGNumber.h>
+#include <LibWeb/SVG/SVGNumberList.h>
 #include <LibWeb/SVG/SVGTextPositioningElement.h>
 
 namespace Web::SVG {
@@ -18,38 +25,132 @@ SVGTextPositioningElement::SVGTextPositioningElement(DOM::Document& document, DO
 {
 }
 
-void SVGTextPositioningElement::initialize(JS::Realm& realm)
+void SVGTextPositioningElement::visit_edges(Visitor& visitor)
 {
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(SVGTextPositioningElement);
-    Base::initialize(realm);
+    Base::visit_edges(visitor);
+    visitor.visit(m_x);
+    visitor.visit(m_y);
+    visitor.visit(m_dx);
+    visitor.visit(m_dy);
+    visitor.visit(m_rotate);
 }
 
-void SVGTextPositioningElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGTextPositioningElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::dx) {
-        m_dx = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    } else if (name == SVG::AttributeNames::dy) {
-        m_dy = AttributeParser::parse_number_percentage(value.value_or(String {}));
-    }
+    if (name == AttributeNames::x)
+        m_x = {};
+    else if (name == AttributeNames::y)
+        m_y = {};
+    else if (name == AttributeNames::dx)
+        m_dx = {};
+    else if (name == AttributeNames::dy)
+        m_dy = {};
+    else if (name == AttributeNames::rotate)
+        m_rotate = {};
 }
 
-Gfx::FloatPoint SVGTextPositioningElement::get_offset(CSSPixelSize const& viewport_size) const
+SVGTextPositioningElement::ParsedTextPositioning SVGTextPositioningElement::parsed_text_positioning() const
 {
-    auto const viewport_width = viewport_size.width().to_float();
-    auto const viewport_height = viewport_size.height().to_float();
+    CSS::Parser::ParsingParams const parsing_params { document() };
 
-    float const x = m_x.value_or({ 0, false }).resolve_relative_to(viewport_width);
-    float const y = m_y.value_or({ 0, false }).resolve_relative_to(viewport_height);
-    float const dx = m_dx.value_or({ 0, false }).resolve_relative_to(viewport_width);
-    float const dy = m_dy.value_or({ 0, false }).resolve_relative_to(viewport_height);
+    // https://svgwg.org/svg2-draft/text.html#TSpanAttributes
+    // FIXME: This only handles single values, not lists.
+    auto parse_value = [&](Utf16FlyString const& attribute) -> Optional<SVGLengthValue> {
+        auto raw_value = get_attribute_value(attribute);
 
-    return { x + dx, y + dy };
+        // FIXME: Should we support tree-counting and/or calculated values here?
+        if (auto style_value = parse_css_type(parsing_params, raw_value, CSS::ValueType::LengthPercentage)) {
+            if (auto value = SVGLengthValue::from_style_value(*style_value);
+                value.has_value() && value->kind() != SVGLengthValue::Kind::Number)
+                return value;
+        }
+
+        if (auto style_value = parse_css_type(parsing_params, raw_value, CSS::ValueType::Number)) {
+            if (auto value = SVGLengthValue::from_style_value(*style_value);
+                value.has_value() && value->kind() == SVGLengthValue::Kind::Number)
+                return value;
+        }
+
+        return {};
+    };
+
+    // FIXME: Implement support for the rotate attribute.
+    return {
+        .x = parse_value(AttributeNames::x),
+        .y = parse_value(AttributeNames::y),
+        .dx = parse_value(AttributeNames::dx),
+        .dy = parse_value(AttributeNames::dy),
+    };
+}
+
+GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::ensure_length_list(GC::Ptr<SVGAnimatedLengthList>& list,
+    Utf16FlyString const& attribute_name) const
+{
+    if (!list) {
+        // FIXME: This only handles single values, not lists.
+        float value = 0.f;
+        auto maybe_number_percentage = parse_number_percentage(get_attribute_value(attribute_name));
+        if (maybe_number_percentage.has_value())
+            value = maybe_number_percentage.release_value().value();
+
+        auto length = SVGLength::create_detached(document().relevant_settings_object().realm(), SVGLengthValue::number(value), SVGLength::ReadOnly::Yes);
+
+        auto items = GC::Heap::the().allocate<SVGLengthList::List>();
+        items->elements().append(length);
+
+        auto length_list = SVGLengthList::create(items, ReadOnlyList::Yes);
+        list = SVGAnimatedLengthList::create(length_list);
+    }
+
+    return *list;
+}
+
+// https://svgwg.org/svg2-draft/text.html#__svg__SVGTextPositioningElement__x
+GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::x()
+{
+    return ensure_length_list(m_x, AttributeNames::x);
+}
+
+// https://svgwg.org/svg2-draft/text.html#__svg__SVGTextPositioningElement__y
+GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::y()
+{
+    return ensure_length_list(m_y, AttributeNames::y);
+}
+
+// https://svgwg.org/svg2-draft/text.html#__svg__SVGTextPositioningElement__dx
+GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::dx()
+{
+    return ensure_length_list(m_dx, AttributeNames::dx);
+}
+
+// https://svgwg.org/svg2-draft/text.html#__svg__SVGTextPositioningElement__dy
+GC::Ref<SVGAnimatedLengthList> SVGTextPositioningElement::dy()
+{
+    return ensure_length_list(m_dy, AttributeNames::dy);
+}
+
+// https://svgwg.org/svg2-draft/text.html#__svg__SVGTextPositioningElement__rotate
+GC::Ref<SVGAnimatedNumberList> SVGTextPositioningElement::rotate()
+{
+    if (!m_rotate) {
+        // FIXME: This only handles single values, not lists.
+        float value = 0.f;
+        auto maybe_number_percentage = parse_number_percentage(get_attribute_value(AttributeNames::rotate));
+        if (maybe_number_percentage.has_value() && !maybe_number_percentage.value().is_percentage())
+            value = maybe_number_percentage.release_value().value();
+
+        auto number = SVGNumber::create(value, SVGNumber::ReadOnly::Yes);
+
+        auto items = GC::Heap::the().allocate<SVGNumberList::List>();
+        items->elements().append(number);
+
+        auto number_list = SVGNumberList::create(items, ReadOnlyList::Yes);
+        m_rotate = SVGAnimatedNumberList::create(number_list);
+    }
+
+    return *m_rotate;
 }
 
 }

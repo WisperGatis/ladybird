@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2021, Tobias Christiansen <tobyase@serenityos.org>
- * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2022-2023, MacDue <macdue@dueutil.tech>
  *
  * SPDX-License-Identifier: BSD-2-Clause
@@ -11,66 +11,46 @@
 
 #include <LibWeb/CSS/Keyword.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
-class KeywordStyleValue : public StyleValueWithDefaultOperators<KeywordStyleValue> {
+class WEB_API KeywordStyleValue : public StyleValueWithDefaultOperators<KeywordStyleValue> {
 public:
     static ValueComparingNonnullRefPtr<KeywordStyleValue const> create(Keyword keyword)
     {
-        switch (keyword) {
-        case Keyword::Inherit: {
-            static ValueComparingNonnullRefPtr<KeywordStyleValue const> const inherit_instance = adopt_ref(*new (nothrow) KeywordStyleValue(Keyword::Inherit));
-            return inherit_instance;
-        }
-        case Keyword::Initial: {
-            static ValueComparingNonnullRefPtr<KeywordStyleValue const> const initial_instance = adopt_ref(*new (nothrow) KeywordStyleValue(Keyword::Initial));
-            return initial_instance;
-        }
-        case Keyword::Revert: {
-            static ValueComparingNonnullRefPtr<KeywordStyleValue const> const revert_instance = adopt_ref(*new (nothrow) KeywordStyleValue(Keyword::Revert));
-            return revert_instance;
-        }
-        case Keyword::RevertLayer: {
-            static ValueComparingNonnullRefPtr<KeywordStyleValue const> const revert_layer_instance = adopt_ref(*new (nothrow) KeywordStyleValue(Keyword::RevertLayer));
-            return revert_layer_instance;
-        }
-        case Keyword::Unset: {
-            static ValueComparingNonnullRefPtr<KeywordStyleValue const> const unset_instance = adopt_ref(*new (nothrow) KeywordStyleValue(Keyword::Unset));
-            return unset_instance;
-        }
-        default:
-            return adopt_ref(*new (nothrow) KeywordStyleValue(keyword));
-        }
+        // Keyword values are immutable and the keyword set is small, so every keyword is
+        // interned: one instance per keyword for the lifetime of the process. Repeated
+        // creations are then allocation-free, and identical keywords are pointer-identical.
+        static auto const& instances = *[] {
+            auto* instances = new (nothrow) Vector<NonnullRefPtr<KeywordStyleValue const>>();
+            instances->ensure_capacity(number_of_keywords);
+            for (size_t i = 0; i < number_of_keywords; ++i)
+                instances->unchecked_append(adopt_ref(*new (nothrow) KeywordStyleValue(static_cast<Keyword>(i))));
+            return instances;
+        }();
+        return instances[to_underlying(keyword)];
     }
     virtual ~KeywordStyleValue() override = default;
 
-    Keyword keyword() const { return m_keyword; }
+    Keyword keyword() const { return static_cast<Keyword>(m_value->keyword.keyword); }
 
     static bool is_color(Keyword);
-    virtual bool has_color() const override;
-    virtual Optional<Color> to_color(ColorResolutionContext) const override;
-    virtual String to_string(SerializationMode) const override;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, FlyString const& associated_property) const override;
-
-    bool properties_equal(KeywordStyleValue const& other) const { return m_keyword == other.m_keyword; }
+    bool has_color() const;
+    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
-    explicit KeywordStyleValue(Keyword keyword)
-        : StyleValueWithDefaultOperators(Type::Keyword)
-        , m_keyword(keyword)
+    friend class StyleValue;
+
+    explicit KeywordStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::Keyword, data)
     {
     }
 
-    Keyword m_keyword { Keyword::Invalid };
+    explicit KeywordStyleValue(Keyword keyword)
+        : StyleValueWithDefaultOperators(Type::Keyword, StyleValueFFI::rust_style_value_create_keyword(to_underlying(keyword)))
+    {
+    }
 };
-
-inline Keyword StyleValue::to_keyword() const
-{
-    if (is_keyword())
-        return static_cast<KeywordStyleValue const&>(*this).keyword();
-    return Keyword::Invalid;
-}
 
 }

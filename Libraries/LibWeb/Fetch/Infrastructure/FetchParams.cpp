@@ -13,20 +13,37 @@ namespace Web::Fetch::Infrastructure {
 
 GC_DEFINE_ALLOCATOR(FetchParams);
 
-FetchParams::FetchParams(GC::Ref<Request> request, GC::Ref<FetchAlgorithms> algorithms, GC::Ref<FetchController> controller, GC::Ref<FetchTimingInfo> timing_info)
+FetchParams::FetchParams(GC::Ref<Request> request, GC::Ref<FetchAlgorithms> algorithms, GC::Ref<FetchController> controller, NonnullRefPtr<FetchTimingInfo> timing_info)
     : m_request(request)
     , m_algorithms(algorithms)
     , m_controller(controller)
-    , m_timing_info(timing_info)
+    , m_timing_info(move(timing_info))
 {
     m_controller->set_fetch_params({}, *this);
 }
 
-GC::Ref<FetchParams> FetchParams::create(JS::VM& vm, GC::Ref<Request> request, GC::Ref<FetchTimingInfo> timing_info)
+FetchParams::FetchParams(FetchParams const& params)
+    : m_request(params.m_request)
+    , m_algorithms(params.m_algorithms)
+    , m_task_destination(params.m_task_destination)
+    , m_cross_origin_isolated_capability(params.m_cross_origin_isolated_capability)
+    , m_controller(params.m_controller)
+    , m_timing_info(params.m_timing_info)
+    , m_preloaded_response_candidate(params.m_preloaded_response_candidate)
+    , m_has_response_body_transfer_lease(params.m_has_response_body_transfer_lease)
 {
-    auto algorithms = Infrastructure::FetchAlgorithms::create(vm, {});
-    auto controller = Infrastructure::FetchController::create(vm);
-    return vm.heap().allocate<FetchParams>(request, algorithms, controller, timing_info);
+}
+
+GC::Ref<FetchParams> FetchParams::create(GC::Ref<Request> request, NonnullRefPtr<FetchTimingInfo> timing_info)
+{
+    auto algorithms = Infrastructure::FetchAlgorithms::create({});
+    auto controller = Infrastructure::FetchController::create();
+    return GC::Heap::the().allocate<FetchParams>(request, algorithms, controller, move(timing_info));
+}
+
+GC::Ref<FetchParams> FetchParams::copy(FetchParams const& params)
+{
+    return GC::Heap::the().allocate<FetchParams>(params);
 }
 
 void FetchParams::visit_edges(JS::Cell::Visitor& visitor)
@@ -35,11 +52,8 @@ void FetchParams::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_request);
     visitor.visit(m_algorithms);
     visitor.visit(m_controller);
-    visitor.visit(m_timing_info);
-    if (m_task_destination.has<GC::Ref<JS::Object>>())
-        visitor.visit(m_task_destination.get<GC::Ref<JS::Object>>());
-    if (m_preloaded_response_candidate.has<GC::Ref<Response>>())
-        visitor.visit(m_preloaded_response_candidate.get<GC::Ref<Response>>());
+    visitor.visit(m_task_destination);
+    visitor.visit(m_preloaded_response_candidate);
 }
 
 // https://fetch.spec.whatwg.org/#fetch-params-aborted
