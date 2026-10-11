@@ -152,6 +152,8 @@ WebIDL::ExceptionOr<GC::Ref<ImageData>> OffscreenCanvasRenderingContext2D::creat
 
 WebIDL::ExceptionOr<GC::Ptr<ImageData>> OffscreenCanvasRenderingContext2D::get_image_data(int, int, int, int, Optional<ImageDataSettings> const&) const
 {
+    if (!m_origin_clean)
+        return WebIDL::SecurityError::create(realm(), "OffscreenCanvas is not origin-clean"_utf16);
     return WebIDL::NotSupportedError::create(realm(), "(STUBBED) OffscreenCanvasRenderingContext2D::get_image_data()"_utf16);
 }
 
@@ -169,6 +171,7 @@ WebIDL::ExceptionOr<void> OffscreenCanvasRenderingContext2D::put_image_data(Imag
 
 void OffscreenCanvasRenderingContext2D::reset_to_default_state()
 {
+    m_origin_clean = true;
     dbgln("(STUBBED) OffscreenCanvasRenderingContext2D::reset_to_default_state()");
 }
 

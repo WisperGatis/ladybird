@@ -25,6 +25,10 @@ AudioCodecPluginQt::AudioCodecPluginQt(NonnullOwnPtr<AudioThread> audio_thread)
         if (on_playback_position_updated)
             on_playback_position_updated(position);
     });
+    connect(m_audio_thread, &AudioThread::decoder_error, this, [this] {
+        if (on_decoder_error)
+            on_decoder_error(MUST(String::from_utf8("Audio playback failed"sv)));
+    });
 }
 
 AudioCodecPluginQt::~AudioCodecPluginQt()

@@ -30,10 +30,10 @@ public:
     Layout::VideoBox* layout_node();
     Layout::VideoBox const* layout_node() const;
 
-    void set_video_width(u32 video_width) { m_video_width = video_width; }
+    void set_video_width(u32 video_width);
     u32 video_width() const;
 
-    void set_video_height(u32 video_height) { m_video_height = video_height; }
+    void set_video_height(u32 video_height);
     u32 video_height() const;
 
     void set_video_track(GC::Ptr<VideoTrack>);
@@ -67,6 +67,7 @@ private:
     virtual void on_paused() override;
     virtual void on_seek(double, MediaSeekMode) override;
     virtual void on_volume_change() override;
+    virtual void reset_media_resource_state() override;
 
     WebIDL::ExceptionOr<void> determine_element_poster_frame(Optional<String> const& poster);
 

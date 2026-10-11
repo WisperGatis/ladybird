@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<video id="video"></video>
+<script src="../include.js"></script>
+<script>
+    test(() => {
+        const video = document.getElementById("video");
+        println(`buffered.length without a resource: ${video.buffered.length}`);
+        try {
+            video.buffered.end(0);
+        } catch (e) {
+            println(`buffered.end(0) throws ${e.name}`);
+        }
+    });
+</script>

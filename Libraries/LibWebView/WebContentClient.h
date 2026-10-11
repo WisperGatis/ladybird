@@ -8,6 +8,7 @@
 
 #include <AK/HashMap.h>
 #include <AK/SourceLocation.h>
+#include <AK/Vector.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/Transport.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
@@ -48,10 +49,9 @@ public:
     void assign_view(Badge<Application>, ViewImplementation&);
     void register_view(u64 page_id, ViewImplementation&);
     void unregister_view(u64 page_id);
+    Vector<ViewImplementation*> views() const;
 
     void web_ui_disconnected(Badge<WebUI>);
-
-    Function<void()> on_web_content_process_crash;
 
     pid_t pid() const { return m_process_handle.pid; }
     void set_pid(pid_t pid) { m_process_handle.pid = pid; }

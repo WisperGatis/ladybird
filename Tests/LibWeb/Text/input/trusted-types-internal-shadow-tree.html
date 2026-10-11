@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">
+<script src="include.js"></script>
+<select><option>a</option></select>
+<input type="number">
+<script>
+    test(() => {
+        let threw = false;
+        try {
+            document.querySelector("select").innerHTML = "x";
+        } catch (e) {
+            threw = e instanceof TypeError;
+        }
+        println(`Internal shadow trees created: ${!!document.querySelector("input")}`);
+        println(`Public innerHTML still enforced: ${threw}`);
+    });
+</script>

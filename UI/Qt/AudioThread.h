@@ -56,6 +56,7 @@ public:
 
 Q_SIGNALS:
     void playback_position_updated(AK::Duration);
+    void decoder_error();
 
 private:
     AudioThread(NonnullRefPtr<Audio::Loader> loader, AudioTaskQueue task_queue);
@@ -100,6 +101,7 @@ private:
 
     AK::Duration m_duration;
     AK::Duration m_position;
+    bool m_failed { false };
 };
 
 }

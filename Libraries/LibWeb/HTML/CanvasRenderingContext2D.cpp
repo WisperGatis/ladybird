@@ -197,7 +197,7 @@ WebIDL::ExceptionOr<void> CanvasRenderingContext2D::draw_image_internal(CanvasIm
 
     // 7. If image is not origin-clean, then set the CanvasRenderingContext2D's origin-clean flag to false.
     if (image_is_not_origin_clean(image))
-        m_origin_clean = false;
+        mark_not_origin_clean();
 
     return {};
 }
@@ -618,6 +618,8 @@ WebIDL::ExceptionOr<void> CanvasRenderingContext2D::put_pixels_from_an_image_dat
 // https://html.spec.whatwg.org/multipage/canvas.html#reset-the-rendering-context-to-its-default-state
 void CanvasRenderingContext2D::reset_to_default_state()
 {
+    m_origin_clean = true;
+
     auto surface = canvas_element().surface();
 
     // 1. Clear canvas's bitmap to transparent black.
@@ -869,22 +871,23 @@ bool image_is_not_origin_clean(CanvasImageSource const& image)
     // An object image is not origin-clean if, switching on image's type:
     return image.visit(
         // HTMLOrSVGImageElement
-        [](GC::Root<HTMLImageElement> const&) {
-            // FIXME: image's current request's image data is CORS-cross-origin.
-            return false;
+        [](GC::Root<HTMLImageElement> const& image) {
+            return image->current_request().is_cors_cross_origin();
         },
-        [](GC::Root<SVG::SVGImageElement> const&) {
-            // FIXME: image's current request's image data is CORS-cross-origin.
-            return false;
+        [](GC::Root<SVG::SVGImageElement> const& image) {
+            return image->is_cors_cross_origin();
         },
-        [](GC::Root<HTML::HTMLVideoElement> const&) {
-            // FIXME: image's media data is CORS-cross-origin.
-            return false;
+        [](GC::Root<HTML::HTMLVideoElement> const& video) {
+            return video->media_data_is_cors_cross_origin();
         },
-        // HTMLCanvasElement, ImageBitmap or OffscreenCanvas
-        [](OneOf<GC::Root<HTMLCanvasElement>, GC::Root<ImageBitmap>, GC::Root<OffscreenCanvas>> auto const&) {
-            // FIXME: image's bitmap's origin-clean flag is false.
-            return false;
+        [](GC::Root<HTMLCanvasElement> const& canvas) {
+            return !canvas->is_origin_clean();
+        },
+        [](GC::Root<ImageBitmap> const& image_bitmap) {
+            return !image_bitmap->is_origin_clean();
+        },
+        [](GC::Root<OffscreenCanvas> const& canvas) {
+            return !canvas->is_origin_clean();
         });
 }
 

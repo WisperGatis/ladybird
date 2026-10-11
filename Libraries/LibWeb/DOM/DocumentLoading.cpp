@@ -60,6 +60,28 @@ bool build_xml_document(DOM::Document& document, ByteBuffer const& data, Optiona
     return !result.is_error() && !builder.has_error();
 }
 
+// The parser's final steps spin the event loop until the document's scripts, stylesheets and load event delayers are
+// done, and those tasks only run once the document is fully active. If the parser were started from inside the nested
+// spin that is activating this very document (apply the history step), that spin could never return. So keep
+// re-queueing until the document has actually been activated, or give up if it was destroyed first.
+static void run_parser_once_document_is_active(GC::Ref<DOM::Document> document, ByteBuffer data, URL::URL url, Optional<MimeSniff::MimeType> mime_type)
+{
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(document->heap(), [document, data = move(data), url = move(url), mime_type = move(mime_type)]() mutable {
+        if (document->has_been_destroyed())
+            return;
+        // NB: is_fully_active() is true as soon as the document has a navigable, so check for real activation.
+        auto navigable = document->navigable();
+        if (!navigable || navigable->has_been_destroyed())
+            return;
+        if (!document->is_active()) {
+            run_parser_once_document_is_active(document, move(data), move(url), move(mime_type));
+            return;
+        }
+        auto parser = HTML::HTMLParser::create_with_uncertain_encoding(document, data, mime_type);
+        parser->run(url);
+    }));
+}
+
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#navigate-html
 static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::NavigationParams const& navigation_params)
 {
@@ -93,10 +115,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
     else {
         // FIXME: Parse as we receive the document data, instead of waiting for the whole document to be fetched first.
         auto process_body = GC::create_function(document->heap(), [document, url = navigation_params.response->url().value(), mime_type = navigation_params.response->header_list()->extract_mime_type()](ByteBuffer data) {
-            Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(document->heap(), [document = document, data = move(data), url = url, mime_type] {
-                auto parser = HTML::HTMLParser::create_with_uncertain_encoding(document, data, mime_type);
-                parser->run(url);
-            }));
+            run_parser_once_document_is_active(document, move(data), url, mime_type);
         });
 
         auto process_body_error = GC::create_function(document->heap(), [](JS::Value) {

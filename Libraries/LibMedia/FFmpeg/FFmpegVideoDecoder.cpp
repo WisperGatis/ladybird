@@ -128,6 +128,11 @@ DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(AK::Duration timesta
         return DecoderError::with_description(DecoderErrorCategory::Invalid, "FFmpeg codec has not been opened"sv);
     case AVERROR(ENOMEM):
         return DecoderError::with_description(DecoderErrorCategory::Memory, "FFmpeg codec ran out of internal memory"sv);
+    case AVERROR_INVALIDDATA:
+        // Keep the packet-level failure explicit. In particular, this prevents
+        // malformed HLS payloads from being mistaken for an end-of-stream and
+        // sending the media element back through its seek/restart path.
+        return DecoderError::format(DecoderErrorCategory::Corrupted, "FFmpeg rejected invalid coded data ({} bytes)"sv, coded_data.size());
     default: {
         // FFmpeg may return various error codes. Try to provide more specific error information.
         // Some errors might be recoverable or indicate format issues rather than corruption.

@@ -369,6 +369,15 @@ void BrowserWindow::initialize_tab(Tab* tab)
         return new_tab.view().handle();
     };
 
+    if (m_is_popup_window == IsPopupWindow::Yes) {
+        tab->view().on_web_content_crashed = [this] {
+            // A popup is disposable. Closing it after its recovered page has
+            // been detached keeps a bad ad from taking focus or state from
+            // the opener window.
+            close();
+        };
+    }
+
     m_tabs_container->setTabIcon(m_tabs_container->indexOf(tab), tab->favicon());
     create_close_button_for_tab(tab);
 }
@@ -380,6 +389,8 @@ void BrowserWindow::activate_tab(int index)
 
 void BrowserWindow::close_tab(int index)
 {
+    if (index < 0 || index >= m_tabs_container->count())
+        return;
     auto* tab = m_tabs_container->widget(index);
     m_tabs_container->removeTab(index);
     tab->deleteLater();

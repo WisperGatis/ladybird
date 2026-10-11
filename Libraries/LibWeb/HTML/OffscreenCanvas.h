@@ -59,6 +59,7 @@ public:
     JS::ThrowCompletionOr<OffscreenRenderingContext> get_context(Bindings::OffscreenRenderingContextId contextId, JS::Value options);
 
     WebIDL::ExceptionOr<GC::Ref<ImageBitmap>> transfer_to_image_bitmap();
+    [[nodiscard]] bool is_origin_clean() const;
 
     GC::Ref<WebIDL::Promise> convert_to_blob(Optional<ImageEncodeOptions> options);
 

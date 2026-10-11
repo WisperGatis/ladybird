@@ -1,0 +1,2 @@
+<source>: in-viewport preview created detached loads (networkState=1, readyState=4)
+src attribute: in-viewport preview created detached loads (networkState=1, readyState=4)

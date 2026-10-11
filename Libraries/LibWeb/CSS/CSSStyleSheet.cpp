@@ -134,7 +134,9 @@ void CSSStyleSheet::visit_edges(Cell::Visitor& visitor)
 // https://www.w3.org/TR/cssom/#dom-cssstylesheet-insertrule
 WebIDL::ExceptionOr<unsigned> CSSStyleSheet::insert_rule(StringView rule, unsigned index)
 {
-    // FIXME: 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    // 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    if (!is_origin_clean())
+        return WebIDL::SecurityError::create(realm(), "Can't modify a stylesheet that is not origin-clean"_utf16);
 
     // If the disallow modification flag is set, throw a NotAllowedError DOMException.
     if (disallow_modification())
@@ -167,7 +169,9 @@ WebIDL::ExceptionOr<unsigned> CSSStyleSheet::insert_rule(StringView rule, unsign
 // https://www.w3.org/TR/cssom/#dom-cssstylesheet-deleterule
 WebIDL::ExceptionOr<void> CSSStyleSheet::delete_rule(unsigned index)
 {
-    // FIXME: 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    // 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    if (!is_origin_clean())
+        return WebIDL::SecurityError::create(realm(), "Can't modify a stylesheet that is not origin-clean"_utf16);
 
     // 2. If the disallow modification flag is set, throw a NotAllowedError DOMException.
     if (disallow_modification())

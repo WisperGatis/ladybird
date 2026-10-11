@@ -102,9 +102,8 @@ u64 ViewImplementation::page_id() const
 
 void ViewImplementation::create_new_process_for_cross_site_navigation(URL::URL const& url)
 {
-    if (m_client_state.client)
-        client().async_close_server();
-
+    // NOTE: initialize_client() unregisters this view from its current client. That closes this view's page in the old
+    //       process, or the whole process if no other views (e.g. an opener or popups) share it.
     initialize_client();
     VERIFY(m_client_state.client);
 
@@ -131,22 +130,36 @@ void ViewImplementation::server_did_paint(Badge<WebContentClient>, i32 bitmap_id
 
 void ViewImplementation::set_window_position(Gfx::IntPoint position)
 {
+    if (!is_connection_open())
+        return;
     client().async_set_window_position(m_client_state.page_index, position.to_type<Web::DevicePixels>());
 }
 
 void ViewImplementation::set_window_size(Gfx::IntSize size)
 {
+    if (!is_connection_open())
+        return;
     client().async_set_window_size(m_client_state.page_index, size.to_type<Web::DevicePixels>());
 }
 
 void ViewImplementation::did_update_window_rect()
 {
+    if (!is_connection_open())
+        return;
     client().async_did_update_window_rect(m_client_state.page_index);
 }
 
 void ViewImplementation::set_system_visibility_state(Web::HTML::VisibilityState visibility_state)
 {
     m_system_visibility_state = visibility_state;
+
+    // Qt can deliver a show/hide event after the WebContent process has
+    // disconnected. The generated async IPC methods assert if they are used
+    // after the transport starts shutting down, so keep the state for the
+    // replacement process but do not send it over a closed connection.
+    if (!is_connection_open())
+        return;
+
     client().async_set_system_visibility_state(m_client_state.page_index, m_system_visibility_state);
 }
 
@@ -542,8 +555,8 @@ void ViewImplementation::did_allocate_iosurface_backing_stores(i32 front_id, Cor
 
     auto bytes_per_row = front_iosurface.bytes_per_row();
 
-    auto front_bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, front_size, bytes_per_row, front_iosurface.data(), [handle = move(front_iosurface)] { });
-    auto back_bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, back_size, bytes_per_row, back_iosurface.data(), [handle = move(back_iosurface)] { });
+    auto front_bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, front_size, bytes_per_row, front_iosurface.data(), bytes_per_row * front_size.height(), [handle = move(front_iosurface)] { });
+    auto back_bitmap = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, back_size, bytes_per_row, back_iosurface.data(), bytes_per_row * back_size.height(), [handle = move(back_iosurface)] { });
 
     m_client_state.front_bitmap.bitmap = front_bitmap.release_value_but_fixme_should_propagate_errors();
     m_client_state.front_bitmap.id = front_id;
@@ -572,6 +585,8 @@ void ViewImplementation::handle_resize()
 void ViewImplementation::initialize_client(CreateNewClient create_new_client)
 {
     if (create_new_client == CreateNewClient::Yes) {
+        if (m_client_state.client)
+            m_client_state.client->unregister_view(m_client_state.page_index);
         m_client_state = {};
 
         // FIXME: Fail to open the tab, rather than crashing the whole application if this fails.
@@ -579,15 +594,6 @@ void ViewImplementation::initialize_client(CreateNewClient create_new_client)
     } else {
         m_client_state.client->register_view(m_client_state.page_index, *this);
     }
-
-    m_client_state.client->on_web_content_process_crash = [this] {
-        Core::deferred_invoke([this] {
-            handle_web_content_process_crash();
-
-            if (on_web_content_crashed)
-                on_web_content_crashed();
-        });
-    };
 
     m_client_state.client_handle = MUST(Web::Crypto::generate_random_uuid());
     client().async_set_window_handle(m_client_state.page_index, m_client_state.client_handle);
@@ -650,6 +656,11 @@ void ViewImplementation::handle_web_content_process_crash(LoadErrorPage load_err
         builder.append("</body></html>"sv);
         load_html(builder.to_byte_string());
     }
+}
+
+void ViewImplementation::recover_from_web_content_process_crash()
+{
+    handle_web_content_process_crash();
 }
 
 void ViewImplementation::default_zoom_level_factor_changed()

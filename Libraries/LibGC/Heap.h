@@ -120,11 +120,19 @@ private:
 
     ALWAYS_INLINE CellAllocator& allocator_for_size(size_t cell_size)
     {
-        // FIXME: Use binary search?
-        for (auto& allocator : m_size_based_cell_allocators) {
-            if (allocator->cell_size() >= cell_size)
-                return *allocator;
+        // Allocators are stored in ascending cell-size order.
+        size_t low = 0;
+        size_t high = m_size_based_cell_allocators.size();
+        while (low < high) {
+            auto middle = low + (high - low) / 2;
+            if (m_size_based_cell_allocators[middle]->cell_size() < cell_size)
+                low = middle + 1;
+            else
+                high = middle;
         }
+        if (low < m_size_based_cell_allocators.size())
+            return *m_size_based_cell_allocators[low];
+
         dbgln("Cannot get CellAllocator for cell size {}, largest available is {}!", cell_size, m_size_based_cell_allocators.last()->cell_size());
         VERIFY_NOT_REACHED();
     }

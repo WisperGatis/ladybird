@@ -65,12 +65,16 @@ PlaybackManager::~PlaybackManager()
 
 void PlaybackManager::resume_playback()
 {
+    if (m_playback_failed)
+        return;
     dbgln_if(PLAYBACK_MANAGER_DEBUG, "Resuming playback.");
     TRY_OR_FATAL_ERROR(m_playback_handler->play());
 }
 
 void PlaybackManager::pause_playback()
 {
+    if (m_playback_failed)
+        return;
     dbgln_if(PLAYBACK_MANAGER_DEBUG, "Pausing playback.");
     if (!m_playback_handler->is_playing())
         warnln("Cannot pause.");
@@ -87,6 +91,13 @@ void PlaybackManager::terminate_playback()
         (void)m_decode_thread->join();
         dbgln_if(PLAYBACK_MANAGER_DEBUG, "Successfully destroyed PlaybackManager.");
     }
+
+    // A stopped decoder can still leave already-decoded bitmaps queued. Drop
+    // them immediately instead of retaining their pixel buffers until the
+    // media element itself is collected.
+    while (m_frame_queue.dequeue().is_error() == false) {
+    }
+    m_next_frame.clear();
 }
 
 AK::Duration PlaybackManager::current_playback_time()
@@ -127,8 +138,12 @@ void PlaybackManager::dispatch_decoder_error(DecoderError error)
         TRY_OR_FATAL_ERROR(m_playback_handler->stop());
         break;
     default:
+        if (m_playback_failed.exchange(true))
+            return;
+
         dbgln("Playback error encountered: {}", error.string_literal());
         TRY_OR_FATAL_ERROR(m_playback_handler->stop());
+        terminate_playback();
 
         if (on_decoder_error)
             on_decoder_error(move(error));
@@ -168,6 +183,8 @@ void PlaybackManager::timer_callback()
 
 void PlaybackManager::seek_to_timestamp(AK::Duration target_timestamp, SeekMode seek_mode)
 {
+    if (m_playback_failed)
+        return;
     TRY_OR_FATAL_ERROR(m_playback_handler->seek(target_timestamp, seek_mode));
 }
 
@@ -198,6 +215,8 @@ void PlaybackManager::set_state_update_timer(int delay_ms)
 
 void PlaybackManager::restart_playback()
 {
+    if (m_playback_failed)
+        return;
     seek_to_timestamp(AK::Duration::zero());
 }
 
@@ -209,6 +228,20 @@ void PlaybackManager::decode_and_queue_one_sample()
 
     FrameQueueItem item_to_enqueue;
 
+    static constexpr size_t max_recovery_attempts = 2;
+    auto try_recover = [&](DecoderError const& error) {
+        auto category = error.category();
+        if (category != DecoderErrorCategory::Corrupted && category != DecoderErrorCategory::IO && category != DecoderErrorCategory::Unknown)
+            return false;
+        if (m_recovery_attempts >= max_recovery_attempts)
+            return false;
+
+        ++m_recovery_attempts;
+        dbgln("HLS: bounded recovery attempt {}/{} after category {}: {}", m_recovery_attempts, max_recovery_attempts, static_cast<u32>(category), error.string_literal());
+        m_decoder->flush();
+        return true;
+    };
+
     while (item_to_enqueue.is_empty()) {
         OwnPtr<VideoFrame> decoded_frame = nullptr;
         CodingIndependentCodePoints container_cicp;
@@ -219,7 +252,10 @@ void PlaybackManager::decode_and_queue_one_sample()
             // Get a sample to decode.
             auto sample_result = m_demuxer->get_next_sample_for_track(m_selected_video_track);
             if (sample_result.is_error()) {
-                item_to_enqueue = FrameQueueItem::error_marker(sample_result.release_error(), FrameQueueItem::no_timestamp);
+                auto error = sample_result.release_error();
+                if (try_recover(error))
+                    continue;
+                item_to_enqueue = FrameQueueItem::error_marker(move(error), FrameQueueItem::no_timestamp);
                 break;
             }
             auto sample = sample_result.release_value();
@@ -228,7 +264,10 @@ void PlaybackManager::decode_and_queue_one_sample()
             // Submit the sample to the decoder.
             auto decode_result = m_decoder->receive_coded_data(sample.timestamp(), sample.data());
             if (decode_result.is_error()) {
-                item_to_enqueue = FrameQueueItem::error_marker(decode_result.release_error(), sample.timestamp());
+                auto error = decode_result.release_error();
+                if (try_recover(error))
+                    continue;
+                item_to_enqueue = FrameQueueItem::error_marker(move(error), sample.timestamp());
                 break;
             }
 
@@ -241,7 +280,10 @@ void PlaybackManager::decode_and_queue_one_sample()
                         break;
                     }
 
-                    item_to_enqueue = FrameQueueItem::error_marker(frame_result.release_error(), sample.timestamp());
+                    auto error = frame_result.release_error();
+                    if (try_recover(error))
+                        continue;
+                    item_to_enqueue = FrameQueueItem::error_marker(move(error), sample.timestamp());
                     break;
                 }
 
@@ -251,6 +293,7 @@ void PlaybackManager::decode_and_queue_one_sample()
 
         // Convert the frame for display.
         if (decoded_frame != nullptr) {
+            m_recovery_attempts = 0;
             auto& cicp = decoded_frame->cicp();
             cicp.adopt_specified_values(container_cicp);
             cicp.default_code_points_if_unspecified({ ColorPrimaries::BT709, TransferCharacteristics::BT709, MatrixCoefficients::BT709, VideoFullRangeFlag::Studio });

@@ -478,11 +478,15 @@ void WebContentView::dropEvent(QDropEvent* event)
 
 void WebContentView::focusInEvent(QFocusEvent*)
 {
+    if (!is_connection_open())
+        return;
     client().async_set_has_focus(m_client_state.page_index, true);
 }
 
 void WebContentView::focusOutEvent(QFocusEvent*)
 {
+    if (!is_connection_open())
+        return;
     client().async_set_has_focus(m_client_state.page_index, false);
 }
 
@@ -530,12 +534,16 @@ void WebContentView::resizeEvent(QResizeEvent* event)
 void WebContentView::set_viewport_rect(Gfx::IntRect rect)
 {
     m_viewport_size = rect.size();
+    if (!is_connection_open())
+        return;
     client().async_set_viewport_size(m_client_state.page_index, rect.size().to_type<Web::DevicePixels>());
 }
 
 void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
 {
     m_device_pixel_ratio = device_pixel_ratio;
+    if (!is_connection_open())
+        return;
     client().async_set_device_pixels_per_css_pixel(m_client_state.page_index, m_device_pixel_ratio * m_zoom_level);
     update_viewport_size();
     handle_resize();
@@ -544,6 +552,8 @@ void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
 void WebContentView::set_maximum_frames_per_second(double maximum_frames_per_second)
 {
     m_maximum_frames_per_second = maximum_frames_per_second;
+    if (!is_connection_open())
+        return;
     client().async_set_maximum_frames_per_second(m_client_state.page_index, m_maximum_frames_per_second);
 }
 
@@ -608,6 +618,8 @@ static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, 
 
 void WebContentView::update_palette(PaletteMode mode)
 {
+    if (!is_connection_open())
+        return;
     client().async_update_system_theme(m_client_state.page_index, make_system_theme_from_qt_palette(*this, mode));
 }
 
@@ -615,7 +627,7 @@ void WebContentView::update_screen_rects()
 {
     auto screens = QGuiApplication::screens();
 
-    if (!screens.empty()) {
+    if (!screens.empty() && is_connection_open()) {
         Vector<Web::DevicePixelRect> screen_rects;
         for (auto const& screen : screens) {
             // NOTE: QScreen::geometry() returns the 'device-independent pixels', we multiply

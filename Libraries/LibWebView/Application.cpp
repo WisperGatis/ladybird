@@ -25,6 +25,7 @@
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/ViewImplementation.h>
 
 #if defined(AK_OS_MACOS)
 #    include <LibWebView/MachPortServer.h>
@@ -594,8 +595,25 @@ void Application::process_did_exit(Process&& process)
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>(); client.has_value()) {
             dbgln_if(WEBVIEW_PROCESS_DEBUG, "Restart WebContent process");
-            if (auto on_web_content_process_crash = move(client->on_web_content_process_crash))
-                on_web_content_process_crash();
+            // A WebContent process can host the opener and one or more
+            // popups. Recover every page independently; a callback stored on
+            // the client used to be overwritten by the last popup and left
+            // the opener attached to the dead transport.
+            auto affected_views = client->views();
+            Vector<Function<void()>> crash_callbacks;
+            for (auto* view : affected_views) {
+                if (view->on_web_content_crashed)
+                    crash_callbacks.append(move(view->on_web_content_crashed));
+            }
+
+            // Reconnect all pages before running UI callbacks. A popup callback
+            // may close its window, which must not interrupt recovery of the
+            // opener or any other page that shared this process.
+            for (auto* view : affected_views)
+                view->recover_from_web_content_process_crash();
+
+            for (auto& crash_callback : crash_callbacks)
+                crash_callback();
         }
         break;
     case ProcessType::WebWorker:

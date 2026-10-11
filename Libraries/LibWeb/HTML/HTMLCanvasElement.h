@@ -39,9 +39,10 @@ public:
 
     virtual void attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
 
-    String to_data_url(StringView type, JS::Value quality);
+    WebIDL::ExceptionOr<String> to_data_url(StringView type, JS::Value quality);
     WebIDL::ExceptionOr<void> to_blob(GC::Ref<WebIDL::CallbackType> callback, StringView type, JS::Value quality);
     RefPtr<Gfx::Bitmap> get_bitmap_from_surface();
+    [[nodiscard]] bool is_origin_clean() const;
 
     void present();
 

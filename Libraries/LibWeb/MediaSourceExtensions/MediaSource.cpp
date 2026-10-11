@@ -191,16 +191,11 @@ bool MediaSource::is_type_supported(JS::VM&, String const& type)
     if (!mime_type.has_value())
         return false;
 
-    // FIXME: 3. If type contains a media type or media subtype that the MediaSource does not support, then
-    //    return false.
-
-    // FIXME: 4. If type contains a codec that the MediaSource does not support, then return false.
-
-    // FIXME: 5. If the MediaSource does not support the specified combination of media type, media
-    //    subtype, and codecs then return false.
-
-    // 6. Return true.
-    return true;
+    // SourceBuffer currently stores appended bytes only; it does not feed them to an
+    // audio or video decoder. Claiming support makes hls.js select MSE playback and
+    // leaves the video permanently buffering. Do not advertise MSE until that data
+    // path is implemented, allowing sites to choose their native HLS fallback.
+    return false;
 }
 
 // Non-standard: Attach to HTMLMediaElement

@@ -196,6 +196,8 @@ Queue<Web::QueuedInputEvent>& PageClient::input_event_queue()
 
 void PageClient::report_finished_handling_input_event(u64 page_id, Web::EventResult event_was_handled)
 {
+    if (!is_connection_open())
+        return;
     client().async_did_finish_handling_input_event(page_id, event_was_handled);
 }
 

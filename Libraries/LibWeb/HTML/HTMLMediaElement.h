@@ -11,6 +11,7 @@
 #include <AK/Optional.h>
 #include <AK/Time.h>
 #include <AK/Variant.h>
+#include <LibCore/Timer.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
@@ -37,13 +38,28 @@ class HTMLMediaElement : public HTMLElement {
 public:
     virtual ~HTMLMediaElement() override;
 
+    virtual bool is_lazy_loading() const override { return true; }
+    virtual GC::Ptr<GC::Function<void()>> take_lazy_load_resumption_steps(Badge<DOM::Document>) override;
+
     virtual bool is_focusable() const override { return true; }
 
     // NOTE: The function is wrapped in a GC::HeapFunction immediately.
     void queue_a_media_element_task(Function<void()>);
+    void queue_a_media_element_task_for_generation(u64, Function<void()>);
+
+    bool is_current_media_resource(u64 generation) const { return generation == m_media_resource_generation; }
+    bool is_active_video_track(VideoTrack const&) const;
+    bool is_active_audio_track(AudioTrack const&) const;
 
     GC::Ptr<MediaError> error() const { return m_error; }
     void set_decoder_error(String error_message);
+    void release_media_playback_admission();
+    bool has_media_playback_admission() const { return m_has_media_playback_admission; }
+    void clear_deferred_media_load();
+    void resume_deferred_media_load();
+    bool is_background_video_preview() const;
+    bool has_pending_media_pipeline() const { return m_pending_media_playback_resume; }
+    [[nodiscard]] bool media_playback_admission_granted(Badge<Page>);
 
     GC::Ptr<MediaSourceExtensions::MediaSource> src_object() const { return m_src_object; }
     void set_src_object(GC::Ptr<MediaSourceExtensions::MediaSource>);
@@ -165,6 +181,7 @@ public:
     CachedLayoutBoxes& cached_layout_boxes(Badge<Painting::MediaPaintable>) const { return m_layout_boxes; }
 
     CORSSettingAttribute crossorigin() const { return m_crossorigin; }
+    [[nodiscard]] bool media_data_is_cors_cross_origin() const { return m_media_data_is_cors_cross_origin; }
 
 protected:
     HTMLMediaElement(DOM::Document&, DOM::QualifiedName);
@@ -187,6 +204,7 @@ protected:
     virtual void on_seek(double, MediaSeekMode) { m_seek_in_progress = false; }
 
     virtual void on_volume_change() { }
+    virtual void reset_media_resource_state() { }
 
 private:
     friend SourceElementSelector;
@@ -199,10 +217,10 @@ private:
     Task::Source media_element_event_task_source() const { return m_media_element_event_task_source.source; }
 
     WebIDL::ExceptionOr<void> load_element();
-    WebIDL::ExceptionOr<void> fetch_resource(URL::URL const&, ESCAPING Function<void(String)> failure_callback);
+    WebIDL::ExceptionOr<void> fetch_resource(URL::URL const&, ESCAPING Function<void(String)> failure_callback, u64 generation);
     static bool verify_response(GC::Ref<Fetch::Infrastructure::Response>, ByteRange const&);
-    WebIDL::ExceptionOr<void> process_media_data(Function<void(String)> failure_callback);
-    WebIDL::ExceptionOr<void> process_hls_stream(String url, Function<void(String)> failure_callback);
+    WebIDL::ExceptionOr<void> process_media_data(Function<void(String)> failure_callback, u64 generation);
+    WebIDL::ExceptionOr<void> process_hls_stream(String url, Function<void(String)> failure_callback, u64 generation);
     WebIDL::ExceptionOr<void> handle_media_source_failure(Span<GC::Ref<WebIDL::Promise>> promises, String error_message);
     void forget_media_resource_specific_tracks();
     void set_ready_state(ReadyState);
@@ -328,7 +346,38 @@ private:
 
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
 
+    // The shared network request currently supplying this element's media data, and this element's consumer id on it.
+    GC::Ptr<SharedMediaResourceRequest> m_shared_media_request;
+    u64 m_shared_media_request_callbacks_id { 0 };
+    bool m_media_data_is_cors_cross_origin { false };
+    void stop_shared_media_fetch();
+
+    // The whole resource is fetched before any of it is handed to the decoder, so nothing would otherwise tell the page
+    // that the download is still making progress. These fire the spec's periodic `progress` event (and a one-off
+    // `stalled` event) while the shared fetch is in flight.
+    void start_media_progress_timer(u64 generation);
+    void stop_media_progress_timer();
+    RefPtr<Core::Timer> m_media_progress_timer;
+
     bool m_seek_in_progress = false;
+    bool m_seek_wait_active = false;
+    bool m_loop_restart_pending = false;
+    u32 m_loop_restarts_without_progress = 0;
+
+    // Identifies the resource currently allowed to mutate this element. This is deliberately
+    // independent of the URL: ad and content URLs can be loaded by the same element in quick
+    // succession, and callbacks from the old URL must become harmless immediately.
+    u64 m_media_resource_generation { 0 };
+    bool m_has_media_playback_admission { false };
+    GC::Ptr<GC::Function<void()>> m_deferred_media_load_resumption_steps;
+    bool m_is_resuming_deferred_media_load { false };
+    bool m_user_requested_playback { false };
+    // A script or user explicitly called play(). Unlike transient activation, this also
+    // covers playback requests made after a same-tab navigation has consumed activation.
+    bool m_explicit_play_requested { false };
+    // Set when this element's remote fetch (regular or HLS) was deferred waiting on the
+    // page's bounded media-playback admission; invoked once a slot is granted.
+    GC::Ptr<GC::Function<void()>> m_pending_media_playback_resume;
 
     // Cached state for layout.
     Optional<MediaComponent> m_mouse_tracking_component;

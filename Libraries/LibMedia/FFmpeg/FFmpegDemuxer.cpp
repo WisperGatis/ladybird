@@ -181,15 +181,18 @@ DecoderErrorOr<Optional<AK::Duration>> FFmpegDemuxer::seek_to_most_recent_keyfra
     // FIXME: What do we do with this here?
     (void)earliest_available_sample;
 
-    VERIFY(track.identifier() < m_format_context->nb_streams);
-    auto* stream = m_format_context->streams[track.identifier()];
-
-    // For HLS streams, seeking is handled by FFmpeg's internal HLS demuxer when we call av_read_frame.
-    // We can just flush the context and FFmpeg will do the right thing.
+    // FFmpeg's HLS demuxer owns the playlist/variant and segment timeline.
+    // Calling av_seek_frame() here asks the HLS format context to seek like a
+    // regular container and fails for signed multi-variant playlists such as
+    // PerfectGirls' stream. Flushing lets FFmpeg reopen from the requested
+    // logical position using its HLS seek machinery.
     if (is_hls_stream()) {
         avformat_flush(m_format_context);
         return timestamp;
     }
+
+    VERIFY(track.identifier() < m_format_context->nb_streams);
+    auto* stream = m_format_context->streams[track.identifier()];
 
     // Check if the stream is seekable
     if (!is_seekable()) {
@@ -267,6 +270,20 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track track)
     VERIFY(track.identifier() < m_format_context->nb_streams);
     auto* stream = m_format_context->streams[track.identifier()];
 
+    if (!m_logged_stream_info) {
+        auto extradata = ReadonlyBytes { stream->codecpar->extradata, static_cast<size_t>(max(stream->codecpar->extradata_size, 0)) };
+        dbgln("FFmpegDemuxer: stream={} codec={} format={} extradata={} bytes (prefix {:02x} {:02x} {:02x} {:02x})",
+            stream->index,
+            avcodec_get_name(stream->codecpar->codec_id),
+            stream->codecpar->format,
+            extradata.size(),
+            extradata.size() > 0 ? extradata[0] : 0,
+            extradata.size() > 1 ? extradata[1] : 0,
+            extradata.size() > 2 ? extradata[2] : 0,
+            extradata.size() > 3 ? extradata[3] : 0);
+        m_logged_stream_info = true;
+    }
+
     for (;;) {
         auto read_frame_error = av_read_frame(m_format_context, m_packet);
         if (read_frame_error < 0) {
@@ -278,6 +295,23 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track track)
         if (m_packet->stream_index != stream->index) {
             av_packet_unref(m_packet);
             continue;
+        }
+
+        if (m_packet->data == nullptr || m_packet->size <= 0) {
+            av_packet_unref(m_packet);
+            return DecoderError::corrupted("Received an empty coded media packet"sv);
+        }
+
+        if (m_logged_packet_count < 4) {
+            dbgln("FFmpegDemuxer: packet stream={} size={} pts={} prefix {:02x} {:02x} {:02x} {:02x}",
+                m_packet->stream_index,
+                m_packet->size,
+                m_packet->pts,
+                m_packet->size > 0 ? m_packet->data[0] : 0,
+                m_packet->size > 1 ? m_packet->data[1] : 0,
+                m_packet->size > 2 ? m_packet->data[2] : 0,
+                m_packet->size > 3 ? m_packet->data[3] : 0);
+            ++m_logged_packet_count;
         }
 
         auto color_primaries = static_cast<ColorPrimaries>(stream->codecpar->color_primaries);

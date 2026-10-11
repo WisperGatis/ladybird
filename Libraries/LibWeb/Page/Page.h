@@ -181,6 +181,10 @@ public:
 
     void register_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
     void unregister_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
+    bool try_acquire_media_playback(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
+    void promote_media_playback(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
+    void release_media_playback(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
+    ByteString describe_media_playback_owner() const;
 
     struct MediaContextMenu {
         URL::URL media_url;
@@ -243,6 +247,7 @@ private:
     void update_find_in_page_selection(Vector<GC::Root<DOM::Range>> matches);
 
     void on_pending_dialog_closed();
+    void grant_next_media_playback();
 
     GC::Ref<PageClient> m_client;
 
@@ -281,6 +286,13 @@ private:
     u64 m_next_clipboard_request_id { 0 };
 
     Vector<UniqueNodeID> m_media_elements;
+    // Bounds how many <video>/<audio> elements may concurrently download and decode at once.
+    // Without this, a thumbnail grid with dozens of autoplay preview videos spawns a full
+    // download and FFmpeg decoder thread per element simultaneously. The value is tuned to
+    // balance responsiveness on thumbnail-grid-heavy pages against per-tab resource usage.
+    static constexpr size_t MAX_CONCURRENT_MEDIA_PLAYBACK = 8;
+    Vector<UniqueNodeID> m_media_playback_owners;
+    Vector<UniqueNodeID> m_media_playback_waiters;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };

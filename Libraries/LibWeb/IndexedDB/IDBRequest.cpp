@@ -127,6 +127,9 @@ void IDBRequest::unregister_request_observer(Badge<IDBRequestObserver>, IDBReque
 
 void IDBRequest::set_processed(bool processed)
 {
+    if (m_processed == processed)
+        return;
+
     m_processed = processed;
     notify_each_request_observer([](IDBRequestObserver const& request_observer) {
         return request_observer.request_processed_changed_observer();

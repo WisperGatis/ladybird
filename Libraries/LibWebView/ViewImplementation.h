@@ -60,6 +60,8 @@ public:
     void did_update_window_rect();
 
     void set_system_visibility_state(Web::HTML::VisibilityState);
+    bool is_connection_open() const { return m_client_state.client && m_client_state.client->is_open(); }
+    void recover_from_web_content_process_crash();
 
     void load(URL::URL const&);
     void load_html(StringView);
@@ -263,7 +265,6 @@ protected:
         Yes,
     };
     void handle_web_content_process_crash(LoadErrorPage = LoadErrorPage::Yes);
-
     virtual void default_zoom_level_factor_changed() override;
     virtual void languages_changed() override;
     virtual void autoplay_settings_changed() override;

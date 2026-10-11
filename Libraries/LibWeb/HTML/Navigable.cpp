@@ -413,6 +413,8 @@ Navigable::ChosenNavigable Navigable::choose_a_navigable(StringView name, Tokeni
     // 3. Let sandboxingFlagSet be currentNavigable's active document's active sandboxing flag set.
     auto sandboxing_flag_set = active_document()->active_sandboxing_flag_set();
 
+    // TEMP-DEBUG(popup): remove after diagnosing
+
     // 4. If name is the empty string or an ASCII case-insensitive match for "_self", then set chosen to currentNavigable.
     if (name.is_empty() || name.equals_ignoring_ascii_case("_self"sv)) {
         chosen = this;
@@ -459,7 +461,8 @@ Navigable::ChosenNavigable Navigable::choose_a_navigable(StringView name, Tokeni
         // --> If the user agent has been configured such that in this instance it will create a new top-level traversable
         else if (true) { // FIXME: When is this the case?
             // 1. Consume user activation of currentNavigable's active window.
-            active_window()->consume_user_activation();
+            if (active_window())
+                active_window()->consume_user_activation();
 
             // 2. Set windowType to "new and unrestricted".
             window_type = WindowType::NewAndUnrestricted;
@@ -1089,6 +1092,10 @@ static WebIDL::ExceptionOr<Navigable::NavigationParamsVariant> create_navigation
             if (response_holder->response() != nullptr)
                 return true;
 
+            // NOTE: Not in the spec: nothing will ever answer for a navigable that was destroyed (e.g. a closed popup).
+            if (navigable->has_been_destroyed())
+                return true;
+
             if (navigation_id.has_value() && (!navigable->ongoing_navigation().has<String>() || navigable->ongoing_navigation().get<String>() != *navigation_id))
                 return true;
 
@@ -1096,6 +1103,10 @@ static WebIDL::ExceptionOr<Navigable::NavigationParamsVariant> create_navigation
         }));
         // If the latter condition occurs, then abort fetchController, and return. Otherwise, proceed onward.
         if (navigation_id.has_value() && (!navigable->ongoing_navigation().has<String>() || navigable->ongoing_navigation().get<String>() != *navigation_id)) {
+            fetch_controller->abort(realm, {});
+            return Navigable::NullOrError {};
+        }
+        if (!response_holder->response()) {
             fetch_controller->abort(realm, {});
             return Navigable::NullOrError {};
         }
@@ -1489,13 +1500,23 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
     auto& page_client = active_document.page().client();
 
     // AD-HOC: If we are not able to continue in this process, request a new process from the UI.
-    if (is_top_level_traversable() && !page_client.is_url_suitable_for_same_process_navigation(active_document.url(), params.url)) {
+    // An initial about:blank popup inherits its opener's origin and is created in the opener's process. Use the
+    // opener's URL when deciding whether the popup's first navigation crosses a site boundary; otherwise a
+    // cross-site ad can remain in the opener's process and block it with long-running script.
+    auto current_url_for_process_selection = active_document.url();
+    if (active_document.is_initial_about_blank() && source_document.ptr() != &active_document)
+        current_url_for_process_selection = source_document->url();
+
+    if (is_top_level_traversable() && !page_client.is_url_suitable_for_same_process_navigation(current_url_for_process_selection, params.url)) {
         page_client.request_new_process_for_navigation(params.url);
         return {};
     }
 
     // 2. Let sourceSnapshotParams be the result of snapshotting source snapshot params given sourceDocument.
     auto source_snapshot_params = source_document->snapshot_source_snapshot_params();
+
+    // TEMP-DEBUG(popup): remove after diagnosing
+    if (is_top_level_traversable())
 
     // 3. Let initiatorOriginSnapshot be sourceDocument's origin.
     auto initiator_origin_snapshot = source_document->origin();
@@ -1543,8 +1564,9 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
 void Navigable::begin_navigation(NavigateParams params)
 {
     // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
-    if (!active_window())
+    if (!active_window()) {
         return;
+    }
 
     auto const& url = params.url;
     auto source_document = params.source_document;
@@ -1735,8 +1757,10 @@ void Navigable::begin_navigation(NavigateParams params)
         auto continue_ = navigation->fire_a_push_replace_reload_navigate_event(navigation_type, url, false, user_involvement, source_element, entry_list_for_firing, navigation_api_state_for_firing);
 
         // 5. If continue is false, then return.
-        if (!continue_)
+        if (!continue_) {
+            if (is_top_level_traversable())
             return;
+        }
     }
 
     // AD-HOC: Tell the UI that we started loading.

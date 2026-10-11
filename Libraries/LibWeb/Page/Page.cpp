@@ -7,6 +7,7 @@
  */
 
 #include <AK/SourceLocation.h>
+#include <AK/StringBuilder.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -497,9 +498,77 @@ void Page::register_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID me
 
 void Page::unregister_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id)
 {
+    m_media_playback_owners.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+    m_media_playback_waiters.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
     m_media_elements.remove_all_matching([&](auto candidate_id) {
         return candidate_id == media_id;
     });
+    grant_next_media_playback();
+}
+
+ByteString Page::describe_media_playback_owner() const
+{
+    if (m_media_playback_owners.is_empty())
+        return "none";
+    StringBuilder builder;
+    builder.appendff("{} of {} slots in use", m_media_playback_owners.size(), MAX_CONCURRENT_MEDIA_PLAYBACK);
+    return builder.to_byte_string();
+}
+
+bool Page::try_acquire_media_playback(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id)
+{
+    if (m_media_playback_owners.contains_slow(media_id))
+        return true;
+
+    if (m_media_playback_owners.size() >= MAX_CONCURRENT_MEDIA_PLAYBACK) {
+        if (!m_media_playback_waiters.contains_slow(media_id))
+            m_media_playback_waiters.append(media_id);
+        return false;
+    }
+    m_media_playback_waiters.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+    m_media_playback_owners.append(media_id);
+    return true;
+}
+
+void Page::promote_media_playback(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id)
+{
+    m_media_playback_waiters.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+    if (m_media_playback_owners.contains_slow(media_id))
+        return;
+
+    if (m_media_playback_owners.size() >= MAX_CONCURRENT_MEDIA_PLAYBACK) {
+        // Bump the oldest background owner to make room for user-requested playback.
+        auto evicted_id = m_media_playback_owners.take_first();
+        m_media_playback_waiters.prepend(evicted_id);
+        auto* evicted_node = DOM::Node::from_unique_id(evicted_id);
+        if (evicted_node && is<HTML::HTMLMediaElement>(evicted_node))
+            as<HTML::HTMLMediaElement>(*evicted_node).release_media_playback_admission();
+    }
+
+    m_media_playback_owners.append(media_id);
+    auto* node = DOM::Node::from_unique_id(media_id);
+    if (!node || !is<HTML::HTMLMediaElement>(node) || !as<HTML::HTMLMediaElement>(*node).media_playback_admission_granted({}))
+        m_media_playback_owners.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+}
+
+void Page::release_media_playback(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id)
+{
+    m_media_playback_owners.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+    m_media_playback_waiters.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+    grant_next_media_playback();
+}
+
+void Page::grant_next_media_playback()
+{
+    while (m_media_playback_owners.size() < MAX_CONCURRENT_MEDIA_PLAYBACK && !m_media_playback_waiters.is_empty()) {
+        auto media_id = m_media_playback_waiters.take_first();
+        auto* node = DOM::Node::from_unique_id(media_id);
+        if (!node || !is<HTML::HTMLMediaElement>(node))
+            continue;
+        m_media_playback_owners.append(media_id);
+        if (!as<HTML::HTMLMediaElement>(*node).media_playback_admission_granted({}))
+            m_media_playback_owners.remove_all_matching([&](auto candidate_id) { return candidate_id == media_id; });
+    }
 }
 
 void Page::did_request_media_context_menu(UniqueNodeID media_id, CSSPixelPoint position, ByteString const& target, unsigned modifiers, MediaContextMenu const& menu)

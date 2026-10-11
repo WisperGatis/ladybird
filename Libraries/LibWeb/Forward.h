@@ -735,6 +735,7 @@ class PromiseRejectionEvent;
 class RadioNodeList;
 class SelectedFile;
 class SessionHistoryEntry;
+class SharedMediaResourceRequest;
 class SharedResourceRequest;
 class SharedWorker;
 class SharedWorkerGlobalScope;

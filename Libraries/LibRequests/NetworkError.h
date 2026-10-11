@@ -20,6 +20,8 @@ enum class NetworkError {
     SSLVerificationFailed,
     MalformedUrl,
     InvalidContentEncoding,
+    PartialFile,
+    HTTP3Error,
     RequestServerDied,
     Unknown,
 };
@@ -45,6 +47,10 @@ constexpr StringView network_error_to_string(NetworkError network_error)
         return "The URL is not formatted properly"sv;
     case NetworkError::InvalidContentEncoding:
         return "Response could not be decoded with its Content-Encoding"sv;
+    case NetworkError::PartialFile:
+        return "Transferred a partial file"sv;
+    case NetworkError::HTTP3Error:
+        return "HTTP/3 error"sv;
     case NetworkError::RequestServerDied:
         return "RequestServer is currently unavailable"sv;
     case NetworkError::Unknown:

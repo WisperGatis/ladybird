@@ -32,6 +32,9 @@ VideoTrack::VideoTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
     , m_playback_manager(move(playback_manager))
 {
     m_playback_manager->on_video_frame = [this](auto frame) {
+        if (!m_media_element->is_active_video_track(*this)) {
+            return;
+        }
         auto playback_position = static_cast<double>(position().to_milliseconds()) / 1000.0;
 
         if (is<HTMLVideoElement>(*m_media_element))
@@ -41,6 +44,8 @@ VideoTrack::VideoTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
     };
 
     m_playback_manager->on_playback_state_change = [this]() {
+        if (!m_media_element->is_active_video_track(*this))
+            return;
         switch (m_playback_manager->get_state()) {
         case Media::PlaybackState::Stopped: {
             auto playback_position_ms = static_cast<double>(duration().to_milliseconds());
@@ -54,11 +59,15 @@ VideoTrack::VideoTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
     };
 
     m_playback_manager->on_decoder_error = [this](auto error) {
+        if (!m_media_element->is_active_video_track(*this))
+            return;
         auto error_message = MUST(String::from_utf8(error.description()));
         m_media_element->set_decoder_error(move(error_message));
     };
 
     m_playback_manager->on_fatal_playback_error = [this](auto error) {
+        if (!m_media_element->is_active_video_track(*this))
+            return;
         auto error_message = MUST(String::from_utf8(error.string_literal()));
         m_media_element->set_decoder_error(move(error_message));
     };

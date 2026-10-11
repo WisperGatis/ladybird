@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<div id="container"></div>
+<script>
+    // Mirrors how ad scripts build muted autoplay creatives: the <video> is created and given a
+    // <source> while it is still detached, and only then inserted into an in-viewport container.
+    function createPreview(useSourceElement) {
+        const video = document.createElement("video");
+        video.setAttribute("loop", true);
+        video.setAttribute("muted", true);
+        video.muted = true;
+        video.setAttribute("autoplay", true);
+        video.setAttribute("playsinline", true);
+        video.setAttribute("preload", "auto");
+        if (useSourceElement) {
+            const source = document.createElement("source");
+            source.setAttribute("src", "../../Assets/test-webm.webm");
+            video.appendChild(source);
+        } else {
+            video.src = "../../Assets/test-webm.webm";
+        }
+        container.appendChild(video);
+        return video;
+    }
+
+    function waitForMetadata(video) {
+        return Promise.race([
+            new Promise(resolve => {
+                video.addEventListener("loadedmetadata", () => resolve(true), { once: true });
+                video.addEventListener("error", () => resolve(true), { once: true });
+            }),
+            timeout(1000).then(() => false),
+        ]);
+    }
+
+    asyncTest(async done => {
+        for (const useSourceElement of [true, false]) {
+            const video = createPreview(useSourceElement);
+            const loaded = await waitForMetadata(video);
+            println(`${useSourceElement ? "<source>" : "src attribute"}: in-viewport preview created detached ${loaded ? "loads" : "FAIL: never loads"} (networkState=${video.networkState}, readyState=${video.readyState})`);
+        }
+        done();
+    });
+</script>

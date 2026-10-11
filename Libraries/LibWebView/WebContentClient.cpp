@@ -64,10 +64,23 @@ void WebContentClient::register_view(u64 page_id, ViewImplementation& view)
 void WebContentClient::unregister_view(u64 page_id)
 {
     m_views.remove(page_id);
-    if (m_views.is_empty()) {
-        on_web_content_process_crash = nullptr;
+
+    if (!is_open())
+        return;
+
+    // NOTE: Popups share their opener's WebContent process, so only close the whole process once no views are left.
+    if (m_views.is_empty())
         async_close_server();
-    }
+    else
+        async_close_page(page_id);
+}
+
+Vector<ViewImplementation*> WebContentClient::views() const
+{
+    Vector<ViewImplementation*> views;
+    for (auto const& it : m_views)
+        views.append(it.value);
+    return views;
 }
 
 void WebContentClient::web_ui_disconnected(Badge<WebUI>)

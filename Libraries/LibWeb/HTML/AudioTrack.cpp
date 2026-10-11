@@ -31,6 +31,8 @@ AudioTrack::AudioTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
     , m_audio_plugin(Platform::AudioCodecPlugin::create(move(loader)).release_value_but_fixme_should_propagate_errors())
 {
     m_audio_plugin->on_playback_position_updated = [this](auto position) {
+        if (!m_media_element->is_active_audio_track(*this))
+            return;
         if (auto* paintable = m_media_element->paintable())
             paintable->set_needs_display();
 
@@ -39,6 +41,8 @@ AudioTrack::AudioTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
     };
 
     m_audio_plugin->on_decoder_error = [this](String error_message) {
+        if (!m_media_element->is_active_audio_track(*this))
+            return;
         m_media_element->set_decoder_error(move(error_message));
     };
 

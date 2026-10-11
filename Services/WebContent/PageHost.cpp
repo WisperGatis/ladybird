@@ -34,6 +34,22 @@ void PageHost::remove_page(Badge<PageClient>, u64 index)
     m_pages.remove(index);
 }
 
+void PageHost::close_page(u64 index)
+{
+    auto page = m_pages.get(index);
+    if (!page.has_value())
+        return;
+
+    // NOTE: Dropping our reference alone would leave the page running (timers, loads and painting) until it is GC'd,
+    //       so close its traversable first. This ends in PageClient::page_did_close_top_level_traversable(), which
+    //       removes the page from m_pages.
+    auto& page_client = *page.value();
+    if (page_client.page().top_level_traversable_is_initialized())
+        page_client.page().top_level_traversable()->close_top_level_traversable();
+    else
+        m_pages.remove(index);
+}
+
 Optional<PageClient&> PageHost::page(u64 index)
 {
     return m_pages.get(index).map([](auto& value) -> PageClient& {

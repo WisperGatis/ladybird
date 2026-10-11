@@ -110,7 +110,11 @@ NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spaci
         shaping_cache.features = features;
     }
 
-    // FIXME: The cache currently grows unbounded. We should have some limit and LRU mechanism.
+    // Keep shaping memory bounded. Pages can generate effectively unbounded
+    // distinct strings (for example timestamps, ads, and user-generated text),
+    // while each cached HarfBuzz buffer retains its glyph data for the lifetime
+    // of the font.
+    constexpr size_t max_cached_strings = 4096;
     auto get_or_create_buffer = [&] -> hb_buffer_t* {
         if (string.length_in_code_units() == 1) {
             auto code_unit = string.code_unit_at(0);
@@ -127,6 +131,8 @@ NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spaci
             it != shaping_cache.map.end()) {
             return it->value;
         }
+        if (shaping_cache.map.size() >= max_cached_strings)
+            shaping_cache.clear();
         auto* buffer = setup_text_shaping(string, font, features);
         shaping_cache.map.set(Utf16String::from_utf16(string), buffer);
         return buffer;

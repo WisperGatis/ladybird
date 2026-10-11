@@ -87,6 +87,28 @@ Layout::VideoBox const* HTMLVideoElement::layout_node() const
     return static_cast<Layout::VideoBox const*>(Node::layout_node());
 }
 
+void HTMLVideoElement::set_video_width(u32 video_width)
+{
+    if (m_video_width == video_width)
+        return;
+
+    m_video_width = video_width;
+    set_needs_style_update(true);
+    if (auto layout_node = this->layout_node())
+        layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLVideoElementSetVideoTrack);
+}
+
+void HTMLVideoElement::set_video_height(u32 video_height)
+{
+    if (m_video_height == video_height)
+        return;
+
+    m_video_height = video_height;
+    set_needs_style_update(true);
+    if (auto layout_node = this->layout_node())
+        layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLVideoElementSetVideoTrack);
+}
+
 // https://html.spec.whatwg.org/multipage/media.html#dom-video-videowidth
 u32 HTMLVideoElement::video_width() const
 {
@@ -121,9 +143,30 @@ void HTMLVideoElement::set_video_track(GC::Ptr<HTML::VideoTrack> video_track)
     m_video_track = video_track;
 }
 
+void HTMLVideoElement::reset_media_resource_state()
+{
+    if (m_video_track)
+        m_video_track->pause_video({});
+    m_video_track = nullptr;
+    audio_tracks()->for_each_enabled_track([](auto& audio_track) {
+        audio_track.pause();
+    });
+    m_current_frame = {};
+    m_poster_frame = nullptr;
+    m_video_width = 0;
+    m_video_height = 0;
+
+    // Clear the old ad frame before the next resource can publish metadata or a frame.
+    set_needs_style_update(true);
+    if (auto layout_node = this->layout_node())
+        layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLVideoElementSetVideoTrack);
+}
+
 void HTMLVideoElement::set_current_frame(Badge<VideoTrack>, RefPtr<Gfx::Bitmap> frame, double position)
 {
     m_current_frame = { move(frame), position };
+    if (is_background_video_preview() && has_media_playback_admission())
+        release_media_playback_admission();
     if (paintable())
         paintable()->set_needs_display();
 }
@@ -150,6 +193,9 @@ void HTMLVideoElement::on_paused()
 
 void HTMLVideoElement::on_seek(double position, MediaSeekMode seek_mode)
 {
+    if (error())
+        return;
+
     if (m_video_track)
         m_video_track->seek(AK::Duration::from_milliseconds(position * 1000.0), seek_mode);
 

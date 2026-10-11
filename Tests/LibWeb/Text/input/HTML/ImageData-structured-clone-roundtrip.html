@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    test(() => {
+        const original = new ImageData(3, 2);
+        for (let i = 0; i < original.data.length; i += 4) {
+            original.data[i + 0] = i;
+            original.data[i + 1] = 190;
+            original.data[i + 2] = 0;
+            original.data[i + 3] = 255;
+        }
+
+        const clone = structuredClone(original);
+        println(`width: ${clone.width}`);
+        println(`height: ${clone.height}`);
+        println(`colorSpace: ${clone.colorSpace}`);
+        println(`data length: ${clone.data.length}`);
+        println(`data equal: ${clone.data.every((value, index) => value === original.data[index])}`);
+        println(`is a distinct object: ${clone !== original && clone.data.buffer !== original.data.buffer}`);
+    });
+</script>

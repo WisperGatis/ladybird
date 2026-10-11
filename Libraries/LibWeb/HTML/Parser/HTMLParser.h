@@ -104,6 +104,7 @@ public:
     size_t script_nesting_level() const { return m_script_nesting_level; }
 
 private:
+    static void finish_the_end(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>);
     HTMLParser(DOM::Document&, StringView input, StringView encoding);
     HTMLParser(DOM::Document&);
 

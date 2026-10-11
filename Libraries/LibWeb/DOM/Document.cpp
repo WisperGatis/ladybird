@@ -19,6 +19,7 @@
 #include <AK/Time.h>
 #include <AK/Utf8View.h>
 #include <LibCore/Timer.h>
+#include <LibWeb/Platform/Timer.h>
 #include <LibGC/RootVector.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/FunctionObject.h>
@@ -83,6 +84,8 @@
 #include <LibWeb/DOM/TreeWalker.h>
 #include <LibWeb/DOM/Utils.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
+#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
@@ -137,6 +140,7 @@
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
+#include <LibWeb/HTML/SharedMediaResourceRequest.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StorageEvent.h>
@@ -543,6 +547,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_page);
+    visitor.visit(m_the_end_wait_timer);
     visitor.visit(m_window);
     visitor.visit(m_layout_root);
     visitor.visit(m_style_sheets);
@@ -577,6 +582,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_first_base_element_with_target_in_tree_order);
     visitor.visit(m_parser);
     visitor.visit(m_lazy_load_intersection_observer);
+    visitor.visit(m_media_preview_intersection_observer);
     visitor.visit(m_visual_viewport);
     visitor.visit(m_latest_entry);
     visitor.visit(m_default_timeline);
@@ -592,6 +598,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     }
 
     visitor.visit(m_shared_resource_requests);
+    visitor.visit(m_shared_media_resource_requests);
 
     visitor.visit(m_associated_animation_timelines);
     visitor.visit(m_list_of_available_images);
@@ -3494,6 +3501,11 @@ bool Document::has_focus_for_bindings() const
     return has_focus();
 }
 
+bool Document::has_transient_activation() const
+{
+    return as<HTML::Window>(HTML::relevant_global_object(*this)).has_transient_activation();
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#has-focus-steps
 bool Document::has_focus() const
 {
@@ -4869,69 +4881,57 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
 }
 
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#start-intersection-observing-a-lazy-loading-element
+GC::Ref<IntersectionObserver::IntersectionObserver> Document::create_lazy_load_intersection_observer(String root_margin)
+{
+    auto& realm = this->realm();
+    auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, [this](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+        auto& entries = as<JS::Array>(vm.argument(0).as_object());
+        auto entries_length = MUST(MUST(entries.get(vm.names.length)).to_length(vm));
+
+        for (size_t i = 0; i < entries_length; ++i) {
+            auto property_key = JS::PropertyKey { i };
+            auto& entry = as<IntersectionObserver::IntersectionObserverEntry>(entries.get_without_side_effects(property_key).as_object());
+            GC::Ptr<GC::Function<void()>> resumption_steps;
+
+            if (entry.is_intersecting()) {
+                VERIFY(entry.target()->is_lazy_loading());
+                resumption_steps = entry.target()->take_lazy_load_resumption_steps({});
+            }
+
+            if (!resumption_steps)
+                continue;
+
+            stop_intersection_observing_a_lazy_loading_element(entry.target());
+            entry.target()->take_lazy_load_resumption_steps({});
+            resumption_steps->function()();
+        }
+
+        return JS::js_undefined();
+    });
+
+    auto options = IntersectionObserver::IntersectionObserverInit {};
+    options.root_margin = move(root_margin);
+    auto wrapped_callback = realm.heap().allocate<WebIDL::CallbackType>(callback, realm);
+    return IntersectionObserver::IntersectionObserver::construct_impl(realm, wrapped_callback, options).release_value_but_fixme_should_propagate_errors();
+}
+
 void Document::start_intersection_observing_a_lazy_loading_element(Element& element)
 {
     VERIFY(element.is_lazy_loading());
-
-    auto& realm = this->realm();
-
-    // 1. Let doc be element's node document.
     VERIFY(&element.document() == this);
-
-    // 2. If doc's lazy load intersection observer is null, set it to a new IntersectionObserver instance, initialized as follows:
-    if (!m_lazy_load_intersection_observer) {
-        // - The callback is these steps, with arguments entries and observer:
-        auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, [this](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
-            // For each entry in entries using a method of iteration which does not trigger developer-modifiable array accessors or iteration hooks:
-            auto& entries = as<JS::Array>(vm.argument(0).as_object());
-            auto entries_length = MUST(MUST(entries.get(vm.names.length)).to_length(vm));
-
-            for (size_t i = 0; i < entries_length; ++i) {
-                auto property_key = JS::PropertyKey { i };
-                auto& entry = as<IntersectionObserver::IntersectionObserverEntry>(entries.get_without_side_effects(property_key).as_object());
-
-                // 1. Let resumptionSteps be null.
-                GC::Ptr<GC::Function<void()>> resumption_steps;
-
-                // 2. If entry.isIntersecting is true, then set resumptionSteps to entry.target's lazy load resumption steps.
-                if (entry.is_intersecting()) {
-                    // 5. Set entry.target's lazy load resumption steps to null.
-                    VERIFY(entry.target()->is_lazy_loading());
-                    resumption_steps = entry.target()->take_lazy_load_resumption_steps({});
-                }
-
-                // 3. If resumptionSteps is null, then return.
-                if (!resumption_steps) {
-                    // NOTE: This is wrong in the spec, since we want to keep processing
-                    //       entries even if one of them doesn't have resumption steps.
-                    // FIXME: Spec bug: https://github.com/whatwg/html/issues/10019
-                    continue;
-                }
-
-                // 4. Stop intersection-observing a lazy loading element for entry.target.
-                stop_intersection_observing_a_lazy_loading_element(entry.target());
-
-                // 5. Set entry.target's lazy load resumption steps to null.
-                entry.target()->take_lazy_load_resumption_steps({});
-
-                // 6. Invoke resumptionSteps.
-                resumption_steps->function()();
-            }
-
-            return JS::js_undefined();
-        });
-
-        // FIXME: The options is an IntersectionObserverInit dictionary with the following dictionary members: «[ "rootMargin" → lazy load root margin ]»
-        // Spec Note: This allows for fetching the image during scrolling, when it does not yet — but is about to — intersect the viewport.
-        auto options = IntersectionObserver::IntersectionObserverInit {};
-
-        auto wrapped_callback = realm.heap().allocate<WebIDL::CallbackType>(callback, realm);
-        m_lazy_load_intersection_observer = IntersectionObserver::IntersectionObserver::construct_impl(realm, wrapped_callback, options).release_value_but_fixme_should_propagate_errors();
-    }
-
-    // 3. Call doc's lazy load intersection observer's observe method with element as the argument.
+    if (!m_lazy_load_intersection_observer)
+        m_lazy_load_intersection_observer = create_lazy_load_intersection_observer("100% 0px"_string);
     VERIFY(m_lazy_load_intersection_observer);
     m_lazy_load_intersection_observer->observe(element);
+}
+
+void Document::start_intersection_observing_a_media_preview(Element& element)
+{
+    VERIFY(element.is_lazy_loading());
+    VERIFY(&element.document() == this);
+    if (!m_media_preview_intersection_observer)
+        m_media_preview_intersection_observer = create_lazy_load_intersection_observer("25% 0px"_string);
+    m_media_preview_intersection_observer->observe(element);
 }
 
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#stop-intersection-observing-a-lazy-loading-element
@@ -4940,11 +4940,10 @@ void Document::stop_intersection_observing_a_lazy_loading_element(Element& eleme
     // 1. Let doc be element's node document.
     // NOTE: It's `this`.
 
-    // 2. Assert: doc's lazy load intersection observer is not null.
-    VERIFY(m_lazy_load_intersection_observer);
-
-    // 3. Call doc's lazy load intersection observer unobserve method with element as the argument.
-    m_lazy_load_intersection_observer->unobserve(element);
+    if (m_lazy_load_intersection_observer)
+        m_lazy_load_intersection_observer->unobserve(element);
+    if (m_media_preview_intersection_observer)
+        m_media_preview_intersection_observer->unobserve(element);
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#shared-declarative-refresh-steps
@@ -5255,9 +5254,14 @@ void Document::update_for_history_step_application(GC::Ref<HTML::SessionHistoryE
     }
 }
 
-HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& Document::shared_resource_requests()
+HashMap<HTML::ListOfAvailableImages::Key, GC::Ptr<HTML::SharedResourceRequest>>& Document::shared_resource_requests()
 {
     return m_shared_resource_requests;
+}
+
+HashMap<HTML::ListOfAvailableImages::Key, GC::Ptr<HTML::SharedMediaResourceRequest>>& Document::shared_media_resource_requests()
+{
+    return m_shared_media_resource_requests;
 }
 
 // https://www.w3.org/TR/web-animations-1/#dom-document-timeline
@@ -6345,10 +6349,15 @@ void Document::parse_html_from_a_string(StringView html)
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-parsehtmlunsafe
-GC::Ref<Document> Document::parse_html_unsafe(JS::VM& vm, StringView html)
+WebIDL::ExceptionOr<GC::Ref<Document>> Document::parse_html_unsafe(JS::VM& vm, TrustedTypes::TrustedHTMLOrString const& html)
 {
     auto& realm = *vm.current_realm();
-    // FIXME: 1. Let compliantHTML to the result of invoking the Get Trusted Type compliant string algorithm with TrustedHTML, this's relevant global object, html, "Document parseHTMLUnsafe", and "script".
+    auto const compliant_html = TRY(TrustedTypes::get_trusted_type_compliant_string(
+        TrustedTypes::TrustedTypeName::TrustedHTML,
+        realm.global_object(),
+        html,
+        TrustedTypes::InjectionSink::DocumentparseHTMLUnsafe,
+        TrustedTypes::Script.to_string()));
 
     // 2. Let document be a new Document, whose content type is "text/html".
     auto document = Document::create_for_fragment_parsing(realm);
@@ -6357,8 +6366,8 @@ GC::Ref<Document> Document::parse_html_unsafe(JS::VM& vm, StringView html)
     // 3. Set document's allow declarative shadow roots to true.
     document->set_allow_declarative_shadow_roots(true);
 
-    // 4. Parse HTML from a string given document and compliantHTML. // FIXME: Use compliantHTML.
-    document->parse_html_from_a_string(html);
+    // 4. Parse HTML from a string given document and compliantHTML.
+    document->parse_html_from_a_string(compliant_html.to_utf8_but_should_be_ported_to_utf16());
 
     // AD-HOC: Setting the origin to match that of the associated document matches the behavior of existing browsers.
     auto& associated_document = as<HTML::Window>(realm.global_object()).associated_document();
