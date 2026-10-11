@@ -26,6 +26,7 @@
 #import <HTML/HTMLScriptElement.idl>
 #import <HTML/Location.idl>
 #import <Selection/Selection.idl>
+#import <TrustedTypes/TrustedHTML.idl>
 #import <ViewTransition/ViewTransition.idl>
 #import <XPath/XPathResult.idl>
 #import <XPath/XPathExpression.idl>
@@ -61,8 +62,7 @@ interface Document : Node {
     // FIXME: [CEReactions] undefined writeln((TrustedHTML or DOMString)... text);
     [CEReactions] undefined writeln(DOMString... text);
 
-    // FIXME: static Document parseHTMLUnsafe((TrustedHTML or DOMString) html);
-    static Document parseHTMLUnsafe(DOMString html);
+    static Document parseHTMLUnsafe((TrustedHTML or Utf16DOMString) html);
 
     attribute DOMString cookie;
 

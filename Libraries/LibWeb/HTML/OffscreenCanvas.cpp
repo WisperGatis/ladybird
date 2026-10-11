@@ -134,6 +134,17 @@ void OffscreenCanvas::reset_context_to_default_state()
         });
 }
 
+bool OffscreenCanvas::is_origin_clean() const
+{
+    return m_context.visit(
+        [](GC::Ref<OffscreenCanvasRenderingContext2D> const& context) {
+            return context->is_origin_clean();
+        },
+        [](auto const&) {
+            return true;
+        });
+}
+
 WebIDL::ExceptionOr<void> OffscreenCanvas::set_new_bitmap_size(Gfx::IntSize new_size)
 {
     if (new_size.width() == 0 || new_size.height() == 0)
@@ -244,6 +255,7 @@ WebIDL::ExceptionOr<GC::Ref<ImageBitmap>> OffscreenCanvas::transfer_to_image_bit
     // 3. Let image be a newly created ImageBitmap object that references the same underlying bitmap data as this OffscreenCanvas object's bitmap.
     auto image = ImageBitmap::create(realm());
     image->set_bitmap(m_bitmap);
+    image->set_origin_clean(is_origin_clean());
 
     // 4. Set this OffscreenCanvas object's bitmap to reference a newly created bitmap of the same dimensions and color space as the previous bitmap, and with its pixels initialized to transparent black, or opaque black if the rendering context' s alpha is false.
     // FIXME: implement the checking of the alpha from the context
@@ -253,6 +265,7 @@ WebIDL::ExceptionOr<GC::Ref<ImageBitmap>> OffscreenCanvas::transfer_to_image_bit
     } else {
         m_bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, size));
     }
+    reset_context_to_default_state();
 
     // 5. Return image.
     return image;
@@ -275,7 +288,10 @@ GC::Ref<WebIDL::Promise> OffscreenCanvas::convert_to_blob(Optional<ImageEncodeOp
 
     // FIXME: 1. If the value of this OffscreenCanvas object's [[Detached]] internal slot is set to true, then return a promise rejected with an "InvalidStateError" DOMException.
 
-    // FIXME 2. If this OffscreenCanvas object's context mode is 2d and the rendering context's output bitmap's origin-clean flag is set to false, then return a promise rejected with a "SecurityError" DOMException.
+    if (m_context.has<GC::Ref<OffscreenCanvasRenderingContext2D>>() && !is_origin_clean()) {
+        auto error = WebIDL::SecurityError::create(realm(), "OffscreenCanvas is not origin-clean"_utf16);
+        return WebIDL::create_rejected_promise_from_exception(realm(), error);
+    }
 
     auto size = bitmap_size_for_canvas();
 

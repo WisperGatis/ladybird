@@ -59,6 +59,7 @@ private:
 
     virtual Messages::WebContentServer::InitTransportResponse init_transport(int peer_pid) override;
     virtual void close_server() override;
+    virtual void close_page(u64 page_id) override;
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(u64 page_id) override;
     virtual void set_window_handle(u64 page_id, String handle) override;
     virtual void connect_to_webdriver(u64 page_id, ByteString webdriver_ipc_path) override;

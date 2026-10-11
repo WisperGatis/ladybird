@@ -1,0 +1,6 @@
+offscreen autoplay preview deferred: true
+preview more than 25% of a viewport away stays deferred: true
+lazy image within one viewport loads while farther preview waits: true
+user activated playback starts loading: true
+preview resumes within 25% of viewport
+scrolling resumes deferred preview

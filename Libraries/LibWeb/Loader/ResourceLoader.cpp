@@ -138,7 +138,10 @@ static ByteString sanitized_url_for_logging(URL::URL const& url)
 {
     if (url.scheme() == "data"sv)
         return "[data URL]"sv;
-    return url.to_byte_string();
+    auto url_without_sensitive_components = url;
+    url_without_sensitive_components.set_query({});
+    url_without_sensitive_components.set_fragment({});
+    return url_without_sensitive_components.to_byte_string();
 }
 
 static void store_response_cookies(Page& page, URL::URL const& url, ByteString const& set_cookie_entry)
@@ -430,8 +433,9 @@ void ResourceLoader::load(LoadRequest& request, GC::Root<SuccessCallback> succes
 
         if (timeout.has_value() && timeout.value() > 0) {
             auto timer = Platform::Timer::create_single_shot(m_heap, timeout.value(), nullptr);
-            timer->on_timeout = GC::create_function(m_heap, [timer = GC::make_root(timer), protocol_request, timeout_callback] {
+            timer->on_timeout = GC::create_function(m_heap, [timer = GC::make_root(timer), protocol_request, timeout_callback, timeout_ms = timeout.value()] {
                 (void)timer;
+                dbgln("ResourceLoader: request timed out after {} ms", timeout_ms);
                 protocol_request->stop();
                 if (timeout_callback)
                     timeout_callback->function()();

@@ -15,9 +15,10 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(CanvasPattern);
 
-CanvasPattern::CanvasPattern(JS::Realm& realm, Gfx::CanvasPatternPaintStyle& pattern)
+CanvasPattern::CanvasPattern(JS::Realm& realm, Gfx::CanvasPatternPaintStyle& pattern, bool origin_clean)
     : PlatformObject(realm)
     , m_pattern(pattern)
+    , m_origin_clean(origin_clean)
 {
 }
 
@@ -61,9 +62,7 @@ WebIDL::ExceptionOr<GC::Ptr<CanvasPattern>> CanvasPattern::create(JS::Realm& rea
     // 6. Let pattern be a new CanvasPattern object with the image image and the repetition behavior given by repetition.
     auto immutable_bitmap = canvas_image_source_bitmap(image);
     auto paint_style = TRY_OR_THROW_OOM(realm.vm(), Gfx::CanvasPatternPaintStyle::create(immutable_bitmap, *repetition_value));
-    auto pattern = realm.create<CanvasPattern>(realm, *paint_style);
-
-    // FIXME: 7. If image is not origin-clean, then mark pattern as not origin-clean.
+    auto pattern = realm.create<CanvasPattern>(realm, *paint_style, !image_is_not_origin_clean(image));
 
     // 8. Return pattern.
     return pattern;

@@ -15,6 +15,7 @@
 #include <LibWeb/HTML/AudioTrackList.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
+#include <LibWeb/HTML/VideoTrackList.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Platform/AudioCodecPlugin.h>
@@ -31,14 +32,25 @@ AudioTrack::AudioTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
     , m_audio_plugin(Platform::AudioCodecPlugin::create(move(loader)).release_value_but_fixme_should_propagate_errors())
 {
     m_audio_plugin->on_playback_position_updated = [this](auto position) {
+        if (!m_media_element->is_active_audio_track(*this))
+            return;
         if (auto* paintable = m_media_element->paintable())
             paintable->set_needs_display();
 
         auto playback_position = static_cast<double>(position.to_milliseconds()) / 1000.0;
+
+        // The video track's playback manager drives the playback position when
+        // one is selected. The audio position reported here is how far the
+        // decoder has read ahead, so letting both write makes the position jump.
+        if (m_media_element->video_tracks()->selected_index() != -1)
+            return;
+
         m_media_element->set_current_playback_position(playback_position);
     };
 
     m_audio_plugin->on_decoder_error = [this](String error_message) {
+        if (!m_media_element->is_active_audio_track(*this))
+            return;
         m_media_element->set_decoder_error(move(error_message));
     };
 

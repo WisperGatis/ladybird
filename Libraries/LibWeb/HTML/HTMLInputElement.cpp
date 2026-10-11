@@ -1103,7 +1103,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
             padding: 0;
             cursor: default;
         )~~~"_string));
-        MUST(up_button->set_inner_html("<svg style=\"width: 1em; height: 1em;\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path fill=\"currentColor\" d=\"M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z\" /></svg>"sv));
+        MUST(up_button->set_inner_html_without_trusted_types_check(Utf16String::from_utf8("<svg style=\"width: 1em; height: 1em;\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path fill=\"currentColor\" d=\"M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z\" /></svg>"sv)));
         MUST(element->append_child(up_button));
 
         auto mouseup_callback_function = JS::NativeFunction::create(
@@ -1135,7 +1135,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
             padding: 0;
             cursor: default;
         )~~~"_string));
-        MUST(down_button->set_inner_html("<svg style=\"width: 1em; height: 1em;\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path fill=\"currentColor\" d=\"M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z\" /></svg>"sv));
+        MUST(down_button->set_inner_html_without_trusted_types_check(Utf16String::from_utf8("<svg style=\"width: 1em; height: 1em;\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path fill=\"currentColor\" d=\"M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z\" /></svg>"sv)));
         MUST(element->append_child(down_button));
 
         auto down_callback_function = JS::NativeFunction::create(

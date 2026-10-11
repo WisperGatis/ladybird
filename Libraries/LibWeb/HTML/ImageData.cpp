@@ -21,7 +21,12 @@ GC_DEFINE_ALLOCATOR(ImageData);
 
 [[nodiscard]] static auto create_bitmap_backed_by_uint8_clamped_array(u32 const width, u32 const height, JS::Uint8ClampedArray& data)
 {
-    return Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Unpremultiplied, Gfx::IntSize(width, height), width * sizeof(u32), data.data().data());
+    // NOTE: `data.data()` is the currently-accessible byte span of the backing buffer (empty if
+    //       detached/out-of-bounds), so passing its real size protects both the ordinary
+    //       constructor path and, more importantly, deserialization: a corrupted or malicious
+    //       structured-clone stream cannot claim a width/height that doesn't match the data.
+    auto bytes = data.data();
+    return Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Unpremultiplied, Gfx::IntSize(width, height), width * sizeof(u32), bytes.data(), bytes.size());
 }
 
 GC::Ref<ImageData> ImageData::create(JS::Realm& realm)

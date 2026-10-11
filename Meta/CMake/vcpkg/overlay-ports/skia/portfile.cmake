@@ -309,6 +309,11 @@ if(VCPKG_TARGET_IS_UWP)
     string(APPEND OPTIONS " extra_ldflags=${SKIA_LD_FLAGS}")
 endif()
 
+if(DEFINED ENV{VCPKG_FORCE_SYSTEM_BINARIES})
+    find_program(GN_EXECUTABLE NAMES gn REQUIRED)
+    set(GN "${GN_EXECUTABLE}")
+endif()
+
 vcpkg_gn_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS "${OPTIONS}"

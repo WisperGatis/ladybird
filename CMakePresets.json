@@ -14,9 +14,12 @@
       "binaryDir": "${fileDir}/Build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXE_LINKER_FLAGS": "-B/run/current-system/sw/bin",
+        "CMAKE_SHARED_LINKER_FLAGS": "-B/run/current-system/sw/bin",
         "LADYBIRD_CACHE_DIR": "${fileDir}/Build/caches",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_INSTALL_OPTIONS": "--no-print-usage",
+        "VCPKG_BOOTSTRAP_OPTIONS": "-musl",
         "VCPKG_OVERLAY_TRIPLETS": "${fileDir}/Meta/CMake/vcpkg/release-triplets"
       },
       "environment": {

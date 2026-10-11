@@ -90,6 +90,8 @@ public:
     virtual void reset_to_default_state() override;
 
     virtual CanvasRenderingContext2DSettings get_context_attributes() const override { return m_context_attributes; }
+    [[nodiscard]] bool is_origin_clean() const { return m_origin_clean; }
+    void mark_not_origin_clean() { m_origin_clean = false; }
 
     virtual GC::Ref<TextMetrics> measure_text(Utf16String const&) override;
 
@@ -145,6 +147,7 @@ private:
     GC::Ref<OffscreenCanvas> m_canvas;
     Gfx::IntSize m_size;
     CanvasRenderingContext2DSettings m_context_attributes;
+    bool m_origin_clean { true };
 };
 
 }

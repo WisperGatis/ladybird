@@ -65,7 +65,10 @@ public:
                 return;
             },
             [&](auto fill_or_stroke_style) {
-                // FIXME: 2. If the given value is a CanvasPattern object that is marked as not origin-clean, then set this's origin-clean flag to false.
+                if constexpr (IsSame<decltype(fill_or_stroke_style), GC::Root<CanvasPattern>>) {
+                    if (!fill_or_stroke_style->is_origin_clean())
+                        reinterpret_cast<IncludingClass&>(*this).mark_not_origin_clean();
+                }
 
                 // 3. Set this's fill style to the given value.
                 my_drawing_state().fill_style = fill_or_stroke_style;
@@ -117,7 +120,10 @@ public:
                 return;
             },
             [&](auto fill_or_stroke_style) {
-                // FIXME: 2. If the given value is a CanvasPattern object that is marked as not origin-clean, then set this's origin-clean flag to false.
+                if constexpr (IsSame<decltype(fill_or_stroke_style), GC::Root<CanvasPattern>>) {
+                    if (!fill_or_stroke_style->is_origin_clean())
+                        reinterpret_cast<IncludingClass&>(*this).mark_not_origin_clean();
+                }
 
                 // 3. Set this's stroke style to the given value.
                 my_drawing_state().fill_style = fill_or_stroke_style;

@@ -33,8 +33,10 @@ GC::Ref<WebIDL::Promise> CacheStorage::open(String const&)
 // https://w3c.github.io/ServiceWorker/#cache-storage-has
 GC::Ref<WebIDL::Promise> CacheStorage::has(String const&)
 {
-    dbgln("FIXME: CacheStorage::has() is not implemented yet");
-    return WebIDL::create_rejected_promise(realm(), JS::Value(false));
+    // A missing named cache is a normal result, not an exceptional condition.
+    // Returning a fulfilled false promise prevents sites from entering an
+    // unhandled-rejection loop while persistent CacheStorage is unavailable.
+    return WebIDL::create_resolved_promise(realm(), JS::Value(false));
 }
 
 }

@@ -46,6 +46,7 @@
         "avformat",
         "dav1d",
         "openh264",
+        "openssl",
         "opus",
         "webp",
         "theora",

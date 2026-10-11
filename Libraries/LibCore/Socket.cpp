@@ -216,8 +216,15 @@ ErrorOr<NonnullOwnPtr<TCPSocket>> TCPSocket::connect(ByteString const& host, u16
     // It should return an error instead of an empty vector.
     VERIFY(!ip_addresses.is_empty());
 
-    // FIXME: Support trying to connect to multiple IP addresses (e.g. if one of them doesn't seem to be working, try another one)
-    return ip_addresses.first().visit([port](auto address) { return connect(SocketAddress { address, port }); });
+    Optional<Error> last_error;
+    for (auto const& ip_address : ip_addresses) {
+        auto result = ip_address.visit([port](auto address) { return connect(SocketAddress { address, port }); });
+        if (!result.is_error())
+            return result.release_value();
+        last_error = result.release_error();
+    }
+    VERIFY(last_error.has_value());
+    return last_error.release_value();
 }
 
 ErrorOr<NonnullOwnPtr<TCPSocket>> TCPSocket::connect(SocketAddress const& address)
@@ -267,8 +274,15 @@ ErrorOr<NonnullOwnPtr<UDPSocket>> UDPSocket::connect(ByteString const& host, u16
     // It should return an error instead of an empty vector.
     VERIFY(!ip_addresses.is_empty());
 
-    // FIXME: Support trying to connect to multiple IP addresses (e.g. if one of them doesn't seem to be working, try another one)
-    return ip_addresses.first().visit([port, timeout](auto address) { return connect(SocketAddress { address, port }, timeout); });
+    Optional<Error> last_error;
+    for (auto const& ip_address : ip_addresses) {
+        auto result = ip_address.visit([port, timeout](auto address) { return connect(SocketAddress { address, port }, timeout); });
+        if (!result.is_error())
+            return result.release_value();
+        last_error = result.release_error();
+    }
+    VERIFY(last_error.has_value());
+    return last_error.release_value();
 }
 
 ErrorOr<NonnullOwnPtr<UDPSocket>> UDPSocket::connect(SocketAddress const& address, Optional<AK::Duration> timeout)

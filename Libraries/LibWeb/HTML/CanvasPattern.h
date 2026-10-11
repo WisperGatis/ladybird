@@ -23,14 +23,16 @@ public:
 
     ~CanvasPattern();
 
+    [[nodiscard]] bool is_origin_clean() const { return m_origin_clean; }
     NonnullRefPtr<Gfx::PaintStyle> to_gfx_paint_style() { return m_pattern; }
 
 private:
-    CanvasPattern(JS::Realm&, Gfx::CanvasPatternPaintStyle&);
+    CanvasPattern(JS::Realm&, Gfx::CanvasPatternPaintStyle&, bool origin_clean);
 
     virtual void initialize(JS::Realm&) override;
 
     NonnullRefPtr<Gfx::CanvasPatternPaintStyle> m_pattern;
+    bool m_origin_clean { true };
 };
 
 }

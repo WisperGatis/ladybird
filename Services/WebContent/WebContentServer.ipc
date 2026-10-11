@@ -20,6 +20,7 @@ endpoint WebContentServer
 {
     init_transport(int peer_pid) => (int peer_pid)
     close_server() =|
+    close_page(u64 page_id) =|
 
     get_window_handle(u64 page_id) => (String handle)
     set_window_handle(u64 page_id, String handle) =|

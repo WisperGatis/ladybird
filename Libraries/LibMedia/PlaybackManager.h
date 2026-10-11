@@ -88,7 +88,9 @@ private:
     AK::Duration m_timestamp { no_timestamp };
 };
 
-static constexpr size_t frame_buffer_count = 4;
+// Keep decoded frames tightly bounded. Each queued frame owns a full decoded
+// bitmap, so a queue growth here is expensive for high-resolution video.
+static constexpr size_t frame_buffer_count = 2;
 using VideoFrameQueue = Core::SharedSingleProducerCircularQueue<FrameQueueItem, frame_buffer_count>;
 
 enum class PlaybackState {
@@ -142,6 +144,8 @@ public:
     Function<void(DecoderError)> on_decoder_error;
     Function<void(Error)> on_fatal_playback_error;
 
+    bool playback_failed() const { return m_playback_failed; }
+
     Track const& selected_video_track() const { return m_selected_video_track; }
 
 private:
@@ -185,9 +189,13 @@ private:
     RefPtr<Threading::Thread> m_decode_thread;
     NonnullOwnPtr<VideoDecoder> m_decoder;
     Atomic<bool> m_stop_decoding { false };
+    // Incremented, with m_decoder_mutex held, whenever the demuxer is repositioned by a seek.
+    Atomic<u64> m_seek_generation { 0 };
+    Atomic<bool> m_playback_failed { false };
     Threading::Mutex m_decode_wait_mutex;
     Threading::ConditionVariable m_decode_wait_condition;
     Atomic<bool> m_buffer_is_full { false };
+    size_t m_recovery_attempts { 0 };
 
     OwnPtr<PlaybackStateHandler> m_playback_handler;
     Optional<FrameQueueItem> m_next_frame;

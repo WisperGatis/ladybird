@@ -60,14 +60,18 @@ NonnullRefPtr<Core::Promise<DecodedImage>> Client::decode_image(ReadonlyBytes en
 void Client::did_decode_image(i64 image_id, bool is_animated, u32 loop_count, Gfx::BitmapSequence bitmap_sequence, Vector<u32> durations, Gfx::FloatPoint scale, Gfx::ColorSpace color_space)
 {
     auto bitmaps = move(bitmap_sequence.bitmaps);
-    VERIFY(!bitmaps.is_empty());
-
     auto maybe_promise = m_pending_decoded_images.take(image_id);
     if (!maybe_promise.has_value()) {
         dbgln("ImageDecoderClient: No pending image with ID {}", image_id);
         return;
     }
     auto promise = maybe_promise.release_value();
+
+    if (bitmaps.is_empty()) {
+        dbgln("ImageDecoderClient: Empty bitmap sequence for request {}", image_id);
+        promise->reject(Error::from_string_literal("Image decoder returned no frames"));
+        return;
+    }
 
     DecodedImage image;
     image.is_animated = is_animated;

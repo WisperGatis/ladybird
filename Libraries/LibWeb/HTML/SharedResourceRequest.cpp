@@ -22,21 +22,28 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(SharedResourceRequest);
 
-GC::Ref<SharedResourceRequest> SharedResourceRequest::get_or_create(JS::Realm& realm, GC::Ref<Page> page, URL::URL const& url)
+GC::Ref<SharedResourceRequest> SharedResourceRequest::get_or_create(JS::Realm& realm, GC::Ref<Page> page, URL::URL const& url, CORSSettingAttribute cors_setting, Optional<URL::Origin> origin)
 {
     auto document = Bindings::principal_host_defined_environment_settings_object(realm).responsible_document();
     VERIFY(document);
     auto& shared_resource_requests = document->shared_resource_requests();
-    if (auto it = shared_resource_requests.find(url); it != shared_resource_requests.end())
+    ListOfAvailableImages::Key key;
+    key.url = url.to_string();
+    key.mode = cors_setting;
+    if (cors_setting != CORSSettingAttribute::NoCORS)
+        key.origin = origin.value_or(document->origin());
+
+    if (auto it = shared_resource_requests.find(key); it != shared_resource_requests.end())
         return *it->value;
-    auto request = realm.create<SharedResourceRequest>(page, url, *document);
-    shared_resource_requests.set(url, request);
+    auto request = realm.create<SharedResourceRequest>(page, url, move(key), *document);
+    shared_resource_requests.set(request->m_key, request);
     return request;
 }
 
-SharedResourceRequest::SharedResourceRequest(GC::Ref<Page> page, URL::URL url, GC::Ref<DOM::Document> document)
+SharedResourceRequest::SharedResourceRequest(GC::Ref<Page> page, URL::URL url, ListOfAvailableImages::Key key, GC::Ref<DOM::Document> document)
     : m_page(page)
     , m_url(move(url))
+    , m_key(move(key))
     , m_document(document)
 {
 }
@@ -47,7 +54,7 @@ void SharedResourceRequest::finalize()
 {
     Base::finalize();
     auto& shared_resource_requests = m_document->shared_resource_requests();
-    shared_resource_requests.remove(m_url);
+    shared_resource_requests.remove(m_key);
 }
 
 void SharedResourceRequest::visit_edges(JS::Cell::Visitor& visitor)
@@ -84,6 +91,7 @@ void SharedResourceRequest::fetch_resource(JS::Realm& realm, GC::Ref<Fetch::Infr
     fetch_algorithms_input.process_response = [this, &realm, request](GC::Ref<Fetch::Infrastructure::Response> response) {
         // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
         //        https://github.com/whatwg/html/issues/9355
+        m_is_cors_cross_origin = response->is_cors_cross_origin();
         response = response->unsafe_response();
 
         auto process_body = GC::create_function(heap(), [this, request, response](ByteBuffer data) {
@@ -143,6 +151,24 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
     // AD-HOC: At this point, things gets very ad-hoc.
     // FIXME: Bring this closer to spec.
 
+    // Tracking pixels commonly use this canonical 1x1 transparent GIF. It is
+    // intentionally not sent through the out-of-process decoder: some GIF
+    // decoder/IPC combinations cannot round-trip this tiny bitmap and return a
+    // null frame, creating a burst of needless failures on ad-heavy pages.
+    if (url_string.to_string().starts_with_bytes("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///"sv)) {
+        auto bitmap = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, { 1, 1 });
+        if (bitmap.is_error()) {
+            handle_failed_fetch();
+            return;
+        }
+        bitmap.value()->set_pixel(0, 0, Gfx::Color::Transparent);
+        Vector<AnimatedBitmapDecodedImageData::Frame> frames;
+        frames.append({ .bitmap = Gfx::ImmutableBitmap::create(bitmap.release_value(), Gfx::AlphaType::Premultiplied, {}), .duration = 0 });
+        m_image_data = AnimatedBitmapDecodedImageData::create(m_document->realm(), move(frames), 0, false).release_value_but_fixme_should_propagate_errors();
+        handle_successful_resource_load();
+        return;
+    }
+
     bool const is_svg_image = mime_type == "image/svg+xml"sv || url_string.basename().ends_with(".svg"sv);
 
     if (is_svg_image) {
@@ -157,8 +183,13 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
     }
 
     auto handle_successful_bitmap_decode = [strong_this = GC::Root(*this)](Web::Platform::DecodedImage& result) -> ErrorOr<void> {
+        if (result.frames.is_empty())
+            return Error::from_string_literal("Image decoder returned no frames");
+
         Vector<AnimatedBitmapDecodedImageData::Frame> frames;
         for (auto& frame : result.frames) {
+            if (!frame.bitmap)
+                return Error::from_string_literal("Image decoder returned an invalid frame");
             frames.append(AnimatedBitmapDecodedImageData::Frame {
                 .bitmap = Gfx::ImmutableBitmap::create(*frame.bitmap, Gfx::AlphaType::Premultiplied, result.color_space),
                 .duration = static_cast<int>(frame.duration),
@@ -170,6 +201,7 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
     };
 
     auto handle_failed_decode = [strong_this = GC::Root(*this)](Error&) -> void {
+        dbgln("SharedResourceRequest: image decode failed for {}", strong_this->m_url);
         strong_this->handle_failed_fetch();
     };
 
@@ -178,6 +210,10 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
 
 void SharedResourceRequest::handle_failed_fetch()
 {
+    if (m_state == State::Failed)
+        return;
+
+    dbgln("SharedResourceRequest: failed image resource {}", m_url);
     m_state = State::Failed;
     for (auto& callback : m_callbacks) {
         if (callback.on_fail)
@@ -188,6 +224,9 @@ void SharedResourceRequest::handle_failed_fetch()
 
 void SharedResourceRequest::handle_successful_resource_load()
 {
+    if (m_state == State::Finished)
+        return;
+
     m_state = State::Finished;
     for (auto& callback : m_callbacks) {
         if (callback.on_finish)

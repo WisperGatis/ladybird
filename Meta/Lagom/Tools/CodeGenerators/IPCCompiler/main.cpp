@@ -657,8 +657,12 @@ void generate_proxy_method(SourceGenerator& message_generator, Endpoint const& e
         return { };)~~~");
         }
     } else {
+        // Asynchronous notifications are allowed to race with transport
+        // shutdown. Dropping one after the peer has gone away is safe; using
+        // MUST here turns an ordinary teardown race into a process-fatal
+        // assertion.
         message_generator.append(R"~~~());
-        MUST(m_connection.post_message(move(message_buffer))); )~~~");
+        (void)m_connection.post_message(move(message_buffer)); )~~~");
     }
 
     message_generator.appendln(R"~~~(

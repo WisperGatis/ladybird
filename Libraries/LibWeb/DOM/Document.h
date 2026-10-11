@@ -34,7 +34,9 @@
 #include <LibWeb/HTML/DocumentReadyState.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
+#include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWeb/HTML/History.h>
+#include <LibWeb/HTML/ListOfAvailableImages.h>
 #include <LibWeb/HTML/NavigationType.h>
 #include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
@@ -499,6 +501,8 @@ public:
     String charset() const { return encoding_or_default(); }
     String input_encoding() const { return encoding_or_default(); }
 
+    void set_the_end_wait_timer(GC::Ptr<Platform::Timer> timer) { m_the_end_wait_timer = timer; }
+
     bool ready_for_post_load_tasks() const { return m_ready_for_post_load_tasks; }
     void set_ready_for_post_load_tasks(bool ready) { m_ready_for_post_load_tasks = ready; }
 
@@ -554,6 +558,7 @@ public:
 
     GC::Ref<CSS::VisualViewport> visual_viewport();
     [[nodiscard]] CSSPixelRect viewport_rect() const;
+    [[nodiscard]] bool has_transient_activation() const;
 
     class ViewportClient {
     public:
@@ -714,7 +719,9 @@ public:
 
     void run_the_update_intersection_observations_steps(HighResolutionTime::DOMHighResTimeStamp time);
 
+    GC::Ref<IntersectionObserver::IntersectionObserver> create_lazy_load_intersection_observer(String root_margin);
     void start_intersection_observing_a_lazy_loading_element(Element&);
+    void start_intersection_observing_a_media_preview(Element&);
     void stop_intersection_observing_a_lazy_loading_element(Element&);
 
     void shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
@@ -729,7 +736,8 @@ public:
 
     void update_for_history_step_application(GC::Ref<HTML::SessionHistoryEntry>, bool do_not_reactivate, size_t script_history_length, size_t script_history_index, Optional<Bindings::NavigationType> navigation_type, Optional<Vector<GC::Ref<HTML::SessionHistoryEntry>>> entries_for_navigation_api = {}, GC::Ptr<HTML::SessionHistoryEntry> previous_entry_for_activation = {}, bool update_navigation_api = true);
 
-    HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
+    HashMap<HTML::ListOfAvailableImages::Key, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
+    HashMap<HTML::ListOfAvailableImages::Key, GC::Ptr<HTML::SharedMediaResourceRequest>>& shared_media_resource_requests();
 
     void restore_the_history_object_state(GC::Ref<HTML::SessionHistoryEntry> entry);
 
@@ -828,7 +836,7 @@ public:
     Vector<GC::Root<Range>> find_matching_text(String const&, CaseSensitivity);
 
     void parse_html_from_a_string(StringView);
-    static GC::Ref<Document> parse_html_unsafe(JS::VM&, StringView);
+    static WebIDL::ExceptionOr<GC::Ref<Document>> parse_html_unsafe(JS::VM&, TrustedTypes::TrustedHTMLOrString const&);
 
     void set_console_client(GC::Ptr<JS::ConsoleClient> console_client) { m_console_client = console_client; }
     GC::Ptr<JS::ConsoleClient> console_client() const { return m_console_client; }
@@ -1073,6 +1081,7 @@ private:
     Optional<String> m_encoding;
 
     bool m_ready_for_post_load_tasks { false };
+    GC::Ptr<Platform::Timer> m_the_end_wait_timer;
 
     GC::Ptr<DOMImplementation> m_implementation;
     GC::Ptr<HTML::HTMLScriptElement> m_current_script;
@@ -1204,6 +1213,7 @@ private:
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-load-intersection-observer
     // Each Document has a lazy load intersection observer, initially set to null but can be set to an IntersectionObserver instance.
     GC::Ptr<IntersectionObserver::IntersectionObserver> m_lazy_load_intersection_observer;
+    GC::Ptr<IntersectionObserver::IntersectionObserver> m_media_preview_intersection_observer;
 
     ResizeObserver::ResizeObserver::ResizeObserversList m_resize_observers;
 
@@ -1218,7 +1228,8 @@ private:
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#latest-entry
     GC::Ptr<HTML::SessionHistoryEntry> m_latest_entry;
 
-    HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> m_shared_resource_requests;
+    HashMap<HTML::ListOfAvailableImages::Key, GC::Ptr<HTML::SharedResourceRequest>> m_shared_resource_requests;
+    HashMap<HTML::ListOfAvailableImages::Key, GC::Ptr<HTML::SharedMediaResourceRequest>> m_shared_media_resource_requests;
 
     // https://www.w3.org/TR/web-animations-1/#timeline-associated-with-a-document
     HashTable<GC::Ref<Animations::AnimationTimeline>> m_associated_animation_timelines;

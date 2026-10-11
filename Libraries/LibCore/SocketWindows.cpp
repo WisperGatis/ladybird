@@ -92,10 +92,11 @@ ErrorOr<bool> PosixSocketHelper::can_read_without_blocking(int timeout) const
     return result;
 }
 
-ErrorOr<void> PosixSocketHelper::set_blocking(bool)
+ErrorOr<void> PosixSocketHelper::set_blocking(bool enabled)
 {
-    // FIXME: Implement Core::PosixSocketHelper::set_blocking
-    // Currently does nothing, sockets are always blocking.
+    u_long non_blocking = enabled ? 0 : 1;
+    if (ioctlsocket(static_cast<SOCKET>(m_fd), FIONBIO, &non_blocking) == SOCKET_ERROR)
+        return Error::from_windows_error(WSAGetLastError());
     return {};
 }
 
@@ -332,8 +333,15 @@ ErrorOr<NonnullOwnPtr<TCPSocket>> TCPSocket::connect(ByteString const& host, u16
     // It should return an error instead of an empty vector.
     VERIFY(!ip_addresses.is_empty());
 
-    // FIXME: Support trying to connect to multiple IP addresses (e.g. if one of them doesn't seem to be working, try another one)
-    return ip_addresses.first().visit([port](auto address) { return connect(SocketAddress { address, port }); });
+    Optional<Error> last_error;
+    for (auto const& ip_address : ip_addresses) {
+        auto result = ip_address.visit([port](auto address) { return connect(SocketAddress { address, port }); });
+        if (!result.is_error())
+            return result.release_value();
+        last_error = result.release_error();
+    }
+    VERIFY(last_error.has_value());
+    return last_error.release_value();
 }
 
 ErrorOr<NonnullOwnPtr<TCPSocket>> TCPSocket::connect(SocketAddress const& address)

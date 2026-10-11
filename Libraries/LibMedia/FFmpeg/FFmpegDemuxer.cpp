@@ -6,6 +6,7 @@
 
 #include <AK/Math.h>
 #include <AK/MemoryStream.h>
+#include <AK/NumericLimits.h>
 #include <AK/Stream.h>
 #include <AK/Time.h>
 #include <LibMedia/FFmpeg/FFmpegDemuxer.h>
@@ -181,15 +182,19 @@ DecoderErrorOr<Optional<AK::Duration>> FFmpegDemuxer::seek_to_most_recent_keyfra
     // FIXME: What do we do with this here?
     (void)earliest_available_sample;
 
-    VERIFY(track.identifier() < m_format_context->nb_streams);
-    auto* stream = m_format_context->streams[track.identifier()];
-
-    // For HLS streams, seeking is handled by FFmpeg's internal HLS demuxer when we call av_read_frame.
-    // We can just flush the context and FFmpeg will do the right thing.
+    // FFmpeg's HLS demuxer owns the playlist/variant and segment timeline, so
+    // seek the format context as a whole (stream index -1, AV_TIME_BASE units)
+    // rather than a single stream. The media timeline we expose starts at
+    // zero, so the container's start time has to be added back.
     if (is_hls_stream()) {
-        avformat_flush(m_format_context);
+        auto target = container_start_time() + av_rescale(timestamp.to_milliseconds(), AV_TIME_BASE, 1000);
+        if (avformat_seek_file(m_format_context, -1, NumericLimits<i64>::min(), target, target, 0) < 0)
+            return DecoderError::format(DecoderErrorCategory::Unknown, "Failed to seek HLS stream to {}ms", timestamp.to_milliseconds());
         return timestamp;
     }
+
+    VERIFY(track.identifier() < m_format_context->nb_streams);
+    auto* stream = m_format_context->streams[track.identifier()];
 
     // Check if the stream is seekable
     if (!is_seekable()) {
@@ -246,6 +251,13 @@ bool FFmpegDemuxer::is_hls_stream() const
            strcmp(m_format_context->iformat->name, "hls,applehttp") == 0;
 }
 
+i64 FFmpegDemuxer::container_start_time() const
+{
+    if (!m_format_context || m_format_context->start_time == AV_NOPTS_VALUE)
+        return 0;
+    return m_format_context->start_time;
+}
+
 bool FFmpegDemuxer::is_seekable() const
 {
     if (!m_format_context)
@@ -267,6 +279,28 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track track)
     VERIFY(track.identifier() < m_format_context->nb_streams);
     auto* stream = m_format_context->streams[track.identifier()];
 
+    // Only the selected stream is ever read from this context. Discarding the
+    // others stops FFmpeg's HLS demuxer from downloading every variant.
+    if (m_active_stream_index != stream->index) {
+        for (unsigned i = 0; i < m_format_context->nb_streams; ++i)
+            m_format_context->streams[i]->discard = static_cast<int>(i) == stream->index ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        m_active_stream_index = stream->index;
+    }
+
+    if (!m_logged_stream_info) {
+        auto extradata = ReadonlyBytes { stream->codecpar->extradata, static_cast<size_t>(max(stream->codecpar->extradata_size, 0)) };
+        dbgln("FFmpegDemuxer: stream={} codec={} format={} extradata={} bytes (prefix {:02x} {:02x} {:02x} {:02x})",
+            stream->index,
+            avcodec_get_name(stream->codecpar->codec_id),
+            stream->codecpar->format,
+            extradata.size(),
+            extradata.size() > 0 ? extradata[0] : 0,
+            extradata.size() > 1 ? extradata[1] : 0,
+            extradata.size() > 2 ? extradata[2] : 0,
+            extradata.size() > 3 ? extradata[3] : 0);
+        m_logged_stream_info = true;
+    }
+
     for (;;) {
         auto read_frame_error = av_read_frame(m_format_context, m_packet);
         if (read_frame_error < 0) {
@@ -279,6 +313,26 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track track)
             av_packet_unref(m_packet);
             continue;
         }
+
+        if (m_packet->data == nullptr || m_packet->size <= 0) {
+            av_packet_unref(m_packet);
+            return DecoderError::corrupted("Received an empty coded media packet"sv);
+        }
+
+        if (m_logged_packet_count < 4) {
+            dbgln("FFmpegDemuxer: packet stream={} size={} pts={} prefix {:02x} {:02x} {:02x} {:02x}",
+                m_packet->stream_index,
+                m_packet->size,
+                m_packet->pts,
+                m_packet->size > 0 ? m_packet->data[0] : 0,
+                m_packet->size > 1 ? m_packet->data[1] : 0,
+                m_packet->size > 2 ? m_packet->data[2] : 0,
+                m_packet->size > 3 ? m_packet->data[3] : 0);
+            ++m_logged_packet_count;
+        }
+
+        // HLS (MPEG-TS) timestamps do not start at zero; present a zero-based media timeline.
+        auto start_pts = is_hls_stream() ? av_rescale_q(container_start_time(), AVRational { 1, AV_TIME_BASE }, stream->time_base) : 0;
 
         auto color_primaries = static_cast<ColorPrimaries>(stream->codecpar->color_primaries);
         auto transfer_characteristics = static_cast<TransferCharacteristics>(stream->codecpar->color_trc);
@@ -299,7 +353,7 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track track)
         auto packet_data = DECODER_TRY_ALLOC(ByteBuffer::copy(m_packet->data, m_packet->size));
 
         auto sample = CodedFrame(
-            time_units_to_duration(m_packet->pts, stream->time_base),
+            time_units_to_duration(m_packet->pts - start_pts, stream->time_base),
             move(packet_data),
             CodedVideoFrameData(CodingIndependentCodePoints(color_primaries, transfer_characteristics, matrix_coefficients, color_range)));
 

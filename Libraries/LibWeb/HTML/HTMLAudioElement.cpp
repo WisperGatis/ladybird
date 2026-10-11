@@ -73,6 +73,9 @@ void HTMLAudioElement::on_paused()
 
 void HTMLAudioElement::on_seek(double position, MediaSeekMode seek_mode)
 {
+    if (error())
+        return;
+
     audio_tracks()->for_each_enabled_track([&](auto& audio_track) {
         audio_track.seek(position, seek_mode);
     });

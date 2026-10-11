@@ -28,6 +28,7 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/Platform/Timer.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLHeadElement.h>
@@ -36,6 +37,7 @@
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLTableElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
+#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/HTMLToken.h>
@@ -272,6 +274,62 @@ void HTMLParser::run(URL::URL const& url, HTMLTokenizer::StopAtInsertionPoint st
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#the-end
+// Steps 9-11
+void HTMLParser::finish_the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> parser)
+{
+    // 9. Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following steps:
+    queue_global_task(HTML::Task::Source::DOMManipulation, *document, GC::create_function(document->heap(), [document, parser] {
+        // 1. Update the current document readiness to "complete".
+        document->update_readiness(HTML::DocumentReadyState::Complete);
+
+        // AD-HOC: We need to wait until the document ready state is complete before detaching the parser, otherwise the DOM complete time will not be set correctly.
+        if (parser)
+            document->detach_parser({});
+
+        // 2. If the Document object's browsing context is null, then abort these steps.
+        if (!document->browsing_context())
+            return;
+
+        // 3. Let window be the Document's relevant global object.
+        auto& window = as<Window>(relevant_global_object(*document));
+
+        // 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
+        document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(window);
+
+        // 5. Fire an event named load at window, with legacy target override flag set.
+        // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
+        //        We should reorganize this so that the flag appears explicitly here instead.
+        window.dispatch_event(DOM::Event::create(document->realm(), HTML::EventNames::load));
+
+        // FIXME: 6. Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
+
+        // FIXME: 7. Set the Document object's navigation id to null.
+
+        // 8. Set the Document's load timing info's load event end time to the current high resolution time given window.
+        document->load_timing_info().load_event_end_time = HighResolutionTime::current_high_resolution_time(window);
+
+        // 9. Assert: Document's page showing is false.
+        VERIFY(!document->page_showing());
+
+        // 10. Set the Document's page showing to true.
+        document->set_page_showing(true);
+
+        // 11. Fire a page transition event named pageshow at window with false.
+        window.fire_a_page_transition_event(HTML::EventNames::pageshow, false);
+
+        // 12. Completely finish loading the Document.
+        document->completely_finish_loading();
+
+        // FIXME: 13. Queue the navigation timing entry for the Document.
+    }));
+
+    // FIXME: 10. If the Document's print when loaded flag is set, then run the printing steps.
+
+    // 11. The Document is now ready for post-load tasks.
+    document->set_ready_for_post_load_tasks(true);
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#the-end
 void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> parser)
 {
     auto& heap = document->heap();
@@ -375,65 +433,35 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     }));
 
     // 7. Spin the event loop until the set of scripts that will execute as soon as possible and the list of scripts that will execute in order as soon as possible are empty.
-    main_thread_event_loop().spin_until(GC::create_function(heap, [document] {
-        return document->scripts_to_execute_as_soon_as_possible().is_empty();
-    }));
-
     // 8. Spin the event loop until there is nothing that delays the load event in the Document.
-    main_thread_event_loop().spin_until(GC::create_function(heap, [document] {
-        return !document->anything_is_delaying_the_load_event();
-    }));
+    // AD-HOC: Spinning here nests event loops, and nested spins can only unwind in LIFO order. A page that is still
+    //         waiting for its load event would then block every navigation started meanwhile (and the activation of
+    //         the navigated-to document) until it finished loading, which may be never. Wait asynchronously instead.
+    auto can_finish = [document] {
+        return document->scripts_to_execute_as_soon_as_possible().is_empty()
+            && !document->anything_is_delaying_the_load_event();
+    };
+    if (!can_finish()) {
+        auto timer = Platform::Timer::create_repeating(heap, 10, nullptr);
+        timer->on_timeout = GC::create_function(heap, [document, parser, can_finish, timer] {
+            if (document->has_been_destroyed()) {
+                timer->stop();
+                document->set_the_end_wait_timer({});
+                return;
+            }
+            if (!can_finish())
+                return;
+            timer->stop();
+            document->set_the_end_wait_timer({});
+            HTMLParser::finish_the_end(document, parser);
+        });
+        document->set_the_end_wait_timer(timer);
+        timer->start();
+        return;
+    }
 
-    // 9. Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following steps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, *document, GC::create_function(document->heap(), [document, parser] {
-        // 1. Update the current document readiness to "complete".
-        document->update_readiness(HTML::DocumentReadyState::Complete);
-
-        // AD-HOC: We need to wait until the document ready state is complete before detaching the parser, otherwise the DOM complete time will not be set correctly.
-        if (parser)
-            document->detach_parser({});
-
-        // 2. If the Document object's browsing context is null, then abort these steps.
-        if (!document->browsing_context())
-            return;
-
-        // 3. Let window be the Document's relevant global object.
-        auto& window = as<Window>(relevant_global_object(*document));
-
-        // 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
-        document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(window);
-
-        // 5. Fire an event named load at window, with legacy target override flag set.
-        // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
-        //        We should reorganize this so that the flag appears explicitly here instead.
-        window.dispatch_event(DOM::Event::create(document->realm(), HTML::EventNames::load));
-
-        // FIXME: 6. Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
-
-        // FIXME: 7. Set the Document object's navigation id to null.
-
-        // 8. Set the Document's load timing info's load event end time to the current high resolution time given window.
-        document->load_timing_info().load_event_end_time = HighResolutionTime::current_high_resolution_time(window);
-
-        // 9. Assert: Document's page showing is false.
-        VERIFY(!document->page_showing());
-
-        // 10. Set the Document's page showing to true.
-        document->set_page_showing(true);
-
-        // 11. Fire a page transition event named pageshow at window with false.
-        window.fire_a_page_transition_event(HTML::EventNames::pageshow, false);
-
-        // 12. Completely finish loading the Document.
-        document->completely_finish_loading();
-
-        // FIXME: 13. Queue the navigation timing entry for the Document.
-    }));
-
-    // FIXME: 10. If the Document's print when loaded flag is set, then run the printing steps.
-
-    // 11. The Document is now ready for post-load tasks.
-    document->set_ready_for_post_load_tasks(true);
+    //  NOTE: Steps 9-11 live in finish_the_end(), so that steps 7-8 don't have to block in a nested event loop.
+    HTMLParser::finish_the_end(document, parser);
 }
 
 void HTMLParser::process_using_the_rules_for(InsertionMode mode, HTMLToken& token)

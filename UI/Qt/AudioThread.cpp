@@ -108,16 +108,22 @@ void AudioThread::run()
                 return;
 
             case AudioTask::Type::Play:
+                if (m_failed)
+                    break;
                 audio_output->resume();
                 paused = Paused::No;
                 break;
 
             case AudioTask::Type::Pause:
+                if (m_failed)
+                    break;
                 audio_output->suspend();
                 paused = Paused::Yes;
                 break;
 
             case AudioTask::Type::Seek:
+                if (m_failed)
+                    break;
                 VERIFY(task.data.has_value());
                 m_position = Web::Platform::AudioCodecPlugin::set_loader_position(m_loader, *task.data, m_duration);
 
@@ -139,7 +145,11 @@ void AudioThread::run()
 
         if (paused == Paused::No) {
             if (auto result = play_next_samples(*audio_output, *io_device); result.is_error()) {
-                // FIXME: Propagate the error to the HTMLMediaElement.
+                dbgln("Audio playback stopped: {}", result.error());
+                audio_output->suspend();
+                paused = Paused::Yes;
+                m_failed = true;
+                Q_EMIT decoder_error();
             } else {
                 Q_EMIT playback_position_updated(m_position);
                 paused = result.value();

@@ -5,6 +5,8 @@
  */
 
 #include <AK/Time.h>
+#include <AK/Math.h>
+#include <math.h>
 #include <LibMedia/Audio/Loader.h>
 #include <LibMedia/Audio/Sample.h>
 #include <LibWeb/Platform/AudioCodecPlugin.h>
@@ -41,13 +43,27 @@ ErrorOr<FixedArray<Audio::Sample>> AudioCodecPlugin::read_samples_from_loader(Au
 
 AK::Duration AudioCodecPlugin::set_loader_position(Audio::Loader& loader, double position, AK::Duration duration)
 {
-    if (loader.total_samples() == 0)
+    // A stream can expose metadata before its duration is known (notably live
+    // HLS). Never divide by a zero/unknown duration or feed an invalid sample
+    // index into the decoder.
+    if (loader.total_samples() == 0 || duration.to_nanoseconds() <= 0 || !std::isfinite(position))
         return current_loader_position(loader);
 
     auto duration_value = static_cast<double>(duration.to_milliseconds()) / 1000.0;
-    position = position / duration_value * static_cast<double>(loader.total_samples() - 1);
+    if (duration_value <= 0.0 || !std::isfinite(duration_value))
+        return current_loader_position(loader);
 
-    loader.seek(static_cast<int>(position)).release_value_but_fixme_should_propagate_errors();
+    position = position / duration_value * static_cast<double>(loader.total_samples() - 1);
+    position = clamp(position, 0.0, static_cast<double>(loader.total_samples() - 1));
+
+    if (auto result = loader.seek(static_cast<int>(position)); result.is_error()) {
+        // Some streams (notably live or partially buffered HLS streams) can
+        // reject a seek. A failed media seek must not terminate the audio
+        // thread through release_value_but_fixme_should_propagate_errors().
+        dbgln("Error while seeking audio: {}", result.error());
+        return current_loader_position(loader);
+    }
+
     return current_loader_position(loader);
 }
 

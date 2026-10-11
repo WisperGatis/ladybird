@@ -1,0 +1,6 @@
+width: 3
+height: 2
+colorSpace: srgb
+data length: 24
+data equal: true
+is a distinct object: true

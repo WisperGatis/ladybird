@@ -20,6 +20,15 @@ struct ForeignRef;
 template<typename T>
 struct ForeignPtr;
 
+template<typename T>
+inline u8 foreign_cell_type_token;
+
+template<typename T>
+inline void const* foreign_cell_type_token_for()
+{
+    return &foreign_cell_type_token<T>;
+}
+
 #define FOREIGN_CELL(class_, base_class) \
     using Base = base_class;             \
     friend class GC::Heap;
@@ -56,9 +65,18 @@ public:
     ~ForeignCell();
 
 private:
+    template<typename>
+    friend struct ForeignRef;
+    template<typename>
+    friend struct ForeignPtr;
+
     ForeignCell(Vtable vtable);
 
+    void set_type_token(void const* token) { m_type_token = token; }
+    bool has_type_token(void const* token) const { return m_type_token == token; }
+
     Vtable m_vtable;
+    void const* m_type_token { nullptr };
 } SWIFT_IMMORTAL_REFERENCE;
 
 template<typename T>
@@ -71,11 +89,15 @@ struct ForeignRef {
         DeferGC const defer_gc(heap);
         auto* cell = T::create(&heap, forward<Args>(args)...);
         if constexpr (IsSame<decltype(cell), Cell*>) {
-            return ForeignRef(*as<ForeignCell>(cell));
+            auto& foreign_cell = *as<ForeignCell>(cell);
+            foreign_cell.set_type_token(foreign_cell_type_token_for<T>());
+            return ForeignRef(foreign_cell);
         } else {
             static_assert(IsSame<decltype(cell), void*>);
             auto* cast_cell = static_cast<Cell*>(cell);
-            return ForeignRef(*as<ForeignCell>(cast_cell));
+            auto& foreign_cell = *as<ForeignCell>(cast_cell);
+            foreign_cell.set_type_token(foreign_cell_type_token_for<T>());
+            return ForeignRef(foreign_cell);
         }
     }
 
@@ -85,7 +107,7 @@ struct ForeignRef {
     ForeignRef(ForeignCell& cell)
         : m_cell(cell)
     {
-        // FIXME: This is super dangerous. How can we assert that the cell is actually a T?
+        VERIFY(m_cell->has_type_token(foreign_cell_type_token_for<T>()));
         m_data = static_cast<T*>(m_cell->foreign_data());
     }
 
@@ -121,7 +143,7 @@ struct ForeignPtr {
     ForeignPtr(ForeignCell& cell)
         : m_cell(&cell)
     {
-        // FIXME: This is super dangerous. How can we assert that the cell is actually a T?
+        VERIFY(m_cell->has_type_token(foreign_cell_type_token_for<T>()));
         m_data = static_cast<T*>(m_cell->foreign_data());
     }
 
@@ -129,7 +151,8 @@ struct ForeignPtr {
     ForeignPtr(ForeignCell* cell)
         : m_cell(cell)
     {
-        // FIXME: This is super dangerous. How can we assert that the cell is actually a T?
+        if (m_cell)
+            VERIFY(m_cell->has_type_token(foreign_cell_type_token_for<T>()));
         m_data = m_cell ? static_cast<T*>(m_cell->foreign_data()) : nullptr;
     }
 

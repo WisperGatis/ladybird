@@ -1749,14 +1749,14 @@ Web::WebDriver::Response WebDriverConnection::element_clear_impl(StringView elem
     // https://w3c.github.io/webdriver/#dfn-clear-a-content-editable-element
     auto clear_content_editable_element = [&](Web::DOM::Element& element) {
         // 1. If element's innerHTML IDL attribute is an empty string do nothing and return.
-        if (auto result = element.inner_html(); result.is_error() || result.value().is_empty())
+        if (auto result = element.inner_html(); result.is_error() || (result.value().has<Utf16String>() && result.value().get<Utf16String>().is_empty()))
             return;
 
         // 2. Run the focusing steps for element.
         Web::HTML::run_focusing_steps(&element);
 
         // 3. Set element's innerHTML IDL attribute to an empty string.
-        (void)element.set_inner_html({});
+        (void)element.set_inner_html_without_trusted_types_check({});
 
         // 4. Run the unfocusing steps for the element.
         Web::HTML::run_unfocusing_steps(&element);

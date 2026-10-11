@@ -645,6 +645,11 @@ void ConnectionFromClient::issue_network_request(i32 request_id, ByteString meth
             set_option(CURLOPT_CONNECTTIMEOUT, s_connect_timeout_seconds);
             set_option(CURLOPT_PIPEWAIT, 1L);
             set_option(CURLOPT_ALTSVC, m_alt_svc_cache_path.characters());
+            // Some CDN media endpoints advertise HTTP/3 through Alt-Svc but
+            // terminate large concurrent transfers with CURLE_HTTP3 or a
+            // partial-file error. Keep the RequestServer on HTTP/2 (with
+            // normal TLS fallback) until HTTP/3 recovery is implemented.
+            set_option(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
 
             set_option(CURLOPT_CUSTOMREQUEST, method.characters());
             set_option(CURLOPT_FOLLOWLOCATION, 0);
@@ -742,6 +747,12 @@ static Requests::NetworkError map_curl_code_to_network_error(CURLcode const& cod
         return Requests::NetworkError::MalformedUrl;
     case CURLE_BAD_CONTENT_ENCODING:
         return Requests::NetworkError::InvalidContentEncoding;
+    case CURLE_PARTIAL_FILE:
+        return Requests::NetworkError::PartialFile;
+#ifdef CURLE_HTTP3
+    case CURLE_HTTP3:
+        return Requests::NetworkError::HTTP3Error;
+#endif
     default:
         return Requests::NetworkError::Unknown;
     }

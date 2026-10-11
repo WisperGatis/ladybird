@@ -86,6 +86,8 @@ public:
     virtual void reset_to_default_state() override;
 
     GC::Ref<HTMLCanvasElement> canvas_for_binding() const;
+    [[nodiscard]] bool is_origin_clean() const { return m_origin_clean; }
+    void mark_not_origin_clean() { m_origin_clean = false; }
 
     virtual CanvasRenderingContext2DSettings get_context_attributes() const override { return m_context_attributes; }
 

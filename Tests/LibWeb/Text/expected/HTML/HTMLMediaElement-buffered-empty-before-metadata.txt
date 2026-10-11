@@ -1,0 +1,2 @@
+buffered.length without a resource: 0
+buffered.end(0) throws IndexSizeError

@@ -1,6 +1,7 @@
 set(TEST_SOURCES
     BenchmarkJPEGLoader.cpp
     TestColor.cpp
+    TestGfxBitmap.cpp
     TestImageDecoder.cpp
     TestImageWriter.cpp
     TestQuad.cpp

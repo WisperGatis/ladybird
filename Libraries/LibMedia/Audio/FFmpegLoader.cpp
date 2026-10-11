@@ -92,6 +92,11 @@ ErrorOr<void> FFmpegLoaderPlugin::initialize()
         return Error::from_string_literal("Failed to find an audio stream");
     m_audio_stream = m_format_context->streams[best_stream_index];
 
+    // Only the selected audio stream is read from this context. Discarding the
+    // others stops FFmpeg's HLS demuxer from downloading every variant.
+    for (unsigned i = 0; i < m_format_context->nb_streams; ++i)
+        m_format_context->streams[i]->discard = m_format_context->streams[i] == m_audio_stream ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+
     // Set up the context to decode the audio stream
     m_codec_context = avcodec_alloc_context3(codec);
     if (m_codec_context == nullptr)
@@ -166,6 +171,11 @@ ErrorOr<void> FFmpegLoaderPlugin::initialize_with_url(StringView url)
         return Error::from_string_literal("Failed to find an audio stream");
     m_audio_stream = m_format_context->streams[best_stream_index];
 
+    // Only the selected audio stream is read from this context. Discarding the
+    // others stops FFmpeg's HLS demuxer from downloading every variant.
+    for (unsigned i = 0; i < m_format_context->nb_streams; ++i)
+        m_format_context->streams[i]->discard = m_format_context->streams[i] == m_audio_stream ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+
     // Set up the context to decode the audio stream
     m_codec_context = avcodec_alloc_context3(codec);
     if (m_codec_context == nullptr)
@@ -210,6 +220,20 @@ ErrorOr<void> FFmpegLoaderPlugin::initialize_with_url(StringView url)
     return {};
 }
 
+bool FFmpegLoaderPlugin::is_hls_stream() const
+{
+    return m_format_context && m_format_context->iformat && StringView { m_format_context->iformat->name, strlen(m_format_context->iformat->name) }.starts_with("hls"sv);
+}
+
+// HLS (MPEG-TS) timestamps do not start at zero; this is the offset, in the
+// audio stream's time base, between them and the zero-based media timeline.
+i64 FFmpegLoaderPlugin::start_timestamp() const
+{
+    if (!is_hls_stream() || m_format_context->start_time == AV_NOPTS_VALUE)
+        return 0;
+    return av_rescale_q(m_format_context->start_time, AVRational { 1, AV_TIME_BASE }, m_audio_stream->time_base);
+}
+
 double FFmpegLoaderPlugin::time_base() const
 {
     return av_q2d(m_audio_stream->time_base);
@@ -245,13 +269,15 @@ static ErrorOr<FixedArray<Sample>> extract_samples_from_frame(AVFrame& frame)
     if (number_of_channels != 1 && number_of_channels != 2)
         return Error::from_string_view("Unsupported number of channels"sv);
 
-    switch (format) {
-    case AV_SAMPLE_FMT_FLTP:
+    switch (packed_format) {
+    case AV_SAMPLE_FMT_U8:
     case AV_SAMPLE_FMT_S16:
     case AV_SAMPLE_FMT_S32:
+    case AV_SAMPLE_FMT_S64:
+    case AV_SAMPLE_FMT_FLT:
+    case AV_SAMPLE_FMT_DBL:
         break;
     default:
-        // FIXME: handle other formats
         return Error::from_string_view("Unsupported sample format"sv);
     }
 
@@ -265,12 +291,18 @@ static ErrorOr<FixedArray<Sample>> extract_samples_from_frame(AVFrame& frame)
     };
     auto read_sample = [&](uint8_t* data, size_t index) -> float {
         switch (packed_format) {
+        case AV_SAMPLE_FMT_U8:
+            return (static_cast<int>(reinterpret_cast<uint8_t*>(data)[index]) - 128) / 128.0f;
         case AV_SAMPLE_FMT_FLT:
             return reinterpret_cast<float*>(data)[index];
+        case AV_SAMPLE_FMT_DBL:
+            return static_cast<float>(reinterpret_cast<double*>(data)[index]);
         case AV_SAMPLE_FMT_S16:
             return reinterpret_cast<i16*>(data)[index] / static_cast<float>(NumericLimits<i16>::max());
         case AV_SAMPLE_FMT_S32:
             return reinterpret_cast<i32*>(data)[index] / static_cast<float>(NumericLimits<i32>::max());
+        case AV_SAMPLE_FMT_S64:
+            return static_cast<float>(static_cast<double>(reinterpret_cast<i64*>(data)[index]) / static_cast<double>(NumericLimits<i64>::max()));
         default:
             VERIFY_NOT_REACHED();
         }
@@ -293,6 +325,8 @@ static ErrorOr<FixedArray<Sample>> extract_samples_from_frame(AVFrame& frame)
 ErrorOr<Vector<FixedArray<Sample>>> FFmpegLoaderPlugin::load_chunks(size_t samples_to_read_from_input)
 {
     Vector<FixedArray<Sample>> chunks {};
+    size_t malformed_packets = 0;
+    static constexpr size_t max_malformed_packets = 8;
 
     do {
         // Obtain a packet
@@ -308,8 +342,18 @@ ErrorOr<Vector<FixedArray<Sample>>> FFmpegLoaderPlugin::load_chunks(size_t sampl
         }
 
         // Send the packet to the decoder
-        if (avcodec_send_packet(m_codec_context, m_packet) < 0)
-            return Error::from_string_literal("Failed to send packet");
+        auto send_packet_result = avcodec_send_packet(m_codec_context, m_packet);
+        if (send_packet_result < 0) {
+            av_packet_unref(m_packet);
+            if (++malformed_packets <= max_malformed_packets) {
+                char error_buffer[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(send_packet_result, error_buffer, AV_ERROR_MAX_STRING_SIZE);
+                dbgln("Audio decoder rejected packet ({}); flushing and skipping malformed packet {}/{}", StringView(error_buffer, strlen(error_buffer)), malformed_packets, max_malformed_packets);
+                avcodec_flush_buffers(m_codec_context);
+                continue;
+            }
+            return Error::from_string_literal("Failed to send packet after malformed-packet recovery");
+        }
         av_packet_unref(m_packet);
 
         // Ask the decoder for a new frame. We might not have sent enough data yet
@@ -322,10 +366,22 @@ ErrorOr<Vector<FixedArray<Sample>>> FFmpegLoaderPlugin::load_chunks(size_t sampl
             return Error::from_string_literal("Failed to receive frame");
         }
 
+        // An HLS seek lands on the start of a segment. Drop the audio that precedes the requested position so that
+        // audio resumes where video does.
+        if (m_discard_frames_before_timestamp.has_value()) {
+            auto frame_duration = av_rescale_q(m_frame->nb_samples, AVRational { 1, static_cast<int>(sample_rate()) }, m_audio_stream->time_base);
+            // The first frame out of a flushed decoder may carry no timestamp; it still precedes the target.
+            if (m_frame->pts == AV_NOPTS_VALUE || m_frame->pts + frame_duration <= m_discard_frames_before_timestamp.value())
+                continue;
+            m_discard_frames_before_timestamp.clear();
+        }
+
         chunks.append(TRY(extract_samples_from_frame(*m_frame)));
+        malformed_packets = 0;
 
         // Use the frame's presentation timestamp to set the number of loaded samples
-        m_loaded_samples = static_cast<int>(m_frame->pts * sample_rate() * time_base());
+        if (m_frame->pts != AV_NOPTS_VALUE)
+            m_loaded_samples = static_cast<int>((m_frame->pts - start_timestamp()) * sample_rate() * time_base());
         if (m_loaded_samples > m_total_samples) [[unlikely]]
             m_total_samples = m_loaded_samples;
 
@@ -343,11 +399,16 @@ ErrorOr<void> FFmpegLoaderPlugin::reset()
 ErrorOr<void> FFmpegLoaderPlugin::seek(int sample_index)
 {
     auto sample_position_in_seconds = static_cast<double>(sample_index) / sample_rate();
-    auto sample_timestamp = AK::round_to<int64_t>(sample_position_in_seconds / time_base());
+    auto sample_timestamp = AK::round_to<int64_t>(sample_position_in_seconds / time_base()) + start_timestamp();
 
-    if (av_seek_frame(m_format_context, m_audio_stream->index, sample_timestamp, AVSEEK_FLAG_ANY) < 0)
+    if (av_seek_frame(m_format_context, m_audio_stream->index, sample_timestamp, is_hls_stream() ? AVSEEK_FLAG_BACKWARD : AVSEEK_FLAG_ANY) < 0)
         return Error::from_string_literal("Failed to seek");
     avcodec_flush_buffers(m_codec_context);
+
+    if (is_hls_stream())
+        m_discard_frames_before_timestamp = sample_timestamp;
+    else
+        m_discard_frames_before_timestamp.clear();
 
     m_loaded_samples = sample_index;
     return {};
@@ -371,7 +432,7 @@ u16 FFmpegLoaderPlugin::num_channels()
 
 PcmSampleFormat FFmpegLoaderPlugin::pcm_format()
 {
-    // FIXME: pcm_format() is unused, always return Float for now
+    // Decoded samples are normalized to float when extracted from the FFmpeg frame.
     return PcmSampleFormat::Float32;
 }
 

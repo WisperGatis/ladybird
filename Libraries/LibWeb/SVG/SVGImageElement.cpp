@@ -212,6 +212,11 @@ bool SVGImageElement::is_image_available() const
     return m_resource_request && m_resource_request->image_data();
 }
 
+bool SVGImageElement::is_cors_cross_origin() const
+{
+    return m_resource_request && m_resource_request->is_cors_cross_origin();
+}
+
 Optional<CSSPixels> SVGImageElement::intrinsic_width() const
 {
     if (!m_resource_request)

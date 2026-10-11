@@ -479,8 +479,11 @@ bool HTMLHyperlinkElementUtils::cannot_navigate() const
 void HTMLHyperlinkElementUtils::follow_the_hyperlink(Optional<String> hyperlink_suffix, UserNavigationInvolvement user_involvement)
 {
     // 1. If subject cannot navigate, then return.
-    if (cannot_navigate())
+    if (cannot_navigate()) {
+        auto& document = hyperlink_element_utils_document();
+        if (document.navigable()->is_top_level_traversable())
         return;
+    }
 
     // 2. Let targetAttributeValue be the empty string.
     String target_attribute_value;
@@ -501,6 +504,9 @@ void HTMLHyperlinkElementUtils::follow_the_hyperlink(Optional<String> hyperlink_
     // 7. Let targetNavigable be the first return value of applying the rules for choosing a navigable given
     //    targetAttributeValue, subject's node navigable, and noopener.
     auto target_navigable = hyperlink_element_utils_document().navigable()->choose_a_navigable(target_attribute_value, noopener).navigable;
+
+    auto& document = hyperlink_element_utils_document();
+    if (document.navigable()->is_top_level_traversable())
 
     // 8. If targetNavigable is null, then return.
     if (!target_navigable)

@@ -630,6 +630,7 @@ set(SOURCES
     HTML/SessionHistoryEntry.cpp
     HTML/SessionHistoryTraversalQueue.cpp
     HTML/ShadowRealmGlobalScope.cpp
+    HTML/SharedMediaResourceRequest.cpp
     HTML/SharedResourceRequest.cpp
     HTML/SharedWorker.cpp
     HTML/SharedWorkerGlobalScope.cpp

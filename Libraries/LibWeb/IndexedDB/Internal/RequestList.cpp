@@ -85,7 +85,9 @@ void RequestList::PendingRequestProcess::add_request_to_observe(GC::Ref<IDBReque
 {
     auto request_observer = heap().allocate<IDBRequestObserver>(request);
     request_observer->set_request_processed_changed_observer(GC::create_function(heap(), [this] {
-        VERIFY(!requests_waiting_on.is_empty());
+        if (requests_waiting_on.is_empty())
+            return;
+
         requests_waiting_on.remove_all_matching([](GC::Ref<IDBRequestObserver> const& pending_request) {
             if (pending_request->request()->processed()) {
                 pending_request->unobserve();

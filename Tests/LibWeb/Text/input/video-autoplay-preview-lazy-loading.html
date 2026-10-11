@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<style>
+    #spacer { height: 300vh; }
+    #imageApproachSpacer { height: 50vh; }
+    #approachSpacer { height: 150vh; }
+    #playButton { position: fixed; top: 0; left: 0; z-index: 1; }
+</style>
+<script src="include.js"></script>
+<button id="playButton">Play offscreen video</button>
+<div id="visiblePreviews">
+    <video autoplay muted src="../../Assets/test-webm.webm"></video>
+    <video autoplay muted src="../../Assets/test-webm.webm"></video>
+    <video autoplay muted src="../../Assets/test-webm.webm"></video>
+    <video autoplay muted src="../../Assets/test-webm.webm"></video>
+</div>
+<div id="imageApproachSpacer"></div>
+<img id="approachingImage" loading="lazy" src="../../Assets/120.png">
+<div id="approachSpacer"></div>
+<video id="approachingVideo" autoplay muted src="../../Assets/test-webm.webm"></video>
+<div id="spacer"></div>
+<video id="scrollVideo" autoplay muted src="../../Assets/test-webm.webm"></video>
+<video id="userVideo" autoplay muted src="../../Assets/test-webm.webm"></video>
+<script>
+    asyncTest(async done => {
+        await timeout(100);
+        println(`offscreen autoplay preview deferred: ${scrollVideo.networkState === 1}`);
+        println(`preview more than 25% of a viewport away stays deferred: ${approachingVideo.networkState === 1}`);
+        const imageLoaded = await Promise.race([
+            new Promise(resolve => {
+                if (approachingImage.complete)
+                    resolve(true);
+                else {
+                    approachingImage.addEventListener("load", () => resolve(true), { once: true });
+                    approachingImage.addEventListener("error", () => resolve(false), { once: true });
+                }
+            }),
+            timeout(1000).then(() => false),
+        ]);
+        println(`lazy image within one viewport loads while farther preview waits: ${imageLoaded && approachingImage.naturalWidth > 1 && approachingVideo.networkState === 1}`);
+
+        playButton.addEventListener("click", () => userVideo.play().catch(() => {}));
+        const playRect = playButton.getBoundingClientRect();
+        internals.click(playRect.left + 5, playRect.top + 5);
+        await timeout(0);
+        println(`user activated playback starts loading: ${userVideo.networkState === 2}`);
+
+        const approachingResumed = new Promise(resolve => {
+            const finish = () => resolve(true);
+            approachingVideo.addEventListener("loadedmetadata", finish, { once: true });
+            approachingVideo.addEventListener("error", finish, { once: true });
+        });
+        const approachScrollY = approachingVideo.getBoundingClientRect().top + scrollY - innerHeight * 0.75;
+        window.scrollTo(0, approachScrollY);
+        const didApproachResume = await Promise.race([approachingResumed, timeout(1000).then(() => false)]);
+        println(didApproachResume
+            ? "preview resumes within 25% of viewport"
+            : "FAIL: approaching preview did not resume");
+
+        const resumed = new Promise(resolve => {
+            const finish = () => resolve(true);
+            scrollVideo.addEventListener("loadedmetadata", finish, { once: true });
+            scrollVideo.addEventListener("error", finish, { once: true });
+        });
+        const scrollVideoY = scrollVideo.getBoundingClientRect().top + scrollY - 100;
+        window.scrollTo(0, scrollVideoY);
+        const didResume = await Promise.race([resumed, timeout(1000).then(() => false)]);
+        println(didResume || scrollVideo.networkState !== 1
+            ? "scrolling resumes deferred preview"
+            : "FAIL: deferred preview did not resume after scrolling");
+        done();
+    });
+</script>
