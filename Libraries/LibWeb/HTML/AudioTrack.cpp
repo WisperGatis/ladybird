@@ -15,6 +15,7 @@
 #include <LibWeb/HTML/AudioTrackList.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
+#include <LibWeb/HTML/VideoTrackList.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Platform/AudioCodecPlugin.h>
@@ -37,6 +38,13 @@ AudioTrack::AudioTrack(JS::Realm& realm, GC::Ref<HTMLMediaElement> media_element
             paintable->set_needs_display();
 
         auto playback_position = static_cast<double>(position.to_milliseconds()) / 1000.0;
+
+        // The video track's playback manager drives the playback position when
+        // one is selected. The audio position reported here is how far the
+        // decoder has read ahead, so letting both write makes the position jump.
+        if (m_media_element->video_tracks()->selected_index() != -1)
+            return;
+
         m_media_element->set_current_playback_position(playback_position);
     };
 

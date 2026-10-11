@@ -53,10 +53,14 @@ private:
     AVPacket* m_packet { nullptr };
     bool m_logged_stream_info { false };
     u32 m_logged_packet_count { 0 };
+    Optional<int> m_active_stream_index;
 
 public:
     bool is_hls_stream() const;
     bool is_seekable() const;
+
+private:
+    i64 container_start_time() const;
 };
 
 }

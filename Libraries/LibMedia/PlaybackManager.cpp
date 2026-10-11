@@ -191,8 +191,10 @@ void PlaybackManager::seek_to_timestamp(AK::Duration target_timestamp, SeekMode 
 DecoderErrorOr<Optional<AK::Duration>> PlaybackManager::seek_demuxer_to_most_recent_keyframe(AK::Duration timestamp, Optional<AK::Duration> earliest_available_sample)
 {
     auto seeked_timestamp = TRY(m_demuxer->seek_to_most_recent_keyframe(m_selected_video_track, timestamp, move(earliest_available_sample)));
-    if (seeked_timestamp.has_value())
+    if (seeked_timestamp.has_value()) {
         m_decoder->flush();
+        ++m_seek_generation;
+    }
     return seeked_timestamp;
 }
 
@@ -227,6 +229,7 @@ void PlaybackManager::decode_and_queue_one_sample()
 #endif
 
     FrameQueueItem item_to_enqueue;
+    u64 seek_generation = 0;
 
     static constexpr size_t max_recovery_attempts = 2;
     auto try_recover = [&](DecoderError const& error) {
@@ -248,6 +251,7 @@ void PlaybackManager::decode_and_queue_one_sample()
 
         {
             Threading::MutexLocker decoder_locker(m_decoder_mutex);
+            seek_generation = m_seek_generation.load();
 
             // Get a sample to decode.
             auto sample_result = m_demuxer->get_next_sample_for_track(m_selected_video_track);
@@ -337,9 +341,19 @@ void PlaybackManager::decode_and_queue_one_sample()
 
     bool had_error = item_to_enqueue.is_error();
     while (true) {
-        if (m_frame_queue.can_enqueue()) {
-            MUST(m_frame_queue.enqueue(move(item_to_enqueue)));
-            break;
+        {
+            // A seek empties the frame queue with this mutex held. An item that was decoded before the seek, and
+            // was waiting here for space, must not be queued afterwards: its timestamp belongs to the old position,
+            // and after a backward seek it would be treated as the next frame to present far in the future.
+            Threading::MutexLocker decoder_locker(m_decoder_mutex);
+            if (seek_generation != m_seek_generation.load()) {
+                m_buffer_is_full.exchange(false);
+                return;
+            }
+            if (m_frame_queue.can_enqueue()) {
+                MUST(m_frame_queue.enqueue(move(item_to_enqueue)));
+                break;
+            }
         }
 
         if (m_stop_decoding.load()) {

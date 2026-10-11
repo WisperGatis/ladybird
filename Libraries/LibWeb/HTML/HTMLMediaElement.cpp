@@ -1791,6 +1791,23 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::process_hls_stream(String url, Funct
         m_video_tracks->dispatch_event(event);
     }
 
+    // Update the duration attribute with the time of the last frame of the resource, if known. If it is not known (e.g. a live
+    // stream), update the duration attribute to the value positive Infinity.
+    auto duration = video_track ? video_track->duration() : audio_track->duration();
+    set_duration(duration > AK::Duration::zero() ? duration.to_seconds_f64() : AK::Infinity<double>);
+
+    // For video elements, set the videoWidth and videoHeight attributes, and queue a media element task given the media element
+    // to fire an event named resize at the media element.
+    if (video_track && is<HTMLVideoElement>(*this)) {
+        auto& video_element = as<HTMLVideoElement>(*this);
+        video_element.set_video_width(video_track->pixel_width());
+        video_element.set_video_height(video_track->pixel_height());
+
+        queue_a_media_element_task_for_generation(generation, [this] {
+            dispatch_event(DOM::Event::create(this->realm(), HTML::EventNames::resize));
+        });
+    }
+
     // -> Once the resource's metadata has been loaded and the user agent has determined the duration, the user agent must set the element's readyState to HAVE_METADATA.
     set_ready_state(ReadyState::HaveMetadata);
 

@@ -44,6 +44,8 @@ private:
     ErrorOr<void> initialize();
     ErrorOr<void> initialize_with_url(StringView url);
     double time_base() const;
+    bool is_hls_stream() const;
+    i64 start_timestamp() const;
 
     AVStream* m_audio_stream;
     AVCodecContext* m_codec_context { nullptr };
@@ -52,6 +54,7 @@ private:
     Optional<NonnullOwnPtr<Media::FFmpeg::FFmpegIOContext>> m_io_context;
     bool m_is_url_based { false };
     int m_loaded_samples { 0 };
+    Optional<i64> m_discard_frames_before_timestamp;
     AVPacket* m_packet { nullptr };
     int m_total_samples { 0 };
 };

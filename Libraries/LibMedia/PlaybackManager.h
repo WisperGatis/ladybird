@@ -189,6 +189,8 @@ private:
     RefPtr<Threading::Thread> m_decode_thread;
     NonnullOwnPtr<VideoDecoder> m_decoder;
     Atomic<bool> m_stop_decoding { false };
+    // Incremented, with m_decoder_mutex held, whenever the demuxer is repositioned by a seek.
+    Atomic<u64> m_seek_generation { 0 };
     Atomic<bool> m_playback_failed { false };
     Threading::Mutex m_decode_wait_mutex;
     Threading::ConditionVariable m_decode_wait_condition;
