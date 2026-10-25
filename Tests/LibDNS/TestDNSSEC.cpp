@@ -483,8 +483,7 @@ struct Server {
             sockaddr_in from {};
             auto query_bytes = MUST(udp->receive(4096, from));
             ++queries;
-            FixedMemoryStream stream { query_bytes.bytes() };
-            auto query = MUST(Message::from_raw(stream));
+            auto query = MUST(Message::from_raw(query_bytes.bytes()));
             auto const& question = query.questions.first();
             if (question.type == ResourceType::DS && held_ds_names.contains_slow(question.name.to_canonical_string())) {
                 held.append({ move(query), from });

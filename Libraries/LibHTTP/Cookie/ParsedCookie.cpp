@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteBuffer.h>
 #include <AK/DateConstants.h>
 #include <AK/Function.h>
 #include <AK/StdLibExtras.h>
@@ -13,93 +14,76 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibURL/URL.h>
+#include <RustFFI.h>
 
 namespace HTTP::Cookie {
 
-static ErrorOr<void> parse_attributes(URL::URL const&, ParsedCookie& parsed_cookie, StringView unparsed_attributes);
-static ErrorOr<void> process_attribute(URL::URL const&, ParsedCookie& parsed_cookie, StringView attribute_name, StringView attribute_value);
+// NB: The string parsing lives in Libraries/LibHTTP/Rust/src/cookie.rs, which reports these attribute kinds.
+enum class AttributeKind : u8 {
+    Expires,
+    MaxAge,
+    Domain,
+    Path,
+};
+
+struct AttributeSink {
+    URL::URL const& url;
+    ParsedCookie& parsed_cookie;
+};
+
+static void on_attribute(void* context, u8 kind, u8 const* value, size_t length);
 static void on_expires_attribute(ParsedCookie& parsed_cookie, StringView attribute_value);
 static void on_max_age_attribute(ParsedCookie& parsed_cookie, StringView attribute_value);
 static ErrorOr<void> on_domain_attribute(ParsedCookie& parsed_cookie, StringView attribute_value);
 static void on_path_attribute(URL::URL const&, ParsedCookie& parsed_cookie, StringView attribute_value);
-static void on_secure_attribute(ParsedCookie& parsed_cookie);
-static void on_http_only_attribute(ParsedCookie& parsed_cookie);
-static void on_same_site_attribute(ParsedCookie& parsed_cookie, StringView attribute_value);
 
 bool cookie_contains_invalid_control_character(StringView cookie_string)
 {
-    for (auto code_point : Utf8View { cookie_string }) {
-        if (code_point <= 0x08)
-            return true;
-        if (code_point >= 0x0a && code_point <= 0x1f)
-            return true;
-        if (code_point == 0x7f)
-            return true;
-    }
-
-    return false;
+    return ladybird_http_contains_invalid_cookie_control_character(cookie_string.bytes().data(), cookie_string.length());
 }
 
 // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6-6
 Optional<ParsedCookie> parse_cookie(URL::URL const& url, StringView cookie_string)
 {
-    // 1. If the set-cookie-string contains a %x00-08 / %x0A-1F / %x7F character (CTL characters excluding HTAB):
-    //    Abort this algorithm and ignore the set-cookie-string entirely.
-    if (cookie_contains_invalid_control_character(cookie_string))
+    // NB: Rust performs the control character, size and tokenizing checks, and reports each attribute in order. The
+    //     attributes that need the clock or the URL are applied by on_attribute.
+    ParsedCookie parsed_cookie;
+    AttributeSink sink { url, parsed_cookie };
+    LadybirdHttpCookieParts parts {};
+    if (!ladybird_http_parse_cookie_string(cookie_string.bytes().data(), cookie_string.length(), &sink, on_attribute, &parts))
         return {};
 
-    StringView name_value_pair;
-    StringView unparsed_attributes;
-
-    // 2. If the set-cookie-string contains a %x3B (";") character:
-    if (auto position = cookie_string.find(';'); position.has_value()) {
-        // 1. The name-value-pair string consists of the characters up to, but not including, the first %x3B (";"), and
-        //    the unparsed-attributes consist of the remainder of the set-cookie-string (including the %x3B (";") in
-        //    question).
-        name_value_pair = cookie_string.substring_view(0, position.value());
-        unparsed_attributes = cookie_string.substring_view(position.value());
-    }
-    // Otherwise:
-    else {
-        // 1. The name-value-pair string consists of all the characters contained in the set-cookie-string, and the
-        //    unparsed-attributes is the empty string.
-        name_value_pair = cookie_string;
-    }
-
-    StringView name;
-    StringView value;
-
-    // 3. If the name-value-pair string lacks a %x3D ("=") character, then the name string is empty, and the value
-    //    string is the value of name-value-pair.
-    if (auto position = name_value_pair.find('='); !position.has_value()) {
-        value = name_value_pair;
-    } else {
-        // Otherwise, the (possibly empty) name string consists of the characters up to, but not including, the first
-        // %x3D ("=") character, and the (possibly empty) value string consists of the characters after the first
-        // %x3D ("=") character.
-        name = name_value_pair.substring_view(0, position.value());
-
-        if (position.value() < name_value_pair.length() - 1)
-            value = name_value_pair.substring_view(position.value() + 1);
-    }
-
-    // 4. Remove any leading or trailing WSP characters from the name string and the value string.
-    name = name.trim_whitespace();
-    value = value.trim_whitespace();
-
-    // 5. If the sum of the lengths of the name string and the value string is more than 4096 octets, abort this
-    //    algorithm and ignore the set-cookie-string entirely.
-    if (name.length() + value.length() > 4096)
-        return {};
-
-    // 6. The cookie-name is the name string, and the cookie-value is the value string.
-    ParsedCookie parsed_cookie { MUST(String::from_utf8(name)), MUST(String::from_utf8(value)) };
-
-    if (parse_attributes(url, parsed_cookie, unparsed_attributes).is_error())
-        return {};
+    parsed_cookie.name = MUST(String::from_utf8(cookie_string.substring_view(parts.name_offset, parts.name_length)));
+    parsed_cookie.value = MUST(String::from_utf8(cookie_string.substring_view(parts.value_offset, parts.value_length)));
+    parsed_cookie.same_site_attribute = static_cast<SameSite>(parts.same_site);
+    parsed_cookie.secure_attribute_present = parts.secure;
+    parsed_cookie.http_only_attribute_present = parts.http_only;
 
     return parsed_cookie;
 }
+
+void on_attribute(void* context, u8 kind, u8 const* value, size_t length)
+{
+    auto& sink = *static_cast<AttributeSink*>(context);
+    auto attribute_value = StringView { reinterpret_cast<char const*>(value), length };
+
+    switch (static_cast<AttributeKind>(kind)) {
+    case AttributeKind::Expires:
+        on_expires_attribute(sink.parsed_cookie, attribute_value);
+        break;
+    case AttributeKind::MaxAge:
+        on_max_age_attribute(sink.parsed_cookie, attribute_value);
+        break;
+    case AttributeKind::Domain:
+        // NB: Rust has already checked that the domain is ASCII and lowercased it.
+        sink.parsed_cookie.domain = MUST(String::from_utf8(attribute_value));
+        break;
+    case AttributeKind::Path:
+        on_path_attribute(sink.url, sink.parsed_cookie, attribute_value);
+        break;
+    }
+}
+
 
 ErrorOr<ParsedCookie> parse_cookie(Cookie const& cookie)
 {
@@ -171,89 +155,6 @@ ErrorOr<ParsedCookie> parse_cookie(Cookie const& cookie)
         parsed_cookie.expiry_time_from_expires_attribute = cookie.expiry_time;
 
     return parsed_cookie;
-}
-
-// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6-8
-ErrorOr<void> parse_attributes(URL::URL const& url, ParsedCookie& parsed_cookie, StringView unparsed_attributes)
-{
-    // 1. If the unparsed-attributes string is empty, skip the rest of these steps.
-    if (unparsed_attributes.is_empty())
-        return {};
-
-    // 2. Discard the first character of the unparsed-attributes (which will be a %x3B (";") character).
-    unparsed_attributes = unparsed_attributes.substring_view(1);
-
-    StringView cookie_av;
-
-    // 3. If the remaining unparsed-attributes contains a %x3B (";") character:
-    if (auto position = unparsed_attributes.find(';'); position.has_value()) {
-        // 1. Consume the characters of the unparsed-attributes up to, but not including, the first %x3B (";") character.
-        cookie_av = unparsed_attributes.substring_view(0, position.value());
-        unparsed_attributes = unparsed_attributes.substring_view(position.value());
-    }
-    // Otherwise:
-    else {
-        // 1. Consume the remainder of the unparsed-attributes.
-        cookie_av = unparsed_attributes;
-        unparsed_attributes = {};
-    }
-    // Let the cookie-av string be the characters consumed in this step; unparsed-attributes now contains any remaining
-    // characters.
-
-    StringView attribute_name;
-    StringView attribute_value;
-
-    // 4. If the cookie-av string contains a %x3D ("=") character:
-    if (auto position = cookie_av.find('='); position.has_value()) {
-        // 1. The (possibly empty) attribute-name string consists of the characters up to, but not including, the first
-        //    %x3D ("=") character, and the (possibly empty) attribute-value string consists of the characters after the
-        //    first %x3D ("=") character.
-        attribute_name = cookie_av.substring_view(0, position.value());
-
-        if (position.value() < cookie_av.length() - 1)
-            attribute_value = cookie_av.substring_view(position.value() + 1);
-    }
-    // Otherwise:
-    else {
-        // 1. The attribute-name string consists of the entire cookie-av string, and the attribute-value string is empty.
-        attribute_name = cookie_av;
-    }
-
-    // 5. Remove any leading or trailing WSP characters from the attribute-name string and the attribute-value string.
-    attribute_name = attribute_name.trim_whitespace();
-    attribute_value = attribute_value.trim_whitespace();
-
-    // 6. If the attribute-value is longer than 1024 octets, ignore the cookie-av string and return to Step 1 of this
-    //    algorithm.
-    if (attribute_value.length() > 1024)
-        return parse_attributes(url, parsed_cookie, unparsed_attributes);
-
-    // 7. Process the attribute-name and attribute-value according to the requirements in the following subsections.
-    //    (Notice that attributes with unrecognized attribute-names are ignored.)
-    TRY(process_attribute(url, parsed_cookie, attribute_name, attribute_value));
-
-    // 8. Return to Step 1 of this algorithm.
-    return parse_attributes(url, parsed_cookie, unparsed_attributes);
-}
-
-ErrorOr<void> process_attribute(URL::URL const& url, ParsedCookie& parsed_cookie, StringView attribute_name, StringView attribute_value)
-{
-    if (attribute_name.equals_ignoring_ascii_case("Expires"sv))
-        on_expires_attribute(parsed_cookie, attribute_value);
-    else if (attribute_name.equals_ignoring_ascii_case("Max-Age"sv))
-        on_max_age_attribute(parsed_cookie, attribute_value);
-    else if (attribute_name.equals_ignoring_ascii_case("Domain"sv))
-        TRY(on_domain_attribute(parsed_cookie, attribute_value));
-    else if (attribute_name.equals_ignoring_ascii_case("Path"sv))
-        on_path_attribute(url, parsed_cookie, attribute_value);
-    else if (attribute_name.equals_ignoring_ascii_case("Secure"sv))
-        on_secure_attribute(parsed_cookie);
-    else if (attribute_name.equals_ignoring_ascii_case("HttpOnly"sv))
-        on_http_only_attribute(parsed_cookie);
-    else if (attribute_name.equals_ignoring_ascii_case("SameSite"sv))
-        on_same_site_attribute(parsed_cookie, attribute_value);
-
-    return {};
 }
 
 // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.1
@@ -333,26 +234,19 @@ ErrorOr<void> on_domain_attribute(ParsedCookie& parsed_cookie, StringView attrib
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-4.1.1-9
     // The domain-value is a subdomain as defined by Section 3.5 of [RFC1034], and as enhanced by Section 2.1 of [RFC1123].
     // Thus, domain-value is a string of [USASCII] characters, such as an "A-label" as defined in Section 2.3.2.1 of [RFC5890].
-    if (!attribute_value.is_ascii())
+    // NB: The ASCII check, the leading "." removal (steps 1 and 2) and the lowercasing (step 3) are done in
+    //     Libraries/LibHTTP/Rust/src/cookie.rs. A lone "." is kept there rather than reduced to "". By the letter of the
+    //     spec this would become an empty domain and be stored as a host cookie, but Chromium, Firefox, WPT (and the
+    //     spec intent) treat `Domain=.` as an invalid domain. See: https://github.com/httpwg/http-extensions/issues/1939
+    // The normalized domain is never longer than the attribute value.
+    auto normalized_domain = TRY(ByteBuffer::create_uninitialized(attribute_value.length()));
+    size_t normalized_domain_length = 0;
+    if (!ladybird_http_normalize_cookie_domain(attribute_value.bytes().data(), attribute_value.length(), normalized_domain.data(), &normalized_domain_length))
         return Error::from_string_literal("Domain must be a string of ASCII characters");
-
-    // 1. Let cookie-domain be the attribute-value.
-    auto cookie_domain = attribute_value;
-
-    // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be cookie-domain without its leading %x2E (".").
-    // NB: We deliberately keep a lone "." rather than reducing it to "". By the letter of the spec this would
-    //     become an empty domain and be stored as a host cookie, but Chromium, Firefox, WPT (and the spec intent)
-    //     treat an treat `Domain=.` as an invalid domain.
-    //     See: https://github.com/httpwg/http-extensions/issues/1939
-    if (cookie_domain.length() > 1 && cookie_domain.starts_with('.'))
-        cookie_domain = cookie_domain.substring_view(1);
-
-    // 3. Convert the cookie-domain to lower case.
-    auto lowercase_cookie_domain = cookie_domain.to_ascii_lowercase_string();
 
     // 4. Append an attribute to the cookie-attribute-list with an attribute-name of Domain and an attribute-value of
     //    cookie-domain.
-    parsed_cookie.domain = move(lowercase_cookie_domain);
+    parsed_cookie.domain = MUST(String::from_utf8(StringView { reinterpret_cast<char const*>(normalized_domain.data()), normalized_domain_length }));
 
     return {};
 }
@@ -378,173 +272,16 @@ void on_path_attribute(URL::URL const& url, ParsedCookie& parsed_cookie, StringV
     parsed_cookie.path = move(cookie_path);
 }
 
-// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.5
-void on_secure_attribute(ParsedCookie& parsed_cookie)
-{
-    parsed_cookie.secure_attribute_present = true;
-}
-
-// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.6
-void on_http_only_attribute(ParsedCookie& parsed_cookie)
-{
-    parsed_cookie.http_only_attribute_present = true;
-}
-
-// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.7
-void on_same_site_attribute(ParsedCookie& parsed_cookie, StringView attribute_value)
-{
-    // 1. Let enforcement be "Default".
-    // 2. If cookie-av's attribute-value is a case-insensitive match for "None", set enforcement to "None".
-    // 3. If cookie-av's attribute-value is a case-insensitive match for "Strict", set enforcement to "Strict".
-    // 4. If cookie-av's attribute-value is a case-insensitive match for "Lax", set enforcement to "Lax".
-    auto enforcement = same_site_from_string(attribute_value);
-
-    // 5. Append an attribute to the cookie-attribute-list with an attribute-name of "SameSite" and an attribute-value
-    //    of enforcement.
-    parsed_cookie.same_site_attribute = enforcement;
-}
-
 // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.1.1
 Optional<UnixDateTime> parse_cookie_date(StringView date_string)
 {
-    // https://tools.ietf.org/html/rfc6265#section-5.1.1
-    unsigned hour = 0;
-    unsigned minute = 0;
-    unsigned second = 0;
-    unsigned day_of_month = 0;
-    unsigned month = 0;
-    unsigned year = 0;
-
-    auto to_uint = [](StringView token, unsigned& result) {
-        if (!all_of(token, is_ascii_digit))
-            return false;
-
-        if (auto converted = token.to_number<unsigned>(); converted.has_value()) {
-            result = *converted;
-            return true;
-        }
-
-        return false;
-    };
-
-    auto parse_time = [&](StringView token) {
-        Vector<StringView> parts = token.split_view(':');
-        if (parts.size() != 3)
-            return false;
-
-        for (auto const& part : parts) {
-            if (part.is_empty() || part.length() > 2)
-                return false;
-        }
-
-        return to_uint(parts[0], hour) && to_uint(parts[1], minute) && to_uint(parts[2], second);
-    };
-
-    auto parse_day_of_month = [&](StringView token) {
-        if (token.is_empty() || token.length() > 2)
-            return false;
-        return to_uint(token, day_of_month);
-    };
-
-    auto parse_month = [&](StringView token) {
-        for (unsigned i = 0; i < 12; ++i) {
-            if (token.equals_ignoring_ascii_case(short_month_names[i])) {
-                month = i + 1;
-                return true;
-            }
-        }
-
-        return false;
-    };
-
-    auto parse_year = [&](StringView token) {
-        if (token.length() != 2 && token.length() != 4)
-            return false;
-        return to_uint(token, year);
-    };
-
-    Function<bool(char)> is_delimiter = [](char ch) {
-        return ch == 0x09 || (ch >= 0x20 && ch <= 0x2f) || (ch >= 0x3b && ch <= 0x40) || (ch >= 0x5b && ch <= 0x60) || (ch >= 0x7b && ch <= 0x7e);
-    };
-
-    // 1. Using the grammar below, divide the cookie-date into date-tokens.
-    Vector<StringView> date_tokens = date_string.split_view_if(is_delimiter);
-
-    // 2. Process each date-token sequentially in the order the date-tokens appear in the cookie-date:
-    bool found_time = false;
-    bool found_day_of_month = false;
-    bool found_month = false;
-    bool found_year = false;
-
-    for (auto const& date_token : date_tokens) {
-        // 1. If the found-time flag is not set and the token matches the time production, set the found-time flag and
-        //    set the hour-value, minute-value, and second-value to the numbers denoted by the digits in the date-token,
-        //    respectively. Skip the remaining sub-steps and continue to the next date-token.
-        if (!found_time && parse_time(date_token)) {
-            found_time = true;
-        }
-
-        // 2. If the found-day-of-month flag is not set and the date-token matches the day-of-month production, set the
-        //    found-day-of-month flag and set the day-of-month-value to the number denoted by the date-token. Skip the
-        //    remaining sub-steps and continue to the next date-token.
-        else if (!found_day_of_month && parse_day_of_month(date_token)) {
-            found_day_of_month = true;
-        }
-
-        // 3. If the found-month flag is not set and the date-token matches the month production, set the found-month
-        //    flag and set the month-value to the month denoted by the date-token. Skip the remaining sub-steps and
-        //    continue to the next date-token.
-        else if (!found_month && parse_month(date_token)) {
-            found_month = true;
-        }
-
-        // 4. If the found-year flag is not set and the date-token matches the year production, set the found-year flag
-        //    and set the year-value to the number denoted by the date-token. Skip the remaining sub-steps and continue
-        //    to the next date-token.
-        else if (!found_year && parse_year(date_token)) {
-            found_year = true;
-        }
-    }
-
-    // 3. If the year-value is greater than or equal to 70 and less than or equal to 99, increment the year-value by 1900.
-    if (year >= 70 && year <= 99)
-        year += 1900;
-
-    // 4. If the year-value is greater than or equal to 0 and less than or equal to 69, increment the year-value by 2000.
-    if (year <= 69)
-        year += 2000;
-
-    // 5. Abort this algorithm and fail to parse the cookie-date if:
-    // * at least one of the found-day-of-month, found-month, found-year, or found-time flags is not set,
-    if (!found_day_of_month || !found_month || !found_year || !found_time)
-        return {};
-    // * the day-of-month-value is less than 1 or greater than 31,
-    if (day_of_month < 1 || day_of_month > 31)
-        return {};
-    // * the year-value is less than 1601,
-    if (year < 1601)
-        return {};
-    // * the hour-value is greater than 23,
-    if (hour > 23)
-        return {};
-    // * the minute-value is greater than 59, or
-    if (minute > 59)
-        return {};
-    // * the second-value is greater than 59.
-    if (second > 59)
-        return {};
-
-    // 6. Let the parsed-cookie-date be the date whose day-of-month, month, year, hour, minute, and second (in UTC) are
-    //    the day-of-month-value, the month-value, the year-value, the hour-value, the minute-value, and the second-value,
-    //    respectively. If no such date exists, abort this algorithm and fail to parse the cookie-date.
-    if (day_of_month > static_cast<unsigned int>(days_in_month(year, month)))
-        return {};
-
+    // The cookie-date is parsed by the Rust decoder in LibHTTP/Rust, which applies the same token rules and range
+    // checks. The result is UTC seconds since the epoch.
     // FIXME: This currently uses UNIX time, which is not equivalent to UTC due to leap seconds.
-    auto parsed_cookie_date = UnixDateTime::from_unix_time_parts(year, month, day_of_month, hour, minute, second, 0);
-
-    // 7. Return the parsed-cookie-date as the result of this algorithm.
-    return parsed_cookie_date;
+    i64 seconds = 0;
+    if (!ladybird_http_parse_cookie_date(date_string.bytes().data(), date_string.length(), &seconds))
+        return {};
+    return UnixDateTime::from_seconds_since_epoch(seconds);
 }
 
 }

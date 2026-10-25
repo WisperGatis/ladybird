@@ -332,3 +332,14 @@ function(_rust_crate_common_setup)
     set(manifest_path "${manifest_path}" PARENT_SCOPE)
     set(workspace_dir "${workspace_dir}" PARENT_SCOPE)
 endfunction()
+
+# A Rust static library bundles its own Rust standard library. In shared builds, exporting those
+# implementation symbols lets ELF symbol interposition bind another crate's Rust runtime to this
+# copy, including its allocator and thread state. Keep Rust crate internals local to their DSO.
+function(ladybird_hide_rust_crate_symbols library_target rust_crate_target)
+    if ((LINUX OR BSD) AND BUILD_SHARED_LIBS)
+        get_target_property(rust_archive ${rust_crate_target} IMPORTED_LOCATION)
+        cmake_path(GET rust_archive FILENAME rust_archive_name)
+        target_link_options(${library_target} PRIVATE "LINKER:--exclude-libs,${rust_archive_name}")
+    endif()
+endfunction()

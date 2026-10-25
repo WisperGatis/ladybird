@@ -10,6 +10,7 @@
 #include <AK/HashTable.h>
 #include <AK/StringUtils.h>
 #include <LibHTTP/HeaderList.h>
+#include <RustFFI.h>
 
 namespace HTTP {
 
@@ -261,47 +262,19 @@ Variant<Empty, u64, HeaderList::ExtractLengthFailure> HeaderList::extract_length
 // https://wicg.github.io/background-fetch/#single-byte-content-range
 static Optional<HeaderList::ContentRangeValues> parse_single_byte_content_range_as_values(ByteString const& string)
 {
+    // The value is parsed by the Rust decoder in LibHTTP/Rust, which accepts the same values as the former lexer code.
+    u64 first_byte_pos = 0;
+    u64 last_byte_pos = 0;
+    bool has_complete_length = false;
+    u64 complete_length = 0;
+    if (!ladybird_http_parse_content_range(reinterpret_cast<u8 const*>(string.characters()), string.length(), &first_byte_pos, &last_byte_pos, &has_complete_length, &complete_length))
+        return {};
+
     HeaderList::ContentRangeValues result;
-    GenericLexer lexer { string };
-
-    // "bytes=" first-byte-pos "-" last-byte-pos "/" complete-length
-
-    // AD-HOC: The spec wants an '=', but the RFC mentioned in the spec requires a space.
-    //         https://github.com/WICG/background-fetch/issues/154
-    if (!lexer.consume_specific("bytes "sv))
-        return {};
-
-    // first-byte-pos = 1*DIGIT
-    auto first_byte_pos_result = lexer.consume_decimal_integer<u64>();
-    if (first_byte_pos_result.is_error())
-        return {};
-    result.first_byte_pos = first_byte_pos_result.release_value();
-
-    if (!lexer.consume_specific('-'))
-        return {};
-
-    // last-byte-pos  = 1*DIGIT
-    auto last_byte_pos_result = lexer.consume_decimal_integer<u64>();
-    if (last_byte_pos_result.is_error())
-        return {};
-    result.last_byte_pos = last_byte_pos_result.release_value();
-
-    if (!lexer.consume_specific('/'))
-        return {};
-
-    // complete-length = ( 1*DIGIT / "*" )
-    if (lexer.consume_specific('*')) {
-        result.complete_length = {};
-    } else {
-        auto complete_length_result = lexer.consume_decimal_integer<u64>();
-        if (complete_length_result.is_error())
-            return {};
-        result.complete_length = complete_length_result.release_value();
-    }
-
-    if (!lexer.is_eof())
-        return {};
-
+    result.first_byte_pos = first_byte_pos;
+    result.last_byte_pos = last_byte_pos;
+    if (has_complete_length)
+        result.complete_length = complete_length;
     return result;
 }
 

@@ -37,8 +37,7 @@ TEST_CASE(parsing_a_reserved_label_length_fails)
     message.append(0x00);
     message.extend({ 0, 1, 0, 1 }); // QTYPE = A, QCLASS = IN
 
-    FixedMemoryStream stream { message.span() };
-    auto result = DNS::Messages::Message::from_raw(stream);
+    auto result = DNS::Messages::Message::from_raw(message.span());
     EXPECT(result.is_error());
 }
 

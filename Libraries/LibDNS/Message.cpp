@@ -9,6 +9,7 @@
 #include <AK/Stream.h>
 #include <AK/UFixedBigInt.h>
 #include <LibDNS/Message.h>
+#include <RustFFI.h>
 
 namespace DNS::Messages {
 
@@ -48,10 +49,11 @@ StringView to_string(Options::ResponseCode code)
     }
 }
 
-ErrorOr<Message> Message::from_raw(AK::Stream& stream)
+ErrorOr<Message> Message::from_raw(ReadonlyBytes bytes)
 {
+    FixedMemoryStream stream { bytes };
     CountingStream counting_stream { MaybeOwned(stream) };
-    auto context = ParseContext { counting_stream, make<RedBlackTree<u16, DomainName>>() };
+    auto context = ParseContext { counting_stream, make<RedBlackTree<u16, DomainName>>(), bytes };
     return from_raw(context);
 }
 
@@ -163,58 +165,6 @@ Vector<ResourceRecord> Message::answers_to(Question const& question) const
         accepted.append(move(copy));
     }
     return accepted;
-}
-
-ErrorOr<String> Message::format_for_log() const
-{
-    StringBuilder builder;
-    builder.appendff("ID: {}\n", header.id);
-    builder.appendff("Flags: {} ({:x})\n", header.options.to_string(), header.options.raw);
-    builder.appendff("qdcount: {}, ancount: {}, nscount: {}, arcount: {}\n", header.question_count, header.answer_count, header.authority_count, header.additional_count);
-
-    if (header.question_count > 0) {
-        builder.appendff("Questions:\n");
-        for (auto& q : questions)
-            builder.appendff("    {} {} {}\n", q.name.to_string(), to_string(q.class_), to_string(q.type));
-    }
-
-    if (header.answer_count > 0) {
-        builder.appendff("Answers:\n");
-        for (auto& a : answers) {
-            builder.appendff("    {} {} {}\n", a.name.to_string(), to_string(a.class_), to_string(a.type));
-            a.record.visit(
-                [&](auto const& record) { builder.appendff("        {}\n", MUST(record.to_string())); },
-                [&](ByteBuffer const& raw) {
-                    builder.appendff("        {:hex-dump}\n", raw.bytes());
-                });
-        }
-    }
-
-    if (header.authority_count > 0) {
-        builder.appendff("Authorities:\n");
-        for (auto& a : authorities) {
-            builder.appendff("    {} {} {}\n", a.name.to_string(), to_string(a.class_), to_string(a.type));
-            a.record.visit(
-                [&](auto const& record) { builder.appendff("        {}\n", MUST(record.to_string())); },
-                [&](ByteBuffer const& raw) {
-                    builder.appendff("        {:hex-dump}\n", raw.bytes());
-                });
-        }
-    }
-
-    if (header.additional_count > 0) {
-        builder.appendff("Additional:\n");
-        for (auto& a : additional_records) {
-            builder.appendff("    {} {} {}\n", a.name.to_string(), to_string(a.type), to_string(a.class_));
-            a.record.visit(
-                [&](auto const& record) { builder.appendff("        {}\n", MUST(record.to_string())); },
-                [&](ByteBuffer const& raw) {
-                    builder.appendff("        {:hex-dump}\n", raw.bytes());
-                });
-        }
-    }
-
-    return builder.to_string();
 }
 
 ErrorOr<Question> Question::from_raw(ParseContext& ctx)
@@ -705,47 +655,45 @@ ErrorOr<DomainName> DomainName::from_raw(ParseContext& ctx)
     //                zero length octet for the null label of the root.  Note
     //                that this field may be an odd number of octets; no
     //                padding is used.
-    DomainName name;
-    auto input_offset_marker = ctx.stream.read_bytes();
-    while (true) {
-        auto length = TRY(ctx.stream.read_value<u8>());
-        if (length == 0)
-            break;
+    //
+    // Decoding, including compression pointers (RFC 1035, 4.1.4), is done by the Rust decoder in LibDNS/Rust. It reads
+    // the message bytes at the current offset and reports how many octets the name occupies in the stream.
+    auto input_offset = ctx.stream.read_bytes();
 
-        constexpr static u8 OffsetMarkerMask = 0b11000000;
-        if ((length & OffsetMarkerMask) == OffsetMarkerMask) {
-            // This is a pointer to a prior domain name.
-            u16 offset = static_cast<u16>(length & ~OffsetMarkerMask) << 8 | TRY(ctx.stream.read_value<u8>());
-            if (auto it = ctx.pointers->find_largest_not_above_iterator(offset); !it.is_end()) {
-                auto labels = it->labels;
-                size_t start_index = 0;
-                size_t start_entry_offset = offset - it.key();
-                while (start_entry_offset > 0 && start_index < labels.size()) {
-                    start_entry_offset -= labels[start_index].length() + 1; // +1 for the length byte
-                    start_index++;
-                }
-                for (size_t i = start_index; i < labels.size(); ++i)
-                    name.labels.append(labels[i].substring_view(i == start_index ? start_entry_offset : 0));
-                break;
-            }
-            dbgln("Invalid domain name pointer in label, no prior domain name found around offset {}", offset);
-            return Error::from_string_literal("Invalid domain name pointer in label");
-        }
-
-        // A normal label is at most 63 octets. Lengths whose top two bits are 0b01 or 0b10 are reserved (RFC 1035,
-        // 4.1.4) and would produce a label that can no longer be re-encoded, so reject them here.
-        if (length > 63)
-            return Error::from_string_literal("Domain name label exceeds 63 octets");
-
-        ByteBuffer content;
-        TRY(ctx.stream.read_until_filled(TRY(content.get_bytes_for_writing(length))));
-        name.labels.append(ByteString::copy(content));
+    // RFC 1035, 2.3.4. Size limits: names are 255 octets or less, including the root label's zero octet.
+    u8 wire_name[255];
+    size_t wire_name_length = 0;
+    size_t consumed = 0;
+    switch (ladybird_dns_decode_name(ctx.message.data(), ctx.message.size(), input_offset, wire_name, sizeof(wire_name), &wire_name_length, &consumed)) {
+    case DnsNameStatus::DnsNameStatus_Ok:
+        break;
+    case DnsNameStatus::DnsNameStatus_Truncated:
+        return Error::from_string_literal("Domain name runs past the end of the message");
+    case DnsNameStatus::DnsNameStatus_InvalidPointer:
+        dbgln("Invalid domain name pointer in label, no prior domain name found around offset {}", input_offset);
+        return Error::from_string_literal("Invalid domain name pointer in label");
+    case DnsNameStatus::DnsNameStatus_TooManyPointers:
+        return Error::from_string_literal("Too many domain name pointers in label");
+    case DnsNameStatus::DnsNameStatus_ReservedLabelType:
+        return Error::from_string_literal("Domain name label exceeds 63 octets");
+    case DnsNameStatus::DnsNameStatus_NameTooLong:
+    case DnsNameStatus::DnsNameStatus_OutputTooSmall:
+        return Error::from_string_literal("Domain name exceeds 255 octets");
     }
+
+    DomainName name;
+    for (size_t i = 0; wire_name[i] != 0;) {
+        size_t label_length = wire_name[i];
+        name.labels.append(ByteString::copy(ReadonlyBytes { &wire_name[i + 1], label_length }));
+        i += 1 + label_length;
+    }
+
+    TRY(ctx.stream.discard(consumed));
 
     if (!name.is_valid())
         return Error::from_string_literal("Domain name exceeds 255 octets");
 
-    ctx.pointers->insert(input_offset_marker, name);
+    ctx.pointers->insert(input_offset, name);
 
     return name;
 }
@@ -945,7 +893,7 @@ ErrorOr<ResourceRecord> ResourceRecord::from_raw(ParseContext& ctx)
     {
         RecordingStream rr_stream { ctx.stream };
         CountingStream rr_counting_stream { MaybeOwned<Stream>(rr_stream), original_offset };
-        ParseContext rr_ctx { rr_counting_stream, move(ctx.pointers) };
+        ParseContext rr_ctx { rr_counting_stream, move(ctx.pointers), ctx.message };
         ScopeGuard guard([&] { ctx.pointers = move(rr_ctx.pointers); });
 
         name = TRY(DomainName::from_raw(rr_ctx));
@@ -973,7 +921,7 @@ ErrorOr<ResourceRecord> ResourceRecord::from_raw(ParseContext& ctx)
 
     FixedMemoryStream stream { rdata.bytes() };
     CountingStream rdata_stream { MaybeOwned<Stream>(stream), original_offset };
-    ParseContext rdata_ctx { rdata_stream, move(ctx.pointers) };
+    ParseContext rdata_ctx { rdata_stream, move(ctx.pointers), ctx.message };
     ScopeGuard guard([&] { ctx.pointers = move(rdata_ctx.pointers); });
 
 #define PARSE_AS_RR(TYPE)                                                                                                 \
@@ -1087,7 +1035,7 @@ ErrorOr<void> ResourceRecord::to_canonical_raw(ByteBuffer& buffer, DomainName co
         [](Records::MX& mx) { mx.exchange = mx.exchange.canonicalized(); },
         [](Records::SRV& srv) { srv.target = srv.target.canonicalized(); },
         [](Records::RRSIG& rrsig) { rrsig.signers_name = rrsig.signers_name.canonicalized(); },
-        [](auto&) {});
+        [](auto&) { });
     return canonical.to_raw(buffer);
 }
 
