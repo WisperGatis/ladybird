@@ -10,6 +10,7 @@
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
 #include <AK/RedBlackTree.h>
+#include <AK/Span.h>
 #include <AK/Time.h>
 #include <LibDNS/Export.h>
 
@@ -20,6 +21,8 @@ struct DomainName;
 struct ParseContext {
     CountingStream& stream;
     NonnullOwnPtr<RedBlackTree<u16, DomainName>> pointers;
+    // The whole message that `stream` reads from, so compression pointers can be resolved by offset.
+    ReadonlyBytes message;
 };
 
 enum class OpCode : u8;
@@ -763,14 +766,12 @@ struct DNS_API Message {
     Vector<ResourceRecord> additional_records;
 
     static ErrorOr<Message> from_raw(ParseContext&);
-    static ErrorOr<Message> from_raw(Stream&);
+    static ErrorOr<Message> from_raw(ReadonlyBytes);
     ErrorOr<size_t> to_raw(ByteBuffer&) const;
 
     // The answer records that respond to the question: RRs owned by the queried name, and RRs reached through a
     // chain of CNAMEs starting there. Anything an alias leads to is valid for no longer than the alias.
     Vector<ResourceRecord> answers_to(Question const&) const;
-
-    ErrorOr<String> format_for_log() const;
 };
 
 }

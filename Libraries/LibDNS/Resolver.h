@@ -40,7 +40,7 @@ public:
             re.record.record.visit(
                 [&](Messages::Records::A const& a) { result.append(a.address); },
                 [&](Messages::Records::AAAA const& aaaa) { result.append(aaaa.address); },
-                [](auto&) {});
+                [](auto&) { });
         }
         return result;
     }
@@ -595,7 +595,7 @@ public:
         in_flight->question = { name, type, class_ };
         in_flight->dnssec_ok = dnssec_ok;
         in_flight->waiters.append(promise);
-        in_flight->retry_timer = Core::Timer::create_single_shot(query_retry_interval_ms, [this, id] { retry_query(id); });
+        in_flight->retry_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(query_retry_interval_ms), [this, id] { retry_query(id); });
         auto* raw = in_flight.ptr();
         m_in_flight.set(key, move(in_flight));
         m_in_flight_by_id.set(id, key);
@@ -930,7 +930,7 @@ private:
             return;
         constexpr int RESOLUTION_DELAY_MS = 50;
         auto weak_state = state.make_weak_ptr();
-        state.grace_timer = Core::Timer::create_single_shot(RESOLUTION_DELAY_MS, [weak_state] {
+        state.grace_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(RESOLUTION_DELAY_MS), [weak_state] {
             if (auto state = weak_state.strong_ref())
                 try_finalize_pending_system_resolution(*state);
         });
@@ -963,8 +963,7 @@ private:
             // Core treats an empty read as EOF and stops notifying us, so this socket is done even on UDP.
             if (datagram.is_empty())
                 return Error::from_string_literal("DNS server socket reached EOF");
-            FixedMemoryStream stream { static_cast<ReadonlyBytes>(datagram) };
-            auto message = Messages::Message::from_raw(stream);
+            auto message = Messages::Message::from_raw(static_cast<ReadonlyBytes>(datagram));
             if (message.is_error()) {
                 dbgln("DNS: Dropping malformed datagram: {}", message.error());
                 return OptionalNone {};
@@ -979,8 +978,7 @@ private:
             if (incoming.size() >= sizeof(u16)) {
                 size_t size = static_cast<size_t>(incoming[0]) << 8 | incoming[1];
                 if (incoming.size() >= sizeof(u16) + size) {
-                    FixedMemoryStream stream { incoming.bytes().slice(sizeof(u16), size) };
-                    auto message = Messages::Message::from_raw(stream);
+                    auto message = Messages::Message::from_raw(incoming.bytes().slice(sizeof(u16), size));
                     auto rest = incoming.bytes().slice(sizeof(u16) + size);
                     incoming = TRY(ByteBuffer::copy(rest));
                     // A frame that does not parse leaves us with no idea where the next one starts.

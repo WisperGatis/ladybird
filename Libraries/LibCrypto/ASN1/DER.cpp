@@ -11,46 +11,45 @@
 #include <AK/Try.h>
 #include <AK/Utf8View.h>
 #include <LibCrypto/ASN1/DER.h>
+#include <RustFFI.h>
 
 namespace Crypto::ASN1 {
 
+static ErrorOr<void> asn1_status_to_error(Asn1Status status, StringView message)
+{
+    if (status == Asn1Status::Asn1Status_Ok)
+        return {};
+    return Error::from_string_view(message);
+}
+
 ErrorOr<Tag> Decoder::read_tag()
 {
-    auto byte = TRY(read_byte());
-    u8 class_ = byte & 0xc0;
-    u8 type = byte & 0x20;
-    u8 kind = byte & 0x1f;
+    // X.690 8.1.2. The identifier octets are parsed by the Rust decoder in LibCrypto/Rust.
+    if (m_stack.is_empty())
+        return Error::from_string_literal("ASN1::Decoder: Reading tag from an empty stack");
+    auto& entry = m_stack.last();
+    size_t position = 0;
+    u8 class_ = 0;
+    u8 constructed = 0;
+    u32 kind = 0;
+    auto status = ladybird_asn1_read_tag(entry.data(), entry.size(), &position, &class_, &constructed, &kind);
+    TRY(asn1_status_to_error(status, "ASN1::Decoder: Invalid identifier octets"sv));
+    entry = entry.slice(position);
 
-    if (kind == 0x1f) {
-        kind = 0;
-        while (byte & 0x80) {
-            byte = TRY(read_byte());
-            kind = (kind << 7) | (byte & 0x7f);
-        }
-    }
-
-    return Tag { (Kind)kind, (Class)class_, (Type)type };
+    return Tag { (Kind)kind, (Class)class_, (Type)constructed };
 }
 
 ErrorOr<size_t> Decoder::read_length()
 {
-    auto byte = TRY(read_byte());
-    size_t length = byte;
-
-    if (byte & 0x80) {
-        auto count = byte & 0x7f;
-        if (count == 0 || count == 0x7f)
-            return Error::from_string_literal("ASN1::Decoder: Length has an invalid count value");
-
-        auto data = TRY(read_bytes(count));
-        length = 0;
-
-        if (data.size() > sizeof(size_t))
-            return Error::from_string_literal("ASN1::Decoder: Length is larger than the target type");
-
-        for (auto&& byte : data)
-            length = (length << 8) | (size_t)byte;
-    }
+    // X.690 8.1.3. The length octets are parsed by the Rust decoder in LibCrypto/Rust.
+    if (m_stack.is_empty())
+        return Error::from_string_literal("ASN1::Decoder: Reading length from an empty stack");
+    auto& entry = m_stack.last();
+    size_t position = 0;
+    size_t length = 0;
+    auto status = ladybird_asn1_read_length(entry.data(), entry.size(), &position, &length);
+    TRY(asn1_status_to_error(status, "ASN1::Decoder: Length has an invalid count value"sv));
+    entry = entry.slice(position);
 
     return length;
 }

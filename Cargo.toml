@@ -1,6 +1,10 @@
 [workspace]
 members = [
     "AK/Rust",
+    "Libraries/LibCrypto/Rust",
+    "Libraries/LibDNS/Rust",
+    "Libraries/LibHTTP/Rust",
+    "Libraries/LibMedia/Rust",
     "Libraries/LibCompositing/Rust",
     "Libraries/LibGfx/Rust",
     "Libraries/LibImageDecoders/Rust",

@@ -32,5 +32,10 @@ set(SOURCES
 
 ladybird_lib(LibCrypto crypto)
 
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libcrypto_rust FFI_HEADER RustFFI.h)
+target_link_libraries(LibCrypto PRIVATE libcrypto_rust)
+ladybird_hide_rust_crate_symbols(LibCrypto libcrypto_rust)
+test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libcrypto_rust)
+
 target_link_libraries(LibCrypto PRIVATE PkgConfig::libtommath)
 target_link_libraries(LibCrypto PUBLIC OpenSSL::Crypto)

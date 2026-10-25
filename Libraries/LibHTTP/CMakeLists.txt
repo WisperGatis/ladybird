@@ -14,10 +14,16 @@ set(SOURCES
     HttpRequest.cpp
     Method.cpp
     NetworkIsolationKey.cpp
+    Port.cpp
+    Proxy.cpp
+    StructuredFields.cpp
 )
 
 include(hsts_preload)
 list(APPEND SOURCES ${HSTS_PRELOAD_SOURCES})
 
 ladybird_lib(LibHTTP http)
-target_link_libraries(LibHTTP PRIVATE LibCompress LibCore LibCrypto LibDatabase LibFileSystem LibIPC LibRegex LibTextCodec LibTLS LibUnicode LibURL)
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libhttp_rust FFI_HEADER RustFFI.h)
+target_link_libraries(LibHTTP PRIVATE libhttp_rust LibCompress LibCore LibCrypto LibDatabase LibFileSystem LibIPC LibRegex LibTextCodec LibTLS LibUnicode LibURL)
+ladybird_hide_rust_crate_symbols(LibHTTP libhttp_rust)
+test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libhttp_rust)
